@@ -36,3 +36,9 @@ export function readRemoteCheckBeforeCommit(): boolean {
   const raw: unknown = getConfiguration().get('remoteCheckBeforeCommit', true);
   return typeof raw === 'boolean' ? raw : true;
 }
+
+/** 是否允许空提交说明；类型非法时按开启处理（默认开启）。 */
+export function readAllowEmptyCommitMessage(): boolean {
+  const raw: unknown = getConfiguration().get('allowEmptyCommitMessage', true);
+  return typeof raw === 'boolean' ? raw : true;
+}

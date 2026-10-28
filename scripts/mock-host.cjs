@@ -21,10 +21,18 @@ const state = {
   /** 模态确认框（更新确认）返回的按钮；undefined 表示用户取消。 */
   confirmResult: undefined,
   progressTitles: [],
+  /** 提交说明输入框返回值。 */
+  inputResult: undefined,
+  /** QuickPick 指定勾选的 label 集合；undefined 表示默认勾选。 */
+  quickPickPicked: undefined,
+  quickPicks: [],
 };
 
 const fakeVscode = {
   ProgressLocation: { Notification: 15 },
+  ThemeIcon: class {
+    constructor(id) { this.id = id; }
+  },
   window: {
     createOutputChannel(title) {
       const ch = {
@@ -58,6 +66,31 @@ const fakeVscode = {
     withProgress(options, task) {
       state.progressTitles.push(options.title);
       return task({ report() {} }, { onCancellationRequested: () => ({ dispose() {} }) });
+    },
+    showInputBox() {
+      return Promise.resolve(state.inputResult);
+    },
+    createQuickPick() {
+      const handlers = {};
+      const qp = {
+        title: '', placeholder: '', canSelectMany: false, matchOnDescription: false,
+        items: [], selectedItems: [],
+        onDidAccept(cb) { (handlers.accept ??= []).push(cb); return { dispose() {} }; },
+        onDidHide(cb) { (handlers.hide ??= []).push(cb); return { dispose() {} }; },
+        onDidTriggerItemButton(cb) { (handlers.button ??= []).push(cb); return { dispose() {} }; },
+        show() {
+          // 模拟用户回车确认：未指定勾选集合时默认选非 unversioned 项。
+          qp.selectedItems = state.quickPickPicked
+            ? qp.items.filter((i) => state.quickPickPicked.includes(i.label))
+            : qp.items.filter((i) => i.description !== 'unversioned');
+          handlers.accept?.forEach((cb) => cb());
+          handlers.hide?.forEach((cb) => cb());
+        },
+        hide() { handlers.hide?.forEach((cb) => cb()); },
+        dispose() {},
+      };
+      state.quickPicks.push(qp);
+      return qp;
     },
     activeTextEditor: undefined,
   },
@@ -260,7 +293,7 @@ async function main() {
   svn(['add', '-q', '--parents', 'remote-add.txt'], remote);
   svn(['commit', '-q', '-m', 'remote add more'], remote);
   state.confirmResult = '更新并继续';
-  const infoBeforeCommit = state.information.length;
+  const quickPicksBeforeCommit = state.quickPicks.length;
   const warningBeforeCommit = state.warning.length;
   const progressBeforeCommit = state.progressTitles.length;
   const linesBeforeCommitCheck = channelText().length;
@@ -276,14 +309,83 @@ async function main() {
   check('执行了更新（进度通知）', state.progressTitles.length > progressBeforeCommit);
   check('频道有更新明细与最终 revision', commitCheckOutput.includes('更新完成，当前 revision'));
   check(
-    '更新后进入提交入口（占位提示）',
-    state.information.length > infoBeforeCommit &&
-      state.information.slice(infoBeforeCommit).some((m) => m.includes('提交')),
-    JSON.stringify(state.information.slice(infoBeforeCommit)),
+    '更新后进入提交面板',
+    state.quickPicks.length > quickPicksBeforeCommit &&
+      String(state.quickPicks.at(-1)?.title).includes('选择要提交的变更'),
+    `面板数 ${state.quickPicks.length}`,
   );
   state.confirmResult = undefined;
 
-  console.log('场景 12：deactivate 正常返回');
+  console.log('场景 12：真实副本「提交」——部分勾选提交、revision 回显、空说明');
+  const probe3 = svnLab.checkout('probe3');
+  writeFileSync(join(probe3, 'b2.txt'), 'v1');
+  writeFileSync(join(probe3, 'c2.txt'), 'v1');
+  svn(['add', '-q', '--parents', 'b2.txt', 'c2.txt'], probe3);
+  svn(['commit', '-q', '-m', 'probe3 init'], probe3);
+  writeFileSync(join(probe3, 'b2.txt'), 'committed content\n');
+  writeFileSync(join(probe3, 'c2.txt'), 'kept local\n');
+  state.inputResult = 'feat: mock host commit';
+  state.quickPickPicked = ['b2.txt'];
+  const infoBeforeRealCommit = state.information.length;
+  const linesBeforeRealCommit = channelText().length;
+  await state.registered.get('svnAnywhere.commit')({ fsPath: probe3, scheme: 'file' });
+  const commitOutput = channelText().slice(linesBeforeRealCommit);
+  check('频道含 Committed revision 输出', commitOutput.includes('Committed revision'), commitOutput.slice(-600));
+  check(
+    '弹提交成功提示含 revision',
+    state.information.slice(infoBeforeRealCommit).some((m) => m.includes('提交成功，revision')),
+    JSON.stringify(state.information.slice(infoBeforeRealCommit)),
+  );
+  // F29 部分提交：未勾选的 c2.txt 保持本地变更（提交后状态报告可见）。
+  check('未勾选项保持本地变更', commitOutput.includes('[modified] c2.txt'), commitOutput.slice(-400));
+  const remoteCheck = svn(['cat', `${svnLab.repoUrl}/b2.txt`]);
+  check('远端确实收到新内容', remoteCheck.includes('committed content'));
+
+  // F24/F80：空说明提交（开关默认允许，空说明二次确认）。
+  state.inputResult = '';
+  state.confirmResult = '继续';
+  state.quickPickPicked = ['c2.txt'];
+  const infoBeforeEmpty = state.information.length;
+  await state.registered.get('svnAnywhere.commit')({ fsPath: probe3, scheme: 'file' });
+  check(
+    '空说明提交成功',
+    state.information.slice(infoBeforeEmpty).some((m) => m.includes('提交成功，revision')),
+    JSON.stringify(state.information.slice(infoBeforeEmpty)),
+  );
+  check('空说明弹了二次确认', state.warning.some((m) => m.includes('提交说明为空')));
+  state.inputResult = undefined;
+  state.confirmResult = undefined;
+  state.quickPickPicked = undefined;
+
+  console.log('场景 13：真实副本「提交」missing——svn delete --force 后提交删除远端文件');
+  writeFileSync(join(probe3, 'drop.txt'), 'to delete');
+  svn(['add', '-q', '--parents', 'drop.txt'], probe3);
+  svn(['commit', '-q', '-m', 'add drop'], probe3);
+  rmSync(join(probe3, 'drop.txt'));
+  state.inputResult = 'chore: drop file';
+  state.confirmResult = '继续';
+  const linesBeforeMissing = channelText().length;
+  const infoBeforeMissing = state.information.length;
+  await state.registered.get('svnAnywhere.commit')({ fsPath: probe3, scheme: 'file' });
+  const missingOutput = channelText().slice(linesBeforeMissing);
+  check('missing 确认弹窗出现', state.warning.some((m) => m.includes('未登记 SVN 删除')));
+  check('commit 输出含删除行 Deleting', missingOutput.includes('Deleting       drop.txt'), missingOutput.slice(-600));
+  check(
+    '提交成功提示',
+    state.information.slice(infoBeforeMissing).some((m) => m.includes('提交成功，revision')),
+  );
+  let remoteMissing = false;
+  try {
+    svn(['cat', `${svnLab.repoUrl}/drop.txt`]);
+    remoteMissing = false;
+  } catch {
+    remoteMissing = true;
+  }
+  check('远端文件已被删除', remoteMissing);
+  state.inputResult = undefined;
+  state.confirmResult = undefined;
+
+  console.log('场景 14：deactivate 正常返回');
   let deactivateOk = true;
   try {
     extension.deactivate();
@@ -293,7 +395,7 @@ async function main() {
   }
   check('deactivate 不抛错', deactivateOk);
 
-  console.log('场景 13：同一宿主实例二次 activate 不重复注册');
+  console.log('场景 15：同一宿主实例二次 activate 不重复注册');
   const secondContext = { subscriptions: [] };
   let secondActivateOk = true;
   try {
