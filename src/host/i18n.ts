@@ -19,6 +19,24 @@ export const strings = {
   target: {
     resolved: '[定位] {command}：目标 {target}，副本根 {wcRoot}',
   },
+  status: {
+    header: '状态（{path}）：',
+    clean: '无本地变更。',
+    entry: '[{status}] {path}',
+  },
+  update: {
+    confirmTitle: '将更新以下路径：\n{target}',
+    confirmButton: '更新',
+    progress: '正在更新 {target}…',
+    done: '更新完成，当前 revision {revision}。',
+    doneNoRevision: '更新完成。',
+    conflicts: '更新完成，但有 {count} 个冲突需要先解决：{paths}',
+    conflictsUnresolved: '更新输出报告了 {count} 个冲突，但未能定位冲突文件，请在输出面板确认。',
+  },
+  cleanup: {
+    progress: '正在清理 {target}…',
+    done: '清理完成。',
+  },
   placeholder: {
     notice: '「{command}」将在后续版本提供。已定位到工作副本：{wcRoot}',
   },

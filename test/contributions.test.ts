@@ -9,7 +9,10 @@ import { describe, expect, it } from 'vitest';
 import { strings } from '../src/host/i18n';
 
 interface Manifest {
-  contributes: { commands: Array<{ command: string; title: string }> };
+  contributes: {
+    commands: Array<{ command: string; title: string; category?: string }>;
+    submenus?: Array<{ id: string; label: string }>;
+  };
 }
 
 const pkg = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf8')) as Manifest & { name: string };

@@ -1,0 +1,117 @@
+/**
+ * svn update 的执行与文本输出解析。core 模块，不依赖 vscode。
+ *
+ * 关键约定：update 存在冲突时退出码仍为 0，冲突必须靠解析输出判断，
+ * 不能依赖 exitCode。args 固定带 --non-interactive：spawn 无 tty，
+ * 防止 svn 等待 stdin 挂起（不影响缓存凭据的静默使用）。
+ */
+import { runOrThrow, type RunOptions, type RunResult } from './svnCli';
+import { escapePeg } from './workspace';
+
+export interface UpdateItem {
+  /** 明细状态字母（A/D/U/C/G/E/R/~ 或树冲突 C），svn 原词。 */
+  status: string;
+  path: string;
+}
+
+export interface ConflictSummaryCounts {
+  text?: number;
+  property?: number;
+  tree?: number;
+}
+
+export interface UpdateResult {
+  items: UpdateItem[];
+  /** 最终 revision（`Updated to revision N` / `At revision N`）。 */
+  finalRevision?: number;
+  /** 产生冲突的路径（明细状态 C 或树冲突行）。 */
+  conflicts: string[];
+  /**
+   * `Summary of conflicts` 段的计数。svn 正常输出 C 行与计数一致；
+   * 两者不一致时（C 行缺失但计数非零）宿主据总数提示，避免漏报冲突。
+   */
+  conflictSummary?: ConflictSummaryCounts;
+}
+
+export type UpdateRunResult = RunResult & UpdateResult;
+
+/** 普通明细行：行首状态字母 + 空白 + 路径（如 `U    src/a.txt`）。 */
+const ITEM_LINE = /^([A-Z~!?])\s+(.+)$/;
+/**
+ * 树冲突明细行：行首空白 + C + 空白 + 路径（如 `   C sub`），
+ * 与行首字母的普通 C 行互斥；Svn 输出时树冲突占属性列。
+ */
+const TREE_CONFLICT_LINE = /^\s+C\s+(.+)$/;
+/** 主副本最终 revision；externals 段的 `Updated external to revision N` 不匹配。 */
+const FINAL_REVISION = /^(?:Updated to|At) revision (\d+)\./;
+/** Summary of conflicts 段内的计数行（缩进两格）。 */
+const SUMMARY_COUNT_LINE = /^\s+(Text|Property|Tree) conflicts: (\d+)$/;
+
+export function parseUpdateOutput(text: string): UpdateResult {
+  const items: UpdateItem[] = [];
+  let finalRevision: number | undefined;
+  let conflictSummary: ConflictSummaryCounts | undefined;
+  let inSummary = false;
+
+  for (const rawLine of text.split('\n')) {
+    const line = rawLine.replace(/\r$/, '');
+
+    if (inSummary) {
+      const count = SUMMARY_COUNT_LINE.exec(line);
+      if (count) {
+        const total = Number(count[2]);
+        if (total > 0) {
+          conflictSummary = conflictSummary ?? {};
+          conflictSummary[count[1].toLowerCase() as keyof ConflictSummaryCounts] = total;
+        }
+        continue;
+      }
+      if (line.trim()) {
+        inSummary = false;
+      }
+    }
+
+    const item = ITEM_LINE.exec(line);
+    if (item) {
+      items.push({ status: item[1], path: item[2] });
+      continue;
+    }
+
+    const treeConflict = TREE_CONFLICT_LINE.exec(line);
+    if (treeConflict) {
+      items.push({ status: 'C', path: treeConflict[1] });
+      continue;
+    }
+
+    const revision = FINAL_REVISION.exec(line);
+    if (revision) {
+      finalRevision = Number(revision[1]);
+      continue;
+    }
+
+    if (line.trim() === 'Summary of conflicts:') {
+      inSummary = true;
+    }
+  }
+
+  return {
+    items,
+    finalRevision,
+    conflicts: items.filter((item) => item.status === 'C').map((item) => item.path),
+    conflictSummary,
+  };
+}
+
+/** 对目标路径执行 `svn update`（固定 --non-interactive）并解析结果。 */
+export async function runUpdate(
+  svnPath: string,
+  target: string,
+  options: RunOptions = {},
+): Promise<UpdateRunResult> {
+  const result = await runOrThrow(
+    svnPath,
+    ['update', '--non-interactive', escapePeg(target)],
+    options,
+  );
+  return { ...result, ...parseUpdateOutput(result.stdout) };
+}
