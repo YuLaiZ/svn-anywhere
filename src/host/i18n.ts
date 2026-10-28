@@ -37,6 +37,15 @@ export const strings = {
     progress: '正在清理 {target}…',
     done: '清理完成。',
   },
+  commitCheck: {
+    remoteSummary: '远端检查：{count} 个远端更新（对照 revision {against}）。',
+    confirmTitle: '发现 {count} 个远端更新，先更新再提交？',
+    updateAndContinue: '更新并继续',
+    updateOnly: '仅更新',
+    cancel: '取消',
+    blockedByConflicts: '更新产生冲突，已停止提交：{paths}',
+    noChanges: '没有可提交的本地变更。',
+  },
   placeholder: {
     notice: '「{command}」将在后续版本提供。已定位到工作副本：{wcRoot}',
   },

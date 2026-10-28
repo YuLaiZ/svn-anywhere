@@ -154,10 +154,10 @@ async function main() {
   writeFileSync(join(wc, '.svn', 'wc.db'), 'fake');
   const fileInside = join(wc, 'a.txt');
   writeFileSync(fileInside, 'x');
-  await state.registered.get('svnAnywhere.commit')({ fsPath: fileInside, scheme: 'file' });
+  await state.registered.get('svnAnywhere.relocate')({ fsPath: fileInside, scheme: 'file' });
   check(
     '弹占位提示且包含副本根',
-    state.information.some((m) => m.includes('提交') && m.includes(wc)),
+    state.information.some((m) => m.includes('重定位') && m.includes(wc)),
     `实际提示：${JSON.stringify(state.information)}`,
   );
   check(
@@ -169,7 +169,7 @@ async function main() {
   console.log('场景 3：右键非工作副本目录，给出明确提示，不静默');
   const plain = makeTempDir('svn-anywhere-mock-plain-');
   const infoBeforePlain = state.information.length;
-  await state.registered.get('svnAnywhere.commit')({ fsPath: plain, scheme: 'file' });
+  await state.registered.get('svnAnywhere.relocate')({ fsPath: plain, scheme: 'file' });
   check(
     '弹「不在工作副本」信息提示',
     state.information.length === infoBeforePlain + 1 &&
@@ -250,7 +250,40 @@ async function main() {
   );
   state.confirmResult = undefined;
 
-  console.log('场景 11：deactivate 正常返回');
+  console.log('场景 11：真实副本「提交」——远端有更新先提示，更新并继续后进入提交入口');
+  const probe2 = svnLab.checkout('probe2');
+  writeFileSync(join(probe2, 'b.txt'), 'v1');
+  svn(['add', '-q', '--parents', 'b.txt'], probe2);
+  svn(['commit', '-q', '-m', 'probe2 init'], probe2);
+  writeFileSync(join(probe2, 'b.txt'), 'local edit\n');
+  writeFileSync(join(remote, 'remote-add.txt'), 'x');
+  svn(['add', '-q', '--parents', 'remote-add.txt'], remote);
+  svn(['commit', '-q', '-m', 'remote add more'], remote);
+  state.confirmResult = '更新并继续';
+  const infoBeforeCommit = state.information.length;
+  const warningBeforeCommit = state.warning.length;
+  const progressBeforeCommit = state.progressTitles.length;
+  const linesBeforeCommitCheck = channelText().length;
+  // 对目录驱动：单文件目标的 status -u 查不到其他路径的远端变更。
+  await state.registered.get('svnAnywhere.commit')({ fsPath: probe2, scheme: 'file' });
+  const commitCheckOutput = channelText().slice(linesBeforeCommitCheck);
+  check(
+    '弹出远端更新提示',
+    state.warning.slice(warningBeforeCommit).some((m) => m.includes('远端更新')),
+    JSON.stringify(state.warning.slice(warningBeforeCommit)),
+  );
+  check('频道写远端检查汇总', commitCheckOutput.includes('远端检查：'));
+  check('执行了更新（进度通知）', state.progressTitles.length > progressBeforeCommit);
+  check('频道有更新明细与最终 revision', commitCheckOutput.includes('更新完成，当前 revision'));
+  check(
+    '更新后进入提交入口（占位提示）',
+    state.information.length > infoBeforeCommit &&
+      state.information.slice(infoBeforeCommit).some((m) => m.includes('提交')),
+    JSON.stringify(state.information.slice(infoBeforeCommit)),
+  );
+  state.confirmResult = undefined;
+
+  console.log('场景 12：deactivate 正常返回');
   let deactivateOk = true;
   try {
     extension.deactivate();
@@ -260,7 +293,7 @@ async function main() {
   }
   check('deactivate 不抛错', deactivateOk);
 
-  console.log('场景 12：同一宿主实例二次 activate 不重复注册');
+  console.log('场景 13：同一宿主实例二次 activate 不重复注册');
   const secondContext = { subscriptions: [] };
   let secondActivateOk = true;
   try {
