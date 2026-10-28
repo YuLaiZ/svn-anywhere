@@ -180,6 +180,7 @@
   "devDependencies": {
     "@types/node": "^26.6.5",
     "@types/vscode": "~1.85.0",
+    "@vscode/vsce": "^4.0.0",
     "esbuild": "^0.28.2",
     "fast-xml-parser": "^5.11.2",
     "typescript": "^7.0.2",
