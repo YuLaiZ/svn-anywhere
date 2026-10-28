@@ -1,0 +1,14 @@
+.vscode/**
+.idea/**
+src/**
+test/**
+scripts/**
+out/*.map
+node_modules/**
+**/*.ts
+**/*.mts
+tsconfig.json
+pnpm-lock.yaml
+pnpm-workspace.yaml
+.gitignore
+.DS_Store

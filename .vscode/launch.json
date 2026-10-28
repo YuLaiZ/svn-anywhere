@@ -1,0 +1,16 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "启动扩展开发宿主（指向真实副本）",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}",
+        "--folder-uri=file://${env:HOME}/Documents/svn/doc/design/%E6%97%A5%E5%BF%97%E7%B3%BB%E7%BB%9F"
+      ],
+      "outFiles": ["${workspaceFolder}/out/**/*.js"],
+      "preLaunchTask": "pnpm: build"
+    }
+  ]
+}

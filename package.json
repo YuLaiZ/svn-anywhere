@@ -1,0 +1,186 @@
+{
+  "name": "svn-anywhere",
+  "displayName": "SVN Anywhere",
+  "description": "在 VS Code 里管理任意布局的 SVN 工作副本",
+  "version": "0.1.0",
+  "publisher": "yulaiz",
+  "private": true,
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:svnAnywhere.update",
+    "onCommand:svnAnywhere.commit",
+    "onCommand:svnAnywhere.showStatus",
+    "onCommand:svnAnywhere.refreshStatus",
+    "onCommand:svnAnywhere.cleanup",
+    "onCommand:svnAnywhere.relocate",
+    "onCommand:svnAnywhere.editIgnore",
+    "onCommand:svnAnywhere.showOutput"
+  ],
+  "contributes": {
+    "submenus": [
+      {
+        "id": "svnAnywhere.submenu",
+        "label": "SVN"
+      }
+    ],
+    "commands": [
+      {
+        "command": "svnAnywhere.update",
+        "title": "更新",
+        "category": "SVN"
+      },
+      {
+        "command": "svnAnywhere.commit",
+        "title": "提交",
+        "category": "SVN"
+      },
+      {
+        "command": "svnAnywhere.showStatus",
+        "title": "显示状态",
+        "category": "SVN"
+      },
+      {
+        "command": "svnAnywhere.refreshStatus",
+        "title": "刷新状态",
+        "category": "SVN"
+      },
+      {
+        "command": "svnAnywhere.cleanup",
+        "title": "清理",
+        "category": "SVN"
+      },
+      {
+        "command": "svnAnywhere.relocate",
+        "title": "重定位（改仓库地址）",
+        "category": "SVN"
+      },
+      {
+        "command": "svnAnywhere.editIgnore",
+        "title": "忽略设置",
+        "category": "SVN"
+      },
+      {
+        "command": "svnAnywhere.showOutput",
+        "title": "显示输出",
+        "category": "SVN"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "submenu": "svnAnywhere.submenu",
+          "when": "resourceScheme == file",
+          "group": "4_svn"
+        }
+      ],
+      "svnAnywhere.submenu": [
+        {
+          "command": "svnAnywhere.showStatus",
+          "group": "1_info@1"
+        },
+        {
+          "command": "svnAnywhere.commit",
+          "group": "2_commit@1"
+        },
+        {
+          "command": "svnAnywhere.update",
+          "group": "3_update@1"
+        },
+        {
+          "command": "svnAnywhere.refreshStatus",
+          "group": "3_update@2"
+        },
+        {
+          "command": "svnAnywhere.cleanup",
+          "group": "3_update@3"
+        },
+        {
+          "command": "svnAnywhere.relocate",
+          "group": "4_advanced@1"
+        },
+        {
+          "command": "svnAnywhere.editIgnore",
+          "group": "4_advanced@2"
+        },
+        {
+          "command": "svnAnywhere.showOutput",
+          "group": "4_advanced@9"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "svnAnywhere.update"
+        },
+        {
+          "command": "svnAnywhere.commit"
+        },
+        {
+          "command": "svnAnywhere.showStatus"
+        },
+        {
+          "command": "svnAnywhere.refreshStatus"
+        },
+        {
+          "command": "svnAnywhere.cleanup"
+        },
+        {
+          "command": "svnAnywhere.relocate"
+        },
+        {
+          "command": "svnAnywhere.editIgnore"
+        },
+        {
+          "command": "svnAnywhere.showOutput"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "SVN Anywhere",
+      "properties": {
+        "svnAnywhere.svnPath": {
+          "type": "string",
+          "default": "",
+          "description": "svn 可执行文件路径；留空时自动使用 PATH 中的 svn，找不到时命令会失败并提示"
+        },
+        "svnAnywhere.allowEmptyCommitMessage": {
+          "type": "boolean",
+          "default": true,
+          "description": "是否允许空提交说明"
+        },
+        "svnAnywhere.remoteCheckBeforeCommit": {
+          "type": "boolean",
+          "default": true,
+          "description": "提交前是否执行 svn status -u 检查远端更新"
+        },
+        "svnAnywhere.timeoutMs": {
+          "type": "number",
+          "default": 120000,
+          "minimum": 0,
+          "description": "单条 svn 命令超时（毫秒），0 表示不限时"
+        },
+        "svnAnywhere.showOutputOnError": {
+          "type": "boolean",
+          "default": true,
+          "description": "命令失败时自动切到输出面板"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node scripts/esbuild.mjs",
+    "watch": "node scripts/esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "@types/vscode": "~1.85.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5"
+  }
+}

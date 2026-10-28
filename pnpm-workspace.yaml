@@ -1,0 +1,4 @@
+# esbuild 的平台二进制经 optionalDependencies 落地，postinstall 仅做校验，
+# 被忽略不影响功能；此处声明为已知忽略，消除每次 install 的警告。
+ignoredBuiltDependencies:
+  - esbuild
