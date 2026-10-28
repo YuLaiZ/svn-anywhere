@@ -9,13 +9,18 @@
  * - 所有包含命令与 args 的错误消息都经过 redactArgs，--password 不进明文。
  */
 import { spawn, type ChildProcess } from 'node:child_process';
-import { SvnError, assertSuccess, tailText } from './errors';
+import { SvnError, assertSuccess, isAuthFailure, tailText } from './errors';
 import { redactArgs } from './redact';
 
 export const DEFAULT_TIMEOUT_MS = 120_000;
 
 /** 超时/取消后先 SIGTERM，进程仍未退出时再等这么久发 SIGKILL。 */
 const SIGKILL_GRACE_MS = 3_000;
+
+export interface AuthCredentials {
+  username: string;
+  password: string;
+}
 
 export interface RunOptions {
   /** 工作目录，默认继承当前进程。 */
@@ -26,6 +31,12 @@ export interface RunOptions {
   signal?: AbortSignal;
   /** 增量输出回调，宿主写 OutputChannel（建议配合 LineBuffer 按行脱敏）。 */
   onOutput?: (chunk: string, source: 'stdout' | 'stderr') => void;
+  /**
+   * 认证失败时的凭据补录回调（宿主弹窗，密码只在内存）。
+   * 提供后 runOrThrow 在识别到认证失败时补录并保留原始 args 重试一次；
+   * 只读的本地命令不应提供。
+   */
+  getCredentials?: () => Promise<AuthCredentials | undefined>;
 }
 
 export interface RunResult {
@@ -222,12 +233,40 @@ export function run(svnPath: string, args: string[], options: RunOptions = {}): 
   });
 }
 
-/** 非零退出码视为失败的常用封装；成功时原样返回结果。 */
+/**
+ * 非零退出码视为失败的常用封装；成功时原样返回结果。
+ * 提供 getCredentials 时，认证失败（E170001/E215004 等）弹窗补录凭据，
+ * 保留原始 args 追加 --username/--password 重试一次；补录取消或重试
+ * 仍失败都按原错误抛出（SvnError.command 构造时脱敏，明文不外泄）。
+ */
 export async function runOrThrow(
   svnPath: string,
   args: string[],
   options: RunOptions = {},
 ): Promise<RunResult> {
-  const result = await run(svnPath, args, options);
-  return assertSuccess(result, args, options.cwd);
+  return runOrThrowWithRunner(svnPath, args, options, run);
+}
+
+/** runOrThrow 的可注入变体：测试用替身 runner 验证认证重试决策逻辑。 */
+export async function runOrThrowWithRunner(
+  svnPath: string,
+  args: string[],
+  options: RunOptions,
+  runner: typeof run,
+): Promise<RunResult> {
+  try {
+    const result = await runner(svnPath, args, options);
+    return assertSuccess(result, args, options.cwd);
+  } catch (err) {
+    if (!options.getCredentials || !(err instanceof SvnError) || !isAuthFailure(err.stderr)) {
+      throw err;
+    }
+    const credentials = await options.getCredentials();
+    if (!credentials) {
+      throw err;
+    }
+    const retryArgs = [...args, '--username', credentials.username, '--password', credentials.password];
+    const result = await runner(svnPath, retryArgs, options);
+    return assertSuccess(result, retryArgs, options.cwd);
+  }
 }

@@ -108,6 +108,10 @@ export const strings = {
     withShowOutput: '{message}',
     buttonShowOutput: '显示输出',
   },
+  auth: {
+    usernamePrompt: 'SVN 认证失败，请输入用户名',
+    passwordPrompt: '请输入密码（仅本次内存使用，不会保存）',
+  },
 } as const;
 
 /** 按 {key} 占位符填充文案。 */

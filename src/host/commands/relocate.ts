@@ -12,6 +12,7 @@ import { format, strings } from '../i18n';
 import { logCommand, logLine, showOutput } from '../output';
 import { resolveWorkingCopyTarget } from './target';
 import { confirmModal } from '../ui/confirm';
+import { promptForCredentials } from '../auth';
 
 export async function commandRelocate(uri?: vscode.Uri): Promise<void> {
   const target = await resolveWorkingCopyTarget(uri, strings.command.relocate);
@@ -62,7 +63,10 @@ export async function commandRelocate(uri?: vscode.Uri): Promise<void> {
       },
       async () => {
         logCommand(svnPath, args, target.wcRoot);
-        const result = await runOrThrow(svnPath, args, runOptions);
+        const result = await runOrThrow(svnPath, args, {
+          ...runOptions,
+          getCredentials: promptForCredentials,
+        });
         logLine(result.stdout.trim());
       },
     );

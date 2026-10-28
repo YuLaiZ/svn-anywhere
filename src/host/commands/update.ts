@@ -12,6 +12,7 @@ import { format, strings } from '../i18n';
 import { createLineBuffer, logCommand, logLine, showOutput } from '../output';
 import { resolveWorkingCopyTarget, type WcTarget } from './target';
 import { confirmModal } from '../ui/confirm';
+import { promptForCredentials } from '../auth';
 
 export async function commandUpdate(uri?: vscode.Uri): Promise<void> {
   const target = await resolveWorkingCopyTarget(uri, strings.command.update);
@@ -59,6 +60,8 @@ export async function performUpdate(target: WcTarget, svnPath: string): Promise<
         signal: abort.signal,
         timeoutMs: readTimeoutMs(),
         onOutput: (chunk) => buffer.push(chunk),
+        // 认证失败时弹窗补录并重试一次（F67）；密码只在内存。
+        getCredentials: promptForCredentials,
       });
     },
   );

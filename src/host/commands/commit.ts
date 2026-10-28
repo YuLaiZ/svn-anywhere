@@ -22,6 +22,7 @@ import { format, strings } from '../i18n';
 import { logCommand, logLine, showOutput } from '../output';
 import { resolveWorkingCopyTarget, type WcTarget } from './target';
 import { performUpdate } from './update';
+import { promptForCredentials } from '../auth';
 import { confirmModal } from '../ui/confirm';
 import { inputCommitMessage, pickCommitFiles } from '../ui/commitQuickPick';
 import { writeStatusReport } from './statusReport';
@@ -134,7 +135,11 @@ async function remoteCheckBeforeCommit(
   runOptions: { cwd: string; timeoutMs: number },
 ): Promise<boolean> {
   logCommand(svnPath, ['status', '-u', '--non-interactive', '--xml', targetArg], target.wcRoot);
-  const remote = await runRemoteStatus(svnPath, targetArg, runOptions);
+  const remote = await runRemoteStatus(svnPath, targetArg, {
+    ...runOptions,
+    // 远端检查遇认证失败同样弹窗补录（F67）。
+    getCredentials: promptForCredentials,
+  });
   const remoteChanges = remoteChangedEntries(remote);
   logLine(
     format(strings.commitCheck.remoteSummary, {
@@ -195,7 +200,11 @@ async function executeCommit(
       const batch = paths.slice(offset, offset + COMMIT_BATCH_SIZE);
       const args = buildCommitArgs(messageFile, batch);
       logCommand(svnPath, args, target.wcRoot);
-      lastResult = await runOrThrow(svnPath, args, { cwd: target.wcRoot, timeoutMs: readTimeoutMs() });
+      lastResult = await runOrThrow(svnPath, args, {
+        cwd: target.wcRoot,
+        timeoutMs: readTimeoutMs(),
+        getCredentials: promptForCredentials,
+      });
       logLine(lastResult.stdout.trimEnd());
       lastRevision = parseCommitOutput(lastResult.stdout).revision ?? lastRevision;
     }
@@ -209,7 +218,11 @@ async function executeCommit(
     ) {
       const args = ['commit', '--non-interactive', '-m', '', ...paths.map((p) => escapePeg(p))];
       logCommand(svnPath, args, target.wcRoot);
-      const result = await runOrThrow(svnPath, args, { cwd: target.wcRoot, timeoutMs: readTimeoutMs() });
+      const result = await runOrThrow(svnPath, args, {
+        cwd: target.wcRoot,
+        timeoutMs: readTimeoutMs(),
+        getCredentials: promptForCredentials,
+      });
       logLine(result.stdout.trimEnd());
       return parseCommitOutput(result.stdout).revision;
     }
