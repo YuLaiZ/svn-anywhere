@@ -174,7 +174,8 @@
     "build": "node scripts/esbuild.mjs",
     "watch": "node scripts/esbuild.mjs --watch",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "mock-host": "pnpm run build && node scripts/mock-host.cjs"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",

@@ -4,7 +4,7 @@
 
 ## 现状
 
-2026-10-27 立项。首个版本 M1（右键工作流）开发中：阶段 1（脚手架与 svn 执行层）已完成并通过验证（54 项单元测试、构建与扩展宿主实测通过）；后续阶段推进中，首个可用版本发布时更新本节。
+2026-10-27 立项。首个版本 M1（右键工作流）开发中：右键菜单与命令骨架已完成并通过自动验证（79 项单元测试、mock 宿主七场景，构建产物约 19.9 KB）；后续能力推进中，首个可用版本发布时更新本节。
 
 ## 为什么
 
@@ -40,6 +40,7 @@ pnpm run build      # esbuild 打包到 out/extension.js
 pnpm run watch      # 监听模式构建
 pnpm run typecheck  # tsc --noEmit
 pnpm run test       # vitest 单元测试
+pnpm run mock-host  # 先构建，再以 mock 宿主加载打包产物验证命令行为
 ```
 
 调试：F5 以「扩展开发宿主」启动（`.vscode/launch.json` 已配置自动构建并指向真实工作副本），在宿主的输出面板选择「SVN Anywhere」查看命令输出。

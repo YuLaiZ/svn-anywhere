@@ -11,11 +11,11 @@ let channel: vscode.OutputChannel | undefined;
 /** dispose 之后的写入（如子进程迟到回调）直接丢弃，避免重建出无人释放的频道。 */
 let disposed = false;
 
-export function getOutputChannel(): vscode.OutputChannel {
+export function getOutputChannel(): vscode.OutputChannel | undefined {
   if (!channel && !disposed) {
     channel = vscode.window.createOutputChannel(strings.output.title);
   }
-  return channel!;
+  return channel;
 }
 
 export function disposeOutputChannel(): void {
@@ -38,7 +38,7 @@ export function logLine(line: string): void {
   if (disposed) {
     return;
   }
-  getOutputChannel().appendLine(sanitize(line));
+  getOutputChannel()?.appendLine(sanitize(line));
 }
 
 /** 记录一条即将执行的命令，格式 `> <svnPath> <args>`，args 脱敏。 */
@@ -56,5 +56,5 @@ export function showOutput(preserveFocus = false): void {
   if (disposed) {
     return;
   }
-  getOutputChannel().show(preserveFocus);
+  getOutputChannel()?.show(preserveFocus);
 }

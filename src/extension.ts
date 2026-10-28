@@ -1,12 +1,12 @@
 /**
- * 扩展入口。阶段 1：激活时探测 svn，并把版本与工作区副本地址写入输出频道。
- * 命令注册在阶段 2 加入。
+ * 扩展入口。激活时探测 svn、注册命令，并把版本与工作区副本地址写入输出频道。
  */
 import * as vscode from 'vscode';
 import { run, runOrThrow, killAllActive } from './core/svnCli';
 import { SvnError, tailText } from './core/errors';
 import { escapePeg, findWorkingCopy } from './core/workspace';
 import { readSvnPath, readTimeoutMs } from './host/config';
+import { registerAllCommands } from './host/commands';
 import { format, strings } from './host/i18n';
 import { disposeOutputChannel, getOutputChannel, logCommand, logLine, resetOutputState } from './host/output';
 
@@ -14,6 +14,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   resetOutputState();
   context.subscriptions.push({ dispose: disposeOutputChannel });
   getOutputChannel();
+  registerAllCommands(context);
   probeSvn().catch((err: unknown) => {
     logLine(format(strings.activation.probeFailed, {
       message: err instanceof Error ? err.message : String(err),

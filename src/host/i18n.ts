@@ -6,6 +6,25 @@ export const strings = {
   output: {
     title: 'SVN Anywhere',
   },
+  command: {
+    showStatus: '显示状态',
+    commit: '提交',
+    update: '更新',
+    refreshStatus: '刷新状态',
+    cleanup: '清理',
+    relocate: '重定位（改仓库地址）',
+    editIgnore: '忽略设置',
+    showOutput: '显示输出',
+  },
+  target: {
+    resolved: '[定位] {command}：目标 {target}，副本根 {wcRoot}',
+  },
+  placeholder: {
+    notice: '「{command}」将在后续版本提供。已定位到工作副本：{wcRoot}',
+  },
+  dialog: {
+    openTarget: '选择要在 SVN 中操作的文件或目录',
+  },
   activation: {
     svnVersionPrefix: 'svn 版本：',
     svnMissing: '未找到 svn 可执行文件。请确认已安装 svn，或把可执行文件路径配置到 svnAnywhere.svnPath。',
@@ -22,6 +41,7 @@ export const strings = {
   error: {
     notWorkingCopy: '当前路径不在 SVN 工作副本中',
     cancelled: '操作已取消',
+    failed: '命令失败：{message}',
     withShowOutput: '{message}',
     buttonShowOutput: '显示输出',
   },

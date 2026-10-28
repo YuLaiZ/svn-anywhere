@@ -24,3 +24,9 @@ export function readTimeoutMs(): number {
   }
   return DEFAULT_TIMEOUT_MS;
 }
+
+/** 命令失败时是否自动切到输出面板；类型非法时按开启处理。 */
+export function readShowOutputOnError(): boolean {
+  const raw: unknown = getConfiguration().get('showOutputOnError', true);
+  return typeof raw === 'boolean' ? raw : true;
+}
