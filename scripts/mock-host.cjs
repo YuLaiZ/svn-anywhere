@@ -23,8 +23,11 @@ const state = {
   progressTitles: [],
   /** 提交说明输入框返回值。 */
   inputResult: undefined,
+  quickPickTitles: [],
   /** QuickPick 指定勾选的 label 集合；undefined 表示默认勾选。 */
   quickPickPicked: undefined,
+  /** showQuickPick 单选面板按 label 匹配返回的项；undefined 表示取消。 */
+  quickPickChoice: undefined,
   quickPicks: [],
 };
 
@@ -69,6 +72,13 @@ const fakeVscode = {
     },
     showInputBox() {
       return Promise.resolve(state.inputResult);
+    },
+    showQuickPick(items, options) {
+      state.quickPickTitles.push(options?.title ?? '');
+      if (state.quickPickChoice === undefined) {
+        return Promise.resolve(undefined);
+      }
+      return Promise.resolve(items.find((i) => i.label === state.quickPickChoice));
     },
     createQuickPick() {
       const handlers = {};
@@ -181,7 +191,9 @@ async function main() {
   // subscriptions = 命令句柄数 + activate 推入的输出频道释放句柄。
   check('注册句柄挂到 context.subscriptions', context.subscriptions.length === expectedIds.length + 1);
 
-  console.log('场景 2：右键工作副本内路径，占位命令提示并定位副本根');
+  console.log('场景 2：右键工作副本内路径，命令定位到副本根并留痕');
+  // 所有 M1 命令已实装，占位模板退役；用重定位命令验证「右键 → 定位 → 执行」链路。
+  // 该副本的 .svn/wc.db 是伪造文件，svn 命令会失败，顺带覆盖重定位的针对性失败提示。
   const wc = makeTempDir('svn-anywhere-mock-wc-');
   mkdirSync(join(wc, '.svn'), { recursive: true });
   writeFileSync(join(wc, '.svn', 'wc.db'), 'fake');
@@ -189,14 +201,14 @@ async function main() {
   writeFileSync(fileInside, 'x');
   await state.registered.get('svnAnywhere.relocate')({ fsPath: fileInside, scheme: 'file' });
   check(
-    '弹占位提示且包含副本根',
-    state.information.some((m) => m.includes('重定位') && m.includes(wc)),
-    `实际提示：${JSON.stringify(state.information)}`,
-  );
-  check(
     '输出频道有定位日志',
     state.channels.some((c) => c.lines.some((l) => l.includes('[定位]') && l.includes(wc))),
     `频道内容：${JSON.stringify(state.channels.map((c) => c.lines))}`,
+  );
+  check(
+    '无效副本上的 info 失败进统一错误收口',
+    state.warning.some((m) => m.startsWith('[error]')),
+    JSON.stringify(state.warning),
   );
 
   console.log('场景 3：右键非工作副本目录，给出明确提示，不静默');
@@ -385,7 +397,70 @@ async function main() {
   state.inputResult = undefined;
   state.confirmResult = undefined;
 
-  console.log('场景 14：deactivate 正常返回');
+  console.log('场景 14：真实副本「忽略设置」——自定义模式写回，status 不再显示');
+  const probe5 = svnLab.checkout('probe5');
+  mkdirSync(join(probe5, 'src'), { recursive: true });
+  writeFileSync(join(probe5, 'src', '.keep'), '');
+  svn(['add', '-q', '--parents', join('src', '.keep')], probe5);
+  svn(['commit', '-q', '-m', 'probe5 init'], probe5);
+  writeFileSync(join(probe5, 'src', 'noise.log'), 'log');
+  state.quickPickChoice = '输入自定义模式（如 *.log）';
+  state.inputResult = '*.log';
+  const infoBeforeIgnore = state.information.length;
+  const linesBeforeIgnore = channelText().length;
+  await state.registered.get('svnAnywhere.editIgnore')({ fsPath: join(probe5, 'src', 'noise.log'), scheme: 'file' });
+  const ignoreOutput = channelText().slice(linesBeforeIgnore);
+  check('频道写 svn:ignore 更新结果', ignoreOutput.includes('svn:ignore 已更新：*.log'), ignoreOutput.slice(-400));
+  check(
+    '弹本地变更提示',
+    state.information.slice(infoBeforeIgnore).some((m) => m.includes('本地变更') && m.includes('提交')),
+  );
+  check('被忽略文件不再出现在 status', !svn(['status'], probe5).includes('noise.log'));
+  state.quickPickChoice = undefined;
+  state.inputResult = undefined;
+
+  console.log('场景 15：真实副本「重定位」——同仓库换地址后 info 指向新地址');
+  const probe6 = svnLab.checkout('probe6');
+  writeFileSync(join(probe6, 'r.txt'), 'v');
+  svn(['add', '-q', '--parents', 'r.txt'], probe6);
+  svn(['commit', '-q', '-m', 'probe6 init'], probe6);
+  const oldUrl = svnLab.repoUrl;
+  const newUrl = `${svnLab.repoUrl}-moved`;
+  execFileSync('mv', [join(svnLab.lab, 'repo'), join(svnLab.lab, 'repo-moved')]);
+  state.inputResult = newUrl;
+  state.confirmResult = '重定位';
+  const linesBeforeRelocate = channelText().length;
+  await state.registered.get('svnAnywhere.relocate')({ fsPath: probe6, scheme: 'file' });
+  const relocateOutput = channelText().slice(linesBeforeRelocate);
+  check('频道写重定位完成', relocateOutput.includes('重定位完成。'), relocateOutput.slice(-400));
+  check(
+    '副本地址已指向新 URL',
+    svn(['info', '--show-item', 'url', '.'], probe6).trim() === newUrl,
+    svn(['info', '--show-item', 'url', '.'], probe6),
+  );
+
+  console.log('场景 16：重定位输入相同地址被拒绝；换仓库失败给针对性提示');
+  state.inputResult = newUrl;
+  const infoBeforeSame = state.information.length;
+  await state.registered.get('svnAnywhere.relocate')({ fsPath: probe6, scheme: 'file' });
+  check(
+    '相同地址提示无需重定位',
+    state.information.slice(infoBeforeSame).some((m) => m.includes('无需重定位')),
+  );
+  const foreign = makeSvnLab();
+  state.inputResult = `file://${foreign.lab}/repo`;
+  state.confirmResult = '重定位';
+  const warningBeforeForeign = state.warning.length;
+  await state.registered.get('svnAnywhere.relocate')({ fsPath: probe6, scheme: 'file' });
+  check(
+    '换仓库失败给针对性提示',
+    state.warning.slice(warningBeforeForeign).some((m) => m.includes('同一仓库换地址')),
+    JSON.stringify(state.warning.slice(warningBeforeForeign)),
+  );
+  state.inputResult = undefined;
+  state.confirmResult = undefined;
+
+  console.log('场景 17：deactivate 正常返回');
   let deactivateOk = true;
   try {
     extension.deactivate();
@@ -395,7 +470,7 @@ async function main() {
   }
   check('deactivate 不抛错', deactivateOk);
 
-  console.log('场景 15：同一宿主实例二次 activate 不重复注册');
+  console.log('场景 18：同一宿主实例二次 activate 不重复注册');
   const secondContext = { subscriptions: [] };
   let secondActivateOk = true;
   try {
