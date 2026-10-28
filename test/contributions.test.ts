@@ -33,4 +33,11 @@ describe('贡献点与 i18n 命令标签一致性', () => {
       expect((strings.command as Record<string, string>)[key], `i18n 缺少 ${c.command} 标签`).toBeDefined();
     }
   });
+
+  it('子菜单与命令类别统一为 SVN Anywhere（与其他 SVN 扩展同名子菜单区分）', () => {
+    expect(pkg.contributes.submenus).toEqual([{ id: 'svnAnywhere.submenu', label: 'SVN Anywhere' }]);
+    for (const c of pkg.contributes.commands) {
+      expect(c.category, `${c.command} 的 category 不是 SVN Anywhere`).toBe('SVN Anywhere');
+    }
+  });
 });

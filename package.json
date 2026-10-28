@@ -24,49 +24,49 @@
     "submenus": [
       {
         "id": "svnAnywhere.submenu",
-        "label": "SVN"
+        "label": "SVN Anywhere"
       }
     ],
     "commands": [
       {
         "command": "svnAnywhere.update",
         "title": "更新",
-        "category": "SVN"
+        "category": "SVN Anywhere"
       },
       {
         "command": "svnAnywhere.commit",
         "title": "提交",
-        "category": "SVN"
+        "category": "SVN Anywhere"
       },
       {
         "command": "svnAnywhere.showStatus",
         "title": "显示状态",
-        "category": "SVN"
+        "category": "SVN Anywhere"
       },
       {
         "command": "svnAnywhere.refreshStatus",
         "title": "刷新状态",
-        "category": "SVN"
+        "category": "SVN Anywhere"
       },
       {
         "command": "svnAnywhere.cleanup",
         "title": "清理",
-        "category": "SVN"
+        "category": "SVN Anywhere"
       },
       {
         "command": "svnAnywhere.relocate",
         "title": "重定位（改仓库地址）",
-        "category": "SVN"
+        "category": "SVN Anywhere"
       },
       {
         "command": "svnAnywhere.editIgnore",
         "title": "忽略设置",
-        "category": "SVN"
+        "category": "SVN Anywhere"
       },
       {
         "command": "svnAnywhere.showOutput",
         "title": "显示输出",
-        "category": "SVN"
+        "category": "SVN Anywhere"
       }
     ],
     "menus": {
