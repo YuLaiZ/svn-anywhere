@@ -6,7 +6,7 @@
  */
 import * as vscode from 'vscode';
 import { isPropertyModified, type StatusEntry } from '../../core/status';
-import { strings } from '../i18n';
+import { format, strings } from '../i18n';
 
 export interface PickedChange {
   path: string;
@@ -70,7 +70,57 @@ export function pickCommitFiles(
   });
 }
 
-/** 提交说明输入；用户取消（Esc）返回 undefined。 */
-export function inputCommitMessage(prompt: string): Thenable<string | undefined> {
-  return vscode.window.showInputBox({ prompt, ignoreFocusOut: true });
+/**
+ * 提交说明输入（F91 多行）：在 untitled 文档中编辑——InputBox 是单行控件，
+ * 粘贴的换行会被展平成空格，无法满足多行要求。
+ * 点通知按钮「使用此说明」返回文档全文（空文档 = 空说明，走空说明确认）；
+ * 点「取消」或直接关闭文档返回 undefined（取消提交）。
+ */
+export async function inputCommitMessage(prompt: string): Promise<string | undefined> {
+  const doc = await vscode.workspace.openTextDocument(
+    vscode.Uri.parse('untitled:svn-commit-message.txt'),
+  );
+  await vscode.window.showTextDocument(doc, { preview: true });
+
+  return new Promise<string | undefined>((resolve) => {
+    let settled = false;
+    const finish = (value: string | undefined) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      closeSubscription.dispose();
+      resolve(value);
+    };
+    const closeSubscription = vscode.workspace.onDidCloseTextDocument((closed) => {
+      if (closed === doc) {
+        finish(undefined);
+      }
+    });
+    void vscode.window
+      .showInformationMessage(
+        format(strings.commit.messageEditorNotice, { prompt, button: strings.commit.useMessageButton }),
+        strings.commit.useMessageButton,
+        strings.commit.cancelButton,
+      )
+      .then((choice) => {
+        finish(choice === strings.commit.useMessageButton ? doc.getText() : undefined);
+        void closeMessageTab(doc);
+      });
+  });
+}
+
+/** 用完关闭说明编辑器的 tab；untitled 文档不落盘，关闭失败不影响主流程。 */
+async function closeMessageTab(doc: vscode.TextDocument): Promise<void> {
+  try {
+    const uri = doc.uri.toString();
+    const tab = vscode.window.tabGroups.all
+      .flatMap((group) => group.tabs)
+      .find((t) => t.input instanceof vscode.TabInputText && t.input.uri.toString() === uri);
+    if (tab) {
+      await vscode.window.tabGroups.close(tab);
+    }
+  } catch {
+    // 忽略：残留一个空 untitled tab 无副作用。
+  }
 }

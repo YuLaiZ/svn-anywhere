@@ -29,6 +29,8 @@ const state = {
   /** showQuickPick 单选面板按 label 匹配返回的项；undefined 表示取消。 */
   quickPickChoice: undefined,
   quickPicks: [],
+  /** 说明编辑通知上点的按钮（「使用此说明」确认提交说明）。 */
+  messageChoice: '使用此说明',
 };
 
 const fakeVscode = {
@@ -36,6 +38,10 @@ const fakeVscode = {
   ThemeIcon: class {
     constructor(id) { this.id = id; }
   },
+  Uri: {
+    parse: (s) => ({ scheme: 'untitled', path: s, toString: () => s }),
+  },
+  TabInputText: class {},
   window: {
     createOutputChannel(title) {
       const ch = {
@@ -49,9 +55,11 @@ const fakeVscode = {
       state.channels.push(ch);
       return ch;
     },
-    showInformationMessage(message) {
+    showInformationMessage(message, ...items) {
       state.information.push(message);
-      return Promise.resolve(undefined);
+      // 说明编辑确认：inputResult 为 undefined 时视为取消（与旧 showInputBox 语义一致）。
+      const choice = state.inputResult === undefined ? undefined : state.messageChoice;
+      return Promise.resolve(items.length > 0 ? choice : undefined);
     },
     showWarningMessage(message, _options, ...items) {
       // 带按钮参数的调用是模态确认框；返回 state.confirmResult 决定确认/取消。
@@ -73,6 +81,8 @@ const fakeVscode = {
     showInputBox() {
       return Promise.resolve(state.inputResult);
     },
+    showTextDocument: async () => undefined,
+    tabGroups: { all: [], close: async () => true },
     showQuickPick(items, options) {
       state.quickPickTitles.push(options?.title ?? '');
       if (state.quickPickChoice === undefined) {
@@ -106,6 +116,13 @@ const fakeVscode = {
   },
   workspace: {
     workspaceFolders: [],
+    // 说明编辑文档：内容直接取 state.inputResult，配合 messageChoice 模拟确认。
+    openTextDocument: async (uri) => ({
+      uri,
+      fileName: 'svn-commit-message.txt',
+      getText: () => state.inputResult ?? '',
+    }),
+    onDidCloseTextDocument: () => ({ dispose() {} }),
     getConfiguration() {
       return { get: (_key, fallback) => fallback };
     },
@@ -336,7 +353,8 @@ async function main() {
   svn(['commit', '-q', '-m', 'probe3 init'], probe3);
   writeFileSync(join(probe3, 'b2.txt'), 'committed content\n');
   writeFileSync(join(probe3, 'c2.txt'), 'kept local\n');
-  state.inputResult = 'feat: mock host commit';
+  // F91 多行说明：换行必须原样进入远端日志，不能被展平成空格。
+  state.inputResult = 'feat: mock host commit\n第二行说明';
   state.quickPickPicked = ['b2.txt'];
   const infoBeforeRealCommit = state.information.length;
   const linesBeforeRealCommit = channelText().length;
@@ -352,6 +370,12 @@ async function main() {
   check('未勾选项保持本地变更', commitOutput.includes('[modified] c2.txt'), commitOutput.slice(-400));
   const remoteCheck = svn(['cat', `${svnLab.repoUrl}/b2.txt`]);
   check('远端确实收到新内容', remoteCheck.includes('committed content'));
+  const logLines = svn(['log', '-r', 'HEAD', svnLab.repoUrl]).split('\n').map((l) => l.trim());
+  check(
+    '多行说明原样进入远端日志',
+    logLines.includes('feat: mock host commit') && logLines.includes('第二行说明'),
+    JSON.stringify(logLines),
+  );
 
   // F24/F80：空说明提交（开关默认允许，空说明二次确认）。
   state.inputResult = '';

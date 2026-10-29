@@ -49,7 +49,9 @@ const vscodeMock = vi.hoisted(() => ({
   quickPicks: [] as Array<Record<string, unknown> & { __handlers: Record<string, Array<(e?: unknown) => void>> }>,
   quickPickAccepted: true,
   quickPickPicked: undefined as string[] | undefined,
-  inputResult: 'fix: sample message' as string | undefined,
+  /** 说明编辑文档的内容；messageChoice 模拟用户在通知上点的按钮。 */
+  messageEditorContent: 'fix: sample message' as string | undefined,
+  messageChoice: undefined as string | undefined,
 }));
 
 interface QuickPickLike {
@@ -71,6 +73,10 @@ vi.mock('vscode', () => ({
   ThemeIcon: class {
     constructor(public id: string) {}
   },
+  Uri: {
+    parse: (s: string) => ({ scheme: 'untitled', path: s, toString: () => s }),
+  },
+  TabInputText: class {},
   window: {
     createOutputChannel: () => {
       const ch = {
@@ -87,9 +93,10 @@ vi.mock('vscode', () => ({
       vscodeMock.channels.push(ch);
       return ch;
     },
-    showInformationMessage: (message: string) => {
+    showInformationMessage: (message: string, ...items: string[]) => {
       vscodeMock.information.push(message);
-      return Promise.resolve(undefined);
+      // 带按钮的调用（说明编辑确认）按 mock 选择返回；无按钮的提示返回 undefined。
+      return Promise.resolve(items.length > 0 ? vscodeMock.messageChoice : undefined);
     },
     showWarningMessage: (message: string, _options?: unknown, ...items: string[]) => {
       vscodeMock.warning.push(message);
@@ -101,7 +108,9 @@ vi.mock('vscode', () => ({
       vscodeMock.openDialogCalls += 1;
       return Promise.resolve(vscodeMock.openDialogResult);
     },
-    showInputBox: () => Promise.resolve(vscodeMock.inputResult),
+    showInputBox: () => Promise.resolve(undefined),
+    showTextDocument: async () => undefined,
+    tabGroups: { all: [] as unknown[], close: async () => true },
     createQuickPick: (): QuickPickLike => {
       const handlers: Record<string, Array<(e?: unknown) => void>> = {};
       const qp = {
@@ -153,6 +162,12 @@ vi.mock('vscode', () => ({
     getConfiguration: () => ({
       get: (key: string, fallback: unknown) => (key in vscodeMock.config ? vscodeMock.config[key] : fallback),
     }),
+    openTextDocument: async (uri: unknown) => ({
+      uri,
+      fileName: 'svn-commit-message.txt',
+      getText: () => vscodeMock.messageEditorContent ?? '',
+    }),
+    onDidCloseTextDocument: () => ({ dispose() {} }),
   },
   ProgressLocation: { Notification: 15 },
 }));
@@ -194,7 +209,8 @@ beforeEach(() => {
   vscodeMock.quickPicks.length = 0;
   vscodeMock.quickPickAccepted = true;
   vscodeMock.quickPickPicked = undefined;
-  vscodeMock.inputResult = 'fix: sample message';
+  vscodeMock.messageEditorContent = 'fix: sample message';
+  vscodeMock.messageChoice = strings.commit.useMessageButton;
   wcRoot = realpathSync(mkdtempSync(join(tmpdir(), 'svn-anywhere-commitchk-')));
   mkdirSync(join(wcRoot, '.svn'), { recursive: true });
   writeFileSync(join(wcRoot, '.svn', 'wc.db'), 'fake');
