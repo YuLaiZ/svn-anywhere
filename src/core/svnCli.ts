@@ -32,6 +32,11 @@ export interface RunOptions {
   /** 增量输出回调，宿主写 OutputChannel（建议配合 LineBuffer 按行脱敏）。 */
   onOutput?: (chunk: string, source: 'stdout' | 'stderr') => void;
   /**
+   * 命令正常结束（含非零退出码）时的回调，宿主用于在输出频道记录退出码；
+   * 超时、取消、启动失败不回调。认证补录重试是第二次执行，会再次回调。
+   */
+  onExit?: (exitCode: number) => void;
+  /**
    * 认证失败时的凭据补录回调（宿主弹窗，密码只在内存）。
    * 提供后 runOrThrow 在识别到认证失败时补录并保留原始 args 重试一次；
    * 只读的本地命令不应提供。
@@ -228,7 +233,9 @@ export function run(svnPath: string, args: string[], options: RunOptions = {}): 
         }));
         return;
       }
-      resolve({ stdout, stderr, exitCode: code ?? -1 });
+      const exitCode = code ?? -1;
+      options.onExit?.(exitCode);
+      resolve({ stdout, stderr, exitCode });
     });
   });
 }

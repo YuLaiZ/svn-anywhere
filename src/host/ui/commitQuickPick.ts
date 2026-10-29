@@ -5,7 +5,8 @@
  * 使用 createQuickPick：showQuickPick 的 options 不支持条目级按钮。
  */
 import * as vscode from 'vscode';
-import type { StatusEntry } from '../../core/status';
+import { isPropertyModified, type StatusEntry } from '../../core/status';
+import { strings } from '../i18n';
 
 export interface PickedChange {
   path: string;
@@ -36,7 +37,11 @@ export function pickCommitFiles(
     picker.matchOnDescription = true;
     picker.items = entries.map((entry) => ({
       label: entry.path,
-      description: entry.wcStatus,
+      // 纯属性变更的 item 是 normal，直接展示会误导为无可提交内容，换成「属性修改」。
+      description:
+        entry.wcStatus === 'normal' && isPropertyModified(entry)
+          ? strings.commit.propModified
+          : entry.wcStatus,
       buttons: [{ iconPath: new vscode.ThemeIcon('diff') }],
       entry,
     }));

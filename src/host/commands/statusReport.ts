@@ -3,7 +3,8 @@
  * 「显示状态」（F09）与「刷新状态」（F08）共用：明细一律用
  * svn wcStatus 原词展示（F15），与 `svn status --xml` 输出保持一致。
  */
-import type { StatusResult } from '../../core/status';
+import type { StatusResult, StatusEntry } from '../../core/status';
+import { isPropertyModified } from '../../core/status';
 import { format, strings } from '../i18n';
 import { logLine } from '../output';
 
@@ -15,6 +16,12 @@ export function writeStatusReport(result: StatusResult): void {
     return;
   }
   for (const entry of result.entries) {
-    logLine(format(strings.status.entry, { status: entry.wcStatus, path: entry.path }));
+    logLine(statusEntryLine(entry));
   }
+}
+
+/** 属性修改的条目（item 可能为 normal）在行尾追加注记，避免被误读为无变更。 */
+function statusEntryLine(entry: StatusEntry): string {
+  const template = isPropertyModified(entry) ? strings.status.entryWithProps : strings.status.entry;
+  return format(template, { status: entry.wcStatus, path: entry.path });
 }

@@ -9,7 +9,7 @@ import { SvnError } from '../../core/errors';
 import { escapePeg } from '../../core/workspace';
 import { readSvnPath, readTimeoutMs } from '../config';
 import { format, strings } from '../i18n';
-import { logCommand, logLine, showOutput } from '../output';
+import { logCommand, logExitCode, logLine, showOutput } from '../output';
 import { resolveWorkingCopyTarget } from './target';
 import { confirmModal } from '../ui/confirm';
 import { promptForCredentials } from '../auth';
@@ -21,7 +21,7 @@ export async function commandRelocate(uri?: vscode.Uri): Promise<void> {
   }
 
   const svnPath = readSvnPath();
-  const runOptions = { cwd: target.wcRoot, timeoutMs: readTimeoutMs() };
+  const runOptions = { cwd: target.wcRoot, timeoutMs: readTimeoutMs(), onExit: logExitCode };
 
   // relocate 作用于副本根，从副本根读当前地址。
   logCommand(svnPath, ['info', '--show-item', 'url', escapePeg(target.wcRoot)], target.wcRoot);

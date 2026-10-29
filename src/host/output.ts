@@ -5,7 +5,7 @@
  */
 import * as vscode from 'vscode';
 import { LineBuffer, redactArgs, sanitizeText } from '../core/redact';
-import { strings } from './i18n';
+import { format, strings } from './i18n';
 
 let channel: vscode.OutputChannel | undefined;
 /** dispose 之后的写入（如子进程迟到回调）直接丢弃，避免重建出无人释放的频道。 */
@@ -44,6 +44,11 @@ export function logLine(line: string): void {
 /** 记录一条即将执行的命令，格式 `> <svnPath> <args>`，args 脱敏。 */
 export function logCommand(svnPath: string, args: string[], cwd?: string): void {
   logLine(`> ${svnPath} ${redactArgs(args).join(' ')}${cwd ? `  (cwd: ${cwd})` : ''}`);
+}
+
+/** 记录命令退出码（成功与非零都记）；命令失败时统一收口也会调用。 */
+export function logExitCode(code: number): void {
+  logLine(format(strings.output.exitCode, { code: String(code) }));
 }
 
 /** 按行缓冲的流式写入器：stdout/stderr chunk 先攒行、脱敏再进频道。 */

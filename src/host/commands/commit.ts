@@ -19,7 +19,7 @@ import {
   readTimeoutMs,
 } from '../config';
 import { format, strings } from '../i18n';
-import { logCommand, logLine, showOutput } from '../output';
+import { logCommand, logExitCode, logLine, showOutput } from '../output';
 import { resolveWorkingCopyTarget, type WcTarget } from './target';
 import { performUpdate } from './update';
 import { promptForCredentials } from '../auth';
@@ -34,9 +34,10 @@ export async function commandCommit(uri?: vscode.Uri): Promise<void> {
   }
 
   const svnPath = readSvnPath();
-  const runOptions = { cwd: target.wcRoot, timeoutMs: readTimeoutMs() };
-  // 与状态命令一致：以副本根为 cwd 传相对目标。
-  const targetArg = relative(target.wcRoot, target.targetPath);
+  // onExit：每条命令结束后向输出频道补一行退出码（验收共同预期）。
+  const runOptions = { cwd: target.wcRoot, timeoutMs: readTimeoutMs(), onExit: logExitCode };
+  // 与状态命令一致：以副本根为 cwd 传相对目标；目标是副本根时归一为 `.`，避免空参数。
+  const targetArg = relative(target.wcRoot, target.targetPath) || '.';
 
   if (readRemoteCheckBeforeCommit()) {
     const proceed = await remoteCheckBeforeCommit(target, svnPath, targetArg, runOptions);
@@ -55,7 +56,7 @@ export async function commandCommit(uri?: vscode.Uri): Promise<void> {
 
   // 文件多选：条目路径相对目标；差异查看与提交参数都需要换算成相对副本根。
   const toWcRelative = (entryPath: string): string =>
-    relative(target.wcRoot, entryPath === targetArg ? target.targetPath : join(target.targetPath, entryPath));
+    relative(target.wcRoot, entryPath === targetArg ? target.targetPath : join(target.targetPath, entryPath)) || '.';
 
   const picked = await pickCommitFiles(status.entries, {
     title: format(strings.commit.pickTitle, { target: target.targetPath }),
@@ -203,6 +204,7 @@ async function executeCommit(
       lastResult = await runOrThrow(svnPath, args, {
         cwd: target.wcRoot,
         timeoutMs: readTimeoutMs(),
+        onExit: logExitCode,
         getCredentials: promptForCredentials,
       });
       logLine(lastResult.stdout.trimEnd());
@@ -221,6 +223,7 @@ async function executeCommit(
       const result = await runOrThrow(svnPath, args, {
         cwd: target.wcRoot,
         timeoutMs: readTimeoutMs(),
+        onExit: logExitCode,
         getCredentials: promptForCredentials,
       });
       logLine(result.stdout.trimEnd());
@@ -236,7 +239,11 @@ async function executeCommit(
 async function showDiff(target: WcTarget, svnPath: string, wcRelativePath: string): Promise<void> {
   const args = ['diff', escapePeg(wcRelativePath)];
   logCommand(svnPath, args, target.wcRoot);
-  const result = await runOrThrow(svnPath, args, { cwd: target.wcRoot, timeoutMs: readTimeoutMs() });
+  const result = await runOrThrow(svnPath, args, {
+    cwd: target.wcRoot,
+    timeoutMs: readTimeoutMs(),
+    onExit: logExitCode,
+  });
   logLine(format(strings.commit.diffHeader, { path: wcRelativePath }));
   logLine(result.stdout.trim() || strings.commit.diffClean);
   showOutput(false);

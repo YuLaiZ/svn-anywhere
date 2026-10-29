@@ -40,7 +40,7 @@ vi.mock('vscode', () => ({
   },
 }));
 
-import { disposeOutputChannel, getOutputChannel, logLine, resetOutputState, showOutput } from '../src/host/output';
+import { disposeOutputChannel, getOutputChannel, logExitCode, logLine, resetOutputState, showOutput } from '../src/host/output';
 
 describe('输出频道生命周期（宿主侧）', () => {
   beforeEach(() => {
@@ -74,5 +74,12 @@ describe('输出频道生命周期（宿主侧）', () => {
     expect(vscodeMock.channels).toHaveLength(2);
     expect(vscodeMock.channels[1]?.lines).toEqual(['二次激活后的输出']);
     expect(getOutputChannel()).not.toBe(first);
+  });
+
+  it('logExitCode 写入「退出码: N」行', () => {
+    getOutputChannel();
+    logExitCode(0);
+    logExitCode(1);
+    expect(vscodeMock.channels[0]?.lines).toEqual(['退出码: 0', '退出码: 1']);
   });
 });

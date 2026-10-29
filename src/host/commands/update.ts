@@ -9,7 +9,7 @@ import { runUpdate, type UpdateRunResult } from '../../core/update';
 import { escapePeg } from '../../core/workspace';
 import { readSvnPath, readTimeoutMs } from '../config';
 import { format, strings } from '../i18n';
-import { createLineBuffer, logCommand, logLine, showOutput } from '../output';
+import { createLineBuffer, logCommand, logExitCode, logLine, showOutput } from '../output';
 import { resolveWorkingCopyTarget, type WcTarget } from './target';
 import { confirmModal } from '../ui/confirm';
 import { promptForCredentials } from '../auth';
@@ -38,9 +38,10 @@ export async function commandUpdate(uri?: vscode.Uri): Promise<void> {
  * 提交流程判断是否继续。
  */
 export async function performUpdate(target: WcTarget, svnPath: string): Promise<UpdateRunResult> {
-  // 与终端 svn update 一致：以副本根为 cwd 传相对目标，明细路径为相对形态。
+  // 与终端 svn update 一致：以副本根为 cwd 传相对目标，明细路径为相对形态；
+  // 目标是副本根时归一为 `.`，避免空参数。
   // core 的 runUpdate 内部做 peg 转义，这里日志记录转义后的实际命令。
-  const targetArg = relative(target.wcRoot, target.targetPath);
+  const targetArg = relative(target.wcRoot, target.targetPath) || '.';
   const args = ['update', '--non-interactive', escapePeg(targetArg)];
 
   // 进度通知的取消按钮桥接 AbortSignal，传给 core 的 svn 执行层。
@@ -60,6 +61,7 @@ export async function performUpdate(target: WcTarget, svnPath: string): Promise<
         signal: abort.signal,
         timeoutMs: readTimeoutMs(),
         onOutput: (chunk) => buffer.push(chunk),
+        onExit: logExitCode,
         // 认证失败时弹窗补录并重试一次（F67）；密码只在内存。
         getCredentials: promptForCredentials,
       });

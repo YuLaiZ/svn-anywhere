@@ -15,7 +15,10 @@ import { runOrThrow } from '../src/core/svnCli';
 import { disposeOutputChannel, getOutputChannel, resetOutputState } from '../src/host/output';
 import { strings } from '../src/host/i18n';
 
-vi.mock('../src/core/status', () => ({ runStatus: vi.fn() }));
+vi.mock('../src/core/status', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/core/status')>();
+  return { ...actual, runStatus: vi.fn() };
+});
 vi.mock('../src/core/update', () => ({ runUpdate: vi.fn() }));
 vi.mock('../src/core/svnCli', () => ({
   run: vi.fn(),
@@ -145,6 +148,25 @@ describe('commandShowStatus（显示状态）', () => {
     vi.mocked(runStatus).mockResolvedValueOnce({ targetPath: '.', entries: [] });
     await commandShowStatus(makeUri(wcRoot));
     expect(channelLines().join('\n')).toContain(strings.status.clean);
+  });
+
+  it('纯属性变更：状态行追加「属性修改」注记，不再裸显 normal', async () => {
+    vi.mocked(runStatus).mockResolvedValueOnce({
+      targetPath: '.',
+      entries: [{ path: '.', wcStatus: 'normal', props: 'modified' }],
+    });
+    await commandShowStatus(makeUri(wcRoot));
+    expect(channelLines().join('\n')).toContain('[normal] .（属性修改）');
+  });
+
+  it('状态命令向执行层传 onExit（输出频道记录退出码）', async () => {
+    vi.mocked(runStatus).mockResolvedValueOnce({ targetPath: '.', entries: [] });
+    await commandShowStatus(makeUri(wcRoot));
+    expect(vi.mocked(runStatus)).toHaveBeenCalledWith(
+      'svn',
+      expect.any(String),
+      expect.objectContaining({ onExit: expect.any(Function) }),
+    );
   });
 });
 

@@ -44,9 +44,14 @@ function toNumber(value: unknown): number | undefined {
 /** 可提交项的 wc-status 集合（unversioned 只在提交面板展示、不参与提交）。 */
 export const COMMITTABLE_ITEMS = new Set(['modified', 'added', 'deleted', 'missing', 'replaced', 'conflicted']);
 
+/** 属性有修改的条目（svn:ignore 等）：item 可能仍是 normal，但 `svn commit <path>` 可提交。 */
+export function isPropertyModified(entry: StatusEntry): boolean {
+  return entry.props === 'modified';
+}
+
 /** 从状态结果中筛出可提交项；conflicted 由提交流程另行拦截。 */
 export function commitableEntries(result: StatusResult): StatusEntry[] {
-  return result.entries.filter((entry) => COMMITTABLE_ITEMS.has(entry.wcStatus));
+  return result.entries.filter((entry) => COMMITTABLE_ITEMS.has(entry.wcStatus) || isPropertyModified(entry));
 }
 
 /** 解析 `svn status --xml` 输出；结构异常时按空结果处理，不抛解析异常。 */

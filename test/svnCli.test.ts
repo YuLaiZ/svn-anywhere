@@ -51,6 +51,24 @@ describe('run（真实 svn）', () => {
     expect(streamed).toBe(result.stdout);
   });
 
+  it.runIf(hasSvn)('onExit 在命令正常结束时收到退出码 0', async () => {
+    const codes: number[] = [];
+    await run('svn', ['--version'], { onExit: (code) => codes.push(code) });
+    expect(codes).toEqual([0]);
+  });
+
+  it.runIf(hasSvn)('非零退出码同样触发 onExit（run 层不把退出码当进程失败）', async () => {
+    const dir = makeTempDir('svn-anywhere-onexit-');
+    try {
+      const codes: number[] = [];
+      const result = await run('svn', ['info'], { cwd: dir, onExit: (code) => codes.push(code) });
+      expect(result.exitCode).not.toBe(0);
+      expect(codes).toEqual([result.exitCode]);
+    } finally {
+      cleanupDir(dir);
+    }
+  });
+
   it.runIf(hasSvn)('onOutput 的 stderr 分支携带非工作副本错误', async () => {
     const dir = makeTempDir('svn-anywhere-stderr-');
     try {
@@ -174,6 +192,20 @@ describe('run（进程级失败，不依赖 svn）', () => {
     setTimeout(() => controller.abort(), 100);
     const promise = run('sleep', ['5'], { signal: controller.signal });
     await expect(promise).rejects.toMatchObject({ name: 'SvnError', code: 'CANCELLED' });
+  });
+
+  it('超时与取消不触发 onExit（无含混的中间退出码）', async () => {
+    const codes: number[] = [];
+    await expect(
+      run('sleep', ['5'], { timeoutMs: 200, onExit: (code) => codes.push(code) }),
+    ).rejects.toMatchObject({ name: 'SvnError', code: 'TIMEOUT' });
+
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 100);
+    await expect(
+      run('sleep', ['5'], { signal: controller.signal, onExit: (code) => codes.push(code) }),
+    ).rejects.toMatchObject({ name: 'SvnError', code: 'CANCELLED' });
+    expect(codes).toEqual([]);
   });
 
   it('已 aborted 的 signal 立即取消，不启动等待', async () => {

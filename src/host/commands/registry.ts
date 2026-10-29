@@ -9,7 +9,7 @@ import * as vscode from 'vscode';
 import { SvnError } from '../../core/errors';
 import { readShowOutputOnError } from '../config';
 import { format, strings } from '../i18n';
-import { logLine, showOutput } from '../output';
+import { logExitCode, logLine, showOutput } from '../output';
 
 export type CommandHandler = (uri?: vscode.Uri) => unknown;
 
@@ -50,6 +50,10 @@ export function showCommandError(err: unknown): void {
   if (err instanceof SvnError) {
     // 频道写「摘要行 + 完整 stderr 一次」：业务失败时 message 就是 stderr 的
     // 截断版（tailText），若整段再写一遍 message 会造成最长 2×8K 的重复。
+    // 命令以非零退出码结束时补记退出码行（成功路径由 onExit 记录）。
+    if (err.exitCode !== undefined) {
+      logExitCode(err.exitCode);
+    }
     logLine(format(strings.error.failed, { message: errorSummary(err.message) }));
     if (err.stderr) {
       logLine(err.stderr);

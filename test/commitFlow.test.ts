@@ -319,6 +319,22 @@ describe('commandCommit 提交闭环', () => {
     expect(vi.mocked(runOrThrow)).not.toHaveBeenCalled();
   });
 
+  it('纯属性变更：不再提示无可提交变更，面板展示「属性修改」并作为提交目标', async () => {
+    vi.mocked(runStatus).mockResolvedValue({
+      targetPath: '.',
+      entries: [{ path: '.', wcStatus: 'normal', props: 'modified' }],
+    });
+    await commandCommit(makeUri(wcRoot));
+
+    expect(vscodeMock.information).not.toContainEqual(strings.commitCheck.noChanges);
+    const picker = vscodeMock.quickPicks[0] as unknown as QuickPickLike;
+    expect(picker.items[0]?.description).toBe(strings.commit.propModified);
+
+    const commitCall = vi.mocked(runOrThrow).mock.calls.find(([, args]) => args[0] === 'commit');
+    // 目标是副本根：条目 '.' 换算后仍为相对根路径，svn commit 以 cwd 为基准提交目录属性。
+    expect(commitCall?.[1]).toContain('.');
+  });
+
   it('提交失败：SvnError 向上传播交给统一收口', async () => {
     vi.mocked(runOrThrow).mockRejectedValueOnce(
       new SvnError({ message: 'svn: E155015: 冲突', command: ['commit'], code: 'E155015' }),

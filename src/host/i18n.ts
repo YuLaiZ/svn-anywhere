@@ -5,6 +5,7 @@
 export const strings = {
   output: {
     title: 'SVN Anywhere',
+    exitCode: '退出码: {code}',
   },
   command: {
     showStatus: '显示状态',
@@ -23,6 +24,7 @@ export const strings = {
     header: '状态（{path}）：',
     clean: '无本地变更。',
     entry: '[{status}] {path}',
+    entryWithProps: '[{status}] {path}（属性修改）',
   },
   update: {
     confirmTitle: '将更新以下路径：\n{target}',
@@ -60,6 +62,7 @@ export const strings = {
     diffHeader: '差异（{path}）：',
     diffClean: '无差异。',
     refreshHeader: '提交后状态：',
+    propModified: '属性修改',
   },
   relocate: {
     inputPrompt: '输入新的仓库地址（当前：{oldUrl}）',

@@ -15,7 +15,7 @@ import {
 import { runOrThrow } from '../../core/svnCli';
 import { readSvnPath, readTimeoutMs } from '../config';
 import { format, strings } from '../i18n';
-import { logCommand, logLine, showOutput } from '../output';
+import { logCommand, logExitCode, logLine, showOutput } from '../output';
 import { resolveWorkingCopyTarget } from './target';
 
 interface IgnoreAction {
@@ -32,7 +32,7 @@ export async function commandEditIgnore(uri?: vscode.Uri): Promise<void> {
   }
 
   const svnPath = readSvnPath();
-  const runOptions = { cwd: target.wcRoot, timeoutMs: readTimeoutMs() };
+  const runOptions = { cwd: target.wcRoot, timeoutMs: readTimeoutMs(), onExit: logExitCode };
 
   // 属性作用于目录：目标是文件时取所在目录，目录取自身。
   let dirPath = target.targetPath;

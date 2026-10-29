@@ -6,7 +6,7 @@
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { parseStatusXml, runStatus } from '../src/core/status';
+import { commitableEntries, parseStatusXml, runStatus } from '../src/core/status';
 import { createSvnLab, writeFile } from './helpers';
 
 const lab = createSvnLab('svn-anywhere-status-');
@@ -74,6 +74,35 @@ describe('parseStatusXml', () => {
     expect(parseStatusXml('')).toEqual({ targetPath: '', entries: [] });
     expect(parseStatusXml('<not-svn/>')).toEqual({ targetPath: '', entries: [] });
   });
+
+  it('纯属性变更样本：item 为 normal、props 为 modified，条目保留原词', () => {
+    const result = parseStatusXml(`<status><target path=".">
+<entry path="."><wc-status item="normal" revision="1" props="modified">
+<commit revision="1"><author>tester</author><date>2026-10-28T00:00:00.000000Z</date></commit>
+</wc-status></entry>
+</target></status>`);
+    expect(result.entries).toEqual([
+      { path: '.', wcStatus: 'normal', kind: undefined, revision: 1, props: 'modified' },
+    ]);
+  });
+});
+
+describe('commitableEntries', () => {
+  it('纯属性变更（normal + props modified）属于可提交项', () => {
+    const result = parseStatusXml(`<status><target path=".">
+<entry path="."><wc-status item="normal" props="modified"></wc-status></entry>
+</target></status>`);
+    expect(commitableEntries(result).map((e) => e.path)).toEqual(['.']);
+  });
+
+  it('unversioned 与无属性修改的条目不计入可提交项', () => {
+    const result = parseStatusXml(`<status><target path=".">
+<entry path="new.txt"><wc-status item="unversioned" props="none"></wc-status></entry>
+<entry path="ok.txt"><wc-status item="modified" props="none"></wc-status></entry>
+<entry path="."><wc-status item="normal" props="none"></wc-status></entry>
+</target></status>`);
+    expect(commitableEntries(result).map((e) => e.path)).toEqual(['ok.txt']);
+  });
 });
 
 describe('runStatus 集成（本地 file:// 副本）', () => {
@@ -94,6 +123,25 @@ describe('runStatus 集成（本地 file:// 副本）', () => {
     const wc = lab.checkout('wc-clean');
     const result = await runStatus('svn', '.', { cwd: wc });
     expect(result.entries).toEqual([]);
+  });
+
+  it('纯 svn:ignore 属性变更：读到 normal + props modified，且可单独提交', async () => {
+    const wc = lab.checkout('wc-props');
+    // 文件名避开其它用例（lab 仓库共享，检出会带出已提交的同名文件）。
+    writeFile(wc, 'props.txt', 'v1', true);
+    lab.svn(['commit', '-q', '-m', 'init'], wc);
+    lab.svn(['propset', '-q', 'svn:ignore', 'debug.log', '.'], wc);
+
+    const result = await runStatus('svn', '.', { cwd: wc });
+    expect(result.entries).toHaveLength(1);
+    expect(result.entries[0]).toMatchObject({ path: '.', wcStatus: 'normal', props: 'modified' });
+    expect(commitableEntries(result).map((e) => e.path)).toEqual(['.']);
+
+    // 端到端：只有属性变更时 svn commit 目标目录可提交成功，随后状态干净。
+    // 目录属性提交要求目录处于 HEAD（检出于 r0、随后才提交过文件），先更新。
+    lab.svn(['update', '-q'], wc);
+    lab.svn(['commit', '-q', '-m', 'ignore debug.log', '.'], wc);
+    expect((await runStatus('svn', '.', { cwd: wc })).entries).toEqual([]);
   });
 
   it('检出目录名含 @2（严格 peg 语法）：escapePeg 转义后状态读取正常', async () => {

@@ -8,7 +8,7 @@ import { runOrThrow } from '../../core/svnCli';
 import { escapePeg } from '../../core/workspace';
 import { readSvnPath, readTimeoutMs } from '../config';
 import { format, strings } from '../i18n';
-import { createLineBuffer, logCommand, logLine, showOutput } from '../output';
+import { createLineBuffer, logCommand, logExitCode, logLine, showOutput } from '../output';
 import { resolveWorkingCopyTarget } from './target';
 
 export async function commandCleanup(uri?: vscode.Uri): Promise<void> {
@@ -43,6 +43,7 @@ export async function commandCleanup(uri?: vscode.Uri): Promise<void> {
         cwd: target.wcRoot,
         timeoutMs: readTimeoutMs(),
         onOutput: (chunk) => buffer.push(chunk),
+        onExit: logExitCode,
       });
     },
   );

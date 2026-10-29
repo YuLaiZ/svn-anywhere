@@ -8,7 +8,7 @@ import { escapePeg, findWorkingCopy } from './core/workspace';
 import { readSvnPath, readTimeoutMs } from './host/config';
 import { registerAllCommands } from './host/commands';
 import { format, strings } from './host/i18n';
-import { disposeOutputChannel, getOutputChannel, logCommand, logLine, resetOutputState } from './host/output';
+import { disposeOutputChannel, getOutputChannel, logCommand, logExitCode, logLine, resetOutputState } from './host/output';
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   resetOutputState();
@@ -35,7 +35,7 @@ async function probeSvn(): Promise<void> {
   const svnPath = readSvnPath();
   logCommand(svnPath, ['--version']);
   try {
-    const result = await run(svnPath, ['--version'], { timeoutMs: readTimeoutMs() });
+    const result = await run(svnPath, ['--version'], { timeoutMs: readTimeoutMs(), onExit: logExitCode });
     if (result.exitCode !== 0 || !result.stdout.includes('svn, version')) {
       const detail = tailText((result.stderr.trim() || result.stdout.trim()).split('\n')[0] ?? '');
       logLine(format(strings.activation.invalidSvnDetail, { detail }));
@@ -79,7 +79,11 @@ async function probeWorkspace(svnPath: string): Promise<void> {
     const args = ['info', '--show-item', 'url', escapePeg(wcRoot)];
     logCommand(svnPath, args, wcRoot);
     try {
-      const result = await runOrThrow(svnPath, args, { cwd: wcRoot, timeoutMs: readTimeoutMs() });
+      const result = await runOrThrow(svnPath, args, {
+        cwd: wcRoot,
+        timeoutMs: readTimeoutMs(),
+        onExit: logExitCode,
+      });
       logLine(format(strings.activation.infoUrl, { url: result.stdout.trim(), path: wcRoot }));
     } catch (err) {
       logLine(format(strings.activation.infoFailed, { message: errorMessage(err) }));
