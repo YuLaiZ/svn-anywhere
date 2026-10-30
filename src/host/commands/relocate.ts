@@ -66,6 +66,8 @@ export async function commandRelocate(uri?: vscode.Uri): Promise<void> {
         const result = await runOrThrow(svnPath, args, {
           ...runOptions,
           getCredentials: promptForCredentials,
+          // 重试命令回显到输出频道（logCommand 内置脱敏，密码不外泄）。
+          onCredentialRetry: (retryArgs) => logCommand(svnPath, retryArgs, target.wcRoot),
         });
         logLine(result.stdout.trim());
       },

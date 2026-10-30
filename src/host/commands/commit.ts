@@ -140,6 +140,8 @@ async function remoteCheckBeforeCommit(
     ...runOptions,
     // 远端检查遇认证失败同样弹窗补录（F67）。
     getCredentials: promptForCredentials,
+    // 重试命令回显到输出频道（logCommand 内置脱敏，密码不外泄）。
+    onCredentialRetry: (args) => logCommand(svnPath, args, target.wcRoot),
   });
   const remoteChanges = remoteChangedEntries(remote);
   logLine(
@@ -206,6 +208,8 @@ async function executeCommit(
         timeoutMs: readTimeoutMs(),
         onExit: logExitCode,
         getCredentials: promptForCredentials,
+        // 重试命令回显到输出频道（logCommand 内置脱敏，密码不外泄）。
+        onCredentialRetry: (retryArgs) => logCommand(svnPath, retryArgs, target.wcRoot),
       });
       logLine(lastResult.stdout.trimEnd());
       lastRevision = parseCommitOutput(lastResult.stdout).revision ?? lastRevision;
@@ -225,6 +229,8 @@ async function executeCommit(
         timeoutMs: readTimeoutMs(),
         onExit: logExitCode,
         getCredentials: promptForCredentials,
+        // 重试命令回显到输出频道（logCommand 内置脱敏，密码不外泄）。
+        onCredentialRetry: (retryArgs) => logCommand(svnPath, retryArgs, target.wcRoot),
       });
       logLine(result.stdout.trimEnd());
       return parseCommitOutput(result.stdout).revision;

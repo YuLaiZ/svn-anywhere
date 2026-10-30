@@ -1,7 +1,8 @@
 /**
  * 认证与错误（F66–F70）测试：runOrThrow 的认证失败识别、保留原始 args
  * 重放、补录取消、非认证错误不触发；host 补录弹窗的用户名预填与密码框；
- * 重试参数与错误对象中的密码脱敏。
+ * 重试参数与错误对象中的密码脱敏；重试前 onCredentialRetry 回调的
+ * 时机与参数（宿主据此回显脱敏命令行）。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { runOrThrowWithRunner, type RunOptions, type RunResult } from '../src/core/svnCli';
@@ -126,6 +127,46 @@ describe('runOrThrow 认证重试（F66/F67）', () => {
     const result = await runOrThrowWithRunner('svn', ['status', '.'], {} as RunOptions, fake.runner);
     expect(result.stdout).toBe('ok');
     expect(fake.calls).toHaveLength(1);
+  });
+
+  it('认证重试执行前 onCredentialRetry 以追加凭据后的 args 调用一次', async () => {
+    const fake = runFake();
+    fake.push(runResult({ exitCode: 1, stderr: 'svn: E170001: Authentication failed' }));
+    fake.push(runResult({ stdout: 'ok', exitCode: 0 }));
+    const observed: Array<{ args: string[]; callsWhenFired: number }> = [];
+
+    await runOrThrowWithRunner('svn', ['update', '.'], {
+      cwd: '/wc',
+      getCredentials: vi.fn().mockResolvedValue({ username: 'yu', password: 's3cret' }),
+      onCredentialRetry: (args) => observed.push({ args, callsWhenFired: fake.calls.length }),
+    }, fake.runner);
+
+    // 回调恰好一次；触发时机在首次执行结束之后、重试执行之前（回显先于执行）。
+    expect(observed).toHaveLength(1);
+    expect(observed[0]?.callsWhenFired).toBe(1);
+    expect(observed[0]?.args).toEqual(['update', '.', '--username', 'yu', '--password', 's3cret']);
+    expect(fake.calls[1]?.args).toEqual(observed[0]?.args);
+  });
+
+  it('无重试（首次成功）与补录取消时 onCredentialRetry 都不调用', async () => {
+    // 首次成功。
+    const ok = runFake();
+    ok.push(runResult({ stdout: 'ok', exitCode: 0 }));
+    const okRetry = vi.fn();
+    await runOrThrowWithRunner('svn', ['status', '.'], { onCredentialRetry: okRetry }, ok.runner);
+    expect(okRetry).not.toHaveBeenCalled();
+
+    // 认证失败但补录取消：不重试，也不回调。
+    const cancelled = runFake();
+    cancelled.push(runResult({ exitCode: 1, stderr: 'svn: E215004: No more credentials' }));
+    const cancelledRetry = vi.fn();
+    await expect(
+      runOrThrowWithRunner('svn', ['update', '.'], {
+        getCredentials: vi.fn().mockResolvedValue(undefined),
+        onCredentialRetry: cancelledRetry,
+      }, cancelled.runner),
+    ).rejects.toBeInstanceOf(SvnError);
+    expect(cancelledRetry).not.toHaveBeenCalled();
   });
 });
 

@@ -39,9 +39,16 @@ export interface RunOptions {
   /**
    * 认证失败时的凭据补录回调（宿主弹窗，密码只在内存）。
    * 提供后 runOrThrow 在识别到认证失败时补录并保留原始 args 重试一次；
-   * 只读的本地命令不应提供。
+   * 只读的本地命令不应提供。注入本回调的调用方必须同时注入
+   * onCredentialRetry 并经 logCommand 脱敏回显，保持输出频道完整可解释。
    */
   getCredentials?: () => Promise<AuthCredentials | undefined>;
+  /**
+   * 认证补录重试执行前的回调，参数为追加 --username/--password 后的重试
+   * args（含明文密码）；宿主用于回显命令行，记录前必须脱敏
+   * （host 层 logCommand 已内置 redactArgs）。未提供或未发生重试不调用。
+   */
+  onCredentialRetry?: (args: string[]) => void;
 }
 
 export interface RunResult {
@@ -243,7 +250,8 @@ export function run(svnPath: string, args: string[], options: RunOptions = {}): 
 /**
  * 非零退出码视为失败的常用封装；成功时原样返回结果。
  * 提供 getCredentials 时，认证失败（E170001/E215004 等）弹窗补录凭据，
- * 保留原始 args 追加 --username/--password 重试一次；补录取消或重试
+ * 保留原始 args 追加 --username/--password 重试一次（重试执行前经
+ * onCredentialRetry 回调，宿主可回显脱敏后的命令行）；补录取消或重试
  * 仍失败都按原错误抛出（SvnError.command 构造时脱敏，明文不外泄）。
  */
 export async function runOrThrow(
@@ -273,6 +281,7 @@ export async function runOrThrowWithRunner(
       throw err;
     }
     const retryArgs = [...args, '--username', credentials.username, '--password', credentials.password];
+    options.onCredentialRetry?.(retryArgs);
     const result = await runner(svnPath, retryArgs, options);
     return assertSuccess(result, retryArgs, options.cwd);
   }

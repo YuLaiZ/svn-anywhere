@@ -64,6 +64,8 @@ export async function performUpdate(target: WcTarget, svnPath: string): Promise<
         onExit: logExitCode,
         // 认证失败时弹窗补录并重试一次（F67）；密码只在内存。
         getCredentials: promptForCredentials,
+        // 重试命令回显到输出频道（logCommand 内置脱敏，密码不外泄）。
+        onCredentialRetry: (args) => logCommand(svnPath, args, target.wcRoot),
       });
     },
   );
