@@ -26,6 +26,7 @@ const state = {
   quickPickTitles: [],
   /** QuickPick 指定勾选的 label 集合；undefined 表示默认勾选。 */
   quickPickPicked: undefined,
+  quickPickDiff: undefined,
   /** showQuickPick 单选面板按 label 匹配返回的项；undefined 表示取消。 */
   quickPickChoice: undefined,
   quickPicks: [],
@@ -103,6 +104,11 @@ const fakeVscode = {
           qp.selectedItems = state.quickPickPicked
             ? qp.items.filter((i) => state.quickPickPicked.includes(i.label))
             : qp.items.filter((i) => i.description !== 'unversioned');
+          if (state.quickPickDiff) {
+            const item = qp.items.find((candidate) => candidate.label === state.quickPickDiff);
+            if (!item) throw new Error(`未找到差异条目 ${state.quickPickDiff}`);
+            handlers.button?.forEach((cb) => cb({ item }));
+          }
           handlers.accept?.forEach((cb) => cb());
           handlers.hide?.forEach((cb) => cb());
         },
@@ -509,6 +515,140 @@ async function main() {
     'mock 模拟了真实 VSCode 的 already exists 行为；抛错说明旧句柄未释放',
   );
   check('命令注册集合仍与贡献点一致', state.registered.size === expectedIds.length);
+
+  console.log('场景 19：嵌套目录与带空格文件的真实差异、选择提交和 missing 删除范围');
+  const nestedLab = makeSvnLab();
+  const nestedWc = nestedLab.checkout('nested');
+  mkdirSync(join(nestedWc, 'src', 'src'), { recursive: true });
+  const nestedNames = ['src/item.txt', 'src/src/item.txt', 'src/ report.txt ', 'src/report.txt', 'src/drop.txt', 'src/src/drop.txt'];
+  for (const name of nestedNames) writeFileSync(join(nestedWc, name), `baseline ${name}\n`);
+  svn(['add', '-q', 'src'], nestedWc);
+  svn(['commit', '-q', '-m', 'nested baseline'], nestedWc);
+  for (const name of nestedNames) writeFileSync(join(nestedWc, name), `modified ${name}\n`);
+  state.quickPickPicked = ['src/item.txt'];
+  state.quickPickDiff = 'src/item.txt';
+  state.inputResult = undefined;
+  const beforeNestedDiff = channelText().length;
+  await state.registered.get('svnAnywhere.commit')({ fsPath: join(nestedWc, 'src'), scheme: 'file' });
+  for (let retry = 0; retry < 100 && !channelText().slice(beforeNestedDiff).includes('+modified src/item.txt'); retry += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  const nestedDiff = channelText().slice(beforeNestedDiff);
+  check('嵌套目录差异指向选中项', nestedDiff.includes('+modified src/item.txt') && !nestedDiff.includes('+modified src/src/item.txt'), nestedDiff.slice(-600));
+  state.quickPickDiff = undefined;
+  state.inputResult = 'commit selected nested path';
+  await state.registered.get('svnAnywhere.commit')({ fsPath: join(nestedWc, 'src'), scheme: 'file' });
+  check('嵌套目录提交选中项，未误提交同名深层项',
+    svn(['cat', `${nestedLab.repoUrl}/src/item.txt`]).startsWith('modified') &&
+    svn(['cat', `${nestedLab.repoUrl}/src/src/item.txt`]).startsWith('baseline'));
+  check('未选中同名深层项仍为本地修改', svn(['status'], nestedWc).includes('src/src/item.txt'));
+
+  state.quickPickPicked = ['src/ report.txt '];
+  await state.registered.get('svnAnywhere.commit')({ fsPath: join(nestedWc, 'src', ' report.txt '), scheme: 'file' });
+  check('文件入口与首尾空格保留准确目标',
+    svn(['cat', '-r', 'HEAD', 'src/ report.txt '], nestedWc).startsWith('modified') &&
+    svn(['cat', '-r', 'HEAD', 'src/report.txt'], nestedWc).startsWith('baseline'));
+
+  rmSync(join(nestedWc, 'src', 'drop.txt'));
+  state.quickPickPicked = ['src/drop.txt'];
+  state.confirmResult = '继续';
+  await state.registered.get('svnAnywhere.commit')({ fsPath: join(nestedWc, 'src'), scheme: 'file' });
+  check('嵌套 missing 只删除选中目标，保留同名深层文件',
+    !svn(['list', `${nestedLab.repoUrl}/src`]).split('\n').includes('drop.txt') &&
+    svn(['cat', `${nestedLab.repoUrl}/src/src/drop.txt`]).startsWith('baseline') &&
+    svn(['status'], nestedWc).includes('src/src/drop.txt'));
+  state.inputResult = undefined;
+  state.confirmResult = undefined;
+  state.quickPickPicked = undefined;
+  rmSync(nestedLab.lab, { recursive: true, force: true });
+
+  console.log('场景 20：无法精确忽略的换行/回车名称不写入属性或误忽略其他文件');
+  const specialLab = makeSvnLab();
+  const specialWc = specialLab.checkout('special');
+  for (const name of ['foo\nbar', 'foo\rbar', 'foo', 'bar']) writeFileSync(join(specialWc, name), 'unversioned');
+  for (const name of ['foo\nbar', 'foo\rbar']) {
+    state.quickPickChoice = `把「${name}」加入忽略`;
+    const warningsBefore = state.warning.length;
+    await state.registered.get('svnAnywhere.editIgnore')({ fsPath: join(specialWc, name), scheme: 'file' });
+    check('不可编码名称给可读提示 ' + JSON.stringify(name), state.warning.slice(warningsBefore).some((message) => message.includes('无法表示为一条精确忽略规则')));
+  }
+  check('拒绝前未写 svn:ignore', !svn(['proplist', '--xml', '.'], specialWc).includes('svn:ignore'));
+  check('相近名称没有被忽略', !svn(['status', '--no-ignore', '--xml', '.'], specialWc).includes('item="ignored"'));
+  state.quickPickChoice = undefined;
+
+  console.log('场景 21：控制字符与字面实体邻名在完整提交入口保持不同身份');
+  const literalNames = ['foo&#10;bar', 'foo&#13;bar', 'foo&#9;bar'];
+  for (const name of literalNames) {
+    writeFileSync(join(specialWc, name), 'literal baseline');
+    svn(['add', '-q', '--', name], specialWc);
+  }
+  svn(['commit', '-q', '-m', 'literal entities baseline'], specialWc);
+  for (const name of literalNames) writeFileSync(join(specialWc, name), 'literal modified');
+  state.quickPickPicked = ['foo\nbar'];
+  state.inputResult = 'try invalid control path';
+  const revisionBeforeControl = svn(['info', '--show-item', 'revision', specialLab.repoUrl]);
+  await state.registered.get('svnAnywhere.commit')({ fsPath: specialWc, scheme: 'file' });
+  const specialLabels = state.quickPicks.at(-1).items.map((item) => item.label);
+  check('面板保留换行与字面实体的不同身份', specialLabels.includes('foo\nbar') && specialLabels.includes('foo&#10;bar'));
+  check('不支持的控制字符目标不会转而提交字面邻名',
+    svn(['info', '--show-item', 'revision', specialLab.repoUrl]) === revisionBeforeControl &&
+    svn(['cat', '-r', 'HEAD', 'foo&#10;bar'], specialWc) === 'literal baseline');
+  state.quickPickPicked = ['foo&#10;bar'];
+  await state.registered.get('svnAnywhere.commit')({ fsPath: specialWc, scheme: 'file' });
+  check('选择字面实体只提交该文件',
+    svn(['cat', '-r', 'HEAD', 'foo&#10;bar'], specialWc) === 'literal modified' &&
+    svn(['cat', '-r', 'HEAD', 'foo&#13;bar'], specialWc) === 'literal baseline');
+
+  console.log('场景 22：短横线选项邻名和 @ 邻名的真实状态/差异/提交/删除范围');
+  const optionName = '--targets=manifest';
+  writeFileSync(join(specialWc, optionName), 'option baseline');
+  writeFileSync(join(specialWc, 'manifest'), 'decoy.txt\n');
+  writeFileSync(join(specialWc, 'decoy.txt'), 'decoy baseline');
+  writeFileSync(join(specialWc, 'a@1'), 'selected baseline');
+  writeFileSync(join(specialWc, 'a@1@'), 'neighbor baseline');
+  svn(['add', '-q', '--', './--targets=manifest', 'manifest', 'decoy.txt', 'a@1@', 'a@1@@'], specialWc);
+  svn(['commit', '-q', '-m', 'special paths baseline'], specialWc);
+  writeFileSync(join(specialWc, optionName), 'OPTION-SELECTED-CHANGE');
+  writeFileSync(join(specialWc, 'decoy.txt'), 'DECOY-CHANGE');
+  writeFileSync(join(specialWc, 'a@1'), 'AT-SELECTED-CHANGE');
+  writeFileSync(join(specialWc, 'a@1@'), 'AT-NEIGHBOR-CHANGE');
+  for (const [name, expected, unexpected] of [
+    [optionName, '+OPTION-SELECTED-CHANGE', '+DECOY-CHANGE'],
+    ['a@1', '+AT-SELECTED-CHANGE', '+AT-NEIGHBOR-CHANGE'],
+    ['a@1@', '+AT-NEIGHBOR-CHANGE', '+AT-SELECTED-CHANGE'],
+  ]) {
+    state.quickPickPicked = [name];
+    state.quickPickDiff = name;
+    state.inputResult = undefined;
+    const before = channelText().length;
+    await state.registered.get('svnAnywhere.commit')({ fsPath: specialWc, scheme: 'file' });
+    for (let retry = 0; retry < 100 && !channelText().slice(before).includes(expected); retry += 1) await new Promise((resolve) => setTimeout(resolve, 20));
+    const output = channelText().slice(before);
+    check('特殊目标差异不指向邻名 ' + name, output.includes(expected) && !output.includes(unexpected), output.slice(-600));
+  }
+  state.quickPickDiff = undefined;
+  state.quickPickPicked = undefined;
+  state.inputResult = 'commit literal option file';
+  await state.registered.get('svnAnywhere.commit')({ fsPath: join(specialWc, optionName), scheme: 'file' });
+  check('短横线文件入口状态和提交均安全，未读取 manifest 误提交',
+    svn(['cat', '-r', 'HEAD', '--', './--targets=manifest'], specialWc) === 'OPTION-SELECTED-CHANGE' &&
+    svn(['cat', '-r', 'HEAD', 'decoy.txt'], specialWc) === 'decoy baseline');
+  state.quickPickPicked = ['a@1'];
+  await state.registered.get('svnAnywhere.commit')({ fsPath: specialWc, scheme: 'file' });
+  check('含 @ 的提交保留 peg 语义且不提交末尾 @ 邻名',
+    svn(['cat', '-r', 'HEAD', 'a@1@'], specialWc) === 'AT-SELECTED-CHANGE' &&
+    svn(['cat', '-r', 'HEAD', 'a@1@@'], specialWc) === 'neighbor baseline');
+  rmSync(join(specialWc, optionName));
+  state.quickPickPicked = [optionName];
+  state.confirmResult = '继续';
+  await state.registered.get('svnAnywhere.commit')({ fsPath: specialWc, scheme: 'file' });
+  check('短横线 missing 登记删除只作用于目标',
+    !svn(['list', specialLab.repoUrl]).split('\n').includes(optionName) &&
+    svn(['cat', '-r', 'HEAD', 'decoy.txt'], specialWc) === 'decoy baseline');
+  state.quickPickPicked = undefined;
+  state.inputResult = undefined;
+  state.confirmResult = undefined;
+  rmSync(specialLab.lab, { recursive: true, force: true });
 
   rmSync(wc, { recursive: true, force: true });
   rmSync(plain, { recursive: true, force: true });

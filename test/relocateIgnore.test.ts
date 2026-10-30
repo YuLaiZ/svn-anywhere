@@ -6,7 +6,8 @@
 import { renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { buildWriteArgs, mergeIgnoreRules, parseIgnoreRules, readIgnoreRules } from '../src/core/ignore';
+import { XMLParser } from 'fast-xml-parser';
+import { buildWriteArgs, literalIgnorePattern, mergeIgnoreRules, parseIgnoreRules, readIgnoreRules } from '../src/core/ignore';
 import { buildRelocateArgs, readRepositoryUrl } from '../src/core/relocate';
 import { runOrThrow } from '../src/core/svnCli';
 import { createSvnLab, writeFile } from './helpers';
@@ -15,12 +16,57 @@ const lab = createSvnLab('svn-anywhere-relign-');
 afterAll(() => lab.cleanup());
 
 describe('svn:ignore 规则', () => {
+  it('无法表示为单条规则的换行/回车名称被拒绝', () => {
+    for (const name of ['foo\nbar', 'foo\rbar', 'foo\r\nbar']) {
+      expect(() => literalIgnorePattern(name)).toThrow(RangeError);
+    }
+  });
+
   it('parseIgnoreRules 与 mergeIgnoreRules：去重、保序、新规则追加末尾', () => {
     expect(parseIgnoreRules('*.log\nbuild\n')).toEqual(['*.log', 'build']);
     expect(parseIgnoreRules('')).toEqual([]);
     expect(mergeIgnoreRules(['*.log', 'build'], ['dist', '*.log'], [])).toEqual(['*.log', 'build', 'dist']);
     expect(mergeIgnoreRules(['*.log', 'build'], [], ['*.log'])).toEqual(['build']);
     expect(mergeIgnoreRules(['build'], [], ['build'])).toEqual([]);
+  });
+
+  it('解析规则保留名称首尾空格，仅去除空行和 CRLF 分隔符', () => {
+    expect(parseIgnoreRules(' report.txt \r\ninside space.txt\r\n \n\n')).toEqual([
+      ' report.txt ', 'inside space.txt', ' ',
+    ]);
+  });
+
+  it('带首尾空格的规则读写往返后仍只忽略精确名称', async () => {
+    const wc = lab.checkout('ig-spaces');
+    writeFile(wc, 'space-baseline.txt', 'v', true);
+    lab.svn(['commit', '-q', '-m', 'baseline'], wc);
+    writeFile(wc, ' report.txt ', 'spaced');
+    writeFile(wc, 'report.txt', 'plain');
+    lab.svn(['propset', 'svn:ignore', ' report.txt ', '.'], wc);
+    const rules = await readIgnoreRules('svn', '.', { cwd: wc });
+    expect(rules).toEqual([' report.txt ']);
+    const rulesFile = join(lab.root, 'space-rules.txt');
+    writeFileSync(rulesFile, `${rules.join('\n')}\n`, 'utf8');
+    lab.svn(buildWriteArgs(rules, '.', rulesFile), wc);
+    const status = lab.svn(['status', '--no-ignore', '--xml'], wc);
+    expect(status).toMatch(/path=" report\.txt "[\s\S]*?item="ignored"/);
+    expect(status).toMatch(/path="report\.txt"[\s\S]*?item="unversioned"/);
+  });
+
+  it('精确名称模式只忽略目标，不把反斜杠或通配符当作模式语法', async () => {
+    const wc = lab.checkout('ig-literal');
+    const names = ['slash\\x', 'double\\\\x', ' mix\\[1]*?.log ', 'star*.tmp', 'question?.tmp', 'bracket[1].tmp'];
+    const near = ['slashx', 'double\\x', ' mix[1]abcx.log ', 'star-other.tmp', 'questionx.tmp', 'bracket1.tmp'];
+    for (const name of [...names, ...near]) writeFile(wc, name, 'unversioned');
+    const rules = names.map(literalIgnorePattern);
+    const rulesFile = join(lab.root, 'literal-rules.txt');
+    writeFileSync(rulesFile, `${rules.join('\n')}\n`, 'utf8');
+    lab.svn(buildWriteArgs(rules, '.', rulesFile), wc);
+    const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '', trimValues: false, isArray: (name) => name === 'entry' });
+    const entries = parser.parse(lab.svn(['status', '--no-ignore', '--xml'], wc)).status.target.entry;
+    for (const name of names) expect(entries.find((entry: { path: string }) => entry.path === name)?.['wc-status'].item, name).toBe('ignored');
+    for (const name of near) expect(entries.find((entry: { path: string }) => entry.path === name)?.['wc-status'].item, name).toBe('unversioned');
+    await expect(readIgnoreRules('svn', '.', { cwd: wc })).resolves.toEqual(rules);
   });
 
   it('属性不存在时 readIgnoreRules 容错返回空规则（实测 W200017 退出码非 0）', async () => {

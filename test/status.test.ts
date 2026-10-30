@@ -3,9 +3,12 @@
  * runStatus 走本地 svnadmin + file:// 副本集成链路，并验证含 @ 的检出
  * 目录（escapePeg 契约）与纯文本 svn status 输出的一致性（F15）。
  */
+import { writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
+import { buildCommitArgs } from '../src/core/commit';
+import { parseRemoteStatusXml, runRemoteStatus } from '../src/core/remoteStatus';
 import { commitableEntries, parseStatusXml, runStatus } from '../src/core/status';
 import { createSvnLab, writeFile } from './helpers';
 
@@ -42,6 +45,16 @@ describe('parseStatusXml', () => {
       { path: 'src/a.txt', wcStatus: 'modified', kind: undefined, revision: 3, props: 'none' },
       { path: 'src/new.txt', wcStatus: 'unversioned', kind: undefined, revision: undefined, props: 'none' },
     ]);
+  });
+
+  it('数字实体只解码一次，保留字面实体与普通 XML 字符', () => {
+    const paths = ['foo&#10;bar', 'foo&#x9;bar', 'foo&#13;bar', 'foo&amp;#10;bar', 'a&amp;lt;b', 'a&lt;b&amp;&quot;&apos;'];
+    const expected = ['foo\nbar', 'foo\tbar', 'foo\rbar', 'foo&#10;bar', 'a&lt;b', "a<b&\"'"];
+    for (let index = 0; index < paths.length; index += 1) {
+      const xml = `<status><target path="."><entry path="${paths[index]}"><wc-status item="modified" props="none"/></entry></target></status>`;
+      expect(parseStatusXml(xml).entries[0]?.path).toBe(expected[index]);
+      expect(parseRemoteStatusXml(xml).entries[0]?.path).toBe(expected[index]);
+    }
   });
 
   it('干净副本：只有 target 没有 entry，结果为空数组', () => {
@@ -142,6 +155,53 @@ describe('runStatus 集成（本地 file:// 副本）', () => {
     lab.svn(['update', '-q'], wc);
     lab.svn(['commit', '-q', '-m', 'ignore debug.log', '.'], wc);
     expect((await runStatus('svn', '.', { cwd: wc })).entries).toEqual([]);
+  });
+
+  it('仅首尾空格不同的文件保持独立，差异和提交只作用于选中路径', async () => {
+    const wc = lab.checkout('wc-space-targets');
+    const spaced = ' report.txt ';
+    const plain = 'report.txt';
+    writeFile(wc, spaced, 'spaced-v1', true);
+    writeFile(wc, plain, 'plain-v1', true);
+    lab.svn(['commit', '-q', '-m', 'space paths baseline'], wc);
+    writeFile(wc, spaced, 'spaced-v2');
+    writeFile(wc, plain, 'plain-v2');
+    const result = await runStatus('svn', '.', { cwd: wc });
+    expect(commitableEntries(result).map((entry) => entry.path).sort()).toEqual([spaced, plain].sort());
+    const target = (await runStatus('svn', join(wc, spaced), { cwd: wc }));
+    expect(target.targetPath).toBe(join(wc, spaced));
+    expect(target.entries.map((entry) => entry.path)).toEqual([join(wc, spaced)]);
+    const remote = await runRemoteStatus('svn', '.', { cwd: wc });
+    expect(remote.entries.filter((entry) => entry.wcStatus === 'modified').map((entry) => entry.path).sort()).toEqual([spaced, plain].sort());
+    const selected = result.entries.find((entry) => entry.path === spaced)!.path;
+    const diff = lab.svn(['diff', selected], wc);
+    expect(diff).toContain('+spaced-v2');
+    expect(diff).not.toContain('+plain-v2');
+    const message = join(lab.root, 'space-path-message.txt');
+    writeFileSync(message, 'commit selected spaced path', 'utf8');
+    lab.svn(buildCommitArgs(message, [selected]), wc);
+    expect((await runStatus('svn', '.', { cwd: wc })).entries.map((entry) => entry.path)).toEqual([plain]);
+    expect(lab.svn(['cat', '-r', 'HEAD', spaced], wc)).toBe('spaced-v2');
+    expect(lab.svn(['cat', '-r', 'HEAD', plain], wc)).toBe('plain-v1');
+  });
+
+  it('真实控制字符与字面数字实体名称不碰撞，选择提交不改变邻名', async () => {
+    const wc = lab.checkout('wc-entities');
+    const names = ['entity\nname', 'entity&#10;name', 'tab\tname', 'tab&#9;name', 'cr\rname', 'cr&#13;name'];
+    for (const [index, name] of names.entries()) writeFile(wc, name, 'baseline', index % 2 === 1);
+    lab.svn(['commit', '-q', '-m', 'entity names baseline'], wc);
+    for (const name of names) writeFile(wc, name, 'modified');
+    expect((await runStatus('svn', '.', { cwd: wc })).entries.map((entry) => entry.path).sort()).toEqual([...names].sort());
+    expect((await runRemoteStatus('svn', '.', { cwd: wc })).entries.filter((entry) => ['modified', 'none', 'unversioned'].includes(entry.wcStatus ?? '')).map((entry) => entry.path).filter((path) => names.includes(path)).sort()).toEqual([...names].sort());
+    const message = join(lab.root, 'entity-message.txt');
+    writeFileSync(message, 'commit newline path', 'utf8');
+    // SVN 不接受控制字符路径纳管；失败不能转而提交字面实体邻名。
+    expect(() => lab.svn(buildCommitArgs(message, [names[0]]), wc)).toThrow();
+    expect(lab.svn(['cat', '-r', 'HEAD', names[1]], wc)).toBe('baseline');
+    lab.svn(buildCommitArgs(message, [names[1]]), wc);
+    expect(lab.svn(['cat', '-r', 'HEAD', names[1]], wc)).toBe('modified');
+    expect(lab.svn(['cat', '-r', 'HEAD', names[3]], wc)).toBe('baseline');
+    expect((await runStatus('svn', '.', { cwd: wc })).entries.map((entry) => entry.path).sort()).toEqual(names.filter((_, index) => index !== 1).sort());
   });
 
   it('检出目录名含 @2（严格 peg 语法）：escapePeg 转义后状态读取正常', async () => {

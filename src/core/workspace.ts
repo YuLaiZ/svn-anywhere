@@ -51,5 +51,7 @@ function isWorkingCopyRoot(dir: string): boolean {
  * 经过本函数；阶段 3 起由命令封装层统一调用，调用方不再自行拼接裸路径。
  */
 export function escapePeg(path: string): string {
-  return path.includes('@') ? `${path}@` : path;
+  // 相对路径以短横线开头时先明确为路径，避免被 SVN 解释为命令选项。
+  const target = path.startsWith('-') ? `./${path}` : path;
+  return target.includes('@') ? `${target}@` : target;
 }

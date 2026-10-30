@@ -81,6 +81,7 @@ export const strings = {
     addCurrentName: '把「{name}」加入忽略',
     addCustomPattern: '输入自定义模式（如 *.log）',
     removeExisting: '移除已有规则：{rule}',
+    unrepresentableName: '名称含换行或回车，无法表示为一条精确忽略规则；未修改忽略规则。',
     customPatternPrompt: '输入要忽略的文件名或通配模式',
     currentRulesHeader: '当前 svn:ignore 规则（{dir}）：',
     emptyRules: '（无规则）',

@@ -10,6 +10,7 @@ import { basename, dirname, join, relative } from 'node:path';
 import {
   buildWriteArgs,
   mergeIgnoreRules,
+  literalIgnorePattern,
   readIgnoreRules,
 } from '../../core/ignore';
 import { runOrThrow } from '../../core/svnCli';
@@ -75,16 +76,22 @@ export async function commandEditIgnore(uri?: vscode.Uri): Promise<void> {
   let additions: string[] = [];
   let removals: string[] = [];
   if (picked.action === 'addName') {
-    additions = [basename(target.targetPath)];
+    try {
+      additions = [literalIgnorePattern(basename(target.targetPath))];
+    } catch (error) {
+      if (!(error instanceof RangeError)) throw error;
+      void vscode.window.showWarningMessage(strings.ignore.unrepresentableName);
+      return;
+    }
   } else if (picked.action === 'addPattern') {
     const pattern = await vscode.window.showInputBox({
       prompt: strings.ignore.customPatternPrompt,
       ignoreFocusOut: true,
     });
-    if (pattern === undefined || pattern.trim() === '') {
+    if (pattern === undefined || pattern === '') {
       return;
     }
-    additions = [pattern.trim()];
+    additions = [pattern];
   } else {
     removals = [picked.rule ?? ''];
   }

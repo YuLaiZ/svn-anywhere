@@ -11,9 +11,23 @@ import { escapePeg } from './workspace';
 /** 解析 `svn propget svn:ignore <dir>` 的输出为规则列表。 */
 export function parseIgnoreRules(output: string): string[] {
   return output
-    .split('\n')
-    .map((line) => line.trim())
+    .split(/\r?\n/)
     .filter((line) => line.length > 0);
+}
+
+/** 将直接子项名转换为精确匹配的 svn:ignore 模式，保留空格。 */
+export function literalIgnorePattern(name: string): string {
+  if (/[\r\n]/.test(name)) {
+    throw new RangeError('A name containing line breaks cannot be represented by one svn:ignore pattern');
+  }
+  return [...name].map((char) => {
+    if (char === '\\') return '\\\\';
+    if (char === '[') return '[[]';
+    if (char === ']') return '[]]';
+    if (char === '*') return '[*]';
+    if (char === '?') return '[?]';
+    return char;
+  }).join('');
 }
 
 /**

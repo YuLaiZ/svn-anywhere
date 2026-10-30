@@ -244,6 +244,25 @@ describe('commandCommit 提交闭环', () => {
     expect(output).toContain('提交后状态：');
   });
 
+  it('嵌套目录的 status 路径相对副本根，提交、missing 和差异不重复拼接目标', async () => {
+    mkdirSync(join(wcRoot, 'src'), { recursive: true });
+    vi.mocked(runStatus).mockResolvedValue({
+      targetPath: 'src',
+      entries: [
+        { path: 'src/item.txt', wcStatus: 'modified', props: 'none' },
+        { path: 'src/drop.txt', wcStatus: 'missing', props: 'none' },
+      ],
+    });
+    vscodeMock.confirmResult = strings.commit.continueButton;
+    await commandCommit(makeUri(join(wcRoot, 'src')));
+    expect(vi.mocked(runOrThrow).mock.calls.find(([, args]) => args[0] === 'delete')?.[1]).toEqual(['delete', '--force', 'src/drop.txt']);
+    const commitArgs = vi.mocked(runOrThrow).mock.calls.find(([, args]) => args[0] === 'commit')?.[1] ?? [];
+    expect(commitArgs.slice(6)).toEqual(['src/item.txt', 'src/drop.txt']);
+    const picker = vscodeMock.quickPicks[0];
+    picker.__handlers.button[0]?.({ item: { entry: { path: 'src/item.txt', wcStatus: 'modified' } } });
+    await vi.waitFor(() => expect(vi.mocked(runOrThrow).mock.calls.some(([, args]) => args[0] === 'diff' && args[1] === '--' && args[2] === 'src/item.txt')).toBe(true));
+  });
+
   it('面板取消：不提交', async () => {
     vscodeMock.quickPickAccepted = false;
     await commandCommit(makeUri(join(wcRoot, 'a.txt')));
@@ -392,6 +411,6 @@ describe('commandCommit 提交闭环', () => {
       expect(channelLines().join('\n')).toContain('差异（a.txt）：');
     });
     const diffCall = vi.mocked(runOrThrow).mock.calls.at(-1);
-    expect(diffCall?.[1]).toEqual(['diff', 'a.txt']);
+    expect(diffCall?.[1]).toEqual(['diff', '--', 'a.txt']);
   });
 });

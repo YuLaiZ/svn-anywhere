@@ -93,6 +93,11 @@ describe('findWorkingCopy', () => {
 });
 
 describe('escapePeg', () => {
+  it('短横线开头的目标显式表示为路径，并保留 peg 转义', () => {
+    expect(escapePeg('--targets=manifest')).toBe('./--targets=manifest');
+    expect(escapePeg('-name@1')).toBe('./-name@1@');
+  });
+
   it('路径含 @ 时在末尾补 @', () => {
     expect(escapePeg('/tmp/a@b/file')).toBe('/tmp/a@b/file@');
     expect(escapePeg('file@')).toBe('file@@');

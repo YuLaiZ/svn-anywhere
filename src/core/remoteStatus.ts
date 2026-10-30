@@ -23,6 +23,10 @@ export interface RemoteStatusResult {
 const parser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: '',
+  // 路径属性中的首尾空格属于文件名，不能改变目标身份。
+  trimValues: false,
+  // SVN 用数字实体表示路径控制字符；解码一次，保留 &amp; 编码的字面实体。
+  htmlEntities: true,
   isArray: (name) => name === 'entry',
 });
 

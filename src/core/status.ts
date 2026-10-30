@@ -9,7 +9,7 @@ import { runOrThrow, type RunOptions } from './svnCli';
 import { escapePeg } from './workspace';
 
 export interface StatusEntry {
-  /** 相对目标的路径，来自 XML 的 entry@path。 */
+  /** 来自 XML 的原始 entry@path：相对目标调用时相对 cwd，绝对目标调用时为绝对路径。 */
   path: string;
   /** svn 工作副本状态原词，来自 wc-status@item。 */
   wcStatus: string;
@@ -29,6 +29,10 @@ export interface StatusResult {
 const parser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: '',
+  // 路径属性中的首尾空格属于文件名，不能改变目标身份。
+  trimValues: false,
+  // SVN 用数字实体表示路径控制字符；解码一次，保留 &amp; 编码的字面实体。
+  htmlEntities: true,
   // status XML 里 entry 一定按集合处理，单个条目也要保持数组形态。
   isArray: (name) => name === 'entry',
 });

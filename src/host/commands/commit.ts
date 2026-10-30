@@ -54,14 +54,12 @@ export async function commandCommit(uri?: vscode.Uri): Promise<void> {
     return;
   }
 
-  // 文件多选：条目路径相对目标；差异查看与提交参数都需要换算成相对副本根。
-  const toWcRelative = (entryPath: string): string =>
-    relative(target.wcRoot, entryPath === targetArg ? target.targetPath : join(target.targetPath, entryPath)) || '.';
-
+  // status 在副本根 cwd 下使用相对目标，entry.path 已相对副本根；
+  // 差异、删除和提交直接使用该路径，不能再拼一次当前目标目录。
   const picked = await pickCommitFiles(status.entries, {
     title: format(strings.commit.pickTitle, { target: target.targetPath }),
     placeholder: strings.commit.pickPlaceholder,
-    onDiff: (entry) => void showDiff(target, svnPath, toWcRelative(entry.path)),
+    onDiff: (entry) => void showDiff(target, svnPath, entry.path),
   });
   if (!picked || picked.length === 0) {
     return;
@@ -95,7 +93,7 @@ export async function commandCommit(uri?: vscode.Uri): Promise<void> {
       return;
     }
     for (const item of missing) {
-      const missingPath = escapePeg(toWcRelative(item.path));
+      const missingPath = escapePeg(item.path);
       logCommand(svnPath, ['delete', '--force', missingPath], target.wcRoot);
       await runOrThrow(svnPath, ['delete', '--force', missingPath], runOptions);
     }
@@ -107,7 +105,7 @@ export async function commandCommit(uri?: vscode.Uri): Promise<void> {
       title: format(strings.commit.commitProgress, { count: String(picked.length) }),
       cancellable: false,
     },
-    () => executeCommit(target, svnPath, picked.map((item) => toWcRelative(item.path)), message),
+    () => executeCommit(target, svnPath, picked.map((item) => item.path), message),
   );
 
   logLine(
@@ -243,7 +241,8 @@ async function executeCommit(
 
 /** 把 svn diff 文本写入输出频道（M1 不引入 vscode.diff）。 */
 async function showDiff(target: WcTarget, svnPath: string, wcRelativePath: string): Promise<void> {
-  const args = ['diff', escapePeg(wcRelativePath)];
+  // 本地 diff 使用字面工作路径；追加 peg 会把 @ 邻名指向另一个文件。
+  const args = ['diff', '--', wcRelativePath];
   logCommand(svnPath, args, target.wcRoot);
   const result = await runOrThrow(svnPath, args, {
     cwd: target.wcRoot,
