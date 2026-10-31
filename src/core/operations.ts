@@ -24,6 +24,15 @@ export type OperationPhase =
   | 'coordination-blocked'
   | 'done';
 
+/** P2 单属性提交的属性载荷：原始/待提交属性的存在与值（值按行原样保留）。 */
+export interface PropertyRecord {
+  name: string;
+  originalExists?: boolean;
+  originalValue?: string[];
+  pendingExists?: boolean;
+  pendingValue?: string[];
+}
+
 /** 持久化的操作记录。不含密码/凭据。 */
 export interface OperationRecord {
   operationId: string;
@@ -36,8 +45,7 @@ export interface OperationRecord {
   nodeKind: 'file' | 'dir';
   /** 发起操作时目标节点的 BASE 修订。 */
   baseRevision?: number;
-  /** P2 单属性提交：原始/待提交属性的存在与值（值按行原样保留）。 */
-  property?: { name: string; originalExists?: boolean; originalValue?: string[]; pendingExists?: boolean; pendingValue?: string[] };
+  property?: PropertyRecord;
   /** P1 批次与显式路径。 */
   explicitPaths?: string[];
   phase: OperationPhase;

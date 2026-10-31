@@ -323,3 +323,90 @@ describe('render：P1 树形与提交面板片段', () => {
     expect(html).toContain('data-index="0"');
   });
 });
+
+describe('render：P2 忽略规则编辑器片段', () => {
+  function ignoreState(patch: Partial<PanelState> = {}): PanelState {
+    return baseState({
+      title: strings.ignorePanel.panelTitle,
+      headerBadges: [{ text: '已读取' }, { text: '2 条' }],
+      headerActions: [{ id: 'refresh', label: strings.ignorePanel.reload }],
+      hint: strings.ignorePanel.hint,
+      ignoreEditor: {
+        rules: [
+          { index: 0, text: '*.log' },
+          { index: 1, text: 'build' },
+        ],
+        listLabel: strings.ignorePanel.panelTitle,
+        removeLabel: strings.ignorePanel.removeRuleLabel,
+        empty: { title: strings.ignorePanel.emptyUnset, detail: strings.ignorePanel.emptyUnsetDetail, extra: strings.ignorePanel.emptyOtherSources },
+        draft: { fieldId: 'draft', label: strings.ignorePanel.draftLabel, value: '', placeholder: strings.ignorePanel.draftPlaceholder },
+        addNote: strings.ignorePanel.addNote,
+        noOriginNote: strings.ignorePanel.noOriginNote,
+        addAction: { id: 'addRule', label: strings.ignorePanel.addRule, disabled: true, disabledReason: strings.ignorePanel.addRuleEmptyReason },
+      },
+      footer: {
+        summary: strings.ignorePanel.summaryClean,
+        primary: { id: 'submitIgnore', label: strings.ignorePanel.commitButton, disabled: true, disabledReason: strings.ignorePanel.commitButtonReason },
+        secondary: [
+          { id: 'closePanel', label: strings.ignorePanel.closeButton },
+          { id: 'saveIgnore', label: strings.ignorePanel.saveButton, disabled: true, disabledReason: strings.ignorePanel.saveButtonReason },
+        ],
+      },
+      ...patch,
+    });
+  }
+
+  it('规则行、待加入输入、页脚（关闭/保存/提交）与标题徽标渲染', () => {
+    const html = render(ignoreState());
+    expect(html).toContain('class="rules"');
+    expect(html).toContain('rule-row');
+    expect(html).toContain('rule-text">*.log');
+    expect(html).toContain('data-intent="removeRule" data-index="1"');
+    expect(html).toContain('aria-label="移除规则 *.log"');
+    expect(html).toContain('add-area');
+    expect(html).toContain('data-field-id="draft"');
+    expect(html).toContain('data-intent="addRule"');
+    expect(html).toContain(strings.ignorePanel.hint.slice(0, 10));
+    expect(html).toContain('badge">已读取');
+    expect(html).toContain('2 条');
+    expect(html).toContain('data-intent="refresh"');
+    // 页脚三按钮齐全。
+    expect(html).toContain('data-intent="closePanel"');
+    expect(html).toContain('data-intent="saveIgnore"');
+    expect(html).toContain('data-intent="submitIgnore"');
+  });
+
+  it('规则文本与属性上下文都转义（通配符/尖括号/引号原样展示）', () => {
+    const html = render(ignoreState({
+      ignoreEditor: {
+        rules: [{ index: 0, text: 'cache[[]1[]][?].log' }, { index: 1, text: 'a<b>&"q".tmp' }],
+        listLabel: 'rules',
+        removeLabel: '移除',
+        empty: { title: 'e' },
+        draft: { fieldId: 'draft', label: 'd', value: '', placeholder: '' },
+        addNote: 'n',
+        addAction: { id: 'addRule', label: '加入' },
+      },
+    }));
+    expect(html).toContain('rule-text">cache[[]1[]][?].log');
+    expect(html).toContain('a&lt;b&gt;&amp;&quot;q&quot;.tmp');
+  });
+
+  it('锁定时编辑区控件随 busy 禁用一致', () => {
+    const html = render(ignoreState({
+      busy: true,
+      ignoreEditor: {
+        rules: [{ index: 0, text: '*.log' }],
+        listLabel: 'rules',
+        removeLabel: '移除',
+        empty: { title: 'e' },
+        draft: { fieldId: 'draft', label: 'd', value: '', placeholder: '', disabled: true },
+        addNote: 'n',
+        addAction: { id: 'addRule', label: '加入', disabled: true },
+        busy: true,
+      },
+    }));
+    expect((html.match(/disabled/g) ?? []).length).toBeGreaterThanOrEqual(3);
+    expect(html).toContain('data-busy="1"');
+  });
+});

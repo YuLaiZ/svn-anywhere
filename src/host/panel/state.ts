@@ -122,6 +122,47 @@ export interface FooterSpec {
   secondary?: ActionSpec[];
 }
 
+/** 标题区状态徽标（P2：未保存/待提交/待核实等）。 */
+export interface HeaderBadgeSpec {
+  text: string;
+  warn?: boolean;
+}
+
+/**
+ * P2 规则编辑器：规则列表与待加入输入分开（交互清单 P2）。
+ * 规则按行原样展示（含首尾空格），移除按行序号定位；待加入输入经
+ * syncInput 同步、addRule 确认入列，未处理前不保存/提交。
+ */
+export interface IgnoreEditorSpec {
+  /** 规则行：index 为当前列表序号（意图 removeRule 的载荷）。 */
+  rules: Array<{ index: number; text: string }>;
+  /** 规则列表容器 aria-label。 */
+  listLabel: string;
+  /** 移除一行的可访问名称（含规则文本）。 */
+  removeLabel: string;
+  /** 无规则时的空态（未设置属性、已清空待删除、读取失败三种由宿主区分）。 */
+  empty: { title: string; detail?: string; extra?: string };
+  /** 待加入输入（fieldId 参与输入同步与序号防回退）。 */
+  draft: {
+    fieldId: string;
+    label: string;
+    value: string;
+    placeholder: string;
+    disabled?: boolean;
+  };
+  /** 输入区下方说明：通配符与路径限制。 */
+  addNote: string;
+  /** 有 originName 时的「用当前项名」说明；与 noOriginNote 二选一。 */
+  originNote?: string;
+  noOriginNote?: string;
+  /** 加入按钮：draft 为空或锁定时禁用（宿主派生并给出原因）。 */
+  addAction: ActionSpec;
+  /** 用当前项名：目录入口无 originName 时不渲染（避免目录名写入自身的歧义动作）。 */
+  fillAction?: ActionSpec;
+  /** 编辑区整体忙碌/锁定（busy/writeLocked 时禁用全部控件）。 */
+  busy?: boolean;
+}
+
 /** 宿主 → 视图的渲染状态。 */
 export interface PanelState {
   /** 当前会话代次：目标切换即更换，异步结果须校验后才允许写入。 */
@@ -143,6 +184,14 @@ export interface PanelState {
   list?: ListSpec;
   form?: FormSpec;
   footer?: FooterSpec;
+  /** 标题区状态徽标（P2；P1 未用）。 */
+  headerBadges?: HeaderBadgeSpec[];
+  /** 标题区动作（如 P2「重新读取」）。 */
+  headerActions?: ActionSpec[];
+  /** 标题区与横幅之间的固定说明（P2 规则作用范围）。 */
+  hint?: string;
+  /** P2 规则编辑区（规则列表 + 待加入输入）。 */
+  ignoreEditor?: IgnoreEditorSpec;
 }
 
 /** reducer 的输入事件：视图意图（intent: 前缀）与宿主内部事件（host: 前缀）。 */

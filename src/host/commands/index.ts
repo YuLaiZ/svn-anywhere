@@ -13,6 +13,7 @@ import { commandShowOutput } from './showOutput';
 import { commandShowStatus } from './showStatus';
 import { commandUpdate } from './update';
 import { setCommitPanelContext } from '../panel/panels/commit';
+import { setIgnorePanelContext } from '../panel/panels/ignore';
 import { initializeOperationStore } from '../../core/operations';
 
 const COMMANDS: ReadonlyArray<{ id: string; handler: CommandHandler }> = [
@@ -32,8 +33,6 @@ const COMMANDS: ReadonlyArray<{ id: string; handler: CommandHandler }> = [
  * already exists，重复注册会让 activate 失败。
  */
 let registeredDisposables: vscode.Disposable[] = [];
-/** 操作记录持久化已随首次 activate 注入；重复 activate 幂等。 */
-let operationStoreReady = false;
 
 export function registerAllCommands(context: vscode.ExtensionContext): void {
   for (const disposable of registeredDisposables) {
@@ -42,11 +41,11 @@ export function registerAllCommands(context: vscode.ExtensionContext): void {
   registeredDisposables = [];
   // 面板创建需要 extensionUri / subscriptions / globalState；activate 注入一次。
   setCommitPanelContext(context);
-  if (!operationStoreReady) {
-    operationStoreReady = true;
-    // 未完成操作记录跨会话恢复限制（写锁在面板打开时生效）。
-    void initializeOperationStore(context.globalState);
-  }
+  setIgnorePanelContext(context);
+  // 未完成操作记录跨会话恢复限制（写锁在面板打开时生效）。
+  // 每次 activate 都重载：记录可能被另一窗口写入同一 globalState，
+  // 重跑 loadPending 是幂等的（已落盘记录随 begin/markPhase 即时写入）。
+  void initializeOperationStore(context.globalState);
   for (const { id, handler } of COMMANDS) {
     registeredDisposables.push(registerCommand(context, id, handler));
   }

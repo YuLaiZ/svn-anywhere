@@ -46,9 +46,13 @@ export function render(state: PanelState): string {
     `<header class="panel-header">`,
     `<span class="panel-title">${escapeHtml(state.title)}</span>`,
     `<span class="panel-target" title="${escapeHtml(state.targetLabel)}">${escapeHtml(state.targetLabel)}</span>`,
+    `<span class="spacer"></span>`,
+    renderHeaderBadges(state),
     `<span class="counts">${escapeHtml(renderCounts(state))}</span>`,
+    renderHeaderActions(state, locked),
     `</header>`,
     renderSuccessCard(state),
+    state.hint ? `<div class="hint">${escapeHtml(state.hint)}</div>` : '',
     renderBanners(state.banners),
   ];
   if (state.form) {
@@ -59,11 +63,32 @@ export function render(state: PanelState): string {
     parts.push(renderSelectionBar(state, locked));
     parts.push(renderList(state, locked));
   }
+  if (state.ignoreEditor) {
+    parts.push(renderIgnoreEditor(state.ignoreEditor));
+  }
   parts.push(renderFooter(state, locked));
   if (busy) {
     parts.push('<div class="progress" role="status" aria-label="busy"><i></i></div>');
   }
   return `<main class="panel" data-busy="${busy ? '1' : '0'}" data-revision="${state.revision}">${parts.join('')}</main>`;
+}
+
+/** 标题区状态徽标（P2：未保存/待提交/待核实/待协调等）。 */
+function renderHeaderBadges(state: PanelState): string {
+  return (state.headerBadges ?? [])
+    .map((badge) => `<span class="badge${badge.warn ? ' warn' : ''}">${escapeHtml(badge.text)}</span>`)
+    .join('');
+}
+
+/** 标题区动作（P2「重新读取」等；锁定时禁用）。 */
+function renderHeaderActions(state: PanelState, locked: boolean): string {
+  return (state.headerActions ?? [])
+    .map((action) => {
+      const disabled = locked || action.disabled ? ' disabled' : '';
+      const title = action.disabledReason ?? action.label;
+      return `<button type="button" class="link" data-intent="${escapeHtml(action.id)}" data-focus="header-${escapeHtml(action.id)}" title="${escapeHtml(title)}" aria-label="${escapeHtml(title)}"${disabled}>${escapeHtml(action.label)}</button>`;
+    })
+    .join('');
 }
 
 function renderCounts(state: PanelState): string {
@@ -77,18 +102,24 @@ function renderCounts(state: PanelState): string {
   return counts + hidden;
 }
 
-/** 成功卡片：level=success 的 banner 用独立卡片样式（标题区下方、可收起）。 */
+/** 成功卡片：level=success 的 banner 用独立卡片样式（标题区下方、可收起）。
+ *  detail 含换行时按多段渲染（P2 提交卡片需同时说明范围与保留项）。 */
 function renderSuccessCard(state: PanelState): string {
   const success = state.banners.find((banner) => banner.id === 'commitSuccess' && banner.level === 'success');
   if (!success) {
     return '';
   }
+  const detailHtml = (success.detail ?? '')
+    .split('\n')
+    .filter((line) => line.length > 0)
+    .map((line) => `<p>${escapeHtml(line)}</p>`)
+    .join('');
   const dismissLabel = strings.panel.dismiss;
   return (
     `<section class="success-card" role="status" aria-live="polite">` +
     `<span class="success-icon" aria-hidden="true">✓</span>` +
     `<div class="success-content"><strong>${escapeHtml(success.title)}</strong>` +
-    (success.detail ? `<p>${escapeHtml(success.detail)}</p>` : '') +
+    detailHtml +
     `</div>` +
     `<button type="button" class="dismiss-success" data-intent="dismissBanner" data-banner-id="${escapeHtml(success.id)}" aria-label="${escapeHtml(dismissLabel)}" title="${escapeHtml(dismissLabel)}" ${lockedDisabled(state.busy || (state.writeLocked ?? false))}>×</button>` +
     `</section>`
@@ -139,6 +170,45 @@ function renderBanner(banner: BannerSpec): string {
 
 function lockedDisabled(locked: boolean): string {
   return locked ? ' disabled' : '';
+}
+
+/**
+ * P2 规则编辑区：规则列表（.rules/.rule-row，含行内移除）与待加入输入
+ * （.add-area：输入 + 加入 + 用当前项名）分开；DOM 结构沿用原型基线。
+ */
+function renderIgnoreEditor(editor: NonNullable<PanelState['ignoreEditor']>): string {
+  const locked = editor.busy ?? false;
+  const listHtml = editor.rules.length > 0
+    ? `<div class="rules" aria-label="${escapeHtml(editor.listLabel)}">` +
+      editor.rules.map((rule) =>
+        `<div class="rule-row">` +
+        `<span class="rule-text">${escapeHtml(rule.text)}</span>` +
+        `<button type="button" class="row-act" data-intent="removeRule" data-index="${rule.index}" data-focus="remove-${rule.index}" aria-label="${escapeHtml(format(strings.ignorePanel.ignoreRemoveRule, { rule: rule.text }))}" title="${escapeHtml(editor.removeLabel)}"${locked ? ' disabled' : ''}>${escapeHtml(editor.removeLabel)}</button>` +
+        `</div>`,
+      ).join('') +
+      `</div>`
+    : `<div class="empty"><h3>${escapeHtml(editor.empty.title)}</h3>` +
+      (editor.empty.detail ? `<p class="muted">${escapeHtml(editor.empty.detail)}</p>` : '') +
+      (editor.empty.extra ? `<p class="muted">${escapeHtml(editor.empty.extra)}</p>` : '') +
+      `</div>`;
+  const draft = editor.draft;
+  const draftDisabled = locked || draft.disabled ? ' disabled' : '';
+  const fillHtml = editor.fillAction
+    ? `<button type="button" data-intent="fillOriginName" title="${escapeHtml(editor.fillAction.disabledReason ?? editor.fillAction.label)}"${editor.fillAction.disabled || locked ? ' disabled' : ''}>${escapeHtml(editor.fillAction.label)}</button>`
+    : '';
+  const originNote = editor.originNote ?? editor.noOriginNote ?? '';
+  return (
+    `${listHtml}` +
+    `<section class="add-area">` +
+    `<div class="add-row">` +
+    `<label for="field-${escapeHtml(draft.fieldId)}">${escapeHtml(draft.label)}</label>` +
+    `<input type="text" id="field-${escapeHtml(draft.fieldId)}" data-field-id="${escapeHtml(draft.fieldId)}" data-focus="field-${escapeHtml(draft.fieldId)}" placeholder="${escapeHtml(draft.placeholder)}" value="${escapeHtml(draft.value)}" aria-describedby="add-note"${draftDisabled}>` +
+    `<button type="button" data-intent="addRule" title="${escapeHtml(editor.addAction.disabledReason ?? editor.addAction.label)}" data-focus="add-rule"${editor.addAction.disabled || locked ? ' disabled' : ''}>${escapeHtml(editor.addAction.label)}</button>` +
+    fillHtml +
+    `</div>` +
+    `<div id="add-note" class="add-note">${escapeHtml(editor.addNote)}${originNote ? `<br>${escapeHtml(originNote)}` : ''}</div>` +
+    `</section>`
+  );
 }
 
 function renderForm(form: PanelState['form'], busy: boolean, locked: boolean): string {

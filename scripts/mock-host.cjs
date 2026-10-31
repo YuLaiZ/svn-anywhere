@@ -170,6 +170,9 @@ const fakeVscode = {
         },
         /** 测试驱动：模拟视图发消息给宿主。 */
         send(raw) {
+          if (process.env.P2_TRACE && raw && raw.type === 'intent' && ['fillOriginName', 'addRule', 'saveIgnore', 'submitIgnore', 'removeRule', 'refresh', 'resolveUnknown', 'syncInput'].includes(raw.intent?.kind)) {
+            console.log('TRACE send:', JSON.stringify({ kind: raw.intent.kind, sid: String(raw.sessionId).slice(0, 5), rid: raw.requestId }));
+          }
           messageHandlers.forEach((cb) => cb(raw));
         },
         /** 测试驱动：模拟视图加载完成握手。 */
@@ -281,6 +284,44 @@ async function waitRender(panel, includes, attempts = 150) {
   return undefined;
 }
 
+/** 等待从 posted[afterIndex] 起出现的、包含指定文本的 render 帧（避免命中历史帧；
+ * 目标切换会重置 revision 序号，故用消息索引而非 revision 比较。
+ * 调用方传快照时的 posted.length——即下一帧的起始索引）。 */
+async function waitNewRender(panel, includes, afterIndex, attempts = 200) {
+  for (let i = 0; i < attempts; i += 1) {
+    const hit = [...panel.webview.posted.slice(afterIndex)].reverse().find(
+      (m) => m.type === 'render' && m.html.includes(includes),
+    );
+    if (hit) return hit;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return undefined;
+}
+
+/** 轮询等待磁盘/仓库状态条件成立（真实 svn 链路耗时不可预测，命令完成晚于面板帧时避免过早断言）。 */
+async function waitForCond(name, fn, attempts = 120) {
+  for (let i = 0; i < attempts; i += 1) {
+    if (fn()) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 120));
+  }
+  console.error(`  COND-TIMEOUT ${name}`);
+  return false;
+}
+
+/** 等待从 posted[afterIndex] 起出现的空闲（非忙碌）render 帧：目标切换/重读完成的可靠信号。 */
+async function waitNewIdle(panel, afterIndex, attempts = 200) {
+  for (let i = 0; i < attempts; i += 1) {
+    const frame = [...panel.webview.posted.slice(afterIndex)].reverse().find(
+      (m) => m.type === 'render' && m.html.includes('data-busy="0"'),
+    );
+    if (frame) return frame;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return undefined;
+}
+
 /**
  * 通过 P1 提交面板驱动一次精确范围的提交：清空勾选 → 逐项勾选 →
  * （可选）同步说明 → 提交。确认框由 state.confirmResult 控制。
@@ -334,15 +375,38 @@ async function waitNewInfo(includes, fromIndex, attempts = 300) {
   return false;
 }
 
+/** 打开 P2 忽略规则面板并等待「本次打开产生」的数据帧（防历史帧命中）。 */
+async function openIgnorePanel(uriFsPath, expectText) {
+  const panel0 = [...state.panels].reverse().find((p) => p.viewType === 'svn-anywhere-ignore');
+  const before = panel0 ? panel0.webview.posted.length : 0;
+  let panel;
+  let render;
+  for (let attempt = 0; attempt < 8 && !render; attempt += 1) {
+    await state.registered.get('svnAnywhere.editIgnore')({ fsPath: uriFsPath, scheme: 'file' });
+    // P2 与 P1 是不同 panelId；取 ignore 面板（viewType svn-anywhere-ignore）。
+    panel = [...state.panels].reverse().find((p) => p.viewType === 'svn-anywhere-ignore');
+    if (!panel) {
+      throw new Error(`忽略规则面板未创建（panels=${state.panels.map((p) => p.viewType).join(',')}）`);
+    }
+    panel.sendReady();
+    render = await waitNewRender(panel, expectText, before, 20);
+  }
+  if (!render || !panel) {
+    const frames = (panel?.webview.posted ?? []).filter((m) => m.type === 'render').slice(-4);
+    throw new Error(`P2 面板数据帧未出现：${expectText}\nlast=${JSON.stringify(frames.map((f) => [f.sessionId?.slice(0, 5), (f.html.match(/<span class="badge[^>]*>[^<]*/g) ?? []).map((x) => x.replace(/<span class="badge[^>]*>/, '')).join('+'), (f.html.match(/rule-text">[^<]{0,30}/g) ?? []).join('|'), f.html.includes('banner error') ? 'ERR-BANNER' : '']))}warn=${JSON.stringify(state.warning.slice(-2)).slice(0, 200)}`);
+  }
+  return panel;
+}
+
 /** 打开提交面板并等待数据帧就绪（expectText 出现于 render 中）。 */
 async function openCommitPanel(uriFsPath, expectText) {
-  // P1 面板同类型复用实例：首次创建、之后切换会话，都在最后一个面板上。
+  // P1 面板同类型复用实例：按 viewType 定位（其他类型面板可能更晚创建）。
   // 上一个会话可能仍在重读（busy 拒绝切换）：轮询重试直到目标数据帧出现。
   let panel;
   let render;
   for (let attempt = 0; attempt < 8 && !render; attempt += 1) {
     await state.registered.get('svnAnywhere.commit')({ fsPath: uriFsPath, scheme: 'file' });
-    panel = state.panels.at(-1);
+    panel = [...state.panels].reverse().find((p) => p.viewType === 'svn-anywhere-commit');
     if (!panel) {
       throw new Error(`提交面板未创建（panels=${state.panels.length}）`);
     }
@@ -619,27 +683,24 @@ async function main() {
   check('远端文件已被删除', remoteMissing);
   state.confirmResult = undefined;
 
-  console.log('场景 14：真实副本「忽略设置」——自定义模式写回，status 不再显示');
+  console.log('场景 14：真实副本「编辑忽略规则」面板——自定义模式保存后 status 不再显示');
   const probe5 = svnLab.checkout('probe5');
   mkdirSync(join(probe5, 'src'), { recursive: true });
   writeFileSync(join(probe5, 'src', '.keep'), '');
   svn(['add', '-q', '--parents', join('src', '.keep')], probe5);
   svn(['commit', '-q', '-m', 'probe5 init'], probe5);
   writeFileSync(join(probe5, 'src', 'noise.log'), 'log');
-  state.quickPickChoice = '输入自定义模式（如 *.log）';
-  state.inputResult = '*.log';
-  const infoBeforeIgnore = state.information.length;
-  const linesBeforeIgnore = channelText().length;
-  await state.registered.get('svnAnywhere.editIgnore')({ fsPath: join(probe5, 'src', 'noise.log'), scheme: 'file' });
-  const ignoreOutput = channelText().slice(linesBeforeIgnore);
-  check('频道写 svn:ignore 更新结果', ignoreOutput.includes('svn:ignore 已更新：*.log'), ignoreOutput.slice(-400));
-  check(
-    '弹本地变更提示',
-    state.information.slice(infoBeforeIgnore).some((m) => m.includes('本地变更') && m.includes('提交')),
-  );
+  // 命令入口已切换为 P2 忽略规则面板：输入模式 → 加入 → 保存。
+  const panel14 = await openIgnorePanel(join(probe5, 'src', 'noise.log'), '未设置 svn:ignore');
+  panel14.sendAuto({ kind: 'syncInput', fieldId: 'draft', value: '*.log', inputRevision: state.intentSeq + 1000 });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  panel14.sendAuto({ kind: 'addRule' });
+  await waitRender(panel14, '未保存');
+  panel14.sendAuto({ kind: 'saveIgnore' });
+  await waitRender(panel14, '忽略规则已保存到本机');
   check('被忽略文件不再出现在 status', !svn(['status'], probe5).includes('noise.log'));
-  state.quickPickChoice = undefined;
-  state.inputResult = undefined;
+  check('保存卡片明示尚未提交 SVN',
+    [...panel14.webview.posted].reverse().some((m) => m.type === 'render' && m.html.includes('尚未提交到 SVN')));
 
   console.log('场景 15：真实副本「重定位」——同仓库换地址后 info 指向新地址');
   const probe6 = svnLab.checkout('probe6');
@@ -779,14 +840,14 @@ async function main() {
   const specialWc = specialLab.checkout('special');
   for (const name of ['foo\nbar', 'foo\rbar', 'foo', 'bar']) writeFileSync(join(specialWc, name), 'unversioned');
   for (const name of ['foo\nbar', 'foo\rbar']) {
-    state.quickPickChoice = `把「${name}」加入忽略`;
-    const warningsBefore = state.warning.length;
-    await state.registered.get('svnAnywhere.editIgnore')({ fsPath: join(specialWc, name), scheme: 'file' });
-    check('不可编码名称给可读提示 ' + JSON.stringify(name), state.warning.slice(warningsBefore).some((message) => message.includes('无法表示为一条精确忽略规则')));
+    const panel20 = await openIgnorePanel(join(specialWc, name), '此目录未设置 svn:ignore');
+    await waitNewIdle(panel20, panel20.webview.posted.length);
+    panel20.sendAuto({ kind: 'fillOriginName' });
+    const rejected20 = await waitRender(panel20, '无法表示为一条精确忽略规则');
+    check('不可编码名称给可读提示 ' + JSON.stringify(name), !!rejected20);
   }
   check('拒绝前未写 svn:ignore', !svn(['proplist', '--xml', '.'], specialWc).includes('svn:ignore'));
   check('相近名称没有被忽略', !svn(['status', '--no-ignore', '--xml', '.'], specialWc).includes('item="ignored"'));
-  state.quickPickChoice = undefined;
 
   console.log('场景 21：P1 面板——控制字符与字面实体邻名保持不同身份，添加失败不波及邻名');
   const literalNames = ['foo&#10;bar', 'foo&#13;bar', 'foo&#9;bar'];
@@ -1312,6 +1373,253 @@ async function main() {
     svn(['list', delLab.repoUrl]));
   state.confirmResult = undefined;
   rmSync(delLab.lab, { recursive: true, force: true });
+
+  console.log('场景 33：P2 面板——文件入口编辑父目录、加入/保存/本机生效/清空 propdel（真实 SVN）');
+  const igLab = makeSvnLab();
+  const igWc = igLab.checkout('ig-wc');
+  mkdirSync(join(igWc, 'src'), { recursive: true });
+  writeFileSync(join(igWc, 'src', '.keep'), '');
+  writeFileSync(join(igLab.lab, 'rules-old.txt'), 'old\n');
+  svn(['add', '-q', '--parents', join('src', '.keep')], igWc);
+  svn(['propset', '-q', 'svn:ignore', '-F', join(igLab.lab, 'rules-old.txt'), 'src'], igWc);
+  svn(['propset', '-q', 'custom:keep', 'v1', 'src'], igWc);
+  svn(['commit', '-q', '-m', 'ig base'], igWc);
+  writeFileSync(join(igWc, 'src', 'noise.log'), 'log');
+  writeFileSync(join(igWc, 'src', 'keep.log'), 'log');
+  const panelsBefore33 = state.panels.length;
+  const p33 = await openIgnorePanel(join(igWc, 'src', 'noise.log'), 'rule-text');
+  const base33 = p33.webview.posted.length;
+  check('P2 打开的是忽略规则面板（不创建 P1）',
+    state.panels.length === panelsBefore33 && p33.viewType === 'svn-anywhere-ignore');
+  const data33 = await waitRender(p33, 'rule-text">old');
+  check('文件入口编辑父目录规则并提供「用当前项名」',
+    data33.html.includes('rule-text">old') && data33.html.includes('用当前项名') && data33.html.includes('noise.log'),
+    data33.html.slice(0, 200));
+  check('hint 说明直接子项作用范围', data33.html.includes('未版本控制的直接子项'));
+  // 用当前项名（无通配符文件名不改变原值）→ 加入 → 保存。
+  p33.sendAuto({ kind: 'fillOriginName' });
+  await waitNewRender(p33, '已填入当前项', base33);
+  p33.sendAuto({ kind: 'addRule' });
+  p33.sendAuto({ kind: 'saveIgnore' });
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  const status33 = svn(['status', '--no-ignore'], igWc);
+  check('保存后匹配的未版本控制直接子项被忽略',
+    /^I\s+src\/noise\.log$/m.test(status33),
+    status33);
+  check('保存仅本机：远端属性未变',
+    svn(['propget', '-r', 'HEAD', 'svn:ignore', `${igLab.repoUrl}/src`]).trim() === 'old');
+  check('成功卡片明示尚未提交 SVN',
+    [...p33.webview.posted].reverse().some((m) => m.type === 'render' && m.html.includes('本机已生效') && m.html.includes('尚未提交到 SVN')));
+  // 清空全部规则 → 保存改 propdel。
+  await waitPanelIdle(p33);
+  p33.sendAuto({ kind: 'removeRule', index: 1 });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  p33.sendAuto({ kind: 'removeRule', index: 0 });
+  const cleared33 = await waitNewRender(p33, '保存将删除', base33);
+  check('清空后空态说明保存将删除属性', !!cleared33 && cleared33.html.includes('此目录未设置 svn:ignore') === false);
+  p33.sendAuto({ kind: 'saveIgnore' });
+  await waitNewRender(p33, '此目录未设置 svn:ignore', base33);
+  check('规则清空后属性被删除（propdel）',
+    !svn(['proplist', '--xml', 'src'], igWc).includes('svn:ignore'),
+    svn(['proplist', '--xml', 'src'], igWc));
+
+  console.log('场景 34：P2 精确名称转义与不可表示名称、路径示例、重复模式');
+  const special34 = ['cache[1]?.log', 'cache1x.log'];
+  for (const name of special34) writeFileSync(join(igWc, 'src', name), 'unversioned');
+  writeFileSync(join(igWc, 'src', 'foo\nbar'), 'unversioned');
+  // 切换到同副本的另一文件入口：无草稿直接切换。
+  const p34 = await openIgnorePanel(join(igWc, 'src', 'cache[1]?.log'), '此目录未设置 svn:ignore');
+  const base34 = p34.webview.posted.length;
+  await waitNewIdle(p34, base34);
+  p34.sendAuto({ kind: 'fillOriginName' });
+  const filled34 = await waitNewRender(p34, 'cache[[]1[]][?].log', base34);
+  check('用当前项名转义通配符为字面量', !!filled34 && filled34.html.includes('cache[[]1[]][?].log'));
+  p34.sendAuto({ kind: 'addRule' });
+  await waitNewRender(p34, '未保存', base34);
+  p34.sendAuto({ kind: 'saveIgnore' });
+  await waitNewRender(p34, '忽略规则已保存到本机', base34);
+  const ignored34 = await waitForCond('34-精确忽略', () => {
+    const out = svn(['status', '--no-ignore'], igWc);
+    return /^I\s+src\/cache\[1\]\?\.log$/m.test(out) && /^\?\s+src\/cache1x\.log$/m.test(out);
+  });
+  check('精确名称只匹配目标（cache[1]?.log 被忽略，相近名不误忽略）', ignored34,
+    svn(['status', '--no-ignore'], igWc));
+  // 含换行的名称：可读拒绝且不写属性。
+  const p34b = await openIgnorePanel(join(igWc, 'src', 'foo\nbar'), 'cache[[]1[]][?].log');
+  await waitPanelIdle(p34b);
+  p34b.sendAuto({ kind: 'fillOriginName' });
+  await waitRender(p34b, '无法表示为一条精确忽略规则');
+  // 路径示例与重复模式的提示。
+  p34b.sendAuto({ kind: 'syncInput', fieldId: 'draft', value: './secret.txt', inputRevision: state.intentSeq + 1000 });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  p34b.sendAuto({ kind: 'addRule' });
+  await waitNewRender(p34b, '路径分隔符', base34);
+  p34b.sendAuto({ kind: 'syncInput', fieldId: 'draft', value: 'cache[[]1[]][?].log', inputRevision: state.intentSeq + 1000 });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  p34b.sendAuto({ kind: 'addRule' });
+  await waitNewRender(p34b, '该模式已在规则中', base34);
+  p34b.sendAuto({ kind: 'syncInput', fieldId: 'draft', value: '', inputRevision: state.intentSeq + 1000 });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  check('拒绝路径示例与重复模式不写属性',
+    svn(['propget', 'svn:ignore', 'src'], igWc).trim() === 'cache[[]1[]][?].log',
+    svn(['propget', 'svn:ignore', 'src'], igWc));
+
+  console.log('场景 35：P2 仅规则提交——隔离临时副本入库，其他属性与子文件保留');
+  const igWc35 = igLab.checkout('ig-wc35');
+  mkdirSync(join(igWc35, 'src'), { recursive: true });
+  writeFileSync(join(igWc35, 'src', 'a.txt'), 'base\n');
+  writeFileSync(join(igLab.lab, 'rules35.txt'), 'old\n');
+  svn(['add', '-q', '--parents', join('src', 'a.txt')], igWc35);
+  svn(['propset', '-q', 'svn:ignore', '-F', join(igLab.lab, 'rules35.txt'), 'src'], igWc35);
+  svn(['propset', '-q', 'custom:keep', 'v1', 'src'], igWc35);
+  svn(['commit', '-q', '-m', 'ig35 base'], igWc35);
+  // add 子项的提交会让目录节点的 BASE 落后于仓库（新增子项推进仓库目录 revision），
+  // 对齐后再进入面板（正常使用中的副本通常已对齐）。
+  svn(['update', '-q', '--depth', 'empty', 'src'], igWc35);
+  // 本地三类修改：ignore 新值（保存）+ 其他属性 + 子文件。
+  writeFileSync(join(igLab.lab, 'rules35b.txt'), '*.log\nbuild\n');
+  svn(['propset', '-q', 'svn:ignore', '-F', join(igLab.lab, 'rules35b.txt'), 'src'], igWc35);
+  svn(['propset', '-q', 'custom:keep', 'v2', 'src'], igWc35);
+  writeFileSync(join(igWc35, 'src', 'a.txt'), 'local edit\n');
+  const p35 = await openIgnorePanel(join(igWc35, 'src'), '本地已保存 · 待提交');
+  const base35 = p35.webview.posted.length;
+  await waitNewIdle(p35, base35);
+  const panelsBefore35 = state.panels.length;
+  p35.sendAuto({ kind: 'submitIgnore' });
+  const committed35 = await waitNewRender(p35, '忽略规则已提交到 SVN', base35, 800);
+  check('提交留在 P2（不打开 P1 面板）', state.panels.length === panelsBefore35);
+  check('提交成功卡片含 revision 与仅 svn:ignore 范围说明',
+    !!committed35 && /r\d+/.test(committed35.html) && committed35.html.includes('仅提交当前目录的 svn:ignore'),
+    committed35 ? committed35.html.slice(0, 200) : '未等到成功卡片');
+  const remote35 = await waitForCond('35-远端仅规则', () =>
+    svn(['propget', '-r', 'HEAD', 'svn:ignore', `${igLab.repoUrl}/src`]).includes('*.log') &&
+    svn(['propget', '-r', 'HEAD', 'custom:keep', `${igLab.repoUrl}/src`]).trim() === 'v1');
+  check('远端仅 svn:ignore 更新（其他属性仍 v1）', remote35);
+  check('子文件修改保留本地、远端内容不变',
+    svn(['status'], igWc35).includes('src/a.txt') &&
+    svn(['cat', '-r', 'HEAD', `${igLab.repoUrl}/src/a.txt`]) === 'base\n');
+  const base35ok = await waitForCond('35-BASE读回', () =>
+    svn(['propget', 'svn:ignore', '-r', 'BASE', 'src'], igWc35).includes('*.log'));
+  check('协调后 BASE 读回为已提交值', base35ok);
+  const badge35 = await waitNewRender(p35, '>已提交<', base35, 600);
+  check('提交后徽标回到已提交且无待提交修改',
+    !!badge35 && badge35.html.includes('已提交 r'),
+    'lastBadges=' + JSON.stringify((badge35?.html ?? '').match(/<span class="badge[^>]*>[^<]*/g)));
+
+  console.log('场景 36：P2 外部修改拒绝提交；重读同步新基线与属性删除');
+  // 保存一份新规则，随后外部改属性 → 提交被拒。
+  const base36 = p35.webview.posted.length;
+  p35.sendAuto({ kind: 'syncInput', fieldId: 'draft', value: 'extra', inputRevision: state.intentSeq + 1000 });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  p35.sendAuto({ kind: 'addRule' });
+  await waitNewRender(p35, '未保存', base36);
+  p35.sendAuto({ kind: 'saveIgnore' });
+  await waitNewRender(p35, '忽略规则已保存到本机', base36);
+  writeFileSync(join(igLab.lab, 'rules36.txt'), 'external-change\n');
+  svn(['propset', '-q', 'svn:ignore', '-F', join(igLab.lab, 'rules36.txt'), 'src'], igWc35);
+  await waitPanelIdle(p35);
+  p35.sendAuto({ kind: 'submitIgnore' });
+  const external35 = await waitNewRender(p35, '本次没有提交', base36);
+  check('提交前核对发现外部修改：不提交不覆盖',
+    !!external35 && external35.html.includes('请重新读取并核对'));
+  const revBefore36 = svn(['info', '--show-item', 'revision', igLab.repoUrl]).trim();
+  check('外部修改场景仓库 revision 未前进', svn(['info', '--show-item', 'revision', igLab.repoUrl]).trim() === revBefore36);
+  // 重新读取（确认放弃草稿）同步新基线；外部删除属性后重读为空态。
+  state.confirmResult = '放弃草稿并读取';
+  p35.sendAuto({ kind: 'refresh' });
+  await waitNewRender(p35, 'external-change', base36);
+  check('重读后新基线生效（列表为外部值）',
+    [...p35.webview.posted.slice(base36)].some((m) => m.type === 'render' && m.html.includes('rule-text">external-change')));
+  state.confirmResult = undefined;
+  svn(['propdel', '-q', 'svn:ignore', 'src'], igWc35);
+  state.confirmResult = '放弃草稿并读取';
+  await waitNewIdle(p35, p35.webview.posted.length);
+  p35.sendAuto({ kind: 'refresh' });
+  await waitNewRender(p35, '此目录未设置 svn:ignore', base36, 200);
+  check('外部删除属性后重读为未设置空态（区别于读取失败）', true);
+  state.confirmResult = undefined;
+
+  console.log('场景 37：P2 结果未知与协调受阻的持久化恢复（真实仓库幂等协调，不二次提交）');
+  const lab37 = makeSvnLab();
+  const wc37 = lab37.checkout('wc37');
+  mkdirSync(join(wc37, 'src'), { recursive: true });
+  writeFileSync(join(wc37, 'src', 'a.txt'), 'base\n');
+  writeFileSync(join(lab37.lab, 'r37a.txt'), 'old\n');
+  svn(['add', '-q', '--parents', join('src', 'a.txt')], wc37);
+  svn(['propset', '-q', 'svn:ignore', '-F', join(lab37.lab, 'r37a.txt'), 'src'], wc37);
+  svn(['commit', '-q', '-m', 'r37 base'], wc37);
+  // a) 预置 unknown 记录（远端仍是原始值）：核实未提交 → 解锁。
+  state.globalStateMap.set('svnAnywhere.operations', [{
+    operationId: 'op-p2-unknown-1',
+    wcRoot: wc37,
+    targetRelPath: 'src',
+    nodeKind: 'dir',
+    phase: 'unknown',
+    property: { name: 'svn:ignore', originalExists: true, originalValue: ['old'], pendingExists: true, pendingValue: ['new37'] },
+    knownRevisions: [],
+    updatedAt: Date.now(),
+  }]);
+  await extension.activate(context); // 重载操作存储，恢复未完成记录限制
+  const p37 = await openIgnorePanel(join(wc37, 'src'), '提交结果未知');
+  await waitNewIdle(p37, p37.webview.posted.length);
+  const base37 = p37.webview.posted.length;
+  check('unknown 记录恢复写锁定（横幅+核实入口）',
+    [...p37.webview.posted].reverse().some((m) => m.type === 'render' && m.html.includes('提交结果未知') && m.html.includes('核实提交结果')));
+  p37.sendAuto({ kind: 'resolveUnknown' });
+  const toast37 = await new Promise((resolve) => {
+    const started = Date.now();
+    const timer = setInterval(() => {
+      const hit = p37.webview.posted.find((m) => m.type === 'toast' && String(m.message).includes('已确认未提交'));
+      if (hit || Date.now() - started > 6000) {
+        clearInterval(timer);
+        resolve(hit);
+      }
+    }, 30);
+  });
+  check('核实未提交后解锁（toast 确认，可重试）', !!toast37);
+  // b) 真实提交 A' 到仓库（不经面板），原副本不 update；预置协调受阻记录。
+  // 真实提交 A'（临时隔离方式）：新检出对齐 BASE 后仅提交属性，原副本不 update。
+  const wc37b = join(lab37.lab, 'wc37b');
+  mkdirSync(wc37b);
+  svn(['checkout', '-q', '--depth', 'empty', `${lab37.repoUrl}/src`, '.'], wc37b);
+  writeFileSync(join(lab37.lab, 'r37b.txt'), 'A-prime\n');
+  svn(['propset', '-q', 'svn:ignore', '-F', join(lab37.lab, 'r37b.txt'), '.'], wc37b);
+  svn(['commit', '-q', '-m', 'commit A-prime', '--depth', 'empty', '.'], wc37b);
+  const rev37 = svn(['info', '--show-item', 'revision', lab37.repoUrl]).trim();
+  state.globalStateMap.set('svnAnywhere.operations', [{
+    operationId: 'op-p2-blocked-1',
+    wcRoot: wc37,
+    targetRelPath: 'src',
+    nodeKind: 'dir',
+    phase: 'coordination-blocked',
+    property: { name: 'svn:ignore', originalExists: true, originalValue: ['old'], pendingExists: true, pendingValue: ['A-prime'] },
+    knownRevisions: [Number(rev37)],
+    updatedAt: Date.now(),
+  }]);
+  await extension.activate(context);
+  const p37b = await openIgnorePanel(join(wc37, 'src'), '尚未协调完成');
+  await waitNewIdle(p37b, p37b.webview.posted.length);
+  const base37b = p37b.webview.posted.length;
+  check('协调受阻记录恢复（横幅含已知 revision）',
+    [...p37b.webview.posted].reverse().some((m) => m.type === 'render' && m.html.includes(`r${rev37}`) && m.html.includes('尚未协调完成')));
+  // 原副本工作值被外部改成 A'+B：恢复协调 → 确认保留 → 冲突解决 → 幂等完成。
+  writeFileSync(join(lab37.lab, 'r37c.txt'), 'A-prime\nB\n');
+  svn(['propset', '-q', 'svn:ignore', '-F', join(lab37.lab, 'r37c.txt'), 'src'], wc37);
+  state.confirmResult = '保留这些修改并完成协调';
+  p37b.sendAuto({ kind: 'resolveUnknown' });
+  const done37 = await waitNewRender(p37b, '忽略规则已提交到 SVN', base37b, 400);
+  const doneFrame37 = await waitNewRender(p37b, '后续本地规则修改仍待提交', base37b, 600);
+  check('恢复协调幂等完成（保留后续修改，不产生第二次提交）',
+    !!done37 && svn(['info', '--show-item', 'revision', lab37.repoUrl]).trim() === rev37,
+    `rev=${svn(['info', '--show-item', 'revision', lab37.repoUrl]).trim()} vs ${rev37}`);
+  const state37 = !!doneFrame37 &&
+    svn(['propget', 'svn:ignore', '-r', 'BASE', 'src'], wc37).trim() === 'A-prime' &&
+    svn(['propget', 'svn:ignore', 'src'], wc37).split('\n').filter(Boolean).join(',') === 'A-prime,B';
+  check('协调完成后 BASE=A\'、工作值=A\'+B（B 保留待提交）', state37);
+  check('完成卡片提示后续本地规则修改仍待提交', !!doneFrame37);
+  state.confirmResult = undefined;
+  rmSync(lab37.lab, { recursive: true, force: true });
+  rmSync(igLab.lab, { recursive: true, force: true });
 
   rmSync(panelLab.lab, { recursive: true, force: true });
 

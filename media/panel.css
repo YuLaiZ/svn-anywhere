@@ -453,3 +453,108 @@ button.dismiss-success {
 }
 
 .toast.error { color: var(--vscode-errorForeground); border-color: var(--vscode-errorForeground); }
+
+/* ------------------------------ P2 忽略规则编辑器 ------------------------------ */
+
+.spacer { flex: 1; }
+
+.hint {
+  flex: none;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+  font-size: 12px;
+  color: var(--vscode-descriptionForeground);
+  overflow-wrap: anywhere;
+}
+
+.rules {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.rule-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 7px 16px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+.rule-row:hover, .rule-row:focus-within { background: var(--vscode-list-hoverBackground); }
+
+.rule-text {
+  white-space: pre-wrap;
+  min-width: 0;
+  font-family: var(--vscode-editor-font-family);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.add-area {
+  padding: 10px 16px;
+  border-top: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-sideBar-background);
+  flex: none;
+}
+
+.add-row {
+  display: flex;
+  gap: 7px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.add-row label { font-size: 12px; white-space: nowrap; }
+
+.add-row input[type="text"] {
+  flex: 1;
+  min-width: 120px;
+  border: 1px solid var(--vscode-input-border);
+  border-radius: 3px;
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  padding: 5px 7px;
+  font: inherit;
+  min-width: 0;
+}
+
+.add-row button {
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: var(--vscode-button-secondaryBackground);
+  color: var(--vscode-button-secondaryForeground);
+  padding: 5px 11px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.add-row button:hover:not([disabled]) { filter: brightness(0.95); }
+.add-row button:disabled { opacity: 0.5; cursor: default; }
+
+.add-note {
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  margin-top: 7px;
+}
+
+.panel-header .link {
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--vscode-textLink-foreground, var(--vscode-focusBorder));
+  padding: 3px 5px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.panel-header .link:hover:not([disabled]) { filter: brightness(1.1); }
+.panel-header .link:disabled { opacity: 0.5; cursor: default; }
+
+@media (max-width: 560px) {
+  .hint, .add-area, .rule-row { padding-left: 12px; padding-right: 12px; }
+  .add-row label { width: 100%; }
+  .add-row input[type="text"] { flex-basis: 100%; width: 100%; }
+}

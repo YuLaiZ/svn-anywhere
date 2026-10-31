@@ -2,7 +2,7 @@
   "name": "svn-anywhere",
   "displayName": "SVN Anywhere",
   "description": "在 VS Code 里管理任意布局的 SVN 工作副本",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "yulaiz",
   "private": true,
   "engines": {
@@ -60,7 +60,7 @@
       },
       {
         "command": "svnAnywhere.editIgnore",
-        "title": "忽略设置",
+        "title": "编辑忽略规则",
         "category": "SVN Anywhere"
       },
       {

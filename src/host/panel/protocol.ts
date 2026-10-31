@@ -13,7 +13,7 @@ import { format, strings } from '../i18n';
 
 export const PROTOCOL_VERSION = 1;
 
-/** 视图可发起的意图（已知动作的联合类型）。阶段 1 起覆盖 P1 提交面板。 */
+/** 视图可发起的意图（已知动作的联合类型）。阶段 1 起覆盖 P1 提交面板，阶段 2 起覆盖 P2 忽略规则编辑器。 */
 export type Intent =
   | { kind: 'refresh' }
   | { kind: 'openDiff'; itemId: string }
@@ -37,7 +37,12 @@ export type Intent =
   | { kind: 'rowMore'; itemId: string }
   | { kind: 'submit' }
   | { kind: 'closePanel' }
-  | { kind: 'resolveUnknown' };
+  | { kind: 'resolveUnknown' }
+  | { kind: 'addRule' }
+  | { kind: 'removeRule'; index: number }
+  | { kind: 'fillOriginName' }
+  | { kind: 'saveIgnore' }
+  | { kind: 'submitIgnore' };
 
 /** 宿主 → 视图：整段渲染（宿主已本地化并转义的 HTML）。 */
 export interface RenderMessage {
@@ -84,6 +89,7 @@ const INTENT_KINDS = new Set([
   'toggleGroup', 'toggleTree', 'setView', 'selectVisible', 'clearSelection',
   'selectChangelist', 'applyPrefix', 'managePrefixes', 'applyHistory', 'showHistory',
   'rowMore', 'submit', 'closePanel', 'resolveUnknown',
+  'addRule', 'removeRule', 'fillOriginName', 'saveIgnore', 'submitIgnore',
 ]);
 
 /** 提交面板视图切换的合法取值。 */
@@ -141,6 +147,10 @@ function parseIntent(raw: unknown): { ok: true; intent: Intent } | { ok: false; 
     case 'submit':
     case 'closePanel':
     case 'resolveUnknown':
+    case 'addRule':
+    case 'fillOriginName':
+    case 'saveIgnore':
+    case 'submitIgnore':
       return { ok: true, intent: { kind } };
     case 'openDiff':
     case 'openFile':
@@ -214,7 +224,8 @@ function parseIntent(raw: unknown): { ok: true; intent: Intent } | { ok: false; 
       return { ok: true, intent: { kind, view: view as 'tree' | 'list' } };
     }
     case 'applyPrefix':
-    case 'applyHistory': {
+    case 'applyHistory':
+    case 'removeRule': {
       const index = readFiniteNumber(raw, 'index', label);
       if (!index.ok) {
         return { ok: false, reason: index.message };

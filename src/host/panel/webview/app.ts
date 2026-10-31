@@ -125,6 +125,7 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
         return;
       case 'applyPrefix':
       case 'applyHistory':
+      case 'removeRule':
         sendIntent({ kind: intent, index: Number(holder.dataset.index ?? 0) });
         return;
       case 'setView':
@@ -132,7 +133,8 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
         return;
       default:
         // refresh/clearFilters/selectVisible/clearSelection/selectChangelist/
-        // managePrefixes/showHistory/submit/closePanel/resolveUnknown 等无参意图。
+        // managePrefixes/showHistory/submit/closePanel/resolveUnknown/
+        // addRule/fillOriginName/saveIgnore/submitIgnore 等无参意图。
         sendIntent({ kind: intent });
     }
   };

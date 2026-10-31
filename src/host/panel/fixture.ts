@@ -96,15 +96,8 @@ export interface CommitPanelState {
 
 /* -------------------------- P2 忽略规则编辑器类型 -------------------------- */
 
-export type IgnorePhase =
-  | 'loading'
-  | 'loadError'
-  | 'ready'
-  | 'saving'
-  | 'committing'
-  | 'unknown'
-  | 'coordinating'
-  | 'coordinationBlocked';
+/** P2 会话相位（正式定义在 ignoreModel；此处保留导出供既有引用）。 */
+export type { IgnoreSessionPhase as IgnorePhase } from './ignoreModel';
 
 /** 工作副本实际快照：与编辑草稿、保存基线、仓库 BASE 分开。 */
 export interface WorkingSnapshot {
@@ -127,7 +120,7 @@ export interface IgnorePanelState {
   repositoryPropertyExists: boolean;
   draft: string;
   busy: boolean;
-  phase: IgnorePhase;
+  phase: import('./ignoreModel').IgnoreSessionPhase;
   error: string | null;
   banners: BannerSpec[];
   localModified: boolean;
@@ -284,23 +277,23 @@ export function commitFixture(scene: string): CommitPanelState {
   }
 }
 
-/* --------------------------- P2 fixture（类型样例） --------------------------- */
+/* --------------------------- P2 fixture（12 场景样例） --------------------------- */
 
-/** P2 normal 场景：四种值一致的类型样例（完整场景数据随阶段 2 补齐）。 */
-export function ignoreFixture(): IgnorePanelState {
-  const rules = ['*.log', 'build/', 'debug.log'];
+const IGNORE_RULES = ['*.log', 'node_modules', '.DS_Store'];
+
+function ignoreBase(patch: Partial<IgnorePanelState> = {}): IgnorePanelState {
   return {
     sessionId: 'session-fixture',
     wcRoot: '/workspace/wc-a',
     targetPath: '/workspace/wc-a/src',
     targetLabel: 'wc-a · src/',
-    originName: null,
-    rules: [...rules],
+    originName: 'debug.log',
+    rules: [...IGNORE_RULES],
     propertyExists: true,
-    savedRules: [...rules],
+    savedRules: [...IGNORE_RULES],
     savedPropertyExists: true,
-    workingSnapshot: { rules: [...rules], exists: true },
-    repositoryRules: [...rules],
+    workingSnapshot: { rules: [...IGNORE_RULES], exists: true },
+    repositoryRules: [...IGNORE_RULES],
     repositoryPropertyExists: true,
     draft: '',
     busy: false,
@@ -312,7 +305,64 @@ export function ignoreFixture(): IgnorePanelState {
     operation: null,
     externalChanged: false,
     otherProperties: [{ name: 'custom:keep', modified: false }],
+    ...patch,
   };
+}
+
+/** P2 原型 12 场景的字段组合；异常分支由 phase/error/notice 组合表达。 */
+export function ignoreFixture(scene = 'normal'): IgnorePanelState {
+  switch (scene) {
+    case 'loading':
+      return ignoreBase({ phase: 'loading', busy: true, rules: [] });
+    case 'loadError':
+      return ignoreBase({
+        phase: 'loadError',
+        rules: [],
+        error: 'svn: E155007: 目标不是有效工作副本（样例）',
+      });
+    case 'empty':
+      return ignoreBase({
+        rules: [],
+        propertyExists: false,
+        savedRules: [],
+        savedPropertyExists: false,
+        repositoryRules: [],
+        repositoryPropertyExists: false,
+        workingSnapshot: { rules: [], exists: false },
+      });
+    case 'dirty':
+      return ignoreBase({ rules: [...IGNORE_RULES, '.idea'] });
+    case 'draft':
+      return ignoreBase({ draft: '.idea' });
+    case 'duplicate':
+      return ignoreBase({ draft: '.DS_Store', banners: [{ id: 'notice', level: 'info', title: '该模式已在规则中，未重复加入。' }] });
+    case 'saving':
+      return ignoreBase({ busy: true, phase: 'saving', rules: [...IGNORE_RULES, '.idea'] });
+    case 'error':
+      return ignoreBase({
+        rules: [...IGNORE_RULES, '.idea'],
+        error: 'svn: E155004: 工作副本已锁定（样例）\n写回失败；编辑内容已保留。',
+      });
+    case 'saved':
+      return ignoreBase({
+        rules: [...IGNORE_RULES, '.idea'],
+        savedRules: [...IGNORE_RULES, '.idea'],
+        savedPropertyExists: true,
+        workingSnapshot: { rules: [...IGNORE_RULES, '.idea'], exists: true },
+        repositoryRules: [...IGNORE_RULES],
+        localModified: true,
+      });
+    case 'external':
+      return ignoreBase({
+        rules: [...IGNORE_RULES, '.idea'],
+        externalChanged: true,
+        banners: [{ id: 'notice', level: 'info', title: '另一处已修改 svn:ignore；保存时会比较读取基线，避免覆盖。' }],
+      });
+    case 'literal':
+      return ignoreBase({ originName: 'cache[1]?.log' });
+    default:
+      return ignoreBase();
+  }
 }
 
 /* ---------------------------- 冒烟列表面板 fixture ---------------------------- */

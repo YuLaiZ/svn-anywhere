@@ -82,4 +82,16 @@ describe('parseViewMessage', () => {
       expect(Object.keys(intent)).not.toContain('path');
     }
   });
+
+  it('P2 意图：addRule/fillOriginName/saveIgnore/submitIgnore 无参放行，removeRule 校验 index', () => {
+    for (const kind of ['addRule', 'fillOriginName', 'saveIgnore', 'submitIgnore']) {
+      const parsed = parseViewMessage(intentMessage({ intent: { kind } }));
+      expect(parsed.ok, kind).toBe(true);
+    }
+    const ok = parseViewMessage(intentMessage({ intent: { kind: 'removeRule', index: 2 } }));
+    expect(ok.ok).toBe(true);
+    expect(parseViewMessage(intentMessage({ intent: { kind: 'removeRule', index: -1 } })).ok).toBe(false);
+    expect(parseViewMessage(intentMessage({ intent: { kind: 'removeRule', index: 1.5 } })).ok).toBe(false);
+    expect(parseViewMessage(intentMessage({ intent: { kind: 'removeRule', index: '0' } })).ok).toBe(false);
+  });
 });
