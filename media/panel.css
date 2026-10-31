@@ -1,0 +1,308 @@
+/**
+ * 面板样式：只使用 --vscode-* 主题变量，不自造色板；状态颜色走
+ * gitDecoration.* 主题变量。布局与 class 命名沿用交互原型基线。
+ * 真实 Webview 中 VSCode 在 body 上注入同名变量；本文件不定义兜底值，
+ * 浏览器预览由原型自带 :root 变量承担，不进产品。
+ */
+
+html, body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--vscode-font-family);
+  font-size: var(--vscode-font-size);
+  color: var(--vscode-foreground);
+  background: var(--vscode-editor-background);
+  display: flex;
+  flex-direction: column;
+}
+
+#app, .panel {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.mono { font-family: var(--vscode-editor-font-family); }
+.muted { color: var(--vscode-descriptionForeground); }
+
+/* ------------------------------ 标题区 ------------------------------ */
+
+.panel-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+  flex: none;
+}
+
+.panel-title { font-size: 15px; font-weight: 650; }
+
+.panel-target {
+  font-size: 12px;
+  color: var(--vscode-descriptionForeground);
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.panel-header .counts {
+  margin-left: auto;
+  color: var(--vscode-descriptionForeground);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* ------------------------------ 提示条 ------------------------------ */
+
+.banners { flex: none; max-height: min(25vh, 210px); overflow: auto; }
+
+.banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 9px 16px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+  font-size: 12px;
+  flex: none;
+  max-height: 190px;
+  overflow: auto;
+  overflow-wrap: anywhere;
+}
+
+.banner-body { min-width: 0; flex: 1; }
+.banner pre {
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  font-family: var(--vscode-editor-font-family);
+  white-space: pre-wrap;
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-panel-border);
+}
+
+.banner.warn { color: var(--vscode-editorWarning-foreground); }
+.banner.error { color: var(--vscode-errorForeground); }
+.banner.info { color: var(--vscode-foreground); background: var(--vscode-sideBar-background); }
+.banner.success { color: var(--vscode-gitDecoration-addedResourceForeground); }
+
+/* ------------------------------ 说明输入 ------------------------------ */
+
+.message-block {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+  flex: none;
+}
+
+.message-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.message-label { font-size: 12px; font-weight: 600; }
+
+.message-input, .message-block textarea, .message-block input[type="text"], .message-block select {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: var(--vscode-font-family);
+  font-size: var(--vscode-font-size);
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border);
+  padding: 6px 8px;
+}
+
+.message-input:focus {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+
+.field-error { color: var(--vscode-errorForeground); font-size: 12px; margin: 4px 0 0; }
+
+/* ------------------------------ 筛选栏 ------------------------------ */
+
+.filter-bar {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 8px 16px;
+  background: var(--vscode-sideBar-background);
+  border-bottom: 1px solid var(--vscode-panel-border);
+  flex: none;
+  align-items: center;
+}
+
+.filter { display: flex; align-items: center; gap: 5px; font-size: 12px; }
+
+.filter select {
+  font-family: var(--vscode-font-family);
+  font-size: 12px;
+  color: var(--vscode-dropdown-foreground, var(--vscode-input-foreground));
+  background: var(--vscode-dropdown-background, var(--vscode-input-background));
+  border: 1px solid var(--vscode-dropdown-border, var(--vscode-input-border));
+  padding: 2px 4px;
+}
+
+/* ------------------------------ 列表 ------------------------------ */
+
+.list { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+
+.row {
+  display: grid;
+  grid-template-columns: 16px 18px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  min-height: 36px;
+  padding: 5px 16px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+.row:hover, .row:focus-within { background: var(--vscode-list-hoverBackground); }
+
+.path-block { min-width: 0; }
+
+.path {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.badges { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 2px; }
+.badges:empty { display: none; }
+
+.badge {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+  display: inline-block;
+  font-size: 10px;
+  line-height: 18px;
+  padding: 0 6px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 8px;
+  color: var(--vscode-badge-foreground);
+  background: var(--vscode-badge-background);
+  white-space: nowrap;
+}
+
+.badge.warn { color: var(--vscode-editorWarning-foreground); }
+
+.st {
+  font-size: 12px;
+  font-weight: bold;
+  text-align: center;
+  font-family: var(--vscode-editor-font-family);
+}
+
+.st.M, .st.missing { color: var(--vscode-gitDecoration-modifiedResourceForeground); }
+.st.A { color: var(--vscode-gitDecoration-addedResourceForeground); }
+.st.D, .st.C, .st.R { color: var(--vscode-gitDecoration-deletedResourceForeground); }
+
+.acts { display: flex; gap: 4px; align-items: center; }
+
+.row-act {
+  font-size: 11px;
+  padding: 2px 8px;
+  font-family: var(--vscode-font-family);
+  color: var(--vscode-button-secondaryForeground);
+  background: var(--vscode-button-secondaryBackground);
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+
+.row-act:hover:not([disabled]) { background: var(--vscode-button-hoverBackground, var(--vscode-button-secondaryBackground)); }
+.row-act:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+
+.empty {
+  flex: 1;
+  min-height: 100px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  text-align: center;
+  gap: 8px;
+  padding: 24px;
+}
+
+.empty h3 { margin: 0; font-weight: 600; }
+.empty p { margin: 0; }
+
+/* ------------------------------ 页脚 ------------------------------ */
+
+.footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 10px 16px;
+  border-top: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-sideBar-background);
+  flex: none;
+}
+
+.footer .summary { flex: 1; min-width: 130px; overflow-wrap: anywhere; font-size: 12px; color: var(--vscode-descriptionForeground); }
+
+.footer-actions { display: flex; gap: 8px; margin-left: auto; flex-wrap: wrap; }
+
+button.primary, .footer-actions button {
+  font-family: var(--vscode-font-family);
+  font-size: 13px;
+  padding: 4px 14px;
+  color: var(--vscode-button-foreground);
+  background: var(--vscode-button-background);
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+
+button.primary:hover:not([disabled]), .footer-actions button:hover:not([disabled]) {
+  background: var(--vscode-button-hoverBackground);
+}
+
+button[disabled], input[disabled], select[disabled], textarea[disabled] {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* ------------------------------ 忙碌进度 ------------------------------ */
+
+.progress { flex: none; height: 3px; background: var(--vscode-panel-border); overflow: hidden; }
+.progress i {
+  display: block;
+  height: 100%;
+  width: 35%;
+  background: var(--vscode-button-background);
+  animation: panel-slide 1.2s linear infinite;
+}
+
+@keyframes panel-slide {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(320%); }
+}
+
+/* ------------------------------ 瞬时提示 ------------------------------ */
+
+.toast {
+  flex: none;
+  margin: 8px 16px 0;
+  padding: 7px 12px;
+  font-size: 12px;
+  border: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-sideBar-background);
+  overflow-wrap: anywhere;
+}
+
+.toast.error { color: var(--vscode-errorForeground); border-color: var(--vscode-errorForeground); }

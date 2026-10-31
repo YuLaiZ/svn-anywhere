@@ -4,7 +4,7 @@
  * 还用本地 svnadmin + file:// 临时副本驱动真实的更新/状态/清理命令链路。
  * 用法：`pnpm run mock-host`（先构建再运行）。任一场景失败退出码为 1。
  */
-const { mkdtempSync, rmSync, mkdirSync, writeFileSync, realpathSync } = require('node:fs');
+const { mkdtempSync, rmSync, mkdirSync, writeFileSync, realpathSync, existsSync, readFileSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const { execFileSync } = require('node:child_process');
@@ -32,15 +32,28 @@ const state = {
   quickPicks: [],
   /** 说明编辑通知上点的按钮（「使用此说明」确认提交说明）。 */
   messageChoice: '使用此说明',
+  /** createWebviewPanel 替身创建的面板记录。 */
+  panels: [],
+  /** executeCommand 调用记录（args 数组）。 */
+  executedCommands: [],
+  /** onDidCloseTextDocument 注册的处理器。 */
+  closeDocHandlers: [],
+  /** showWarningMessage 调用记录（复用 warning，另存供切换拒绝断言）。 */
 };
 
 const fakeVscode = {
   ProgressLocation: { Notification: 15 },
+  ViewColumn: { Active: 1, Beside: 2 },
   ThemeIcon: class {
     constructor(id) { this.id = id; }
   },
   Uri: {
     parse: (s) => ({ scheme: 'untitled', path: s, toString: () => s }),
+    file: (path) => ({ scheme: 'file', path, fsPath: path, toString: () => `file://${path}` }),
+    joinPath: (base, ...parts) => {
+      const path = [base.path.replace(/\/$/, ''), ...parts].join('/');
+      return { scheme: 'file', path, fsPath: path, toString: () => `file://${path}` };
+    },
   },
   TabInputText: class {},
   window: {
@@ -119,6 +132,58 @@ const fakeVscode = {
       return qp;
     },
     activeTextEditor: undefined,
+    createWebviewPanel(viewType, title, _showOptions, options) {
+      const messageHandlers = [];
+      const disposeHandlers = [];
+      const webview = {
+        _html: '',
+        posted: [],
+        onDidReceiveMessage(handler) {
+          messageHandlers.push(handler);
+          return { dispose() {} };
+        },
+        postMessage(message) {
+          webview.posted.push(message);
+          return Promise.resolve(true);
+        },
+        asWebviewUri: (uri) => ({ scheme: 'vscode-webview', path: uri.path, toString: () => `vscode-webview://fake${uri.path}` }),
+        cspSource: 'vscode-webview-fake:',
+        set html(value) {
+          webview._html = value;
+        },
+        get html() {
+          return webview._html;
+        },
+      };
+      const panel = {
+        viewType, title, webview, options,
+        revealed: 0, disposed: false,
+        reveal() { panel.revealed += 1; },
+        dispose() {
+          if (panel.disposed) return;
+          panel.disposed = true;
+          disposeHandlers.forEach((cb) => cb());
+        },
+        /** 测试驱动：模拟视图发消息给宿主。 */
+        send(raw) {
+          messageHandlers.forEach((cb) => cb(raw));
+        },
+        /** 测试驱动：模拟视图加载完成握手。 */
+        sendReady() {
+          panel.send({ type: 'ready', protocolVersion: 1 });
+        },
+        /** 测试驱动：模拟视图意图。 */
+        sendIntent(intent, sessionId, requestId) {
+          panel.send({ type: 'intent', protocolVersion: 1, sessionId, requestId: `req-${requestId}`, intent });
+        },
+      };
+      panel.onDidDispose = (handler) => {
+        disposeHandlers.push(handler);
+        return { dispose() {} };
+      };
+      state.panels.push(panel);
+      return panel;
+    },
   },
   workspace: {
     workspaceFolders: [],
@@ -128,12 +193,19 @@ const fakeVscode = {
       fileName: 'svn-commit-message.txt',
       getText: () => state.inputResult ?? '',
     }),
-    onDidCloseTextDocument: () => ({ dispose() {} }),
+    onDidCloseTextDocument: (handler) => {
+      state.closeDocHandlers.push(handler);
+      return { dispose() {} };
+    },
     getConfiguration() {
       return { get: (_key, fallback) => fallback };
     },
   },
   commands: {
+    executeCommand: async (command, ...args) => {
+      state.executedCommands.push([command, ...args]);
+      return undefined;
+    },
     // 模拟真实 VSCode：重复注册同一命令 ID 抛 already exists，dispose 后可重新注册。
     registerCommand(id, handler) {
       if (state.activeCommandIds.has(id)) {
@@ -201,7 +273,10 @@ function makeSvnLab() {
 async function main() {
   const extension = require('../out/extension.js');
   const pkg = require('../package.json');
-  const context = { subscriptions: [] };
+  const context = {
+    subscriptions: [],
+    extensionUri: { scheme: 'file', path: '/mock-ext', toString: () => 'file:///mock-ext' },
+  };
   await extension.activate(context);
 
   console.log('场景 1：activate 后全部命令注册，与 package.json 贡献点一致');
@@ -501,7 +576,10 @@ async function main() {
   check('deactivate 不抛错', deactivateOk);
 
   console.log('场景 18：同一宿主实例二次 activate 不重复注册');
-  const secondContext = { subscriptions: [] };
+  const secondContext = {
+    subscriptions: [],
+    extensionUri: { scheme: 'file', path: '/mock-ext', toString: () => 'file:///mock-ext' },
+  };
   let secondActivateOk = true;
   try {
     await extension.activate(secondContext);
@@ -649,6 +727,143 @@ async function main() {
   state.inputResult = undefined;
   state.confirmResult = undefined;
   rmSync(specialLab.lab, { recursive: true, force: true });
+
+  console.log('场景 23：状态面板——创建、CSP 骨架、渲染与单文件差异（真实副本）');
+  const panelLab = makeSvnLab();
+  const panelWc = panelLab.checkout('panel-wc');
+  mkdirSync(join(panelWc, 'src'), { recursive: true });
+  writeFileSync(join(panelWc, 'src', 'a.txt'), 'base content\n');
+  writeFileSync(join(panelWc, 'src', 'prop-dir.txt'), 'x');
+  writeFileSync(join(panelWc, 'src', 'bin.img'), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x0d]));
+  svn(['add', '-q', 'src'], panelWc);
+  svn(['commit', '-q', '-m', 'panel baseline'], panelWc);
+  writeFileSync(join(panelWc, 'src', 'a.txt'), 'work content\n');
+  writeFileSync(join(panelWc, 'src', 'new.txt'), 'unversioned body');
+  svn(['propset', '-q', 'svn:ignore', 'tmp', 'src'], panelWc);
+  const panelsBefore = state.panels.length;
+  await state.registered.get('svnAnywhere.showStatusPanel')({ fsPath: panelWc, scheme: 'file' });
+  check('创建了一个 webview 面板', state.panels.length === panelsBefore + 1, `面板数 ${state.panels.length}`);
+  const panel = state.panels.at(-1);
+  check('HTML 骨架含 CSP/nonce/asWebviewUri 资源',
+    panel.webview.html.includes("default-src 'none'") &&
+    /script-src 'nonce-[0-9a-f]+/.test(panel.webview.html) &&
+    panel.webview.html.includes('vscode-webview://fake/mock-ext/media/panel.js'),
+    panel.webview.html.slice(0, 400));
+  panel.sendReady();
+  const firstRender = panel.webview.posted.find((m) => m.type === 'render');
+  check('ready 后收到首帧 render（协议版本 1、含会话 ID）',
+    firstRender && firstRender.protocolVersion === 1 && typeof firstRender.sessionId === 'string' &&
+    firstRender.revision >= 1 && firstRender.html.includes('class="panel"'),
+    JSON.stringify(firstRender ?? {}).slice(0, 200));
+  // 首帧是忙碌态，等待数据帧（runStatus 完成后推送）。
+  for (let retry = 0; retry < 100 && !panel.webview.posted.some((m) => m.type === 'render' && m.html.includes('src/a.txt')); retry += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  const dataRender = [...panel.webview.posted].reverse().find((m) => m.type === 'render' && m.html.includes('src/a.txt'));
+  check('渲染包含 modified 原词与 unversioned 行',
+    dataRender && dataRender.html.includes('modified') && dataRender.html.includes('src/new.txt'),
+    dataRender ? dataRender.html.slice(0, 300) : '未等到数据帧');
+  check('unversioned 行差异按钮禁用并给原因',
+    dataRender && dataRender.html.match(/data-item-id="src\/new\.txt"[^>]*/)?.[0]?.includes('disabled') === true,
+    dataRender ? dataRender.html.match(/data-item-id="src\/new\.txt"[^>]*/)?.[0] : '未等到数据帧');
+
+  console.log('场景 24：面板意图——单文件差异、属性差异与能力边界');
+  const commandsBeforeDiff = state.executedCommands.length;
+  panel.sendIntent({ kind: 'openDiff', itemId: 'src/a.txt' }, dataRender.sessionId, 1);
+  for (let retry = 0; retry < 100 && state.executedCommands.length === commandsBeforeDiff; retry += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  const diffCall = state.executedCommands.at(-1);
+  check('modified 打开 vscode.diff 并排差异',
+    diffCall && diffCall[0] === 'vscode.diff',
+    JSON.stringify(state.executedCommands.slice(commandsBeforeDiff)).slice(0, 300));
+  if (diffCall && diffCall[0] === 'vscode.diff') {
+    const baseContent = readFileSync(diffCall[1].path, 'utf8');
+    check('差异左端是 BASE 内容', baseContent === 'base content\n', baseContent);
+    check('差异右端是工作文件', diffCall[2].path === join(panelWc, 'src', 'a.txt'), diffCall[2].path);
+    // 关闭差异文档 → 临时资源释放。
+    state.closeDocHandlers.forEach((cb) => cb({ uri: diffCall[1] }));
+    check('关闭差异后临时 BASE 文件已释放', !existsSync(diffCall[1].path), diffCall[1].path);
+  }
+  const propCommands = state.executedCommands.length;
+  panel.sendIntent({ kind: 'openDiff', itemId: 'src' }, dataRender.sessionId, 2);
+  for (let retry = 0; retry < 100 && state.executedCommands.length === propCommands; retry += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  check('纯属性目录走属性差异（不打开文本 diff，写输出频道）',
+    !state.executedCommands.slice(propCommands).some((args) => args[0] === 'vscode.diff') &&
+    channelText().includes('属性差异'),
+    channelText().slice(-400));
+  const forgedCommands = state.executedCommands.length;
+  panel.sendIntent({ kind: 'openDiff', itemId: 'src/new.txt' }, dataRender.sessionId, 3);
+  panel.sendIntent({ kind: 'openDiff', itemId: 'not-exist' }, dataRender.sessionId, 4);
+  panel.sendIntent({ kind: 'openDiff', itemId: 'src/a.txt' }, 'stale-session', 5);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  check('伪造/越权/旧会话意图不触发差异',
+    state.executedCommands.length === forgedCommands,
+    JSON.stringify(state.executedCommands.slice(forgedCommands)).slice(0, 200));
+  const invalidToastBefore = panel.webview.posted.length;
+  panel.send({ type: 'intent', protocolVersion: 99, sessionId: dataRender.sessionId, requestId: 'x', intent: { kind: 'refresh' } });
+  check('协议版本不兼容被拒绝并 toast 原因',
+    panel.webview.posted.slice(invalidToastBefore).some((m) => m.type === 'toast' && m.message.includes('协议版本不兼容')),
+    JSON.stringify(panel.webview.posted.slice(invalidToastBefore).slice(0, 2)));
+
+  console.log('场景 25：面板生命周期——同目标复用、目标切换、忙碌拒绝与迟到结果');
+  const panelsBeforeReuse = state.panels.length;
+  await state.registered.get('svnAnywhere.showStatusPanel')({ fsPath: panelWc, scheme: 'file' });
+  check('同目标再次调用复用面板并 reveal',
+    state.panels.length === panelsBeforeReuse && panel.revealed === 1,
+    `panels=${state.panels.length} revealed=${panel.revealed}`);
+  const panelWc2 = panelLab.checkout('panel-wc2');
+  writeFileSync(join(panelWc2, 'b.txt'), 'v2\n');
+  const panelsBeforeSwitch = state.panels.length;
+  await state.registered.get('svnAnywhere.showStatusPanel')({ fsPath: panelWc2, scheme: 'file' });
+  check('不同目标切换复用同一面板实例（不新建）', state.panels.length === panelsBeforeSwitch);
+  for (let retry = 0; retry < 100 && ![...panel.webview.posted].reverse().some((m) => m.type === 'render' && m.html.includes('b.txt')); retry += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  const secondRender = [...panel.webview.posted].reverse().find((m) => m.type === 'render' && m.html.includes('b.txt'));
+  check('切换后渲染新目标会话（含 b.txt）',
+    secondRender && secondRender.sessionId !== dataRender.sessionId,
+    JSON.stringify(secondRender ?? {}).slice(0, 200));
+  // 旧会话迟到结果：直接向旧 sessionId 发意图应被忽略。
+  const lateCommands = state.executedCommands.length;
+  panel.sendIntent({ kind: 'openDiff', itemId: 'src/a.txt' }, firstRender.sessionId, 6);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  check('旧会话迟到意图不再执行', state.executedCommands.length === lateCommands);
+  // 忙碌拒绝切换：refresh 进行中切新目标。
+  panel.sendIntent({ kind: 'refresh' }, secondRender.sessionId, 7);
+  const warningBeforeBusy = state.warning.length;
+  const panelWc3 = panelLab.checkout('panel-wc3');
+  writeFileSync(join(panelWc3, 'c.txt'), 'v3\n');
+  await state.registered.get('svnAnywhere.showStatusPanel')({ fsPath: panelWc3, scheme: 'file' });
+  check('忙碌期间拒绝切换目标并提示',
+    state.warning.slice(warningBeforeBusy).some((m) => m.includes('拒绝切换')),
+    JSON.stringify(state.warning.slice(warningBeforeBusy)));
+  for (let retry = 0; retry < 100 && channelText().includes('正在读取…'); retry += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+
+  console.log('场景 26：面板销毁——dispose 后迟到结果与二次打开');
+  const lastSessionRender = [...panel.webview.posted].reverse().find((m) => m.type === 'render');
+  panel.dispose();
+  const postedAfterDispose = panel.webview.posted.length;
+  panel.sendIntent({ kind: 'openDiff', itemId: 'b.txt' }, lastSessionRender.sessionId, 8);
+  panel.sendReady();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  check('销毁后不再有任何消息更新', panel.webview.posted.length === postedAfterDispose);
+  await state.registered.get('svnAnywhere.showStatusPanel')({ fsPath: panelWc, scheme: 'file' });
+  const reopened = state.panels.at(-1);
+  check('销毁后再次打开创建新面板', reopened !== panel && state.panels.length === panelsBeforeReuse + 1);
+  reopened.sendReady();
+  for (let retry = 0; retry < 100 && !reopened.webview.posted.some((m) => m.type === 'render' && m.html.includes('src/a.txt')); retry += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  const reopenedRender = [...reopened.webview.posted].reverse().find((m) => m.type === 'render' && m.html.includes('src/a.txt'));
+  check('新面板新会话渲染同一目标',
+    reopenedRender && reopenedRender.sessionId !== lastSessionRender.sessionId && reopenedRender.html.includes('src/a.txt'),
+    JSON.stringify(reopenedRender ?? {}).slice(0, 200));
+  rmSync(panelLab.lab, { recursive: true, force: true });
 
   rmSync(wc, { recursive: true, force: true });
   rmSync(plain, { recursive: true, force: true });

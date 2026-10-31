@@ -6,3 +6,5 @@ dist/
 .vscode-test/
 *.log
 .idea/
+# 视图构建产物（media/panel.css 等静态源文件保留入库）
+media/panel.js

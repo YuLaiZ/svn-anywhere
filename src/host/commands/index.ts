@@ -12,9 +12,11 @@ import { commandRefreshStatus } from './refreshStatus';
 import { commandShowOutput } from './showOutput';
 import { commandShowStatus } from './showStatus';
 import { commandUpdate } from './update';
+import { commandShowStatusPanel, setStatusPanelContext } from '../panel/panels/statusList';
 
 const COMMANDS: ReadonlyArray<{ id: string; handler: CommandHandler }> = [
   { id: 'svnAnywhere.showStatus', handler: commandShowStatus },
+  { id: 'svnAnywhere.showStatusPanel', handler: commandShowStatusPanel },
   { id: 'svnAnywhere.commit', handler: commandCommit },
   { id: 'svnAnywhere.update', handler: commandUpdate },
   { id: 'svnAnywhere.refreshStatus', handler: commandRefreshStatus },
@@ -36,6 +38,8 @@ export function registerAllCommands(context: vscode.ExtensionContext): void {
     disposable.dispose();
   }
   registeredDisposables = [];
+  // 面板创建需要 extensionUri（CSP/asWebviewUri）与 subscriptions；activate 注入一次。
+  setStatusPanelContext(context);
   for (const { id, handler } of COMMANDS) {
     registeredDisposables.push(registerCommand(context, id, handler));
   }

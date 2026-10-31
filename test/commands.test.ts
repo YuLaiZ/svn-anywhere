@@ -311,13 +311,13 @@ describe('registerAllCommands 二次激活', () => {
   it('同一实例二次注册：先释放上次句柄再重新注册，不触发重复 ID 报错', () => {
     const firstContext = { subscriptions: [] } as unknown as vscode.ExtensionContext;
     registerAllCommands(firstContext);
-    expect(vscodeMock.registered).toHaveLength(8);
+    expect(vscodeMock.registered).toHaveLength(9);
     const firstHandles = vscodeMock.registered.map((r) => r.disposable);
 
     const secondContext = { subscriptions: [] } as unknown as vscode.ExtensionContext;
     expect(() => registerAllCommands(secondContext)).not.toThrow();
     expect(firstHandles.every((d) => d.disposed)).toBe(true);
-    expect(vscodeMock.registered).toHaveLength(16);
-    expect(vscodeMock.activeCommandIds.size).toBe(8);
+    expect(vscodeMock.registered).toHaveLength(18);
+    expect(vscodeMock.activeCommandIds.size).toBe(9);
   });
 });
