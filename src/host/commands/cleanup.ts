@@ -5,6 +5,7 @@ import * as vscode from 'vscode';
 import { statSync } from 'node:fs';
 import { dirname, relative } from 'node:path';
 import { runOrThrow } from '../../core/svnCli';
+import { getOperationRegistry } from '../../core/operations';
 import { escapePeg } from '../../core/workspace';
 import { readSvnPath, readTimeoutMs } from '../config';
 import { format, strings } from '../i18n';
@@ -28,8 +29,33 @@ export async function commandCleanup(uri?: vscode.Uri): Promise<void> {
   } catch {
     // 保留原路径
   }
+  // 注册表互斥：同一副本有在途/受限操作（提交中/结果未知/待协调）时拒绝清理。
+  const registry = getOperationRegistry();
+  const held = registry.writeRestriction(target.wcRoot);
+  if (held) {
+    void vscode.window.showWarningMessage(format(strings.panel.operationHeldBusy, { phase: held.phase }));
+    return;
+  }
+  const begin = await registry.begin({ wcRoot: target.wcRoot, targetRelPath: '.', nodeKind: 'dir' });
+  if (!begin.ok) {
+    void vscode.window.showWarningMessage(format(strings.panel.operationHeldBusy, { phase: begin.heldBy.phase }));
+    return;
+  }
   const targetArg = escapePeg(relative(target.wcRoot, cleanupTarget));
   const args = ['cleanup', targetArg];
+  try {
+    await runCleanup(svnPath, args, target, cleanupTarget);
+  } finally {
+    await registry.finish(begin.operationId);
+  }
+}
+
+async function runCleanup(
+  svnPath: string,
+  args: string[],
+  target: { targetPath: string; wcRoot: string },
+  cleanupTarget: string,
+): Promise<void> {
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,

@@ -178,8 +178,11 @@ export class OperationRegistry {
     return next;
   }
 
-  /** 操作彻底结束（协调完成等）后移除记录；幂等。 */
-  async finish(operationId: string): Promise<void> {
+  /** 操作彻底结束（协调完成等）后移除记录；幂等；未登记的 ID 忽略。 */
+  async finish(operationId: string | undefined): Promise<void> {
+    if (!operationId) {
+      return;
+    }
     const record = this.records.get(operationId);
     if (record) {
       if (this.active.get(record.wcRoot)?.operationId === operationId) {
@@ -210,7 +213,47 @@ export function getOperationRegistry(): OperationRegistry {
   return globalRegistry;
 }
 
+/** 宿主注入持久化实现并加载未完成记录（恢复写限制）。 */
+export function setGlobalOperationRegistry(registry: OperationRegistry): void {
+  globalRegistry = registry;
+}
+
 /** 测试用：替换/重置进程级注册表。 */
 export function setOperationRegistryForTest(registry?: OperationRegistry): void {
   globalRegistry = registry;
+}
+
+/** globalState 风格的最小持久化接口（不依赖 vscode 类型）。 */
+export interface MementoLike {
+  get<T>(key: string, defaultValue?: T): T;
+  update(key: string, value: unknown): Thenable<void> | Promise<void>;
+}
+
+const OPERATIONS_KEY = 'svnAnywhere.operations';
+
+/**
+ * 用宿主 globalState 构造操作存储并初始化全局注册表：
+ * activate 时调用一次；已完成的记录不进入限制集合。
+ */
+export async function initializeOperationStore(memento: MementoLike): Promise<void> {
+  const store: OperationStore = {
+    load: () => memento.get<OperationRecord[]>(OPERATIONS_KEY, []),
+    async save(record) {
+      const records = memento.get<OperationRecord[]>(OPERATIONS_KEY, []);
+      const index = records.findIndex((item) => item.operationId === record.operationId);
+      if (index >= 0) {
+        records[index] = record;
+      } else {
+        records.push(record);
+      }
+      await memento.update(OPERATIONS_KEY, records);
+    },
+    async remove(operationId) {
+      const records = memento.get<OperationRecord[]>(OPERATIONS_KEY, []);
+      await memento.update(OPERATIONS_KEY, records.filter((item) => item.operationId !== operationId));
+    },
+  };
+  const registry = new OperationRegistry(store);
+  await registry.loadPending();
+  setGlobalOperationRegistry(registry);
 }

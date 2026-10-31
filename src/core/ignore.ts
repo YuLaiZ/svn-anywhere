@@ -15,6 +15,76 @@ export function parseIgnoreRules(output: string): string[] {
     .filter((line) => line.length > 0);
 }
 
+function escapeRegExp(char: string): string {
+  return /[.*+?^${}()|[\]\\]/.test(char) ? `\\${char}` : char;
+}
+
+/**
+ * 把 svn:ignore 模式（apr_fnmatch 子集：* 任意串、? 单字符、[...] 字符类、
+ * \ 转义）转换为整名匹配的正则。模式只用于直接子项名，不含路径分隔。
+ */
+export function ignorePatternToRegExp(pattern: string): RegExp {
+  let source = '';
+  for (let i = 0; i < pattern.length; i += 1) {
+    const char = pattern[i] ?? '';
+    if (char === '\\' && i + 1 < pattern.length) {
+      source += escapeRegExp(pattern[i + 1] ?? '');
+      i += 1;
+      continue;
+    }
+    if (char === '*') {
+      source += '.*';
+      continue;
+    }
+    if (char === '?') {
+      source += '.';
+      continue;
+    }
+    if (char === '[') {
+      let j = i + 1;
+      let negate = false;
+      if (pattern[j] === '!' || pattern[j] === '^') {
+        negate = true;
+        j += 1;
+      }
+      let body = '';
+      if (pattern[j] === ']') {
+        body += '\\]';
+        j += 1;
+      }
+      while (j < pattern.length && pattern[j] !== ']') {
+        const cls = pattern[j] ?? '';
+        body += cls === '\\' ? '\\\\' : escapeRegExp(cls);
+        j += 1;
+      }
+      if (j >= pattern.length) {
+        // 未闭合的 [ 按字面量处理。
+        source += '\\[';
+        continue;
+      }
+      source += negate ? `[^${body}]` : `[${body}]`;
+      i = j;
+      continue;
+    }
+    source += escapeRegExp(char);
+  }
+  return new RegExp(`^${source}$`);
+}
+
+/** 名称是否命中任一忽略规则（名称按原值比较，不 trim）。 */
+export function matchesIgnoreRules(name: string, rules: string[]): boolean {
+  return rules.some((rule) => {
+    const trimmed = rule.trim();
+    if (trimmed === '') {
+      return false;
+    }
+    if (trimmed === name) {
+      return true;
+    }
+    return ignorePatternToRegExp(rule).test(name);
+  });
+}
+
 /** 将直接子项名转换为精确匹配的 svn:ignore 模式，保留空格。 */
 export function literalIgnorePattern(name: string): string {
   if (/[\r\n]/.test(name)) {

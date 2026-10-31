@@ -293,6 +293,153 @@ button[disabled], input[disabled], select[disabled], textarea[disabled] {
   to { transform: translateX(320%); }
 }
 
+/* ------------------------------ 组头与树形（P1） ------------------------------ */
+
+.group-head {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 7px 16px;
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--vscode-sideBar-background);
+  border-bottom: 1px solid var(--vscode-panel-border);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.group-head .num { font-weight: 400; color: var(--vscode-descriptionForeground); }
+.group-head label { display: flex; gap: 8px; align-items: center; min-width: 0; }
+
+input[type="checkbox"] { width: 15px; height: 15px; margin: 0; accent-color: var(--vscode-button-background); flex: none; }
+
+.view-switch { display: inline-flex; }
+
+.view-switch button {
+  font-size: 12px;
+  padding: 4px 8px;
+  border: 1px solid var(--vscode-input-border);
+  color: var(--vscode-button-secondaryForeground);
+  background: var(--vscode-button-secondaryBackground);
+  cursor: pointer;
+}
+
+.view-switch button[aria-pressed="true"] {
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+}
+
+.filter-right { margin-left: auto; display: flex; align-items: center; gap: 7px; white-space: nowrap; }
+.filter-right .summary { color: var(--vscode-descriptionForeground); font-size: 12px; }
+
+button.link {
+  border-color: transparent;
+  color: var(--vscode-textLink-foreground, var(--vscode-focusBorder));
+  background: transparent;
+  padding: 3px 5px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.selection-bar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 5px 16px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+  flex: none;
+  font-size: 12px;
+}
+
+.selection-bar button.link { max-width: 100%; overflow-wrap: anywhere; }
+
+.tree-folder {
+  display: flex;
+  gap: 7px;
+  align-items: center;
+  min-height: 32px;
+  padding: 4px 16px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-sideBar-background);
+}
+
+.tree-toggle {
+  background: transparent;
+  padding: 0;
+  width: 18px;
+  flex: none;
+  color: var(--vscode-foreground);
+  border: none;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.tree-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+  min-width: 0;
+}
+
+.tree-children .row { min-width: 0; }
+.tree-children[hidden] { display: none; }
+
+/* ------------------------------ 说明工具条（P1） ------------------------------ */
+
+.message-tools { margin-top: 6px; display: flex; gap: 5px; flex-wrap: wrap; }
+
+button.chip {
+  padding: 2px 9px;
+  border-radius: 12px;
+  font-size: 12px;
+  border: 1px solid var(--vscode-panel-border);
+  background: transparent;
+  color: var(--vscode-foreground);
+  cursor: pointer;
+}
+
+/* ------------------------------ 成功卡片（P1） ------------------------------ */
+
+.success-card {
+  flex: none;
+  margin: 10px 16px 0;
+  padding: 12px 14px;
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  border: 1px solid var(--vscode-testing-iconPassed, var(--vscode-gitDecoration-addedResourceForeground));
+  border-left-width: 5px;
+  border-radius: 4px;
+  color: var(--vscode-foreground);
+}
+
+.success-icon {
+  flex: none;
+  font-size: 22px;
+  line-height: 1.2;
+  color: var(--vscode-testing-iconPassed, var(--vscode-gitDecoration-addedResourceForeground));
+  font-weight: 700;
+}
+
+.success-card strong { display: block; font-size: 15px; margin-bottom: 3px; }
+.success-card p { font-size: 12px; margin: 0; overflow-wrap: anywhere; min-width: 0; }
+.success-content { min-width: 0; flex: 1; }
+
+button.dismiss-success {
+  margin: 0 0 0 auto;
+  padding: 1px 6px;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--vscode-foreground);
+  cursor: pointer;
+  flex: none;
+}
+
 /* ------------------------------ 瞬时提示 ------------------------------ */
 
 .toast {

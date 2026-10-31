@@ -27,7 +27,7 @@ const parser = new XMLParser({
   trimValues: false,
   // SVN 用数字实体表示路径控制字符；解码一次，保留 &amp; 编码的字面实体。
   htmlEntities: true,
-  isArray: (name) => name === 'entry',
+  isArray: (name) => name === 'entry' || name === 'changelist',
 });
 
 /** 不计入远端更新的 repos-status 值：none 是无变化，external 不在 M1 范围。 */
@@ -39,29 +39,42 @@ export function parseRemoteStatusXml(xml: string): RemoteStatusResult {
     status?: {
       target?: {
         against?: { revision?: string | number };
-        entry?: Array<{
-          path?: string;
-          'wc-status'?: { item?: string };
-          'repos-status'?: { item?: string };
-        }>;
+        entry?: RemoteXmlEntry[];
       };
+      /** -u 输出同样把 changelist 条目放进与 <target> 平级的容器。 */
+      changelist?: Array<{ name?: string; entry?: RemoteXmlEntry[] }>;
     };
   };
 
   const target = parsed.status?.target;
   const entries: RemoteStatusEntry[] = [];
   for (const entry of target?.entry ?? []) {
-    if (!entry.path) {
-      continue;
+    pushRemoteEntry(entries, entry);
+  }
+  for (const group of parsed.status?.changelist ?? []) {
+    for (const entry of group.entry ?? []) {
+      pushRemoteEntry(entries, entry);
     }
-    entries.push({
-      path: entry.path,
-      wcStatus: entry['wc-status']?.item,
-      reposStatus: entry['repos-status']?.item,
-    });
   }
   const againstRevision = toNumber(target?.against?.revision);
   return { against: againstRevision, entries };
+}
+
+interface RemoteXmlEntry {
+  path?: string;
+  'wc-status'?: { item?: string };
+  'repos-status'?: { item?: string };
+}
+
+function pushRemoteEntry(entries: RemoteStatusEntry[], entry: RemoteXmlEntry): void {
+  if (!entry.path) {
+    return;
+  }
+  entries.push({
+    path: entry.path,
+    wcStatus: entry['wc-status']?.item,
+    reposStatus: entry['repos-status']?.item,
+  });
 }
 
 /** 远端有变化的条目（repos-status 存在且非 none/external）。 */

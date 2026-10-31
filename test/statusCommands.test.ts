@@ -95,7 +95,7 @@ const channelLines = (): string[] => {
   return (channel as unknown as { lines: string[] }).lines;
 };
 
-vi.mocked(runStatus).mockResolvedValue({ targetPath: '.', entries: [] });
+vi.mocked(runStatus).mockResolvedValue({ targetPath: '.', entries: [], externals: [] });
 vi.mocked(runUpdate).mockResolvedValue({
   stdout: '', stderr: '', exitCode: 0, items: [], conflicts: [],
 });
@@ -130,9 +130,10 @@ describe('commandShowStatus（显示状态）', () => {
     vi.mocked(runStatus).mockResolvedValueOnce({
       targetPath: 'src/a.txt',
       entries: [
-        { path: 'src/a.txt', wcStatus: 'modified', props: 'none', revision: 3 },
-        { path: 'src/new.txt', wcStatus: 'unversioned', props: 'none' },
+        { path: 'src/a.txt', wcStatus: 'modified', props: 'none', revision: 3, changelist: null },
+        { path: 'src/new.txt', wcStatus: 'unversioned', props: 'none', changelist: null },
       ],
+      externals: [],
     });
 
     await commandShowStatus(makeUri(filePath));
@@ -145,7 +146,7 @@ describe('commandShowStatus（显示状态）', () => {
   });
 
   it('干净副本：频道写「无本地变更」', async () => {
-    vi.mocked(runStatus).mockResolvedValueOnce({ targetPath: '.', entries: [] });
+    vi.mocked(runStatus).mockResolvedValueOnce({ targetPath: '.', entries: [], externals: [] });
     await commandShowStatus(makeUri(wcRoot));
     expect(channelLines().join('\n')).toContain(strings.status.clean);
   });
@@ -153,14 +154,15 @@ describe('commandShowStatus（显示状态）', () => {
   it('纯属性变更：状态行追加「属性修改」注记，不再裸显 normal', async () => {
     vi.mocked(runStatus).mockResolvedValueOnce({
       targetPath: '.',
-      entries: [{ path: '.', wcStatus: 'normal', props: 'modified' }],
+      entries: [{ path: '.', wcStatus: 'normal', props: 'modified', changelist: null }],
+      externals: [],
     });
     await commandShowStatus(makeUri(wcRoot));
     expect(channelLines().join('\n')).toContain('[normal] .（属性修改）');
   });
 
   it('状态命令向执行层传 onExit（输出频道记录退出码）', async () => {
-    vi.mocked(runStatus).mockResolvedValueOnce({ targetPath: '.', entries: [] });
+    vi.mocked(runStatus).mockResolvedValueOnce({ targetPath: '.', entries: [], externals: [] });
     await commandShowStatus(makeUri(wcRoot));
     expect(vi.mocked(runStatus)).toHaveBeenCalledWith(
       'svn',
@@ -173,7 +175,7 @@ describe('commandShowStatus（显示状态）', () => {
 describe('commandRefreshStatus（刷新状态）', () => {
   it('整副本刷新：目标固定为相对根 `.`', async () => {
     writeFileSync(join(wcRoot, 'any.txt'), 'x');
-    vi.mocked(runStatus).mockResolvedValueOnce({ targetPath: '.', entries: [] });
+    vi.mocked(runStatus).mockResolvedValueOnce({ targetPath: '.', entries: [], externals: [] });
     await commandRefreshStatus(makeUri(join(wcRoot, 'any.txt')));
     expect(vi.mocked(runStatus)).toHaveBeenCalledWith('svn', '.', expect.objectContaining({ cwd: wcRoot }));
   });

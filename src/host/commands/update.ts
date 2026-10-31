@@ -6,6 +6,7 @@
 import * as vscode from 'vscode';
 import { relative } from 'node:path';
 import { runUpdate, type UpdateRunResult } from '../../core/update';
+import { getOperationRegistry } from '../../core/operations';
 import { escapePeg } from '../../core/workspace';
 import { readSvnPath, readTimeoutMs } from '../config';
 import { format, strings } from '../i18n';
@@ -33,11 +34,48 @@ export async function commandUpdate(uri?: vscode.Uri): Promise<void> {
 }
 
 /**
+ * 更新前的注册表互斥：同一工作副本有在途/受限操作（提交中、结果未知、
+ * 待协调）时拒绝执行；返回登记的操作 ID（执行完须 finish）或 undefined。
+ */
+export async function beginUpdateOperation(wcRoot: string): Promise<string | undefined> {
+  const registry = getOperationRegistry();
+  const held = registry.writeRestriction(wcRoot);
+  if (held) {
+    void vscode.window.showWarningMessage(format(strings.panel.operationHeldBusy, { phase: held.phase }));
+    return undefined;
+  }
+  const begin = await registry.begin({ wcRoot, targetRelPath: '.', nodeKind: 'dir' });
+  if (!begin.ok) {
+    void vscode.window.showWarningMessage(format(strings.panel.operationHeldBusy, { phase: begin.heldBy.phase }));
+    return undefined;
+  }
+  return begin.operationId;
+}
+
+/** 更新操作登记释放（幂等）。 */
+export async function finishUpdateOperation(operationId: string | undefined): Promise<void> {
+  await getOperationRegistry().finish(operationId);
+}
+
+/**
  * 执行一次更新并完成回显：进度通知（可取消）、流式明细、最终 revision
  * 与冲突汇总都写输出频道；有冲突时弹警告列出文件。返回执行结果供
  * 提交流程判断是否继续。
  */
 export async function performUpdate(target: WcTarget, svnPath: string): Promise<UpdateRunResult> {
+  // 注册表互斥：同一副本有在途/受限操作时拒绝更新（含从资源管理器入口）。
+  const operationId = await beginUpdateOperation(target.wcRoot);
+  if (!operationId) {
+    return { stdout: '', stderr: '', exitCode: 0, items: [], conflicts: [] };
+  }
+  try {
+    return await executeUpdate(target, svnPath);
+  } finally {
+    await finishUpdateOperation(operationId);
+  }
+}
+
+async function executeUpdate(target: WcTarget, svnPath: string): Promise<UpdateRunResult> {
   // 与终端 svn update 一致：以副本根为 cwd 传相对目标，明细路径为相对形态；
   // 目标是副本根时归一为 `.`，避免空参数。
   // core 的 runUpdate 内部做 peg 转义，这里日志记录转义后的实际命令。

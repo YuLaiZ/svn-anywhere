@@ -13,7 +13,7 @@ import { format, strings } from '../i18n';
 
 export const PROTOCOL_VERSION = 1;
 
-/** 视图可发起的意图（已知动作的联合类型）。阶段 0 为基座 + 只读列表面板所需。 */
+/** 视图可发起的意图（已知动作的联合类型）。阶段 1 起覆盖 P1 提交面板。 */
 export type Intent =
   | { kind: 'refresh' }
   | { kind: 'openDiff'; itemId: string }
@@ -23,7 +23,21 @@ export type Intent =
   | { kind: 'setFilter'; filterId: string; value: string }
   | { kind: 'clearFilters' }
   | { kind: 'toggleRow'; rowId: string; selected: boolean }
-  | { kind: 'syncInput'; fieldId: string; value: string; inputRevision: number };
+  | { kind: 'syncInput'; fieldId: string; value: string; inputRevision: number }
+  | { kind: 'toggleGroup'; groupId: string; selected: boolean }
+  | { kind: 'toggleTree'; nodeId: string; selected: boolean }
+  | { kind: 'setView'; view: 'tree' | 'list' }
+  | { kind: 'selectVisible' }
+  | { kind: 'clearSelection' }
+  | { kind: 'selectChangelist' }
+  | { kind: 'applyPrefix'; index: number }
+  | { kind: 'managePrefixes' }
+  | { kind: 'applyHistory'; index: number }
+  | { kind: 'showHistory' }
+  | { kind: 'rowMore'; itemId: string }
+  | { kind: 'submit' }
+  | { kind: 'closePanel' }
+  | { kind: 'resolveUnknown' };
 
 /** 宿主 → 视图：整段渲染（宿主已本地化并转义的 HTML）。 */
 export interface RenderMessage {
@@ -67,7 +81,13 @@ export type ViewToHostMessage = ReadyMessage | IntentMessage;
 const INTENT_KINDS = new Set([
   'refresh', 'openDiff', 'openFile', 'dismissBanner', 'bannerAction',
   'setFilter', 'clearFilters', 'toggleRow', 'syncInput',
+  'toggleGroup', 'toggleTree', 'setView', 'selectVisible', 'clearSelection',
+  'selectChangelist', 'applyPrefix', 'managePrefixes', 'applyHistory', 'showHistory',
+  'rowMore', 'submit', 'closePanel', 'resolveUnknown',
 ]);
+
+/** 提交面板视图切换的合法取值。 */
+const VIEW_MODES = new Set(['tree', 'list']);
 
 export interface ParsedViewMessage {
   ok: true;
@@ -113,12 +133,21 @@ function parseIntent(raw: unknown): { ok: true; intent: Intent } | { ok: false; 
   switch (kind) {
     case 'refresh':
     case 'clearFilters':
+    case 'selectVisible':
+    case 'clearSelection':
+    case 'selectChangelist':
+    case 'managePrefixes':
+    case 'showHistory':
+    case 'submit':
+    case 'closePanel':
+    case 'resolveUnknown':
       return { ok: true, intent: { kind } };
     case 'openDiff':
-    case 'openFile': {
+    case 'openFile':
+    case 'rowMore': {
       const itemId = readString(raw, 'itemId', label);
       return itemId.ok
-        ? { ok: true, intent: { kind: kind as 'openDiff' | 'openFile', itemId: itemId.value } }
+        ? { ok: true, intent: { kind: kind as 'openDiff' | 'openFile' | 'rowMore', itemId: itemId.value } }
         : { ok: false, reason: itemId.message };
     }
     case 'dismissBanner': {
@@ -156,6 +185,44 @@ function parseIntent(raw: unknown): { ok: true; intent: Intent } | { ok: false; 
         return { ok: false, reason: format(strings.panel.validation.booleanField, { label }) };
       }
       return { ok: true, intent: { kind, rowId: rowId.value, selected: raw.selected } };
+    }
+    case 'toggleGroup': {
+      const groupId = readString(raw, 'groupId', label);
+      if (!groupId.ok) {
+        return { ok: false, reason: groupId.message };
+      }
+      if (typeof raw.selected !== 'boolean') {
+        return { ok: false, reason: format(strings.panel.validation.booleanField, { label }) };
+      }
+      return { ok: true, intent: { kind, groupId: groupId.value, selected: raw.selected } };
+    }
+    case 'toggleTree': {
+      const nodeId = readString(raw, 'nodeId', label);
+      if (!nodeId.ok) {
+        return { ok: false, reason: nodeId.message };
+      }
+      if (typeof raw.selected !== 'boolean') {
+        return { ok: false, reason: format(strings.panel.validation.booleanField, { label }) };
+      }
+      return { ok: true, intent: { kind, nodeId: nodeId.value, selected: raw.selected } };
+    }
+    case 'setView': {
+      const view = raw.view;
+      if (typeof view !== 'string' || !VIEW_MODES.has(view)) {
+        return { ok: false, reason: format(strings.panel.validation.viewMode, { view: String(view) }) };
+      }
+      return { ok: true, intent: { kind, view: view as 'tree' | 'list' } };
+    }
+    case 'applyPrefix':
+    case 'applyHistory': {
+      const index = readFiniteNumber(raw, 'index', label);
+      if (!index.ok) {
+        return { ok: false, reason: index.message };
+      }
+      if (!Number.isInteger(index.value) || index.value < 0) {
+        return { ok: false, reason: format(strings.panel.validation.numberField, { label: `${label}.index` }) };
+      }
+      return { ok: true, intent: { kind, index: index.value } };
     }
     case 'syncInput': {
       const fieldId = readString(raw, 'fieldId', label);

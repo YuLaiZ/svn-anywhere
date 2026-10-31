@@ -21,6 +21,8 @@ export interface ActionSpec {
   disabled?: boolean;
   /** 禁用原因：可访问名称与 title 都用它，让不可用可解释。 */
   disabledReason?: string;
+  /** 附加意图参数：渲染为 data-* 属性，视图转发时原样带上（如前缀序号）。 */
+  payload?: Record<string, string>;
 }
 
 export interface RowSpec {
@@ -28,12 +30,21 @@ export interface RowSpec {
   group?: string;
   /** 稳定展示键 → 单元格文本；路径、状态等一律原值，不 trim。 */
   cells: Record<string, string>;
+  /** 行显示名（树内文件名 / 目录条目类型名）；缺省由 cells.path 派生。 */
+  label?: string;
   badges?: Array<{ text: string; kind?: 'muted' | 'warn' }>;
   selected?: boolean;
+  /** 复选框半选态（目录聚合/组头的派生结果，渲染为 indeterminate）。 */
+  indeterminate?: boolean;
   disabled?: boolean;
   disabledReason?: string;
   actions?: ActionSpec[];
-  /** M2 本地变更路径树；冒烟列表为扁平行，阶段 1 启用嵌套。 */
+  /**
+   * 导航目录节点：只组织路径，不是 SVN 提交目标；勾选是「聚合筛选后子树」
+   * 的意图，展开/折叠是视图瞬时状态。折叠 key 用 id。
+   */
+  nav?: { path: string };
+  /** M2 本地变更路径树；导航节点与条目行统一用 children 嵌套。 */
   children?: RowSpec[];
 }
 
@@ -52,11 +63,17 @@ export interface ListSpec {
   groups?: Array<{
     id: string;
     label: string;
-    count: number;
-    selection: 'none' | 'some' | 'all' | 'disabled';
+    /** 组条目数与选择态由渲染层从 rows+filters 派生（不保留第二份真相）；
+     * 这里的静态值仅作为无 rows 时的兜底。 */
+    count?: number;
+    selection?: 'none' | 'some' | 'all' | 'disabled';
   }>;
   rows: RowSpec[];
   filters?: FilterSpec[];
+  /** 渲染模式：树形（嵌套 + 导航目录）或平铺列表；切换不改变选择与筛选。 */
+  viewMode?: 'tree' | 'list';
+  /** 选择工具条上的链接动作（选择可见可提交项 / 清空 / 整组 changelist 选择）。 */
+  selectionActions?: ActionSpec[];
   /** 选择计数（reducer 在筛选变化后重算）：全局已选、可见已选、被筛选隐藏的已选。 */
   selection: { total: number; visible: number; hidden: number };
   /** 无任何条目时的空态。 */
@@ -79,6 +96,8 @@ export interface FormFieldSpec {
 export interface FormSpec {
   id: string;
   fields: FormFieldSpec[];
+  /** 说明区工具条动作（前缀 chips / 前缀管理 / 历史），意图经 formAction 转发。 */
+  tools?: ActionSpec[];
   busy: boolean;
   /** 表单内容与读取/保存基线的比较结论；阶段 2（P2）启用。 */
   dirty?: boolean;
@@ -96,6 +115,13 @@ export interface BannerSpec {
   actions?: ActionSpec[];
 }
 
+/** 页脚动作区：摘要 + 主按钮 + 次按钮（关闭/提交等）。 */
+export interface FooterSpec {
+  summary: string;
+  primary?: ActionSpec;
+  secondary?: ActionSpec[];
+}
+
 /** 宿主 → 视图的渲染状态。 */
 export interface PanelState {
   /** 当前会话代次：目标切换即更换，异步结果须校验后才允许写入。 */
@@ -108,9 +134,15 @@ export interface PanelState {
   /** 表单输入序号：宿主确认一次输入同步后递增。 */
   formRevision: number;
   busy: boolean;
+  /**
+   * 写锁定：提交结果未知/待协调等期间，除核实/重读外的全部写意图被拒绝，
+   * DOM 渲染同步禁用（含动态构建的目录聚合复选框与折叠按钮）。
+   */
+  writeLocked?: boolean;
   banners: BannerSpec[];
   list?: ListSpec;
   form?: FormSpec;
+  footer?: FooterSpec;
 }
 
 /** reducer 的输入事件：视图意图（intent: 前缀）与宿主内部事件（host: 前缀）。 */
@@ -118,6 +150,11 @@ export type PanelEvent =
   | { type: 'intent:dismissBanner'; bannerId: string }
   | { type: 'intent:setFilter'; filterId: string; value: string }
   | { type: 'intent:toggleRow'; rowId: string; selected: boolean }
+  | { type: 'intent:toggleGroup'; groupId: string; selected: boolean }
+  | { type: 'intent:toggleTree'; nodeId: string; selected: boolean }
+  | { type: 'intent:setView'; view: 'tree' | 'list' }
+  | { type: 'intent:selectVisible' }
+  | { type: 'intent:clearSelection' }
   | { type: 'intent:syncInput'; fieldId: string; value: string }
   | { type: 'host:beginBusy' }
   | { type: 'host:endBusy' }
@@ -126,13 +163,16 @@ export type PanelEvent =
 export function reduce(state: PanelState, event: PanelEvent): PanelState {
   switch (event.type) {
     case 'intent:dismissBanner': {
+      if (state.busy || state.writeLocked) {
+        return state;
+      }
       if (!state.banners.some((banner) => banner.id === event.bannerId)) {
         return state;
       }
       return { ...state, banners: state.banners.filter((banner) => banner.id !== event.bannerId) };
     }
     case 'intent:setFilter': {
-      if (state.busy) {
+      if (state.busy || state.writeLocked) {
         return state;
       }
       const list = state.list;
@@ -146,12 +186,12 @@ export function reduce(state: PanelState, event: PanelEvent): PanelState {
       return { ...state, list: { ...withFilters, selection: countSelection(withFilters) } };
     }
     case 'intent:toggleRow': {
-      if (state.busy) {
+      if (state.busy || state.writeLocked) {
         return state;
       }
       const list = state.list;
       const row = list && findRow(list.rows, event.rowId);
-      if (!list || !row || row.disabled) {
+      if (!list || !row || row.nav || row.disabled) {
         return state;
       }
       const nextRows = mapRows(list.rows, (candidate) =>
@@ -160,7 +200,63 @@ export function reduce(state: PanelState, event: PanelEvent): PanelState {
       const nextList = { ...list, rows: nextRows };
       return { ...state, list: { ...nextList, selection: countSelection(nextList) } };
     }
+    case 'intent:toggleGroup': {
+      // 组头勾选只作用于「当前可见（命中筛选）且可提交」的行。
+      const list = rejectWhenLocked(state);
+      if (!list) {
+        return state;
+      }
+      const nextRows = mapSelectableVisible(list.rows, list.filters, (row) =>
+        row.group === event.groupId ? { ...row, selected: event.selected } : row,
+      );
+      const nextList = { ...list, rows: nextRows };
+      return { ...state, list: { ...nextList, selection: countSelection(nextList) } };
+    }
+    case 'intent:toggleTree': {
+      // 目录聚合勾选作用于筛选后子树内可提交的行；折叠不缩小其范围。
+      const list = rejectWhenLocked(state);
+      if (!list || !findRow(list.rows, event.nodeId)?.nav) {
+        return state;
+      }
+      const applySubtree = (rows: RowSpec[]): RowSpec[] =>
+        mapSelectableVisible(rows, list.filters, (row) => ({ ...row, selected: event.selected }));
+      const nextRows = walkRows(list.rows, (row) =>
+        row.id === event.nodeId && row.nav
+          ? { ...row, children: applySubtree(row.children ?? []) }
+          : undefined,
+      );
+      const nextList = { ...list, rows: nextRows };
+      return { ...state, list: { ...nextList, selection: countSelection(nextList) } };
+    }
+    case 'intent:setView': {
+      const list = rejectWhenLocked(state);
+      if (!list) {
+        return state;
+      }
+      return { ...state, list: { ...list, viewMode: event.view } };
+    }
+    case 'intent:selectVisible': {
+      const list = rejectWhenLocked(state);
+      if (!list) {
+        return state;
+      }
+      const nextRows = mapSelectableVisible(list.rows, list.filters, (row) => ({ ...row, selected: true }));
+      const nextList = { ...list, rows: nextRows };
+      return { ...state, list: { ...nextList, selection: countSelection(nextList) } };
+    }
+    case 'intent:clearSelection': {
+      const list = rejectWhenLocked(state);
+      if (!list) {
+        return state;
+      }
+      const nextRows = mapRows(list.rows, (row) => ({ ...row, selected: false }));
+      const nextList = { ...list, rows: nextRows };
+      return { ...state, list: { ...nextList, selection: countSelection(nextList) } };
+    }
     case 'intent:syncInput': {
+      if (state.writeLocked) {
+        return state;
+      }
       const form = state.form;
       const field = form?.fields.find((candidate) => candidate.id === event.fieldId);
       if (!form || !field || field.disabled) {
@@ -219,17 +315,64 @@ export function mapRows(rows: RowSpec[], transform: (row: RowSpec) => RowSpec): 
   });
 }
 
+/**
+ * 递归遍历行树：transform 返回 undefined 表示保持该节点原样（仍递归其子行）；
+ * 返回新行则整体替换该节点（不再递归旧 children，由 transform 自行处理）。
+ */
+export function walkRows(rows: RowSpec[], transform: (row: RowSpec) => RowSpec | undefined): RowSpec[] {
+  return rows.map((row) => {
+    const replaced = transform(row);
+    if (replaced) {
+      return replaced;
+    }
+    return row.children ? { ...row, children: walkRows(row.children, transform) } : row;
+  });
+}
+
+/** 变换「命中筛选且未禁用」的条目行（导航节点只递归不变换）。 */
+function mapSelectableVisible(
+  rows: RowSpec[],
+  filters: FilterSpec[] | undefined,
+  transform: (row: RowSpec) => RowSpec,
+): RowSpec[] {
+  return rows.map((row) => {
+    if (row.nav) {
+      return { ...row, children: mapSelectableVisible(row.children ?? [], filters, transform) };
+    }
+    const next = rowMatchesFilters(row, filters) && !row.disabled ? transform(row) : row;
+    return row.children ? { ...next, children: mapSelectableVisible(row.children, filters, transform) } : next;
+  });
+}
+
+/** 写/锁定期间返回 undefined，调用方据此保持原状态。 */
+function rejectWhenLocked(state: PanelState): ListSpec | undefined {
+  if (state.busy || state.writeLocked) {
+    return undefined;
+  }
+  return state.list;
+}
+
 /** 行是否命中全部筛选（筛选叠加；'all' 哨兵不过滤）。筛选只改可见性。 */
 export function rowMatchesFilters(row: RowSpec, filters?: FilterSpec[]): boolean {
   if (!filters || filters.length === 0) {
     return true;
   }
+  if (row.nav) {
+    // 导航节点自身不参与筛选（是否保留由「有命中后代」决定）。
+    return true;
+  }
   return filters.every((filter) => filter.value === 'all' || row.cells[filter.cellKey] === filter.value);
 }
 
-/** 当前可见行（嵌套行按子行独立判断；阶段 0 冒烟列表为扁平行）。 */
+/**
+ * 当前可见行（命中筛选的条目行，导航目录不计入；嵌套树中命中行会连同
+ * 所在位置由渲染层保留祖先）。计数与组头勾选都以这里的语义为准。
+ */
 export function visibleRows(rows: RowSpec[], filters?: FilterSpec[]): RowSpec[] {
-  return rows.filter((row) => rowMatchesFilters(row, filters));
+  return rows.flatMap((row) => {
+    const own = !row.nav && rowMatchesFilters(row, filters) ? [row] : [];
+    return row.children ? [...own, ...visibleRows(row.children, filters)] : own;
+  });
 }
 
 /** 重算选择计数：全局已选 / 可见已选 / 被筛选隐藏的已选。 */
@@ -239,9 +382,22 @@ export function countSelection(list: ListSpec): ListSpec['selection'] {
   return { total: selectedAll, visible: selectedVisible, hidden: selectedAll - selectedVisible };
 }
 
-function collectSelected(rows: RowSpec[]): RowSpec[] {
+/** 收集已选行（导航节点无选择态，天然跳过）。 */
+export function collectSelectedRows(rows: RowSpec[]): RowSpec[] {
   return rows.flatMap((row) => {
     const own = row.selected ? [row] : [];
-    return row.children ? [...own, ...collectSelected(row.children)] : own;
+    return row.children ? [...own, ...collectSelectedRows(row.children)] : own;
   });
+}
+
+/** 递归收集全部条目行（非导航节点），供分组计数与平铺渲染。 */
+export function collectLeafRows(rows: RowSpec[]): RowSpec[] {
+  return rows.flatMap((row) => {
+    const own = row.nav ? [] : [row];
+    return row.children ? [...own, ...collectLeafRows(row.children)] : own;
+  });
+}
+
+function collectSelected(rows: RowSpec[]): RowSpec[] {
+  return collectSelectedRows(rows);
 }

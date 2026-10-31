@@ -140,6 +140,95 @@ describe('reduce：提示条与快照', () => {
   });
 });
 
+describe('reduce：P1 树形与分组事件', () => {
+  function treeState(): PanelState {
+    // local 组：src 导航下 a(可选)、b(disabled)；unversioned 组：u1。
+    const srcNav: RowSpec = {
+      id: 'local|src',
+      nav: { path: 'src' },
+      cells: {},
+      children: [
+        row('src/a', { group: 'local' }),
+        row('src/b', { group: 'local', disabled: true, disabledReason: '冲突' }),
+      ],
+    };
+    const uNav: RowSpec = {
+      id: 'unversioned|src',
+      nav: { path: 'src' },
+      cells: {},
+      children: [row('src/u1', { group: 'unversioned', cells: { path: 'src/u1', status: 'unversioned', ext: 'none' } })],
+    };
+    const state = listState([srcNav, uNav], [
+      { id: 'status', cellKey: 'status', value: 'all', options: [] },
+    ]);
+    state.list!.groups = [{ id: 'local', label: '本地' }, { id: 'unversioned', label: '未版本控制' }];
+    state.list!.viewMode = 'tree';
+    return state;
+  }
+
+  it('toggleGroup 只作用于该组可见可选行；disabled 行不受影响', () => {
+    const state = treeState();
+    const next = reduce(state, { type: 'intent:toggleGroup', groupId: 'local', selected: true });
+    expect(findRow(next.list!.rows, 'src/a')?.selected).toBe(true);
+    expect(findRow(next.list!.rows, 'src/b')?.selected).toBeFalsy();
+    // 筛选后组头只作用于可见行。
+    const filtered = reduce(next, { type: 'intent:setFilter', filterId: 'status', value: 'unversioned' });
+    const back = reduce(filtered, { type: 'intent:toggleGroup', groupId: 'local', selected: false });
+    expect(findRow(back.list!.rows, 'src/a')?.selected).toBe(true);
+  });
+
+  it('toggleTree 聚合勾选作用于筛选后子树；折叠（视图态）不改变选择', () => {
+    const state = treeState();
+    const next = reduce(state, { type: 'intent:toggleTree', nodeId: 'local|src', selected: true });
+    expect(findRow(next.list!.rows, 'src/a')?.selected).toBe(true);
+    expect(next.list!.selection.total).toBe(1);
+    // unversioned 子树不受 local 导航节点聚合影响。
+    expect(findRow(next.list!.rows, 'src/u1')?.selected).toBeFalsy();
+    // 筛选隐藏 local 子树后，聚合只作用于仍可见的 unversioned 导航子树。
+    const filtered = reduce(state, { type: 'intent:setFilter', filterId: 'status', value: 'unversioned' });
+    const picked = reduce(filtered, { type: 'intent:toggleTree', nodeId: 'unversioned|src', selected: true });
+    expect(findRow(picked.list!.rows, 'src/u1')?.selected).toBe(true);
+  });
+
+  it('setView 切换树/列表不改选择与筛选', () => {
+    const state = reduce(treeState(), { type: 'intent:toggleRow', rowId: 'src/a', selected: true });
+    const next = reduce(state, { type: 'intent:setView', view: 'list' });
+    expect(next.list!.viewMode).toBe('list');
+    expect(next.list!.selection.total).toBe(1);
+    expect(next.list!.filters![0].value).toBe('all');
+  });
+
+  it('selectVisible 只选可见可选行；clearSelection 清空全部', () => {
+    const state = treeState();
+    const some = reduce(state, { type: 'intent:selectVisible' });
+    // 可见可选行：src/a 与 src/u1（disabled 的 src/b 不选）。
+    expect(findRow(some.list!.rows, 'src/a')?.selected).toBe(true);
+    expect(findRow(some.list!.rows, 'src/u1')?.selected).toBe(true);
+    expect(findRow(some.list!.rows, 'src/b')?.selected).toBeFalsy();
+    const cleared = reduce(some, { type: 'intent:clearSelection' });
+    expect(cleared.list!.selection.total).toBe(0);
+  });
+
+  it('writeLocked（结果未知）期间拒绝全部写事件', () => {
+    const state = { ...treeState(), writeLocked: true };
+    expect(reduce(state, { type: 'intent:toggleRow', rowId: 'src/a', selected: true })).toBe(state);
+    expect(reduce(state, { type: 'intent:toggleGroup', groupId: 'local', selected: true })).toBe(state);
+    expect(reduce(state, { type: 'intent:toggleTree', nodeId: 'local|src', selected: true })).toBe(state);
+    expect(reduce(state, { type: 'intent:setView', view: 'list' })).toBe(state);
+    expect(reduce(state, { type: 'intent:selectVisible' })).toBe(state);
+    expect(reduce(state, { type: 'intent:clearSelection' })).toBe(state);
+    expect(reduce(state, { type: 'intent:setFilter', filterId: 'status', value: 'x' })).toBe(state);
+    expect(reduce(state, { type: 'intent:dismissBanner', bannerId: 'n' })).toBe(state);
+  });
+
+  it('嵌套行的可见计数：导航节点不计入，隐藏已选仍计入 hidden', () => {
+    const state = treeState();
+    const picked = reduce(state, { type: 'intent:toggleRow', rowId: 'src/a', selected: true });
+    const filtered = reduce(picked, { type: 'intent:setFilter', filterId: 'status', value: 'unversioned' });
+    expect(filtered.list!.selection).toEqual({ total: 1, visible: 0, hidden: 1 });
+  });
+});
+
 describe('0a typed fixture 复用', () => {
   it('P1 场景 fixture 按 §3.1 字段组合落成正式字段', () => {
     const normal = commitFixture('normal');

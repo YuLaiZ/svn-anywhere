@@ -14,7 +14,6 @@
     "onCommand:svnAnywhere.update",
     "onCommand:svnAnywhere.commit",
     "onCommand:svnAnywhere.showStatus",
-    "onCommand:svnAnywhere.showStatusPanel",
     "onCommand:svnAnywhere.refreshStatus",
     "onCommand:svnAnywhere.cleanup",
     "onCommand:svnAnywhere.relocate",
@@ -42,11 +41,6 @@
       {
         "command": "svnAnywhere.showStatus",
         "title": "显示状态",
-        "category": "SVN Anywhere"
-      },
-      {
-        "command": "svnAnywhere.showStatusPanel",
-        "title": "显示状态面板",
         "category": "SVN Anywhere"
       },
       {
@@ -89,10 +83,6 @@
           "group": "1_info@1"
         },
         {
-          "command": "svnAnywhere.showStatusPanel",
-          "group": "1_info@2"
-        },
-        {
           "command": "svnAnywhere.commit",
           "group": "2_commit@1"
         },
@@ -130,9 +120,6 @@
         },
         {
           "command": "svnAnywhere.showStatus"
-        },
-        {
-          "command": "svnAnywhere.showStatusPanel"
         },
         {
           "command": "svnAnywhere.refreshStatus"

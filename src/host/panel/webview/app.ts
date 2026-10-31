@@ -62,6 +62,8 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
 
   let currentSessionId = '';
   let lastFormRevision = -1;
+  /** 已折叠的导航目录 key（data-nav-key）；视图瞬时状态，宿主重绘后恢复。 */
+  const foldedNavKeys = new Set<string>();
 
   /* --------------------------- 事件委托 --------------------------- */
 
@@ -89,55 +91,77 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
   /** 输入法组合态：compositionstart 置位、compositionend 复位；组合期间不触发快捷动作。 */
   let isComposing = false;
 
+  /**
+   * 点击类意图的通用转发：按 data-intent 组装载荷，参数取自 data-* 标记。
+   * 这里只做标记转发，不判断任何业务对错。
+   */
+  const forwardClickIntent = (holder: HTMLElement): void => {
+    const intent = holder.dataset.intent;
+    if (!intent) {
+      return;
+    }
+    switch (intent) {
+      case 'toggleRow':
+      case 'toggleGroup':
+      case 'toggleTree':
+      case 'setFilter':
+      case 'syncInput':
+        // 复选框/下拉的选中态由 change 事件负责；click 只做禁用守卫。
+        return;
+      case 'openDiff':
+      case 'openFile':
+      case 'rowMore':
+        sendIntent({ kind: intent, itemId: holder.dataset.itemId ?? '' });
+        return;
+      case 'dismissBanner':
+        sendIntent({ kind: 'dismissBanner', bannerId: holder.dataset.bannerId ?? '' });
+        return;
+      case 'bannerAction':
+        sendIntent({
+          kind: 'bannerAction',
+          bannerId: holder.dataset.bannerId ?? '',
+          actionId: holder.dataset.actionId ?? '',
+        });
+        return;
+      case 'applyPrefix':
+      case 'applyHistory':
+        sendIntent({ kind: intent, index: Number(holder.dataset.index ?? 0) });
+        return;
+      case 'setView':
+        sendIntent({ kind: 'setView', view: holder.dataset.view === 'list' ? 'list' : 'tree' });
+        return;
+      default:
+        // refresh/clearFilters/selectVisible/clearSelection/selectChangelist/
+        // managePrefixes/showHistory/submit/closePanel/resolveUnknown 等无参意图。
+        sendIntent({ kind: intent });
+    }
+  };
+
   const onClick = (event: MouseEvent): void => {
     if (isComposing) {
       return;
     }
     const target = event.target instanceof Element ? event.target : null;
+    // 导航目录折叠是视图瞬时行为，不产生意图；禁用守卫与 DOM disabled 一致。
+    const toggle = target?.closest<HTMLElement>('.tree-toggle');
+    if (toggle && !toggle.hasAttribute('disabled')) {
+      const key = toggle.dataset.navKey;
+      if (key !== undefined) {
+        const folded = !foldedNavKeys.has(key);
+        if (folded) {
+          foldedNavKeys.add(key);
+        } else {
+          foldedNavKeys.delete(key);
+        }
+        applyFold(toggle, folded);
+      }
+      return;
+    }
     const holder = target?.closest<HTMLElement>('[data-intent]');
     if (!holder || holder.hasAttribute('disabled') || (holder instanceof HTMLInputElement && holder.disabled)) {
       return;
     }
-    const intent = holder.dataset.intent;
-    if (!intent) {
-      return;
-    }
-    if (intent === 'toggleRow') {
-      // checkbox 的选中态由 change 事件负责；click 只做禁用守卫。
-      return;
-    }
-    if (intent === 'setFilter') {
-      return;
-    }
-    if (intent === 'openDiff' || intent === 'openFile') {
-      const itemId = holder.dataset.itemId;
-      if (itemId !== undefined) {
-        sendIntent({ kind: intent, itemId });
-      }
-      return;
-    }
-    if (intent === 'dismissBanner') {
-      const bannerId = holder.dataset.bannerId;
-      if (bannerId !== undefined) {
-        sendIntent({ kind: 'dismissBanner', bannerId });
-      }
-      return;
-    }
-    if (intent === 'bannerAction') {
-      const bannerId = holder.dataset.bannerId;
-      const actionId = holder.dataset.actionId;
-      if (bannerId !== undefined && actionId !== undefined) {
-        sendIntent({ kind: 'bannerAction', bannerId, actionId });
-      }
-      return;
-    }
-    if (intent === 'clearFilters') {
-      sendIntent({ kind: 'clearFilters' });
-      return;
-    }
-    if (intent === 'refresh') {
-      sendIntent({ kind: 'refresh' });
-    }
+    forwardClickIntent(holder);
   };
 
   const onChange = (event: Event): void => {
@@ -146,12 +170,19 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
       return;
     }
     const intent = target.dataset.intent;
-    if (intent === 'toggleRow' && target instanceof HTMLInputElement) {
-      const rowId = target.dataset.rowId;
-      if (rowId !== undefined) {
-        sendIntent({ kind: 'toggleRow', rowId, selected: target.checked });
+    if (target instanceof HTMLInputElement) {
+      if (intent === 'toggleRow') {
+        sendIntent({ kind: 'toggleRow', rowId: target.dataset.rowId ?? '', selected: target.checked });
+        return;
       }
-      return;
+      if (intent === 'toggleGroup') {
+        sendIntent({ kind: 'toggleGroup', groupId: target.dataset.groupId ?? '', selected: target.checked });
+        return;
+      }
+      if (intent === 'toggleTree') {
+        sendIntent({ kind: 'toggleTree', nodeId: target.dataset.nodeId ?? '', selected: target.checked });
+        return;
+      }
     }
     if (intent === 'setFilter' && target instanceof HTMLSelectElement) {
       const filterId = target.dataset.filterId;
@@ -243,7 +274,30 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
         control.value = pending.value;
       }
     }
+    // 派生半选态（组头/目录聚合）：宿主只输出 data-indeterminate 标记，
+    // indeterminate 属性无法用 HTML 表达，这里统一落到 DOM。
+    for (const box of root.querySelectorAll<HTMLInputElement>('[data-indeterminate="1"]')) {
+      box.indeterminate = true;
+    }
+    // 恢复导航目录的折叠状态（视图瞬时状态，不因宿主重绘丢失）。
+    for (const toggle of root.querySelectorAll<HTMLElement>('.tree-toggle')) {
+      const key = toggle.dataset.navKey;
+      if (key !== undefined && foldedNavKeys.has(key)) {
+        applyFold(toggle, true);
+      }
+    }
     restoreState(snapshot);
+  };
+
+  /** 应用一个导航目录的折叠/展开状态到 DOM（符号、aria 与子树显隐）。 */
+  const applyFold = (toggle: HTMLElement, folded: boolean): void => {
+    toggle.textContent = folded ? '▸' : '▾';
+    toggle.setAttribute('aria-expanded', folded ? 'false' : 'true');
+    const branch = toggle.closest('.tree-branch');
+    const children = branch?.querySelector<HTMLElement>(':scope > .tree-children');
+    if (children) {
+      children.hidden = folded;
+    }
   };
 
   const showToast = (level: string, message: string): void => {
@@ -266,7 +320,12 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
     }
     const message = raw as Record<string, unknown>;
     if (message.type === 'render') {
-      currentSessionId = String(message.sessionId ?? '');
+      const nextSessionId = String(message.sessionId ?? '');
+      if (nextSessionId !== currentSessionId) {
+        // 目标切换：上一会话的折叠状态不带入新目标。
+        foldedNavKeys.clear();
+      }
+      currentSessionId = nextSessionId;
       const formRevision = Number(message.formRevision ?? -1);
       if (Number.isFinite(formRevision) && formRevision >= lastFormRevision) {
         lastFormRevision = formRevision;

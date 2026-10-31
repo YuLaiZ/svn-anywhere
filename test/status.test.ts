@@ -42,8 +42,8 @@ describe('parseStatusXml', () => {
     const result = parseStatusXml(SAMPLE_WITH_ENTRIES);
     expect(result.targetPath).toBe('.');
     expect(result.entries).toEqual([
-      { path: 'src/a.txt', wcStatus: 'modified', kind: undefined, revision: 3, props: 'none' },
-      { path: 'src/new.txt', wcStatus: 'unversioned', kind: undefined, revision: undefined, props: 'none' },
+      { path: 'src/a.txt', wcStatus: 'modified', kind: undefined, revision: 3, props: 'none', changelist: null },
+      { path: 'src/new.txt', wcStatus: 'unversioned', kind: undefined, revision: undefined, props: 'none', changelist: null },
     ]);
   });
 
@@ -84,8 +84,8 @@ describe('parseStatusXml', () => {
 </target></status>`);
     expect(conflict.entries.map((e) => e.wcStatus)).toEqual(['added']);
 
-    expect(parseStatusXml('')).toEqual({ targetPath: '', entries: [] });
-    expect(parseStatusXml('<not-svn/>')).toEqual({ targetPath: '', entries: [] });
+    expect(parseStatusXml('')).toEqual({ targetPath: '', entries: [], externals: [] });
+    expect(parseStatusXml('<not-svn/>')).toEqual({ targetPath: '', entries: [], externals: [] });
   });
 
   it('纯属性变更样本：item 为 normal、props 为 modified，条目保留原词', () => {
@@ -95,10 +95,11 @@ describe('parseStatusXml', () => {
 </wc-status></entry>
 </target></status>`);
     expect(result.entries).toEqual([
-      { path: '.', wcStatus: 'normal', kind: undefined, revision: 1, props: 'modified' },
+      { path: '.', wcStatus: 'normal', kind: undefined, revision: 1, props: 'modified', changelist: null },
     ]);
   });
 });
+
 
 describe('commitableEntries', () => {
   it('纯属性变更（normal + props modified）属于可提交项', () => {
@@ -128,7 +129,7 @@ describe('runStatus 集成（本地 file:// 副本）', () => {
     // 与终端 svn status 一致：目标传相对路径，条目路径为相对形态。
     const result = await runStatus('svn', 'a.txt', { cwd: wc });
     expect(result.entries).toEqual([
-      { path: 'a.txt', wcStatus: 'modified', kind: undefined, revision: 1, props: 'none' },
+      { path: 'a.txt', wcStatus: 'modified', kind: undefined, revision: 1, props: 'none', changelist: null },
     ]);
   });
 
@@ -242,6 +243,55 @@ describe('runStatus 集成（本地 file:// 副本）', () => {
         .map((line) => `${PLAIN_CODE_TO_ITEM[line[0].trim()]} ${line.slice(8).trim()}`),
     );
     expect([...fromXml].sort()).toEqual([...fromPlain].sort());
+  });
+});
+
+describe('parseStatusXml changelist 容器', () => {
+  it('changelist 容器条目带名称原值，未分组条目直挂 target 且 changelist 为 null', () => {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<status>
+<target path=".">
+<entry path="plain.txt">
+<wc-status item="modified" props="none"></wc-status>
+</entry>
+</target>
+<changelist name=" spaced ">
+<entry path="grouped.txt">
+<wc-status item="modified" props="none"></wc-status>
+</entry>
+</changelist>
+<changelist name="all">
+<entry path="sentinel.txt">
+<wc-status item="unversioned" props="none"></wc-status>
+</entry>
+</changelist>
+</status>
+`;
+    const result = parseStatusXml(xml);
+    expect(result.entries).toEqual([
+      { path: 'plain.txt', wcStatus: 'modified', kind: undefined, revision: undefined, props: 'none', changelist: null },
+      { path: 'grouped.txt', wcStatus: 'modified', kind: undefined, revision: undefined, props: 'none', changelist: ' spaced ' },
+      { path: 'sentinel.txt', wcStatus: 'unversioned', kind: undefined, revision: undefined, props: 'none', changelist: 'all' },
+    ]);
+  });
+
+  it('真实副本：分组条目与未分组条目同时读取，changelist 名保留首尾空格', async () => {
+    const wc = lab.checkout('cl-wc');
+    writeFile(wc, 'cl-grouped.txt', 'v1');
+    writeFile(wc, 'cl-plain.txt', 'v1');
+    lab.svn(['add', '-q', 'cl-grouped.txt', 'cl-plain.txt'], wc);
+    lab.svn(['commit', '-q', '-m', 'cl init'], wc);
+    writeFile(wc, 'cl-grouped.txt', 'v2');
+    writeFile(wc, 'cl-plain.txt', 'v2');
+    lab.svn(['changelist', '-q', ' x ', 'cl-grouped.txt'], wc);
+    const result = await runStatus('svn', '.', { cwd: wc });
+    const a = result.entries.find((entry) => entry.path === 'cl-grouped.txt');
+    const b = result.entries.find((entry) => entry.path === 'cl-plain.txt');
+    expect(a?.changelist).toBe(' x ');
+    expect(b?.changelist).toBeNull();
+    // 远端解析同样读取 changelist 容器（-u 输出与 target 平级）。
+    const remote = await runRemoteStatus('svn', '.', { cwd: wc });
+    expect(remote.entries.some((entry) => entry.path === 'cl-grouped.txt')).toBe(true);
   });
 });
 

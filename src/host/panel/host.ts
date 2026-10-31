@@ -26,6 +26,7 @@ import {
   type ViewToHostMessage,
 } from './protocol';
 import type { PanelState } from './state';
+import { findRow } from './state';
 import { render } from './view';
 
 export interface PanelController {
@@ -314,9 +315,22 @@ async function handleViewMessage(entry: PanelEntry, raw: unknown): Promise<void>
     });
     return;
   }
-  // 条目操作能力校验：意图引用的条目必须存在于当前状态。
+  if (!busy && entry.state?.writeLocked && intent.kind !== 'resolveUnknown' && intent.kind !== 'refresh') {
+    // 结果未知/待核实等写锁定期间，连同输入同步在内的全部写意图都被拒绝；
+    // 只放行核实/恢复与重读动作（由控制器自行分发）。
+    postToView(entry, {
+      type: 'toast',
+      protocolVersion: PROTOCOL_VERSION,
+      sessionId: entry.sessionId,
+      level: 'info',
+      message: strings.panel.toastBusyRejected,
+    });
+    return;
+  }
+  // 条目操作能力校验：意图引用的条目必须存在于当前状态（嵌套行递归查找）。
   if (entry.state) {
-    const invalid = intentRequiresItem(intent) && !entry.state.list?.rows.some((row) => row.id === intent.itemId);
+    const invalid =
+      intentRequiresItem(intent) && !entry.state.list?.rows.some((row) => findRow([row], intent.itemId));
     if (invalid) {
       return;
     }
@@ -338,7 +352,7 @@ async function handleViewMessage(entry: PanelEntry, raw: unknown): Promise<void>
 }
 
 function intentRequiresItem(intent: Intent): intent is Intent & { itemId: string } {
-  return intent.kind === 'openDiff' || intent.kind === 'openFile';
+  return intent.kind === 'openDiff' || intent.kind === 'openFile' || intent.kind === 'rowMore';
 }
 
 /** 测试辅助：重置面板注册表（真实宿主不需要）。 */

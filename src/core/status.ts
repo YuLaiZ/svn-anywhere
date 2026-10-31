@@ -19,11 +19,16 @@ export interface StatusEntry {
   revision?: number;
   /** 属性状态（none / normal / modified）。 */
   props?: string;
+  /** 所属 changelist 名称原值（含首尾空格）；未分组条目为 null。 */
+  changelist: string | null;
 }
 
 export interface StatusResult {
   targetPath: string;
   entries: StatusEntry[];
+  /** externals 边界目录路径（item=external 的条目，未进 entries）。
+   * 外部副本内部的变更仍会出现在 entries 中，调用方须按这些前缀隔离。 */
+  externals: string[];
 }
 
 const parser = new XMLParser({
@@ -33,11 +38,12 @@ const parser = new XMLParser({
   trimValues: false,
   // SVN 用数字实体表示路径控制字符；解码一次，保留 &amp; 编码的字面实体。
   htmlEntities: true,
-  // status XML 里 entry 一定按集合处理，单个条目也要保持数组形态。
-  isArray: (name) => name === 'entry',
+  // status XML 里 entry 一定按集合处理，单个条目也要保持数组形态；
+  // changelist 容器同理（多个分组必然是数组，单个分组保持数组形态）。
+  isArray: (name) => name === 'entry' || name === 'changelist',
 });
 
-/** M1 不展示的条目：svn 默认参数不输出 ignored，external 防御性过滤占位行。 */
+/** 不进面板/展示的条目：svn 默认参数不输出 ignored；external 在入口单独收集。 */
 const HIDDEN_ITEMS = new Set(['ignored', 'external']);
 
 function toNumber(value: unknown): number | undefined {
@@ -64,38 +70,56 @@ export function parseStatusXml(xml: string): StatusResult {
     status?: {
       target?: {
         path?: string;
-        entry?: Array<{
-          path?: string;
-          'wc-status'?: {
-            item?: string;
-            kind?: string;
-            revision?: string | number;
-            props?: string;
-          };
-        }>;
+        entry?: StatusXmlEntry[];
       };
+      /** 与 <target> 平级的分组容器：svn 把分了 changelist 的条目挪进来。 */
+      changelist?: Array<{ name?: string; entry?: StatusXmlEntry[] }>;
     };
   };
 
   const target = parsed.status?.target;
   const entries: StatusEntry[] = [];
+  const externals: string[] = [];
   for (const entry of target?.entry ?? []) {
-    const wcStatus = entry['wc-status'];
-    if (!entry.path || !wcStatus?.item) {
+    // 未分组条目直挂 <target>；externals 边界目录单独记录（副本边界隔离用）。
+    if (entry['wc-status']?.item === 'external' && entry.path) {
+      externals.push(entry.path);
       continue;
     }
-    if (HIDDEN_ITEMS.has(wcStatus.item)) {
-      continue;
-    }
-    entries.push({
-      path: entry.path,
-      wcStatus: wcStatus.item,
-      kind: wcStatus.kind,
-      revision: toNumber(wcStatus.revision),
-      props: wcStatus.props,
-    });
+    pushEntry(entries, entry, null);
   }
-  return { targetPath: target?.path ?? '', entries };
+  for (const group of parsed.status?.changelist ?? []) {
+    for (const entry of group.entry ?? []) {
+      // changelist 名称保留 XML 原值（含首尾空格），不 trim。
+      pushEntry(entries, entry, typeof group.name === 'string' ? group.name : null);
+    }
+  }
+  return { targetPath: target?.path ?? '', entries, externals };
+}
+
+interface StatusXmlEntry {
+  path?: string;
+  'wc-status'?: {
+    item?: string;
+    kind?: string;
+    revision?: string | number;
+    props?: string;
+  };
+}
+
+function pushEntry(entries: StatusEntry[], entry: StatusXmlEntry, changelist: string | null): void {
+  const wcStatus = entry['wc-status'];
+  if (!entry.path || !wcStatus?.item || HIDDEN_ITEMS.has(wcStatus.item)) {
+    return;
+  }
+  entries.push({
+    path: entry.path,
+    wcStatus: wcStatus.item,
+    kind: wcStatus.kind,
+    revision: toNumber(wcStatus.revision),
+    props: wcStatus.props,
+    changelist,
+  });
 }
 
 /** 对目标路径执行 `svn status --xml` 并解析。target 须经 escapePeg 转义。 */

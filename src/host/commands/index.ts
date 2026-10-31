@@ -12,11 +12,11 @@ import { commandRefreshStatus } from './refreshStatus';
 import { commandShowOutput } from './showOutput';
 import { commandShowStatus } from './showStatus';
 import { commandUpdate } from './update';
-import { commandShowStatusPanel, setStatusPanelContext } from '../panel/panels/statusList';
+import { setCommitPanelContext } from '../panel/panels/commit';
+import { initializeOperationStore } from '../../core/operations';
 
 const COMMANDS: ReadonlyArray<{ id: string; handler: CommandHandler }> = [
   { id: 'svnAnywhere.showStatus', handler: commandShowStatus },
-  { id: 'svnAnywhere.showStatusPanel', handler: commandShowStatusPanel },
   { id: 'svnAnywhere.commit', handler: commandCommit },
   { id: 'svnAnywhere.update', handler: commandUpdate },
   { id: 'svnAnywhere.refreshStatus', handler: commandRefreshStatus },
@@ -32,14 +32,21 @@ const COMMANDS: ReadonlyArray<{ id: string; handler: CommandHandler }> = [
  * already exists，重复注册会让 activate 失败。
  */
 let registeredDisposables: vscode.Disposable[] = [];
+/** 操作记录持久化已随首次 activate 注入；重复 activate 幂等。 */
+let operationStoreReady = false;
 
 export function registerAllCommands(context: vscode.ExtensionContext): void {
   for (const disposable of registeredDisposables) {
     disposable.dispose();
   }
   registeredDisposables = [];
-  // 面板创建需要 extensionUri（CSP/asWebviewUri）与 subscriptions；activate 注入一次。
-  setStatusPanelContext(context);
+  // 面板创建需要 extensionUri / subscriptions / globalState；activate 注入一次。
+  setCommitPanelContext(context);
+  if (!operationStoreReady) {
+    operationStoreReady = true;
+    // 未完成操作记录跨会话恢复限制（写锁在面板打开时生效）。
+    void initializeOperationStore(context.globalState);
+  }
   for (const { id, handler } of COMMANDS) {
     registeredDisposables.push(registerCommand(context, id, handler));
   }

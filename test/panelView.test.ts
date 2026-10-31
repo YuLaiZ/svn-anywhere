@@ -209,3 +209,117 @@ describe('render：说明输入与计数', () => {
     expect(html).toContain('tmp/scratch.md');
   });
 });
+
+describe('render：P1 树形与提交面板片段', () => {
+  function treeRows(): RowSpec[] {
+    return [
+      {
+        id: 'local|src',
+        group: 'local',
+        nav: { path: 'src' },
+        cells: {},
+        children: [
+          { id: 'src/a.ts', group: 'local', cells: { path: 'src/a.ts', status: 'modified' }, selected: true },
+          { id: 'src/b.ts', group: 'local', cells: { path: 'src/b.ts', status: 'modified' } },
+        ],
+      },
+      {
+        id: 'unversioned|new',
+        group: 'unversioned',
+        nav: { path: 'new' },
+        cells: {},
+        children: [
+          { id: 'new/u.ts', group: 'unversioned', cells: { path: 'new/u.ts', status: 'unversioned' }, selected: false },
+        ],
+      },
+    ];
+  }
+
+  it('树模式渲染导航目录（聚合勾选+折叠按钮）与树内 basename 显示', () => {
+    const state = listState(treeRows(), {
+      viewMode: 'tree',
+      groups: [{ id: 'local', label: '本地变更' }, { id: 'unversioned', label: '未版本控制' }],
+    });
+    const html = render(state);
+    expect(html).toContain('tree-folder');
+    expect(html).toContain('data-node-id="local|src"');
+    expect(html).toContain('data-nav-key="local|src"');
+    expect(html).toContain('data-intent="toggleTree"');
+    // 树内叶行显示 basename，title 保留完整路径。
+    expect(html).toMatch(/title="src\/a\.ts"[^>]*>a\.ts</);
+    // 组头渲染与 data-indeterminate 半选标记（local 组 2 选 1）。
+    expect(html).toContain('data-intent="toggleGroup"');
+    expect(html).toContain('data-group-id="local"');
+  });
+
+  it('列表模式平铺完整路径，无导航节点', () => {
+    const state = listState(treeRows(), {
+      viewMode: 'list',
+      groups: [{ id: 'local', label: '本地变更' }, { id: 'unversioned', label: '未版本控制' }],
+    });
+    const html = render(state);
+    expect(html).not.toContain('tree-folder');
+    expect(html).toContain('>src/a.ts</span>');
+    expect(html).toContain('>new/u.ts</span>');
+  });
+
+  it('成功卡片独立渲染（level=success 的 commitSuccess banner）', () => {
+    const state = baseState({
+      banners: [{ id: 'commitSuccess', level: 'success', title: '提交成功', detail: '已提交 2 项 · revision r9' }],
+    });
+    const html = render(state);
+    expect(html).toContain('success-card');
+    expect(html).toContain('success-icon');
+    expect(html).not.toContain('<div class="banners">');
+  });
+
+  it('unknown 写锁定：折叠按钮、提交、关闭、筛选全部禁用', () => {
+    const state = listState(treeRows(), {
+      viewMode: 'tree',
+      groups: [{ id: 'local', label: '本地变更' }],
+    });
+    state.writeLocked = true;
+    state.footer = {
+      summary: '提交结果待核实，暂不能重提',
+      primary: { id: 'submit', label: '待核实', disabled: true },
+      secondary: [{ id: 'closePanel', label: '关闭', disabled: true }],
+    };
+    const html = render(state);
+    expect(html).toMatch(/data-nav-key="local\|src"[^>]*disabled/);
+    expect(html).toMatch(/data-intent="setFilter"[^>]*disabled/);
+    expect(html).toMatch(/data-intent="submit"[^>]*disabled/);
+  });
+
+  it('选择工具条渲染已选计数与动作链接', () => {
+    const state = listState(treeRows(), {
+      groups: [{ id: 'local', label: '本地变更' }, { id: 'unversioned', label: '未版本控制' }],
+      selectionActions: [
+        { id: 'selectVisible', label: '选择可见可提交项' },
+        { id: 'clearSelection', label: '清空全部勾选' },
+      ],
+      selection: { total: 1, visible: 1, hidden: 0 },
+    });
+    const html = render(state);
+    expect(html).toContain('selection-bar');
+    expect(html).toContain('已选 1 项');
+    expect(html).toContain('data-intent="selectVisible"');
+  });
+
+  it('说明工具条渲染前缀 chips 与历史按钮', () => {
+    const state = baseState({
+      form: {
+        id: 'message',
+        busy: false,
+        fields: [{ id: 'message', label: '提交说明', value: '', type: 'textarea' }],
+        tools: [
+          { id: 'applyPrefix', label: '修复', payload: { index: '0' } },
+          { id: 'managePrefixes', label: '前缀…' },
+        ],
+      },
+    });
+    const html = render(state);
+    expect(html).toContain('class="chip"');
+    expect(html).toContain('data-intent="applyPrefix"');
+    expect(html).toContain('data-index="0"');
+  });
+});

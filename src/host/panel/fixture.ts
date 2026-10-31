@@ -164,7 +164,7 @@ export const FIXTURE_COMMIT_ITEMS: CommitItem[] = [
   commitItem('s1', 'src/core/status.ts', 'modified', { changelist: 'mylist' }),
   commitItem('s2', 'src/host/commit.ts', 'modified', { changelist: 'mylist' }),
   commitItem('s3', 'src/host/panel/host.ts', 'added'),
-  commitItem('s4', 'src/host/ui/commitQuickPick.ts', 'deleted'),
+  commitItem('s4', 'src/host/legacy-picker.ts', 'deleted'),
   commitItem('s5', 'package.json', 'modified', { changelist: 'other', props: 'modified' }),
   commitItem('s6', 'src/', 'normal', { kind: 'dir', props: 'modified' }),
   commitItem('u1', 'notes.txt', 'unversioned', { group: 'unversioned' }),
