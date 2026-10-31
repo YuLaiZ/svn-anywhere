@@ -38,11 +38,17 @@ export const strings = {
   update: {
     confirmTitle: '将更新以下路径：\n{target}',
     confirmButton: '更新',
+    revisionPrompt: '输入要更新到的 revision（正整数或 HEAD）',
+    revisionInvalid: '版本号须为正整数或 HEAD，请重新输入。',
     progress: '正在更新 {target}…',
+    progressRevision: '正在更新 {target} 至 revision {revision}…',
     done: '更新完成，当前 revision {revision}。',
     doneNoRevision: '更新完成。',
     conflicts: '更新完成，但有 {count} 个冲突需要先解决：{paths}',
     conflictsUnresolved: '更新输出报告了 {count} 个冲突，但未能定位冲突文件，请在输出面板确认。',
+    openConflictButton: '打开冲突文件',
+    conflictPickPlaceholder: '选择要打开的冲突文件',
+    conflictMissingLocal: '{path} 的本地文件不存在，无法打开。',
   },
   cleanup: {
     progress: '正在清理 {target}…',

@@ -6,11 +6,32 @@
  */
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { parseUpdateOutput, runUpdate } from '../src/core/update';
+import { normalizeUpdateRevision, parseUpdateOutput, runUpdate } from '../src/core/update';
 import { createSvnLab, writeFile } from './helpers';
 
 const lab = createSvnLab('svn-anywhere-update-');
 afterAll(() => lab.cleanup());
+
+describe('normalizeUpdateRevision（更新版本号输入校验）', () => {
+  it('正整数与 HEAD 合法；前导零归一化、大小写不敏感、允许首尾空白', () => {
+    expect(normalizeUpdateRevision('2')).toBe('2');
+    expect(normalizeUpdateRevision('007')).toBe('7');
+    expect(normalizeUpdateRevision(' 12 ')).toBe('12');
+    expect(normalizeUpdateRevision('HEAD')).toBe('HEAD');
+    expect(normalizeUpdateRevision('head')).toBe('HEAD');
+  });
+
+  it('零、负数、小数、非数字与非空白的非法输入返回 undefined', () => {
+    expect(normalizeUpdateRevision('0')).toBeUndefined();
+    expect(normalizeUpdateRevision('-1')).toBeUndefined();
+    expect(normalizeUpdateRevision('1.5')).toBeUndefined();
+    expect(normalizeUpdateRevision('abc')).toBeUndefined();
+    expect(normalizeUpdateRevision('')).toBeUndefined();
+    expect(normalizeUpdateRevision('   ')).toBeUndefined();
+    expect(normalizeUpdateRevision('r2')).toBeUndefined();
+    expect(normalizeUpdateRevision('2 3')).toBeUndefined();
+  });
+});
 
 describe('parseUpdateOutput', () => {
   it('解析主会话实测样本：明细行、最终 revision、冲突路径', () => {
@@ -198,6 +219,31 @@ describe('runUpdate 集成（本地 file:// 副本）', () => {
 
     const result = await runUpdate('svn', join(wc, 'archive@2.txt'), { cwd: wc });
     expect(result.items).toEqual([{ status: 'U', path: 'archive@2.txt' }]);
+  });
+
+  it('指定 revision 更新：-r 1 后 svn info 显示 revision 1，再 -r HEAD 回到最新', async () => {
+    const wc = lab.checkout('u-rev-wc');
+    // a.txt 已随首个用例的 init 提交入库（r1），直接改内容再提交。
+    writeFile(wc, 'a.txt', 'v1\n');
+    lab.svn(['commit', '-q', '-m', 'rev base'], wc);
+    writeFile(wc, 'a.txt', 'v2\n');
+    lab.svn(['commit', '-q', '-m', 'rev second'], wc);
+
+    const infoRevision = () =>
+      Number(lab.svn(['info', '--show-item', 'revision', '.'], wc).trim());
+    // 仓库被共享用例复用，HEAD 动态取（首个用例的 init 提交保证 r1 存在）。
+    const head = headRevision(lab);
+
+    // 更新到 r1：内容回退、副本 revision 变为 1。
+    const toR1 = await runUpdate('svn', '.', { cwd: wc }, '1');
+    expect(toR1.finalRevision).toBe(1);
+    expect(infoRevision()).toBe(1);
+    expect(toR1.items.some((item) => item.path === 'a.txt')).toBe(true);
+
+    // 再以 HEAD 更新回最新。
+    const toHead = await runUpdate('svn', '.', { cwd: wc }, 'HEAD');
+    expect(toHead.finalRevision).toBe(head);
+    expect(infoRevision()).toBe(head);
   });
 });
 

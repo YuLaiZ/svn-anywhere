@@ -4,7 +4,7 @@
  * 还用本地 svnadmin + file:// 临时副本驱动真实的更新/状态/清理命令链路。
  * 用法：`pnpm run mock-host`（先构建再运行）。任一场景失败退出码为 1。
  */
-const { mkdtempSync, rmSync, mkdirSync, writeFileSync, realpathSync, existsSync, readFileSync, symlinkSync } = require('node:fs');
+const { mkdtempSync, rmSync, mkdirSync, writeFileSync, realpathSync, existsSync, readFileSync, symlinkSync, statSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const { execFileSync } = require('node:child_process');
@@ -20,9 +20,16 @@ const state = {
   disposables: [],
   /** 模态确认框（更新确认）返回的按钮；undefined 表示用户取消。 */
   confirmResult: undefined,
+  /** 非模态警告消息（如冲突提示）按钮点击结果；undefined 表示未点击。 */
+  warningChoice: undefined,
+  /** 警告挂起门：'hold' 时带按钮的非模态警告返回挂起 promise（模拟用户未处理通知）。 */
+  warningGate: 'off',
+  warningGateResolvers: [],
   progressTitles: [],
   /** 提交说明输入框返回值。 */
   inputResult: undefined,
+  /** InputBox 输入队列（逐个弹出，优先于 inputResult；元素 undefined 表示该次取消）。 */
+  inputQueue: [],
   quickPickTitles: [],
   /** QuickPick 指定勾选的 label 集合；undefined 表示默认勾选。 */
   quickPickPicked: undefined,
@@ -60,6 +67,7 @@ const fakeVscode = {
     },
   },
   TabInputText: class {},
+  FileType: { File: 1, Directory: 2, SymbolicLink: 64 },
   window: {
     createOutputChannel(title) {
       const ch = {
@@ -79,10 +87,22 @@ const fakeVscode = {
       const choice = state.inputResult === undefined ? undefined : state.messageChoice;
       return Promise.resolve(items.length > 0 ? choice : undefined);
     },
-    showWarningMessage(message, _options, ...items) {
-      // 带按钮参数的调用是模态确认框；返回 state.confirmResult 决定确认/取消。
+    showWarningMessage(message, ...rest) {
+      // 两种形态：模态确认框（第二参 { modal: true }，confirmResult 决定
+      // 确认/取消）与带字符串按钮的非模态警告（如冲突提示，warningChoice
+      // 决定点击结果）；无按钮消息返回 undefined。
       state.warning.push(message);
-      return Promise.resolve(items.length > 0 ? state.confirmResult : undefined);
+      const first = rest[0];
+      const modalOpt = first && typeof first === 'object' && first.modal ? first : undefined;
+      const items = modalOpt ? rest.slice(1) : rest;
+      if (items.length === 0) {
+        return Promise.resolve(undefined);
+      }
+      // 挂起门：模拟带按钮通知已弹出、用户尚未处理的窗口期。
+      if (!modalOpt && state.warningGate === 'hold') {
+        return new Promise((resolve) => state.warningGateResolvers.push(resolve));
+      }
+      return Promise.resolve(modalOpt ? state.confirmResult : state.warningChoice);
     },
     showErrorMessage(message) {
       state.warning.push(`[error] ${message}`);
@@ -97,6 +117,10 @@ const fakeVscode = {
       return task({ report() {} }, { onCancellationRequested: () => ({ dispose() {} }) });
     },
     showInputBox() {
+      // 队列优先：驱动「非法输入提示后重试」链路；元素 undefined 表示该次取消。
+      if (state.inputQueue.length > 0) {
+        return Promise.resolve(state.inputQueue.shift());
+      }
       return Promise.resolve(state.inputResult);
     },
     showTextDocument: async () => undefined,
@@ -218,6 +242,18 @@ const fakeVscode = {
     },
     getConfiguration() {
       return { get: (_key, fallback) => fallback };
+    },
+    fs: {
+      // 真实文件系统探查（冲突路径定位用）；不存在时抛错，与宿主语义一致。
+      stat: async (uri) => {
+        const st = statSync(uri.fsPath);
+        return {
+          type: st.isDirectory() ? 2 : st.isFile() ? 1 : 0,
+          ctime: st.ctimeMs,
+          mtime: st.mtimeMs,
+          size: st.size,
+        };
+      },
     },
   },
   commands: {
@@ -521,6 +557,7 @@ async function main() {
   svn(['add', '-q', '--parents', 'remote-new.txt'], remote);
   svn(['commit', '-q', '-m', 'remote add'], remote);
   state.confirmResult = '更新';
+  state.inputQueue = ['HEAD'];
   const linesBeforeUpdate = channelText().length;
   // 对目录驱动更新：单文件目标拉不到远端新增文件。
   await state.registered.get('svnAnywhere.update')({ fsPath: probe, scheme: 'file' });
@@ -556,6 +593,7 @@ async function main() {
   svn(['commit', '-q', '-m', 'remote edit a'], remote);
   writeFileSync(join(probe, 'a.txt'), 'local edit\n');
   state.confirmResult = '更新';
+  state.inputQueue = ['HEAD'];
   const warningBeforeConflict = state.warning.length;
   const linesBeforeConflict = channelText().length;
   await state.registered.get('svnAnywhere.update')({ fsPath: probe, scheme: 'file' });
@@ -1340,6 +1378,7 @@ async function main() {
   rmSync(join(extMain, '.svn', 'ext-def.tmp'));
   svn(['commit', '-q', '-m', 'declare externals'], extMain);
   state.confirmResult = '更新';
+  state.inputQueue = ['HEAD'];
   await state.registered.get('svnAnywhere.update')({ fsPath: extMain, scheme: 'file' });
   state.confirmResult = undefined;
   // 外部副本内产生修改 + 主副本修改。
@@ -1745,6 +1784,7 @@ async function main() {
   rmSync(join(main40e, '.svn', 'ext-def.tmp'));
   svn(['commit', '-q', '-m', 'init with externals'], main40e);
   state.confirmResult = '更新';
+  state.inputQueue = ['HEAD'];
   await state.registered.get('svnAnywhere.update')({ fsPath: main40e, scheme: 'file' });
   writeFileSync(join(main40e, 'vendor', 's.txt'), 'v2 in external');
   writeFileSync(join(main40e, 'a.txt'), 'v2 main');
@@ -1807,6 +1847,156 @@ async function main() {
   await state.registered.get('svnAnywhere.revealInFinder')(undefined);
   check('无 uri 且无活动编辑器时静默返回（不转发）',
     state.executedCommands.length === executedBefore42 + 1);
+
+  console.log('场景 43：右键「更新」输入指定版本号——-r 生效，svn info 显示目标版本');
+  const lab43 = makeSvnLab();
+  const base43 = lab43.checkout('base43');
+  writeFileSync(join(base43, 'a.txt'), 'v1\n');
+  svn(['add', '-q', '--parents', 'a.txt'], base43);
+  svn(['commit', '-q', '-m', 'r1'], base43);
+  const other43 = lab43.checkout('other43');
+  writeFileSync(join(other43, 'a.txt'), 'v2\n');
+  svn(['commit', '-q', '-m', 'r2'], other43);
+  state.confirmResult = '更新';
+  state.inputQueue = ['1'];
+  const linesBefore43 = channelText().length;
+  await state.registered.get('svnAnywhere.update')({ fsPath: base43, scheme: 'file' });
+  const out43 = channelText().slice(linesBefore43);
+  check('频道回显带 -r 1 的更新命令', out43.includes('update --non-interactive -r 1'), out43.slice(-400));
+  const infoRev43 = () => Number(svn(['info', '--show-item', 'revision', '.'], base43).trim());
+  check('svn info 显示目标版本 1', infoRev43() === 1, `revision=${infoRev43()}`);
+  check('内容回退到 r1', readFileSync(join(base43, 'a.txt'), 'utf8') === 'v1\n');
+  state.inputQueue = ['HEAD'];
+  const linesBefore43b = channelText().length;
+  await state.registered.get('svnAnywhere.update')({ fsPath: base43, scheme: 'file' });
+  check('HEAD 更新回显 -r HEAD', channelText().slice(linesBefore43b).includes('-r HEAD'));
+  check('HEAD 后回到最新 revision 且内容同步',
+    infoRev43() === 2 && readFileSync(join(base43, 'a.txt'), 'utf8') === 'v2\n');
+  state.confirmResult = undefined;
+  rmSync(lab43.lab, { recursive: true, force: true });
+
+  console.log('场景 44：版本号非法输入提示后重试；取消输入不执行更新');
+  const lab44 = makeSvnLab();
+  const wc44 = lab44.checkout('wc44');
+  writeFileSync(join(wc44, 'a.txt'), 'v1\n');
+  svn(['add', '-q', '--parents', 'a.txt'], wc44);
+  svn(['commit', '-q', '-m', 'init'], wc44);
+  state.confirmResult = '更新';
+  state.inputQueue = ['abc', '0', '-1', '1'];
+  const warningBefore44 = state.warning.length;
+  const linesBefore44 = channelText().length;
+  await state.registered.get('svnAnywhere.update')({ fsPath: wc44, scheme: 'file' });
+  check('非法输入每次提示后重试（3 次提示）',
+    state.warning.slice(warningBefore44).filter((m) => m.includes('版本号须为正整数或 HEAD')).length === 3,
+    JSON.stringify(state.warning.slice(warningBefore44)));
+  check('重试到合法值后执行 -r 1', channelText().slice(linesBefore44).includes('update --non-interactive -r 1'));
+  const progressBefore44 = state.progressTitles.length;
+  const linesBefore44b = channelText().length;
+  state.inputQueue = [undefined];
+  await state.registered.get('svnAnywhere.update')({ fsPath: wc44, scheme: 'file' });
+  check('取消版本号输入不执行更新',
+    state.progressTitles.length === progressBefore44 && !channelText().slice(linesBefore44b).includes('> svn update'),
+    channelText().slice(linesBefore44b).slice(-300));
+  state.confirmResult = undefined;
+  rmSync(lab44.lab, { recursive: true, force: true });
+
+  console.log('场景 45：更新冲突提示「打开冲突文件」——文本冲突在编辑器打开');
+  const lab45 = makeSvnLab();
+  const base45 = lab45.checkout('base45');
+  writeFileSync(join(base45, 'c.txt'), 'line1\n');
+  svn(['add', '-q', '--parents', 'c.txt'], base45);
+  svn(['commit', '-q', '-m', 'base'], base45);
+  const other45 = lab45.checkout('other45');
+  writeFileSync(join(other45, 'c.txt'), 'line1\nremote\n');
+  svn(['commit', '-q', '-m', 'remote edit'], other45);
+  writeFileSync(join(base45, 'c.txt'), 'line1\nlocal\n');
+  state.confirmResult = '更新';
+  state.warningChoice = '打开冲突文件';
+  state.inputQueue = ['HEAD'];
+  const executedBefore45 = state.executedCommands.length;
+  await state.registered.get('svnAnywhere.update')({ fsPath: base45, scheme: 'file' });
+  const conflictCmds45 = state.executedCommands.slice(executedBefore45);
+  check('点「打开冲突文件」后用 vscode.open 打开冲突文件',
+    conflictCmds45.some(([cmd, uri]) => cmd === 'vscode.open' && uri && uri.fsPath === join(base45, 'c.txt')),
+    JSON.stringify(conflictCmds45));
+  state.warningChoice = undefined;
+  state.confirmResult = undefined;
+  rmSync(lab45.lab, { recursive: true, force: true });
+
+  console.log('场景 46：树冲突提示定位到目录——revealFileInOS');
+  const lab46 = makeSvnLab();
+  const base46 = lab46.checkout('base46');
+  mkdirSync(join(base46, 'dir'), { recursive: true });
+  writeFileSync(join(base46, 'dir', 'nested.txt'), 'v1\n');
+  svn(['add', '-q', '--parents', 'dir/nested.txt'], base46);
+  svn(['commit', '-q', '-m', 'dir base'], base46);
+  const other46 = lab46.checkout('other46');
+  svn(['delete', '-q', 'dir'], other46);
+  svn(['commit', '-q', '-m', 'remote delete dir'], other46);
+  writeFileSync(join(base46, 'dir', 'nested.txt'), 'local edit\n');
+  state.confirmResult = '更新';
+  state.warningChoice = '打开冲突文件';
+  state.inputQueue = ['HEAD'];
+  const warningBefore46 = state.warning.length;
+  const executedBefore46 = state.executedCommands.length;
+  await state.registered.get('svnAnywhere.update')({ fsPath: base46, scheme: 'file' });
+  check('树冲突提示列出目录',
+    state.warning.slice(warningBefore46).some((m) => m.includes('冲突') && m.includes('dir')),
+    JSON.stringify(state.warning.slice(warningBefore46)));
+  const cmds46 = state.executedCommands.slice(executedBefore46);
+  check('树冲突目录在系统文件管理器定位（revealFileInOS）',
+    cmds46.some(([cmd, uri]) => cmd === 'revealFileInOS' && uri && uri.fsPath === join(base46, 'dir')),
+    JSON.stringify(cmds46));
+  state.warningChoice = undefined;
+  state.confirmResult = undefined;
+  rmSync(lab46.lab, { recursive: true, force: true });
+
+  console.log('场景 47：冲突通知未处理期间互斥锁已释放——同副本清理可立即执行');
+  const warningBase47 = state.warning.length;
+  const lab47 = makeSvnLab();
+  const base47 = lab47.checkout('base47');
+  writeFileSync(join(base47, 'c.txt'), 'line1\n');
+  svn(['add', '-q', '--parents', 'c.txt'], base47);
+  svn(['commit', '-q', '-m', 'base'], base47);
+  const other47 = lab47.checkout('other47');
+  writeFileSync(join(other47, 'c.txt'), 'line1\nremote\n');
+  svn(['commit', '-q', '-m', 'remote edit'], other47);
+  writeFileSync(join(base47, 'c.txt'), 'line1\nlocal\n');
+  state.confirmResult = '更新';
+  state.inputQueue = ['HEAD'];
+  state.warningGate = 'hold';
+  const linesBefore47 = channelText().length;
+  const updating47 = state.registered.get('svnAnywhere.update')({ fsPath: base47, scheme: 'file' });
+  // 等待本场景新增的冲突警告弹出（挂起中，模拟用户尚未处理通知）。
+  // 只认 warningBase47 之后的增量且路径为 c.txt，避免命中历史场景的冲突警告。
+  let warned47 = false;
+  for (let retry = 0; retry < 200 && !warned47; retry += 1) {
+    warned47 = state.warning.slice(warningBase47).some((m) => m.includes('1 个冲突') && m.includes('c.txt'));
+    if (!warned47) await new Promise((resolve) => setTimeout(resolve, 30));
+  }
+  check('冲突警告已弹出（挂起等待用户处理）', warned47,
+    JSON.stringify(state.warning.slice(warningBase47).filter((m) => m.includes('冲突'))));
+  // 锁已释放：同副本清理不被「工作副本有未完成操作」拒绝，正常完成。
+  state.confirmResult = '清理';
+  const warningBefore47 = state.warning.length;
+  const linesBefore47c = channelText().length;
+  await state.registered.get('svnAnywhere.cleanup')({ fsPath: base47, scheme: 'file' });
+  const cleanupOut47 = channelText().slice(linesBefore47c);
+  check('冲突通知等待期间清理正常执行（互斥锁已释放）', cleanupOut47.includes('清理完成。'), cleanupOut47.slice(-300));
+  check('未被「工作副本有未完成操作」拒绝',
+    !state.warning.slice(warningBefore47).some((m) => m.includes('工作副本有未完成操作')),
+    JSON.stringify(state.warning.slice(warningBefore47)));
+  // 放行挂起的冲突通知（用户关闭），更新命令正常收尾。
+  for (const resolveGate of state.warningGateResolvers.splice(0)) resolveGate(state.warningChoice);
+  state.warningGate = 'off';
+  await updating47;
+  check('通知处理后更新命令完成（频道含冲突明细）',
+    channelText().slice(linesBefore47).includes('C    c.txt'),
+    channelText().slice(linesBefore47).slice(-300));
+  state.confirmResult = undefined;
+  state.warningChoice = undefined;
+  rmSync(lab47.lab, { recursive: true, force: true });
+
   rmSync(igLab.lab, { recursive: true, force: true });
 
   rmSync(panelLab.lab, { recursive: true, force: true });

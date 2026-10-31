@@ -102,16 +102,39 @@ export function parseUpdateOutput(text: string): UpdateResult {
   };
 }
 
-/** 对目标路径执行 `svn update`（固定 --non-interactive）并解析结果。 */
+/**
+ * 校验并归一化用户输入的更新版本号：十进制正整数或 `HEAD`（不区分大小写）。
+ * 合法返回归一化值（正整数去前导零、HEAD 大写），非法返回 undefined。
+ * 这是用户键盘输入的校验，允许首尾空白；与 SVN 数据解析的原值保留约定无关。
+ */
+export function normalizeUpdateRevision(input: string): string | undefined {
+  const value = input.trim();
+  if (/^\d+$/.test(value)) {
+    const revision = Number(value);
+    if (Number.isSafeInteger(revision) && revision > 0) {
+      return String(revision);
+    }
+    return undefined;
+  }
+  if (value.toLowerCase() === 'head') {
+    return 'HEAD';
+  }
+  return undefined;
+}
+
+/** 对目标路径执行 `svn update`（固定 --non-interactive）并解析结果；
+ * revision 传入已归一化的正整数字符串或 `HEAD` 时追加 `-r <rev>`。 */
 export async function runUpdate(
   svnPath: string,
   target: string,
   options: RunOptions = {},
+  revision?: string,
 ): Promise<UpdateRunResult> {
-  const result = await runOrThrow(
-    svnPath,
-    ['update', '--non-interactive', escapePeg(target)],
-    options,
-  );
+  const args = ['update', '--non-interactive'];
+  if (revision) {
+    args.push('-r', revision);
+  }
+  args.push(escapePeg(target));
+  const result = await runOrThrow(svnPath, args, options);
   return { ...result, ...parseUpdateOutput(result.stdout) };
 }

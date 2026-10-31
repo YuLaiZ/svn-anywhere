@@ -1,11 +1,12 @@
 /**
- * 「更新」命令（F16/F17/F19）：执行前模态确认目标路径，确认后以进度通知
- * 执行 svn update（可取消），流式回显明细，完成后汇总最终 revision 与冲突。
- * 更新执行段（performUpdate）供提交前检查（F145）复用。
+ * 「更新」命令（F16/F17/F19）：执行前模态确认目标路径，确认后用原生
+ * InputBox 输入目标版本号（正整数或 HEAD，非法输入提示后重试），再以进度
+ * 通知执行 svn update（可取消），流式回显明细，完成后汇总最终 revision
+ * 与冲突。更新执行段（performUpdate）供提交前检查（F145）复用。
  */
 import * as vscode from 'vscode';
-import { relative } from 'node:path';
-import { runUpdate, type UpdateRunResult } from '../../core/update';
+import { join, relative } from 'node:path';
+import { normalizeUpdateRevision, runUpdate, type UpdateRunResult } from '../../core/update';
 import { getOperationRegistry } from '../../core/operations';
 import { escapePeg } from '../../core/workspace';
 import { readSvnPath, readTimeoutMs } from '../config';
@@ -30,7 +31,36 @@ export async function commandUpdate(uri?: vscode.Uri): Promise<void> {
     return;
   }
 
-  await performUpdate(target, svnPath);
+  const revision = await promptUpdateRevision();
+  if (revision === undefined) {
+    return;
+  }
+
+  await performUpdate(target, svnPath, { revision, conflictPrompt: true });
+}
+
+/**
+ * 原生 InputBox 输入更新目标版本号：输入框内实时校验（validateInput），
+ * 归一化失败时提示后重试（覆盖 validateInput 不生效的宿主路径）；
+ * 取消（Esc）返回 undefined，调用方应中止更新。
+ */
+export async function promptUpdateRevision(): Promise<string | undefined> {
+  for (;;) {
+    const input = await vscode.window.showInputBox({
+      prompt: strings.update.revisionPrompt,
+      value: 'HEAD',
+      validateInput: (value) =>
+        normalizeUpdateRevision(value) === undefined ? strings.update.revisionInvalid : undefined,
+    });
+    if (input === undefined) {
+      return undefined;
+    }
+    const revision = normalizeUpdateRevision(input);
+    if (revision !== undefined) {
+      return revision;
+    }
+    void vscode.window.showWarningMessage(strings.update.revisionInvalid);
+  }
 }
 
 /**
@@ -57,37 +87,70 @@ export async function finishUpdateOperation(operationId: string | undefined): Pr
   await getOperationRegistry().finish(operationId);
 }
 
+export interface UpdateRunOptions {
+  /** 已归一化的目标版本号（正整数字符串或 HEAD）；缺省为不传 -r。 */
+  revision?: string;
+  /**
+   * 冲突提示形态：直接更新命令入口为 true，互斥锁释放后弹带「打开冲突
+   * 文件」按钮的警告并等待用户处理（通知会停留，不能在持锁期间等待）；
+   * 提交前检查链路为 false，保持无按钮的即时警告（面板自身会展示冲突
+   * 分组，不阻塞返回）。
+   */
+  conflictPrompt?: boolean;
+}
+
 /**
  * 执行一次更新并完成回显：进度通知（可取消）、流式明细、最终 revision
  * 与冲突汇总都写输出频道；有冲突时弹警告列出文件。返回执行结果供
  * 提交流程判断是否继续。
  */
-export async function performUpdate(target: WcTarget, svnPath: string): Promise<UpdateRunResult> {
+export async function performUpdate(
+  target: WcTarget,
+  svnPath: string,
+  options: UpdateRunOptions = {},
+): Promise<UpdateRunResult> {
   // 注册表互斥：同一副本有在途/受限操作时拒绝更新（含从资源管理器入口）。
   const operationId = await beginUpdateOperation(target.wcRoot);
   if (!operationId) {
     return { stdout: '', stderr: '', exitCode: 0, items: [], conflicts: [] };
   }
+  let result: UpdateRunResult;
   try {
-    return await executeUpdate(target, svnPath);
+    result = await executeUpdate(target, svnPath, options);
   } finally {
     await finishUpdateOperation(operationId);
   }
+  // 带按钮的冲突提示在互斥锁释放后进行：通知会停留到用户处理，等待期间
+  // 不能持有同副本写锁（否则还原/清理/提交等会被「未完成操作」拒绝）。
+  if (options.conflictPrompt && result.conflicts.length > 0) {
+    await promptConflictOpen(target.wcRoot, result.conflicts);
+  }
+  return result;
 }
 
-async function executeUpdate(target: WcTarget, svnPath: string): Promise<UpdateRunResult> {
+async function executeUpdate(
+  target: WcTarget,
+  svnPath: string,
+  options: UpdateRunOptions = {},
+): Promise<UpdateRunResult> {
   // 与终端 svn update 一致：以副本根为 cwd 传相对目标，明细路径为相对形态；
   // 目标是副本根时归一为 `.`，避免空参数。
   // core 的 runUpdate 内部做 peg 转义，这里日志记录转义后的实际命令。
   const targetArg = relative(target.wcRoot, target.targetPath) || '.';
-  const args = ['update', '--non-interactive', escapePeg(targetArg)];
+  const args = ['update', '--non-interactive'];
+  if (options.revision) {
+    args.push('-r', options.revision);
+  }
+  args.push(escapePeg(targetArg));
 
   // 进度通知的取消按钮桥接 AbortSignal，传给 core 的 svn 执行层。
   const abort = new AbortController();
   const result = await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: format(strings.update.progress, { target: target.targetPath }),
+      title: options.revision
+        ? format(strings.update.progressRevision, { target: target.targetPath, revision: options.revision })
+        : format(strings.update.progress, { target: target.targetPath }),
       cancellable: true,
     },
     async (_progress, token) => {
@@ -104,7 +167,7 @@ async function executeUpdate(target: WcTarget, svnPath: string): Promise<UpdateR
         getCredentials: promptForCredentials,
         // 重试命令回显到输出频道（logCommand 内置脱敏，密码不外泄）。
         onCredentialRetry: (args) => logCommand(svnPath, args, target.wcRoot),
-      });
+      }, options.revision);
     },
   );
 
@@ -117,12 +180,16 @@ async function executeUpdate(target: WcTarget, svnPath: string): Promise<UpdateR
   showOutput(false);
 
   if (result.conflicts.length > 0) {
-    void vscode.window.showWarningMessage(
-      format(strings.update.conflicts, {
-        count: String(result.conflicts.length),
-        paths: result.conflicts.join('、'),
-      }),
-    );
+    // conflictPrompt 形态的带按钮警告由 performUpdate 在释放互斥锁后弹出
+    // （通知等待期间不能持锁）；提交前检查链路保持无按钮的即时警告。
+    if (!options.conflictPrompt) {
+      void vscode.window.showWarningMessage(
+        format(strings.update.conflicts, {
+          count: String(result.conflicts.length),
+          paths: result.conflicts.join('、'),
+        }),
+      );
+    }
     return result;
   }
   // 兜底：Summary 段报告了冲突但明细行未能定位到文件时，不静默放行。
@@ -131,4 +198,62 @@ async function executeUpdate(target: WcTarget, svnPath: string): Promise<UpdateR
     void vscode.window.showWarningMessage(format(strings.update.conflictsUnresolved, { count: String(summaryTotal) }));
   }
   return result;
+}
+
+/**
+ * 冲突警告（带「打开冲突文件」按钮）与打开交互。必须在互斥锁释放后
+ * 调用：带按钮的通知会停留到用户处理，等待期间不应阻塞同副本其他操作。
+ */
+async function promptConflictOpen(wcRoot: string, conflicts: string[]): Promise<void> {
+  const choice = await vscode.window.showWarningMessage(
+    format(strings.update.conflicts, {
+      count: String(conflicts.length),
+      paths: conflicts.join('、'),
+    }),
+    strings.update.openConflictButton,
+  );
+  if (choice === strings.update.openConflictButton) {
+    await openConflictFiles(wcRoot, conflicts);
+  }
+}
+
+/**
+ * 定位并打开冲突路径：单个冲突直接打开；多个冲突先让用户选择。
+ * 文件在编辑器打开，目录（树冲突常见形态）在系统文件管理器定位；
+ * 本地已缺失时给出提示，不报错。
+ */
+async function openConflictFiles(wcRoot: string, conflicts: string[]): Promise<void> {
+  let relPath: string | undefined;
+  if (conflicts.length === 1) {
+    relPath = conflicts[0];
+  } else {
+    const picked = await vscode.window.showQuickPick(
+      conflicts.map((label) => ({ label })),
+      { placeHolder: strings.update.conflictPickPlaceholder },
+    );
+    relPath = picked?.label;
+  }
+  if (!relPath) {
+    return;
+  }
+  // 冲突路径是 update 明细的副本根相对路径，按原值拼接，不做修剪。
+  const absPath = join(wcRoot, relPath);
+  const uri = vscode.Uri.file(absPath);
+  let stat: vscode.FileStat | undefined;
+  try {
+    stat = await vscode.workspace.fs.stat(uri);
+  } catch {
+    stat = undefined;
+  }
+  if (!stat) {
+    void vscode.window.showInformationMessage(
+      format(strings.update.conflictMissingLocal, { path: relPath }),
+    );
+    return;
+  }
+  if (stat.type === vscode.FileType.Directory) {
+    await vscode.commands.executeCommand('revealFileInOS', uri);
+    return;
+  }
+  await vscode.commands.executeCommand('vscode.open', uri, { preview: false });
 }
