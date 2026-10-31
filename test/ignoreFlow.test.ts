@@ -646,3 +646,89 @@ function sapEmpty(): PropertySnapshot {
 function getRegistryRestricted(wcRoot: string): boolean {
   return getOperationRegistry().pendingForWcRoot(wcRoot).length > 0;
 }
+
+describe('P2 面板：表单输入序号（webview 输入防回退）', () => {
+  it('宿主主动改输入值时递增 formRevision：加入后渲染携带序号且输入框清空', async () => {
+    const lab = makeFakeWc();
+    try {
+      enqueue(snap(['*.log']), snap(['*.log']));
+      const panel = await openPanel(join(lab, 'src'), 'rule-text');
+      const renderAt = (): { html: string; formRevision: number } | undefined => {
+        const frames = panel.posted.filter((m) => m.type === 'render');
+        const last = frames[frames.length - 1];
+        return last ? { html: String(last.html), formRevision: Number(last.formRevision) } : undefined;
+      };
+      // 手动输入（inputRevision 与 mock-host 一致取大值，暴露恒 0 回归）。
+      panel.sendIntent({ kind: 'syncInput', fieldId: 'draft', value: '.idea', inputRevision: 1100 });
+      await settle();
+      panel.sendIntent({ kind: 'addRule' });
+      await settle(30);
+      const afterAdd = renderAt();
+      expect(afterAdd).toBeDefined();
+      expect(afterAdd!.formRevision).toBeGreaterThanOrEqual(1101);
+      expect(afterAdd!.html).toContain('rule-text">.idea');
+      // 输入框被宿主清空：渲染值为空（webview 侧 pending 不再覆盖）。
+      expect(afterAdd!.html).toMatch(/value=""/);
+    } finally {
+      rmSync(lab, { recursive: true, force: true });
+    }
+  });
+
+  it('「用当前项名」写入输入值时同样递增 formRevision', async () => {
+    const lab = mkdtempSync(join(tmpdir(), 'svn-anywhere-p2flow-'));
+    try {
+      mkdirSync(join(lab, '.svn'), { recursive: true });
+      writeFileSync(join(lab, '.svn', 'wc.db'), 'fake');
+      mkdirSync(join(lab, 'src'), { recursive: true });
+      writeFileSync(join(lab, 'src', 'cache[1]?.log'), 'x');
+      enqueue(snap(['*.log']), snap(['*.log']));
+      const panel = await openPanel(join(lab, 'src', 'cache[1]?.log'), 'rule-text');
+      const before = Number((panel.posted.filter((m) => m.type === 'render').at(-1) ?? {}).formRevision);
+      panel.sendIntent({ kind: 'fillOriginName' });
+      await settle();
+      const after = panel.posted.filter((m) => m.type === 'render').at(-1);
+      expect(Number(after?.formRevision)).toBeGreaterThan(before);
+      expect(String(after?.html)).toContain('cache[[]1[]][?].log');
+    } finally {
+      rmSync(lab, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('P2 面板：提交进行中用户关闭面板', () => {
+  it('成功 revision 仍即时落盘（待协调相位），协调留给重开恢复', async () => {
+    const lab = makeFakeWc();
+    try {
+      enqueue(snap(['*.log', '.idea']), snap(['*.log']));
+      const panel = await openPanel(join(lab, 'src'), 'rule-text');
+      await settle();
+      const committed = snap(['*.log', '.idea']);
+      // 提交前重读：工作值==保存基线，BASE 仍为旧值（有待提交修改）。
+      enqueue(committed, snap(['*.log']));
+      // 提交子进程挂起：发出提交后用户以原生 X 关闭面板，再放行提交。
+      let releaseCommit: (value: number) => void = () => {};
+      vi.mocked(commitTempIgnore).mockImplementationOnce(() => new Promise<number>((resolve) => {
+        releaseCommit = resolve;
+      }));
+      panel.sendIntent({ kind: 'submitIgnore' });
+      await settle(40);
+      panel.dispose();
+      releaseCommit(9);
+      // 成功 revision 的落盘不依赖面板存活（§14.1 即时落盘）。
+      const registry = getOperationRegistry();
+      // findWorkingCopy 返回 realpath 后的副本根（macOS 的 /tmp 是符号链接）。
+      const wcRoot = realpathSync(lab);
+      let record = registry.pendingForWcRoot(wcRoot)[0];
+      for (let i = 0; i < 100 && (!record || record.phase !== 'committed-pending-coordination'); i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        record = registry.pendingForWcRoot(wcRoot)[0];
+      }
+      expect(record?.phase).toBe('committed-pending-coordination');
+      expect(record?.knownRevisions).toEqual([9]);
+      // 协调未自动执行（面板已关）：临时副本保留给恢复流程。
+      expect(vi.mocked(coordinateUpdate)).not.toHaveBeenCalled();
+    } finally {
+      rmSync(lab, { recursive: true, force: true });
+    }
+  });
+});

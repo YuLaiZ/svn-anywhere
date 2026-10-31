@@ -80,6 +80,11 @@ export function setIgnorePanelContext(context: PanelContext): void {
   panelContext = context;
 }
 
+/** 面板可能已被用户关闭（执行中按 X）：瞬时提示静默跳过，不中断状态机。 */
+function toastSafely(level: 'info' | 'error', message: string): void {
+  handle?.toast(level, message);
+}
+
 function runOptions(cwd: string) {
   return {
     cwd,
@@ -206,6 +211,8 @@ async function loadSession(
     successVisible: true,
     operation: null,
   };
+  // 会话读取重置输入草稿：递增输入序号让 webview 的未确认本地输入被空值覆盖。
+  formRevision += 1;
   pushRender();
 
   // 操作注册表限制（unknown/待协调）跨面板关闭保持。
@@ -281,7 +288,9 @@ function pushRender(): void {
   if (!session || !handle) {
     return;
   }
-  handle.update(buildIgnorePanelState(session), handle.sessionId);
+  // 表单输入序号随渲染合入：webview 据此判断本地未确认输入是否已被
+  // 宿主确认/覆盖（宿主主动改值前须递增，见 addRule/fillOriginName）。
+  handle.update({ ...buildIgnorePanelState(session), formRevision }, handle.sessionId);
 }
 
 /* ------------------------------ 意图分发 ------------------------------ */
@@ -341,6 +350,8 @@ async function onIntent(intent: Intent, context: { sessionId: string; busy: bool
       session.draft = '';
       session.notice = null;
       session.submittedRevision = null;
+      // 宿主清空了输入值：递增序号让渲染的空值覆盖 webview 本地未确认输入。
+      formRevision += 1;
       pushRender();
       return;
     }
@@ -363,6 +374,8 @@ async function onIntent(intent: Intent, context: { sessionId: string; busy: bool
       try {
         session.draft = literalIgnorePattern(session.originName);
         session.notice = strings.ignorePanel.noticeFilled;
+        // 宿主写入了输入值：递增序号让渲染值覆盖 webview 本地未确认输入。
+        formRevision += 1;
       } catch (err) {
         if (!(err instanceof RangeError)) {
           throw err;
@@ -434,8 +447,10 @@ async function saveIgnore(sessionId: string): Promise<boolean> {
     handle.toast('info', format(strings.panel.operationHeldBusy, { phase: begin.heldBy.phase }));
     return false;
   }
-  activeOperationId = begin.operationId;
-  await registry.markPhase(activeOperationId, 'saving');
+  // 局部引用：面板销毁会把模块级 activeOperationId 置空，finish 不能依赖它。
+  const operationId = begin.operationId;
+  activeOperationId = operationId;
+  await registry.markPhase(operationId, 'saving');
   s.phase = 'saving';
   s.error = null;
   s.notice = null;
@@ -443,7 +458,7 @@ async function saveIgnore(sessionId: string): Promise<boolean> {
   try {
     // 覆盖防护：磁盘实际值与保存基线不一致说明外部修改过，不覆盖。
     const current = await readIgnoreSnapshot(svnPath, s.dirArg, runOptions(s.wcRoot));
-    if (handle.sessionId !== sessionId) {
+    if (handle && handle.sessionId !== sessionId) {
       return false;
     }
     if (!snapshotEqual(current, { rules: s.savedRules, exists: s.savedPropertyExists })) {
@@ -451,8 +466,10 @@ async function saveIgnore(sessionId: string): Promise<boolean> {
       s.phase = 'ready';
       s.error = strings.ignorePanel.externalSaveDetail;
       s.errorKind = 'external';
-      await registry.finish(activeOperationId);
-      activeOperationId = undefined;
+      await registry.finish(operationId);
+      if (activeOperationId === operationId) {
+        activeOperationId = undefined;
+      }
       pushRender();
       showOutput(false);
       return false;
@@ -461,7 +478,7 @@ async function saveIgnore(sessionId: string): Promise<boolean> {
     await applyIgnoreSnapshot(svnPath, s.dirArg, target, runOptions(s.wcRoot));
     // 保存成功后读回实际值，再更新实际快照与保存基线。
     const actual = await readIgnoreSnapshot(svnPath, s.dirArg, runOptions(s.wcRoot));
-    if (handle.sessionId !== sessionId) {
+    if (handle && handle.sessionId !== sessionId) {
       return false;
     }
     s.workingSnapshot = actual;
@@ -472,12 +489,14 @@ async function saveIgnore(sessionId: string): Promise<boolean> {
     s.successVisible = true;
     s.phase = 'ready';
     s.notice = s.localModified ? null : strings.ignorePanel.noticeNoPendingChange;
-    await registry.finish(activeOperationId);
-    activeOperationId = undefined;
+    await registry.finish(operationId);
+    if (activeOperationId === operationId) {
+      activeOperationId = undefined;
+    }
     pushRender();
     return true;
   } catch (err) {
-    if (handle.sessionId !== sessionId) {
+    if (handle && handle.sessionId !== sessionId) {
       return false;
     }
     // 本地写进程级失败：重读实际值即可证明结果（属性是本地状态，无服务端未知）。
@@ -491,8 +510,10 @@ async function saveIgnore(sessionId: string): Promise<boolean> {
           s.localModified = localModifiedOf(s);
           s.successVisible = true;
           s.phase = 'ready';
-          await registry.finish(activeOperationId);
-          activeOperationId = undefined;
+          await registry.finish(operationId);
+          if (activeOperationId === operationId) {
+            activeOperationId = undefined;
+          }
           pushRender();
           return true;
         }
@@ -503,8 +524,10 @@ async function saveIgnore(sessionId: string): Promise<boolean> {
     s.phase = 'ready';
     s.error = err instanceof Error ? err.message : String(err);
     s.errorKind = 'save';
-    await registry.finish(activeOperationId);
-    activeOperationId = undefined;
+    await registry.finish(operationId);
+    if (activeOperationId === operationId) {
+      activeOperationId = undefined;
+    }
     pushRender();
     showOutput(false);
     return false;
@@ -552,7 +575,7 @@ async function submitIgnore(sessionId: string): Promise<void> {
       readIgnoreSnapshot(svnPath, s.dirArg, runOptions(s.wcRoot)),
       readIgnoreSnapshot(svnPath, s.dirArg, { ...runOptions(s.wcRoot), revision: 'BASE' }),
     ]);
-    if (handle.sessionId !== sessionId) {
+    if (handle && handle.sessionId !== sessionId) {
       return;
     }
   } catch (err) {
@@ -619,11 +642,13 @@ async function submitIgnore(sessionId: string): Promise<void> {
     pushRender();
     return;
   }
-  activeOperationId = begin.operationId;
+  // 局部引用：面板销毁会把模块级 activeOperationId 置空，落盘不能依赖它。
+  const operationId = begin.operationId;
+  activeOperationId = operationId;
   s.operation = begin.record;
   s.submittedRevision = null;
   s.successVisible = false;
-  await registry.markPhase(activeOperationId, 'committing');
+  await registry.markPhase(operationId, 'committing');
   logLine(strings.ignorePanel.commitStartedNotice);
   pushRender();
 
@@ -646,23 +671,25 @@ async function submitIgnore(sessionId: string): Promise<void> {
       getCredentials: promptForCredentials,
       onCredentialRetry: (args) => logCommand(svnPath, args, s.wcRoot),
     });
-    if (handle.sessionId !== sessionId) {
-      return;
-    }
-    // 成功 revision 先落盘，再进入协调。
-    await registry.markPhase(activeOperationId, 'committed-pending-coordination', {
+    // 成功 revision 先落盘（与面板是否存活无关），再考虑协调：
+    // 面板已被用户关闭（handle 置空）时不再自动协调原副本，恢复入口
+    // 由重开面板时的待协调记录提供（§14.1 不能跳过即时落盘）。
+    await registry.markPhase(operationId, 'committed-pending-coordination', {
       knownRevisions: [revision],
       tempWcPath: tempDir,
     });
     logLine(format(strings.commit.committed, { revision: String(revision) }));
-    await coordinateAfterCommit(sessionId, activeOperationId, revision, pending, tempDir);
+    if (!handle || handle.sessionId !== sessionId) {
+      return;
+    }
+    await coordinateAfterCommit(sessionId, operationId, revision, pending, tempDir);
   } catch (err) {
-    if (handle.sessionId !== sessionId) {
+    if (handle && handle.sessionId !== sessionId) {
       return;
     }
     if (isProcessFailure(err)) {
-      // 结果未知：保留操作记录并冻结写意图，只允许核实。
-      await registry.markPhase(activeOperationId, 'unknown', { tempWcPath: tempDir });
+      // 结果未知：保留操作记录并冻结写意图，只允许核实（面板销毁同样落盘）。
+      await registry.markPhase(operationId, 'unknown', { tempWcPath: tempDir });
       s.phase = 'unknown';
       s.operation = registry.writeRestriction(s.wcRoot) ?? s.operation;
       s.error = null;
@@ -670,19 +697,22 @@ async function submitIgnore(sessionId: string): Promise<void> {
       showOutput(false);
       return;
     }
-    await confirmCommitFailure(err);
+    await confirmCommitFailure(operationId, err);
   }
 }
 
-/** 确认未提交的失败：结束操作登记，保留本地规则，可核对后重试。 */
-async function confirmCommitFailure(err: unknown): Promise<void> {
+/** 确认未提交的失败：结束操作登记，保留本地规则，可核对后重试。
+ *  面板已销毁（用户以原生 X 关闭）时同样完成 finish，操作记录不得滞留。 */
+async function confirmCommitFailure(operationId: string, err: unknown): Promise<void> {
   const s = session;
-  if (!s || !handle) {
+  await getOperationRegistry().finish(operationId);
+  if (activeOperationId === operationId) {
+    activeOperationId = undefined;
+  }
+  cleanupTempDir();
+  if (!s) {
     return;
   }
-  await getOperationRegistry().finish(activeOperationId);
-  activeOperationId = undefined;
-  cleanupTempDir();
   s.phase = 'ready';
   const message = err instanceof Error ? err.message : String(err);
   const outOfDate = err instanceof SvnError && /E160028|out of date/i.test(err.stderr || err.message);
@@ -716,7 +746,7 @@ async function coordinateAfterCommit(
   tempDir: string,
 ): Promise<void> {
   const s = session;
-  if (!s || !handle) {
+  if (!s) {
     return;
   }
   s.phase = 'coordinating';
@@ -726,7 +756,7 @@ async function coordinateAfterCommit(
     // 协调前再次核对原副本身份和规则（本地后续修改不自动覆盖）。
     const identity = await readNodeIdentity(svnPath, s.dirArg, runOptions(s.wcRoot));
     const working = await readIgnoreSnapshot(svnPath, s.dirArg, runOptions(s.wcRoot));
-    if (handle.sessionId !== sessionId) {
+    if (handle && handle.sessionId !== sessionId) {
       return;
     }
     if (s.identity && (s.identity.url !== identity.url || s.identity.repositoryUuid !== identity.repositoryUuid)) {
@@ -740,7 +770,7 @@ async function coordinateAfterCommit(
     }
     await runCoordinationUpdate(sessionId, operationId, revision, pending, working, false, tempDir);
   } catch (err) {
-    if (handle.sessionId !== sessionId) {
+    if (handle && handle.sessionId !== sessionId) {
       return;
     }
     // 协调失败：已知成功保留 revision，进入受阻（不重复提交）。
@@ -760,7 +790,7 @@ async function runCoordinationUpdate(
   tempDir: string,
 ): Promise<void> {
   const s = session;
-  if (!s || !handle) {
+  if (!s) {
     return;
   }
   const svnPath = readSvnPath();
@@ -769,7 +799,7 @@ async function runCoordinationUpdate(
     getCredentials: promptForCredentials,
     onCredentialRetry: (args) => logCommand(svnPath, args, s.wcRoot),
   });
-  if (handle.sessionId !== sessionId) {
+  if (handle && handle.sessionId !== sessionId) {
     return;
   }
   if (await propertyConflicted(svnPath, s.dirArg, runOptions(s.wcRoot))) {
@@ -815,7 +845,7 @@ async function blockCoordination(
 /** 协调完成：BASE 已确认，工作值（含后续修改）保留为新的草稿基线。 */
 async function finishCoordination(operationId: string, revision: number, tempDir?: string): Promise<void> {
   const s = session;
-  if (!s || !handle) {
+  if (!s) {
     return;
   }
   const svnPath = readSvnPath();
@@ -868,7 +898,7 @@ async function resolveUnknown(sessionId: string): Promise<void> {
     const property = restriction ? propertyOf(restriction) : undefined;
     if (!restriction || !property) {
       // 其他面板的在途操作：本面板只提示，核实入口在对应面板。
-      handle.toast('info', strings.ignorePanel.noticeForeignOperation);
+      toastSafely('info', strings.ignorePanel.noticeForeignOperation);
       return;
     }
     s.phase = 'coordinating';
@@ -895,7 +925,7 @@ async function resolveUnknown(sessionId: string): Promise<void> {
         getCredentials: promptForCredentials,
         onCredentialRetry: (args) => logCommand(svnPath, args, s.wcRoot),
       });
-      if (handle.sessionId !== sessionId) {
+      if (handle && handle.sessionId !== sessionId) {
         return;
       }
       if (snapshotEqual(head, pending)) {
@@ -904,7 +934,7 @@ async function resolveUnknown(sessionId: string): Promise<void> {
         await registry.markPhase(restriction.operationId, 'committed-pending-coordination', {
           knownRevisions: [lastChangedRevision],
         });
-        handle.toast('info', format(strings.ignorePanel.noticeVerifyCommitted, { revision: String(lastChangedRevision) }));
+        toastSafely('info', format(strings.ignorePanel.noticeVerifyCommitted, { revision: String(lastChangedRevision) }));
         await coordinateAfterCommit(sessionId, restriction.operationId, lastChangedRevision, pending, '');
         return;
       }
@@ -918,7 +948,7 @@ async function resolveUnknown(sessionId: string): Promise<void> {
         s.successVisible = true;
         pushRender();
         // 成功卡片在场时 info 横幅会被压住，核实结论用 toast 保证可见。
-        handle.toast('info', strings.ignorePanel.noticeVerifyNotCommitted);
+        toastSafely('info', strings.ignorePanel.noticeVerifyNotCommitted);
         return;
       }
       // 值变化但不匹配任何一方（他人提交或状态复杂）：证据不唯一，继续冻结。
@@ -926,7 +956,7 @@ async function resolveUnknown(sessionId: string): Promise<void> {
       s.notice = strings.ignorePanel.noticeVerifyStillUnknown;
       pushRender();
     } catch (err) {
-      if (handle.sessionId !== sessionId) {
+      if (handle && handle.sessionId !== sessionId) {
         return;
       }
       s.phase = 'unknown';
@@ -940,7 +970,7 @@ async function resolveUnknown(sessionId: string): Promise<void> {
     const restriction = registry.writeRestriction(s.wcRoot);
     const property = restriction ? propertyOf(restriction) : undefined;
     if (!restriction || !property) {
-      handle.toast('info', strings.ignorePanel.noticeForeignOperation);
+      toastSafely('info', strings.ignorePanel.noticeForeignOperation);
       return;
     }
     const revision = restriction.knownRevisions[0] ?? s.submittedRevision ?? 0;
@@ -957,7 +987,7 @@ async function resolveUnknown(sessionId: string): Promise<void> {
         readIgnoreSnapshot(svnPath, s.dirArg, runOptions(s.wcRoot)),
         readIgnoreSnapshot(svnPath, s.dirArg, { ...runOptions(s.wcRoot), revision: 'BASE' }),
       ]);
-      if (handle.sessionId !== sessionId) {
+      if (handle && handle.sessionId !== sessionId) {
         return;
       }
       if (s.identity && (s.identity.url !== identity.url || s.identity.repositoryUuid !== identity.repositoryUuid)) {
@@ -985,7 +1015,7 @@ async function resolveUnknown(sessionId: string): Promise<void> {
       }
       await runCoordinationUpdate(sessionId, restriction.operationId, revision, pending, working, false, '');
     } catch (err) {
-      if (handle.sessionId !== sessionId) {
+      if (handle && handle.sessionId !== sessionId) {
         return;
       }
       const detail = err instanceof Error ? err.message : String(err);

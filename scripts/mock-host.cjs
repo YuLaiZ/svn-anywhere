@@ -694,8 +694,13 @@ async function main() {
   const panel14 = await openIgnorePanel(join(probe5, 'src', 'noise.log'), '未设置 svn:ignore');
   panel14.sendAuto({ kind: 'syncInput', fieldId: 'draft', value: '*.log', inputRevision: state.intentSeq + 1000 });
   await new Promise((resolve) => setTimeout(resolve, 150));
+  const base14 = panel14.webview.posted.length;
+  const before14 = Number((panel14.webview.posted.filter((m) => m.type === 'render').at(-1) ?? {}).formRevision);
   panel14.sendAuto({ kind: 'addRule' });
-  await waitRender(panel14, '未保存');
+  const afterAdd14 = await waitNewRender(panel14, '未保存', base14);
+  check('加入后输入框被宿主清空（formRevision 前进，本地未确认输入不回退）',
+    !!afterAdd14 && afterAdd14.formRevision > before14 && afterAdd14.formRevision >= 1000 && /value=""/.test(afterAdd14.html),
+    `formRevision=${afterAdd14?.formRevision} before=${before14}`);
   panel14.sendAuto({ kind: 'saveIgnore' });
   await waitRender(panel14, '忽略规则已保存到本机');
   check('被忽略文件不再出现在 status', !svn(['status'], probe5).includes('noise.log'));
