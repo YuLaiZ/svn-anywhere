@@ -1,5 +1,6 @@
 /**
- * 「清理」命令（F59）：进度通知中执行 svn cleanup，输出原样进输出频道。
+ * 「清理」命令（F59）：模态确认（写明影响范围）后在进度通知中执行
+ * svn cleanup，输出原样进输出频道。
  */
 import * as vscode from 'vscode';
 import { statSync } from 'node:fs';
@@ -11,10 +12,20 @@ import { readSvnPath, readTimeoutMs } from '../config';
 import { format, strings } from '../i18n';
 import { createLineBuffer, logCommand, logExitCode, logLine, showOutput } from '../output';
 import { resolveWorkingCopyTarget } from './target';
+import { confirmModal } from '../ui/confirm';
 
 export async function commandCleanup(uri?: vscode.Uri): Promise<void> {
   const target = await resolveWorkingCopyTarget(uri, strings.command.cleanup);
   if (!target) {
+    return;
+  }
+
+  // 二次确认：cleanup 会清理工作副本锁与未完成的操作日志，统一走模态确认。
+  const confirmed = await confirmModal(
+    format(strings.cleanup.confirmTitle, { target: target.targetPath }),
+    strings.cleanup.confirmButton,
+  );
+  if (!confirmed) {
     return;
   }
 

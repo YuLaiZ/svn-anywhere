@@ -315,13 +315,13 @@ describe('registerAllCommands 二次激活', () => {
     };
     const firstContext = { subscriptions: [], globalState } as unknown as vscode.ExtensionContext;
     registerAllCommands(firstContext);
-    expect(vscodeMock.registered).toHaveLength(8);
+    expect(vscodeMock.registered).toHaveLength(13);
     const firstHandles = vscodeMock.registered.map((r) => r.disposable);
 
     const secondContext = { subscriptions: [], globalState } as unknown as vscode.ExtensionContext;
     expect(() => registerAllCommands(secondContext)).not.toThrow();
     expect(firstHandles.every((d) => d.disposed)).toBe(true);
-    expect(vscodeMock.registered).toHaveLength(16);
-    expect(vscodeMock.activeCommandIds.size).toBe(8);
+    expect(vscodeMock.registered).toHaveLength(26);
+    expect(vscodeMock.activeCommandIds.size).toBe(13);
   });
 });

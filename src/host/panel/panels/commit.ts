@@ -23,6 +23,7 @@ import { join, relative } from 'node:path';
 import { promisify } from 'node:util';
 import { matchesIgnoreRules, parseIgnoreRules } from '../../../core/ignore';
 import { buildCommitArgs, COMMIT_BATCH_SIZE, parseCommitOutput } from '../../../core/commit';
+import { buildDeleteArgs, buildRevertArgs, listVersionedSubtree } from '../../../core/dailyOps';
 import { runStatus } from '../../../core/status';
 import { remoteChangedEntries, runRemoteStatus, type RemoteStatusResult } from '../../../core/remoteStatus';
 import { runOrThrow, type RunOptions } from '../../../core/svnCli';
@@ -151,12 +152,26 @@ function metaByPath(path: string): CommitEntryMeta | undefined {
   return session?.metas.find((meta) => meta.path === path);
 }
 
+/** loadSession 世代号：并发交错时只有最新一次加载有权写 session 与推帧。 */
+let loadSessionGeneration = 0;
+
 /** 读取目标状态（含可选远端分组与未版本控制目录枚举）并推送渲染。 */
 async function loadSession(
   sessionId: string,
   target: WcTarget,
   options: { initial: boolean },
 ): Promise<void> {
+  // 入口立即校验会话：调用点求值（sessionId/target）与真正执行之间可能
+  // 跨过一次目标切换，旧会话的迟到重读在覆盖 session 前直接放弃。
+  if (handle && handle.sessionId !== sessionId) {
+    return;
+  }
+  // 世代化：同副本的重复重读与目标切换的加载可能并发交错，先进入者
+  // 在 await 恢复点发现自己已被更新的一次加载取代时立即放弃，不再
+  // 覆盖 session（否则旧目标的迟到数据会写进新会话）。
+  const generation = ++loadSessionGeneration;
+  const isStale = () =>
+    generation !== loadSessionGeneration || handle?.sessionId !== sessionId;
   // 会话/目标切换后旧的对照基准失效，防止跨副本残留脏值。
   commitBaseAgainst = undefined;
   const keepDraft = !options.initial && session !== undefined;
@@ -167,6 +182,11 @@ async function loadSession(
   // 操作注册表限制（unknown/待协调）跨面板保持：受限时进入写锁定会话。
   const restriction = getOperationRegistry().writeRestriction(target.wcRoot);
 
+  const prefixes = await loadPrefixes();
+  const history = await loadHistory(target.wcRoot);
+  if (isStale()) {
+    return;
+  }
   session = {
     sessionId,
     wcRoot: target.wcRoot,
@@ -178,8 +198,8 @@ async function loadSession(
     filters: keepDraft ? { ...(previous?.filters ?? allFilters()) } : allFilters(),
     message: keepDraft ? (previous?.message ?? '') : '',
     allowEmpty: readAllowEmptyCommitMessage(),
-    prefixes: await loadPrefixes(),
-    history: await loadHistory(target.wcRoot),
+    prefixes,
+    history,
     phase: 'loading',
     error: null,
     result: null,
@@ -199,12 +219,15 @@ async function loadSession(
   try {
     logCommand(svnPath, ['status', '--xml', targetArg], target.wcRoot);
     const status = await runStatus(svnPath, targetArg, runOptions(target.wcRoot));
+    if (isStale()) {
+      return;
+    }
     let remote: RemoteStatusResult | undefined;
     if (session.remoteIncluded) {
       remote = await runRemoteStatusWithAuth(svnPath, targetArg, target);
-    }
-    if (handle?.sessionId !== sessionId) {
-      return;
+      if (isStale()) {
+        return;
+      }
     }
     session.externalPrefixes = status.externals ?? [];
     const metas = mergeStatusEntries(status.entries, remote?.entries, session.externalPrefixes);
@@ -231,7 +254,7 @@ async function loadSession(
     }
     pushRender();
   } catch (err) {
-    if (handle?.sessionId !== sessionId) {
+    if (isStale()) {
       return;
     }
     session.phase = 'loadError';
@@ -725,15 +748,9 @@ async function finishInlineOperation(operationId: string | undefined): Promise<v
 
 /** 删除目录的影响子树清单（svn list -R 的版本控制条目，截断到上限）。 */
 async function listDeletionSubtree(svnPath: string, dirPath: string): Promise<string[]> {
-  const args = ['list', '-R', '--', escapePeg(dirPath)];
-  logCommand(svnPath, args, session!.wcRoot);
-  try {
-    const result = await runOrThrow(svnPath, args, { ...runOptions(session!.wcRoot), timeoutMs: 10_000 });
-    return result.stdout.split('\n').map((line) => line.trim()).filter((line) => line.length > 0 && !line.endsWith('/'));
-  } catch {
-    // 子树枚举失败不阻塞删除确认：确认框仍列目录本身。
-    return [];
-  }
+  logCommand(svnPath, ['list', '-R', '--', escapePeg(dirPath)], session!.wcRoot);
+  // 子树枚举失败不阻塞删除确认：core 返回空清单，确认框仍列目录本身。
+  return listVersionedSubtree(svnPath, session!.wcRoot, dirPath, runOptions(session!.wcRoot));
 }
 
 async function revertEntry(meta: CommitEntryMeta): Promise<void> {
@@ -741,6 +758,10 @@ async function revertEntry(meta: CommitEntryMeta): Promise<void> {
     return;
   }
   const svnPath = readSvnPath();
+  // 行内操作进行中面板不置 busy、可被切换目标：重读的目标与会话在操作
+  // 开始时捕获，完成后核对会话未变再重读，避免旧目标数据写入新会话。
+  const startedSessionId = handle?.sessionId;
+  const startedTarget = targetOf(session);
   const impact =
     meta.kind === 'dir'
       ? `${strings.panel.revertConfirmDetail}\n${meta.path}\n${strings.panel.revertDirNote}`
@@ -753,7 +774,8 @@ async function revertEntry(meta: CommitEntryMeta): Promise<void> {
   if (!operationId) {
     return;
   }
-  const args = ['revert', '--', escapePeg(meta.path)];
+  // 行内还原不递归（只还原目录节点登记），整目录递归还原走右键「还原」命令。
+  const args = buildRevertArgs(meta.path);
   logCommand(svnPath, args, session.wcRoot);
   try {
     await runOrThrow(svnPath, args, runOptions(session.wcRoot));
@@ -764,7 +786,10 @@ async function revertEntry(meta: CommitEntryMeta): Promise<void> {
   } finally {
     await finishInlineOperation(operationId);
   }
-  await loadSession(handle!.sessionId, targetOf(session), { initial: false });
+  if (!handle || handle.sessionId !== startedSessionId) {
+    return;
+  }
+  await loadSession(handle.sessionId, startedTarget, { initial: false });
 }
 
 async function deleteEntry(meta: CommitEntryMeta): Promise<void> {
@@ -772,6 +797,9 @@ async function deleteEntry(meta: CommitEntryMeta): Promise<void> {
     return;
   }
   const svnPath = readSvnPath();
+  // 与 revertEntry 相同：会话与目标在操作开始时捕获，完成后核对再重读。
+  const startedSessionId = handle?.sessionId;
+  const startedTarget = targetOf(session);
   // 目录删除是结构性删除：确认框枚举完整影响子树（版本控制条目清单）。
   let subtree: string[] = [];
   if (meta.kind === 'dir') {
@@ -779,7 +807,9 @@ async function deleteEntry(meta: CommitEntryMeta): Promise<void> {
   }
   const subtreeLines = subtree.length
     ? subtree.slice(0, SUBTREE_LIST_LIMIT).map((path) => `· ${meta.path}/${path}`).join('\n') +
-      (subtree.length > SUBTREE_LIST_LIMIT ? `\n· …（共 ${subtree.length} 项）` : '')
+      (subtree.length > SUBTREE_LIST_LIMIT
+        ? `\n· ${format(strings.list.moreSuffix, { count: String(subtree.length) })}`
+        : '')
     : '';
   const impact =
     meta.kind === 'dir'
@@ -793,7 +823,7 @@ async function deleteEntry(meta: CommitEntryMeta): Promise<void> {
   if (!operationId) {
     return;
   }
-  const args = ['delete', '--force', '--', escapePeg(meta.path)];
+  const args = buildDeleteArgs(meta.path, { force: true });
   logCommand(svnPath, args, session.wcRoot);
   try {
     await runOrThrow(svnPath, args, runOptions(session.wcRoot));
@@ -804,7 +834,10 @@ async function deleteEntry(meta: CommitEntryMeta): Promise<void> {
   } finally {
     await finishInlineOperation(operationId);
   }
-  await loadSession(handle!.sessionId, targetOf(session), { initial: false });
+  if (!handle || handle.sessionId !== startedSessionId) {
+    return;
+  }
+  await loadSession(handle.sessionId, startedTarget, { initial: false });
 }
 
 /** 未版本控制删除：优先 /usr/bin/trash，失败回退 osascript 交 Finder 删除。 */
@@ -812,6 +845,9 @@ async function trashEntry(meta: CommitEntryMeta): Promise<void> {
   if (!session) {
     return;
   }
+  // 与 revertEntry 相同：会话与目标在操作开始时捕获，完成后核对再重读。
+  const startedSessionId = handle?.sessionId;
+  const startedTarget = targetOf(session);
   const confirmed = await confirmModal(
     `${strings.panel.trashConfirmDetail}\n${meta.path}`,
     strings.commit.continueButton,
@@ -823,7 +859,7 @@ async function trashEntry(meta: CommitEntryMeta): Promise<void> {
   if (!operationId) {
     return;
   }
-  const absPath = join(session.wcRoot, meta.path);
+  const absPath = join(startedTarget.wcRoot, meta.path);
   const ok = await moveToTrash(absPath);
   if (!ok) {
     handle?.toast('error', format(strings.panel.trashFailedNotice, { message: absPath }));
@@ -832,7 +868,10 @@ async function trashEntry(meta: CommitEntryMeta): Promise<void> {
   }
   handle?.toast('info', format(strings.panel.trashDoneNotice, { path: meta.path }));
   await finishInlineOperation(operationId);
-  await loadSession(handle!.sessionId, targetOf(session), { initial: false });
+  if (!handle || handle.sessionId !== startedSessionId) {
+    return;
+  }
+  await loadSession(handle.sessionId, startedTarget, { initial: false });
 }
 
 async function moveToTrash(absPath: string): Promise<boolean> {
@@ -1363,7 +1402,9 @@ async function resolveUnknown(sessionId: string): Promise<void> {
         format(strings.panel.verifyCommitted, { revisions: revisions.map((r) => `r${r}`).join('、r') || '—' }),
       );
       const verified: CommitSessionState['result'] = { kind: 'success', revisions, committedIds: explicit };
-      await loadSession(handle.sessionId, target, { initial: false });
+      // unknown 期 busy=false、目标可切换：用已核对的会话 ID 重读，
+      // loadSession 入口校验拦截切换后的迟到执行。
+      await loadSession(sessionId, target, { initial: false });
       if (session) {
         session.result = verified;
         pushRender();
@@ -1376,7 +1417,7 @@ async function resolveUnknown(sessionId: string): Promise<void> {
       activeOperationId = undefined;
       session.phase = 'ready';
       handle.toast('info', strings.panel.verifyNotCommitted);
-      await loadSession(handle.sessionId, target, { initial: false });
+      await loadSession(sessionId, target, { initial: false });
       return;
     }
     // 远端不可读，或显式路径出现远端变化但本地修改仍在：证据不唯一，继续冻结。

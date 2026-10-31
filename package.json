@@ -18,7 +18,12 @@
     "onCommand:svnAnywhere.cleanup",
     "onCommand:svnAnywhere.relocate",
     "onCommand:svnAnywhere.editIgnore",
-    "onCommand:svnAnywhere.showOutput"
+    "onCommand:svnAnywhere.showOutput",
+    "onCommand:svnAnywhere.add",
+    "onCommand:svnAnywhere.delete",
+    "onCommand:svnAnywhere.revert",
+    "onCommand:svnAnywhere.move",
+    "onCommand:svnAnywhere.revealInFinder"
   ],
   "contributes": {
     "submenus": [
@@ -67,6 +72,31 @@
         "command": "svnAnywhere.showOutput",
         "title": "显示输出",
         "category": "SVN Anywhere"
+      },
+      {
+        "command": "svnAnywhere.add",
+        "title": "添加",
+        "category": "SVN Anywhere"
+      },
+      {
+        "command": "svnAnywhere.delete",
+        "title": "删除",
+        "category": "SVN Anywhere"
+      },
+      {
+        "command": "svnAnywhere.revert",
+        "title": "还原",
+        "category": "SVN Anywhere"
+      },
+      {
+        "command": "svnAnywhere.move",
+        "title": "移动",
+        "category": "SVN Anywhere"
+      },
+      {
+        "command": "svnAnywhere.revealInFinder",
+        "title": "在 Finder 中显示",
+        "category": "SVN Anywhere"
       }
     ],
     "menus": {
@@ -83,8 +113,28 @@
           "group": "1_info@1"
         },
         {
+          "command": "svnAnywhere.revealInFinder",
+          "group": "1_info@2"
+        },
+        {
           "command": "svnAnywhere.commit",
           "group": "2_commit@1"
+        },
+        {
+          "command": "svnAnywhere.add",
+          "group": "2_daily@1"
+        },
+        {
+          "command": "svnAnywhere.revert",
+          "group": "2_daily@2"
+        },
+        {
+          "command": "svnAnywhere.move",
+          "group": "2_daily@3"
+        },
+        {
+          "command": "svnAnywhere.delete",
+          "group": "2_daily@4"
         },
         {
           "command": "svnAnywhere.update",
@@ -135,6 +185,21 @@
         },
         {
           "command": "svnAnywhere.showOutput"
+        },
+        {
+          "command": "svnAnywhere.add"
+        },
+        {
+          "command": "svnAnywhere.delete"
+        },
+        {
+          "command": "svnAnywhere.revert"
+        },
+        {
+          "command": "svnAnywhere.move"
+        },
+        {
+          "command": "svnAnywhere.revealInFinder"
         }
       ]
     },

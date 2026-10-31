@@ -1,14 +1,19 @@
 /**
  * 命令注册总表。命令 ID 与 package.json 贡献点一一对应，
- * 顺序按子菜单分组（信息、提交、更新、高级）排列。
+ * 顺序按子菜单分组（信息、提交、日常操作、更新、高级）排列。
  */
 import type * as vscode from 'vscode';
+import { commandAdd } from './add';
 import { commandCleanup } from './cleanup';
 import { commandCommit } from './commit';
+import { commandDelete } from './delete';
 import { commandEditIgnore } from './ignore';
+import { commandMove } from './move';
 import { type CommandHandler, registerCommand } from './registry';
 import { commandRelocate } from './relocate';
 import { commandRefreshStatus } from './refreshStatus';
+import { commandReveal } from './reveal';
+import { commandRevert } from './revert';
 import { commandShowOutput } from './showOutput';
 import { commandShowStatus } from './showStatus';
 import { commandUpdate } from './update';
@@ -25,6 +30,11 @@ const COMMANDS: ReadonlyArray<{ id: string; handler: CommandHandler }> = [
   { id: 'svnAnywhere.relocate', handler: commandRelocate },
   { id: 'svnAnywhere.editIgnore', handler: commandEditIgnore },
   { id: 'svnAnywhere.showOutput', handler: commandShowOutput },
+  { id: 'svnAnywhere.add', handler: commandAdd },
+  { id: 'svnAnywhere.delete', handler: commandDelete },
+  { id: 'svnAnywhere.revert', handler: commandRevert },
+  { id: 'svnAnywhere.move', handler: commandMove },
+  { id: 'svnAnywhere.revealInFinder', handler: commandReveal },
 ];
 
 /**

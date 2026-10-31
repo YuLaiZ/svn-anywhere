@@ -8,6 +8,8 @@ import { dirname, join } from 'node:path';
  * 从给定路径向上逐级查找最近的 SVN 工作副本根（1.7+ 单 `.svn` 目录格式，
  * 以 `.svn/wc.db` 存在为准）。传入路径是文件时从其父目录开始找；
  * 是目录时从自身开始找（目录本身可能是副本根）。
+ * 路径本身已缺失（missing：本地删除未登记/文件系统移动）时退到最近的
+ * 现存父目录继续定位，还原/登记删除/移动检测才能解析这类目标。
  * 嵌套副本天然命中最近的一个。每次命令重新查找，不做缓存。
  */
 export function findWorkingCopy(fsPath: string): string | undefined {
@@ -15,7 +17,11 @@ export function findWorkingCopy(fsPath: string): string | undefined {
   try {
     resolved = realpathSync(fsPath);
   } catch {
-    return undefined;
+    const parent = dirname(fsPath);
+    if (parent === fsPath) {
+      return undefined;
+    }
+    return findWorkingCopy(parent);
   }
 
   let stat;

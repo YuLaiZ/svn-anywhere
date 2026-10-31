@@ -19,6 +19,7 @@ import { basename, relative } from 'node:path';
 import type { StatusEntry } from '../../core/status';
 import type { RemoteStatusEntry } from '../../core/remoteStatus';
 import { matchesIgnoreRules } from '../../core/ignore';
+import { isInsideExternalPrefixes } from '../../core/dailyOps';
 import { format, strings } from '../i18n';
 import type { CommitGroup, CommitPhase, CommitResult } from './fixture';
 import type { ActionSpec, BannerSpec, FilterSpec, FooterSpec, ListSpec, PanelState, RowSpec } from './state';
@@ -754,9 +755,8 @@ export function mergeStatusEntries(
   externalPrefixes: string[] = [],
 ): CommitEntryMeta[] {
   // externals 边界：外部副本内部的条目（svn status 会递归列出）不进本面板，
-  // 提交范围按副本边界隔离。
-  const insideExternal = (path: string) =>
-    externalPrefixes.some((prefix) => path === prefix || path.startsWith(`${prefix}/`));
+  // 提交范围按副本边界隔离（谓词与日常命令共用 core 实现）。
+  const insideExternal = (path: string) => isInsideExternalPrefixes(path, externalPrefixes);
   const remoteByPath = new Map<string, string>();
   if (remote) {
     for (const entry of remote) {

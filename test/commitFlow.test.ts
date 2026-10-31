@@ -522,6 +522,45 @@ describe('P1 提交面板 提交闭环', () => {
     expect(revertCall?.[1]).toEqual(['revert', '--', 'a.txt']);
   });
 
+  it('行内操作中途切换目标：迟到重读被守卫放弃，不写入新会话（目标隔离）', async () => {
+    // 行内操作进行中面板不置 busy、可被切换目标：操作开始时捕获会话与
+    // 目标，完成后核对；已切换则放弃重读，避免旧目标数据覆盖新目标。
+    const panel = await openPanelAndWait(join(wcRoot, 'a.txt'), 'a.txt');
+    let releaseRevert!: (value: { stdout: string; stderr: string; exitCode: number }) => void;
+    vi.mocked(runOrThrow).mockImplementationOnce(
+      () => new Promise((resolve) => { releaseRevert = resolve; }),
+    );
+    vscodeMock.quickPickChoice = strings.panel.actRevert;
+    vscodeMock.confirmResult = strings.commit.continueButton;
+    panel.sendIntent({ kind: 'rowMore', itemId: 'a.txt' }, 'more-race');
+    await vi.waitFor(() => {
+      expect(vi.mocked(runOrThrow).mock.calls.some(([, args]) => args[0] === 'revert')).toBe(true);
+    });
+
+    // 操作挂起期间切换到新目标（同副本不同子目录）。
+    mkdirSync(join(wcRoot, 'sub-dir'));
+    vi.mocked(runStatus).mockImplementation(async (_svn, target) =>
+      String(target).includes('sub-dir')
+        ? { targetPath: 'sub-dir', entries: [{ path: 'sub.txt', wcStatus: 'modified', props: 'none', changelist: null }], externals: [] }
+        : { targetPath: '.', entries: [{ path: 'a.txt', wcStatus: 'modified', props: 'none', changelist: null }], externals: [] },
+    );
+    await commandCommit(makeUri(join(wcRoot, 'sub-dir')));
+    await vi.waitFor(() => {
+      const subRender = [...panel.posted].reverse().find((m) => m.type === 'render' && String(m.html ?? '').includes('sub.txt'));
+      expect(subRender).toBeDefined();
+    });
+    const postedAfterSwitch = panel.posted.length;
+    const statusCallsAfterSwitch = vi.mocked(runStatus).mock.calls.length;
+
+    // 释放挂起的 revert：会话已切换，迟到重读必须被放弃。
+    releaseRevert({ stdout: '', stderr: '', exitCode: 0 });
+    await new Promise((resolve) => setTimeout(resolve, 120));
+
+    expect(vi.mocked(runStatus).mock.calls.length).toBe(statusCallsAfterSwitch);
+    const lateRenders = panel.posted.slice(postedAfterSwitch).filter((m) => m.type === 'render');
+    expect(lateRenders.some((m) => String(m.html ?? '').includes('data-row-id="a.txt"'))).toBe(false);
+  });
+
   it('关闭面板：草稿有变化时先确认，取消不关闭', async () => {
     const panel = await openPanelAndWait(join(wcRoot, 'a.txt'), 'a.txt');
     panel.sendIntent({ kind: 'syncInput', fieldId: 'message', value: '草稿', inputRevision: 1 }, 'in-1');

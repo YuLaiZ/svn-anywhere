@@ -250,13 +250,15 @@ describe('commandUpdate（更新）', () => {
 });
 
 describe('commandCleanup（清理）', () => {
-  it('进度通知中执行 cleanup：目标转义、频道写完成行', async () => {
+  it('模态确认后执行 cleanup：目标转义、频道写完成行', async () => {
     const filePath = join(wcRoot, 'dir@2');
     mkdirSync(join(wcRoot, 'dir@2'));
+    vscodeMock.confirmResult = strings.cleanup.confirmButton;
     vi.mocked(runOrThrow).mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 });
 
     await commandCleanup(makeUri(filePath));
 
+    expect(vscodeMock.warning.some((m) => m.includes('svn cleanup'))).toBe(true);
     expect(vscodeMock.progressCalls).toEqual([strings.cleanup.progress.replace('{target}', filePath)]);
     expect(vi.mocked(runOrThrow)).toHaveBeenCalledWith(
       'svn',
@@ -266,7 +268,16 @@ describe('commandCleanup（清理）', () => {
     expect(channelLines().join('\n')).toContain(strings.cleanup.done);
   });
 
+  it('模态确认取消：不执行 cleanup', async () => {
+    vscodeMock.confirmResult = undefined;
+    const before = vi.mocked(runOrThrow).mock.calls.length;
+    await commandCleanup(makeUri(wcRoot));
+    expect(vi.mocked(runOrThrow).mock.calls.length).toBe(before);
+    expect(vscodeMock.progressCalls).toHaveLength(0);
+  });
+
   it('svn 失败：异常向上传播交给统一收口', async () => {
+    vscodeMock.confirmResult = strings.cleanup.confirmButton;
     vi.mocked(runOrThrow).mockRejectedValueOnce(
       new SvnError({ message: 'svn: E155007: 出错', command: ['cleanup'], code: 'E155007' }),
     );

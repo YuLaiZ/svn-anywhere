@@ -16,9 +16,18 @@ export const strings = {
     relocate: '重定位（改仓库地址）',
     editIgnore: '编辑忽略规则',
     showOutput: '显示输出',
+    add: '添加',
+    delete: '删除',
+    revert: '还原',
+    move: '移动',
+    revealInFinder: '在 Finder 中显示',
   },
   target: {
     resolved: '[定位] {command}：目标 {target}，副本根 {wcRoot}',
+  },
+  list: {
+    /** 清单超出列举上限时的截断后缀（确认框等用户可见处）。 */
+    moreSuffix: '…（共 {count} 项）',
   },
   status: {
     header: '状态（{path}）：',
@@ -37,7 +46,41 @@ export const strings = {
   },
   cleanup: {
     progress: '正在清理 {target}…',
+    confirmTitle: '将对以下路径执行 svn cleanup（清理工作副本锁与未完成操作日志）：\n{target}',
+    confirmButton: '清理',
     done: '清理完成。',
+  },
+  add: {
+    missingTarget: '{path} 的本地文件已缺失，无法添加；missing 路径属还原或登记删除范畴。',
+    alreadyVersioned: '{path} 已在版本控制中，无需添加。',
+    done: '已登记添加：{path}',
+  },
+  deleteOp: {
+    unversionedTarget: '{path} 未纳入版本控制，SVN 删除仅适用于已版本控制路径。',
+    confirmDetail: '将删除本地文件并登记 SVN 删除（提交后从仓库移除）：',
+    confirmDetailMissing: '{path} 的本地文件已缺失，将登记 SVN 删除（提交后从仓库移除）：',
+    dirNote: '目标为目录：删除会登记整个目录子树，不能保留其中未选的子项。',
+    irreversibleNote: '删除登记提交后无法从工作副本直接撤销，需要时须回溯仓库历史。',
+    confirmButton: '删除',
+    done: '已登记删除：{path}',
+  },
+  revert: {
+    nothing: '{path} 没有可还原的本地修改。',
+    confirmDetail: '将丢弃 {count} 个路径的本地修改（含文本、属性与添加/删除登记）：',
+    dirNote: '目标为目录：递归还原目录下全部本地修改；未版本控制文件不受影响。',
+    irreversibleNote: '还原立即生效且不可撤销，被丢弃的本地修改无法找回。',
+    confirmButton: '还原',
+    done: '已还原 {count} 个路径（目标 {path}）。',
+  },
+  move: {
+    unversionedTarget: '{path} 未纳入版本控制，svn move 仅适用于已版本控制路径；请先「添加」。',
+    fsMovedHint:
+      '{path} 已不在本地（可能已被文件系统移动或删除）。SVN 不会把这类移动识别为重命名；若刚移动过，请先把内容移回原位置，再用「移动」（svn move）完成，以保留历史。本次未执行任何操作。',
+    inputPrompt: '输入移动/重命名目标路径（svn move 保留历史），源：{path}',
+    sameTarget: '目标路径与源相同，无需移动。',
+    targetExists: '目标路径已存在：{target}',
+    outsideWorkingCopy: '目标路径不在同一工作副本内，svn move 无法跨副本移动。',
+    done: '已移动：{src} → {dst}（保留历史）',
   },
   commitCheck: {
     remoteSummary: '远端检查：{count} 个远端更新（对照 revision {against}）。',

@@ -540,11 +540,16 @@ async function main() {
     state.progressTitles.length === progressBeforeCancel && !cancelOutput.includes('> svn update'),
     cancelOutput.slice(-300));
 
-  console.log('场景 9：真实副本「清理」完成写频道');
+  console.log('场景 9：真实副本「清理」——模态确认后完成写频道');
+  state.confirmResult = '清理';
   const linesBeforeCleanup = channelText().length;
   await state.registered.get('svnAnywhere.cleanup')({ fsPath: join(probe, 'a.txt'), scheme: 'file' });
   const cleanupOutput = channelText().slice(linesBeforeCleanup);
+  check('确认框写明影响范围（svn cleanup 与目标）',
+    state.warning.some((m) => m.includes('svn cleanup') && m.includes(probe)),
+    JSON.stringify(state.warning.slice(-3)));
   check('频道写清理完成', cleanupOutput.includes('清理完成。'), cleanupOutput.slice(-300));
+  state.confirmResult = undefined;
 
   console.log('场景 10：真实副本「更新」遇冲突——退出码为 0 仍要提示冲突');
   writeFileSync(join(remote, 'a.txt'), 'remote edit\n');
@@ -578,7 +583,7 @@ async function main() {
   const progressBeforeCommit = state.progressTitles.length;
   const linesBeforeCommitCheck = channelText().length;
   // 对目录驱动：单文件目标的 status -u 查不到其他路径的远端变更。
-  const panel11 = await openCommitPanel(probe2, 'b.txt');
+  const panel11 = await openCommitPanel(probe2, 'data-row-id="b.txt"');
   const render11 = await waitRender(panel11, '仅远端变更');
   check('面板出现仅远端分组（提交前检查开启）', !!render11, '未出现远端分组');
   await commitViaPanel(panel11, ['b.txt'], '提交本地修改');
@@ -613,7 +618,7 @@ async function main() {
   writeFileSync(join(probe3, 'b2.txt'), 'committed content\n');
   writeFileSync(join(probe3, 'c2.txt'), 'kept local\n');
   writeFileSync(join(probe3, 'fresh.txt'), 'fresh body\n');
-  const panel12 = await openCommitPanel(probe3, 'fresh.txt');
+  const panel12 = await openCommitPanel(probe3, 'data-row-id="fresh.txt"');
   const lastFrame = panel12.webview.posted.filter((m) => m.type === 'render').at(-1);
   const data12 = await waitRender(panel12, 'fresh.txt');
   check(
@@ -665,7 +670,7 @@ async function main() {
   state.confirmResult = '继续';
   const linesBeforeMissing = channelText().length;
   const infoBeforeMissing = state.information.length;
-  const panel13 = await openCommitPanel(probe3, 'drop.txt');
+  const panel13 = await openCommitPanel(probe3, 'data-row-id="drop.txt"');
   const infoBefore13 = state.information.length;
   await commitViaPanel(panel13, ['drop.txt'], 'chore: drop file');
   await waitNewInfo('提交成功', infoBefore13);
@@ -788,7 +793,7 @@ async function main() {
   svn(['commit', '-q', '-m', 'nested baseline'], nestedWc);
   for (const name of nestedNames) writeFileSync(join(nestedWc, name), `modified ${name}\n`);
   // 以 wcRoot 为 cwd 的嵌套目标：entry 已相对根，面板路径不重复拼 target 前缀。
-  const panel19 = await openCommitPanel(join(nestedWc, 'src'), 'src/item.txt');
+  const panel19 = await openCommitPanel(join(nestedWc, 'src'), 'data-row-id="src/item.txt"');
   const data19 = await waitRender(panel19, 'src/src/item.txt');
   check(
     '面板保留嵌套同名路径的独立身份（不拼目标前缀）',
@@ -863,7 +868,7 @@ async function main() {
   svn(['commit', '-q', '-m', 'literal entities baseline'], specialWc);
   for (const name of literalNames) writeFileSync(join(specialWc, name), 'literal modified');
   const revisionBeforeControl = svn(['info', '--show-item', 'revision', specialLab.repoUrl]);
-  const panel21 = await openCommitPanel(specialWc, 'foo&amp;#10;bar');
+  const panel21 = await openCommitPanel(specialWc, 'data-row-id="foo&amp;#10;bar"');
   const data21 = await waitRender(panel21, 'unversioned');
   // 控制字符名（unversioned）与字面实体名（modified）同时出现且身份不同。
   check(
@@ -903,7 +908,7 @@ async function main() {
   writeFileSync(join(specialWc, 'decoy.txt'), 'DECOY-CHANGE');
   writeFileSync(join(specialWc, 'a@1'), 'AT-SELECTED-CHANGE');
   writeFileSync(join(specialWc, 'a@1@'), 'AT-NEIGHBOR-CHANGE');
-  const panel22 = await openCommitPanel(specialWc, 'a@1');
+  const panel22 = await openCommitPanel(specialWc, 'data-row-id="a@1"');
   // 差异不指向邻名：逐项 openDiff 后断言 vscode.diff 右端是目标工作文件。
   for (const name of [optionName, 'a@1', 'a@1@']) {
     const before22 = state.executedCommands.length;
@@ -971,7 +976,7 @@ async function main() {
   writeFileSync(join(panelWc, 'src', 'new.txt'), 'unversioned body');
   writeFileSync(join(panelWc, 'src', 'core', 'a.txt'), 'work content\n');
   svn(['propset', '-q', 'svn:ignore', 'tmp', 'src'], panelWc);
-  const panel = await openCommitPanel(panelWc, 'src/core/a.txt');
+  const panel = await openCommitPanel(panelWc, 'data-row-id="src/core/a.txt"');
   check('HTML 骨架含 CSP/nonce/asWebviewUri 资源',
     panel.webview.html.includes("default-src 'none'") &&
     /script-src 'nonce-[0-9a-f]+/.test(panel.webview.html) &&
@@ -1087,7 +1092,7 @@ async function main() {
   svn(['commit', '-q', '-m', 'act baseline'], actWc);
   writeFileSync(join(actWc, 'revert.txt'), 'changed\n');
   writeFileSync(join(actWc, 'del.txt'), 'changed\n');
-  const panel26 = await openCommitPanel(actWc, 'revert.txt');
+  const panel26 = await openCommitPanel(actWc, 'data-row-id="revert.txt"');
   state.quickPickChoice = '还原…';
   state.confirmResult = '继续';
   await waitPanelIdle(panel26);
@@ -1113,7 +1118,7 @@ async function main() {
     'warn=' + JSON.stringify(state.warning.slice(-3)).slice(0, 300));
   // 未版本控制删除：优先 /usr/bin/trash（文件从原位置消失即视为进回收站流程）。
   writeFileSync(join(actWc, 'trash-me.txt'), 'x');
-  const panel26b = await openCommitPanel(actWc, 'trash-me.txt');
+  const panel26b = await openCommitPanel(actWc, 'data-row-id="trash-me.txt"');
   state.quickPickChoice = '移到回收站…';
   await waitPanelIdle(panel26b);
   panel26b.sendAuto({ kind: 'rowMore', itemId: 'trash-me.txt' });
@@ -1134,7 +1139,7 @@ async function main() {
   writeFileSync(join(clWc, 'plain.txt'), 'v2');
   svn(['changelist', '-q', 'all', 'all.txt'], clWc);
   svn(['changelist', '-q', 'name:all', 'none.txt'], clWc);
-  const panel27 = await openCommitPanel(clWc, 'plain.txt');
+  const panel27 = await openCommitPanel(clWc, 'data-row-id="plain.txt"');
   const data27 = await waitRender(panel27, 'changelist');
   // 分组条目与未分组条目都在面板上，changelist 徽标按原值。
   check('changelist 容器条目与未分组条目同时出现',
@@ -1142,19 +1147,30 @@ async function main() {
     data27.html.includes('data-row-id="none.txt"') &&
     data27.html.includes('data-row-id="plain.txt"'));
   // 筛选真实组名 all：编码值 name:all 与哨兵不冲突。
+  // 上一目标的慢重读（file:// status -u）可能让面板长时间 busy、切换被拒
+  // 或短暂停留在旧目标：等待循环检测最新帧不是本目标时重新驱动命令
+  // （等价用户再点一次「提交」），而不是只靠固定次数重试。
   await waitPanelIdle(panel27);
-  panel27.sendAuto({ kind: 'setFilter', filterId: 'changelist', value: 'name:all' });
   let filtered27;
-  for (let retry = 0; retry < 200; retry += 1) {
-    filtered27 = [...panel27.webview.posted].reverse().find(
-      (m) => m.type === 'render' && m.html.includes('data-row-id="all.txt"') && m.html.includes('显示 1 / 3 项'),
-    );
-    if (filtered27) break;
-    await new Promise((resolve) => setTimeout(resolve, 30));
+  for (let attempt = 0; attempt < 10 && !filtered27; attempt += 1) {
+    const latest27 = [...panel27.webview.posted].reverse().find((m) => m.type === 'render');
+    if (latest27 && !String(latest27.html).includes('cl-wc')) {
+      await state.registered.get('svnAnywhere.commit')({ fsPath: clWc, scheme: 'file' });
+      await waitNewRender(panel27, 'data-row-id="plain.txt"', panel27.webview.posted.length, 150);
+    }
+    panel27.sendAuto({ kind: 'setFilter', filterId: 'changelist', value: 'name:all' });
+    for (let retry = 0; retry < 100; retry += 1) {
+      filtered27 = [...panel27.webview.posted].reverse().find(
+        (m) => m.type === 'render' && m.html.includes('data-row-id="all.txt"') && m.html.includes('显示 1 / 3 项'),
+      );
+      if (filtered27) break;
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    }
+    await waitPanelIdle(panel27, 100);
   }
   check('真实组名 all 的筛选不与哨兵冲突（只显示 all.txt，全局选择保留）',
     !!filtered27 && filtered27.html.includes('data-row-id="all.txt"') && !filtered27.html.includes('data-row-id="plain.txt"'),
-    filtered27 ? filtered27.html.slice(0, 300) : '未等到筛选帧');
+    filtered27 ? filtered27.html.slice(0, 300) : `未等到筛选帧；尾部帧=${JSON.stringify(panel27.webview.posted.slice(-8).map((m) => m.type === 'render' ? ['render', String(m.sessionId).slice(0, 5), 'busy=' + (m.html.includes('data-busy="1"') ? 1 : 0), (m.html.match(/显示 [^<]*/g) ?? []).slice(-1)[0] ?? '', m.html.includes('cl-wc') ? 'T=cl-wc' : m.html.includes('act-wc') ? 'T=act-wc' : 'T=?', (m.html.match(/data-row-id="[^"]{0,30}/g) ?? []).slice(0, 5).join(',')] : [m.type, String(m.message ?? '').slice(0, 40)]))}`);
   // 显式整组选择：替换选择为该组成员；随后仍可取消单项，提交按实际勾选。
   panel27.sendAuto({ kind: 'selectChangelist' });
   await new Promise((resolve) => setTimeout(resolve, 200));
@@ -1191,7 +1207,7 @@ async function main() {
   const nestedWc28 = join(dirWc, 'newdir', 'nested-wc');
   mkdirSync(nestedWc28, { recursive: true });
   svn(['checkout', '-q', panelLab.repoUrl, nestedWc28], dirWc);
-  const panel28 = await openCommitPanel(dirWc, 'newdir');
+  const panel28 = await openCommitPanel(dirWc, 'data-row-id="newdir"');
   const data28 = await waitRender(panel28, 'newdir/main.ts');
   check('未版本控制目录枚举出具体子项（svn status 不进入，面板递归枚举）',
     data28.html.includes('data-row-id="newdir/main.ts"') && data28.html.includes('data-row-id="newdir/sub/child.ts"'),
@@ -1223,7 +1239,7 @@ async function main() {
   svn(['add', '-q', 'batch'], batchWc);
   svn(['commit', '-q', '-m', 'batch baseline'], batchWc);
   for (const name of batchNames) writeFileSync(join(batchWc, name), 'modified\n');
-  const panel29 = await openCommitPanel(batchWc, 'batch/f000.txt');
+  const panel29 = await openCommitPanel(batchWc, 'data-row-id="batch/f000.txt"');
   const data29 = await waitRender(panel29, 'batch/f119.txt');
   check('120 项全部进入面板（默认全选可提交本地项）', data29.html.includes('data-row-id="batch/f119.txt"'));
   // 默认全选直接提交（不 clear，保留默认勾选）。
@@ -1275,7 +1291,7 @@ async function main() {
     ['#!/bin/sh', 'REPOS="$1"', 'TXN="$2"', `FILES=\`${svnlookBin} changed "$REPOS" -t "$TXN"\``, 'case "$FILES" in *f110*) echo "reject f110" 1>&2; exit 1;; esac', 'exit 0', ''].join('\n'),
   );
   execFileSync('chmod', ['+x', join(partialLab.lab, 'repo', 'hooks', 'pre-commit')]);
-  const panel30 = await openCommitPanel(partialWc, 'batch/f119.txt');
+  const panel30 = await openCommitPanel(partialWc, 'data-row-id="batch/f119.txt"');
   await waitPanelIdle(panel30);
   const revBefore30 = (channelText().match(/Committed revision/g) || []).length;
   panel30.sendAuto({ kind: 'syncInput', fieldId: 'message', value: 'partial commit', inputRevision: state.intentSeq + 1000 });
@@ -1329,7 +1345,7 @@ async function main() {
   // 外部副本内产生修改 + 主副本修改。
   writeFileSync(join(extMain, 'vendor', 'shared.txt'), 'shared changed in external\n');
   writeFileSync(join(extMain, 'main.txt'), 'main changed\n');
-  const panel31 = await openCommitPanel(extMain, 'main.txt');
+  const panel31 = await openCommitPanel(extMain, 'data-row-id="main.txt"');
   const data31 = [...panel31.webview.posted].reverse().find((m) => m.type === 'render' && m.html.includes('data-row-id="main.txt"'));
   check('externals 占位条目不进入面板（解析层过滤 external）',
     !!data31 && !data31.html.includes('data-row-id="vendor"'),
@@ -1624,6 +1640,173 @@ async function main() {
   check('完成卡片提示后续本地规则修改仍待提交', !!doneFrame37);
   state.confirmResult = undefined;
   rmSync(lab37.lab, { recursive: true, force: true });
+
+  console.log('场景 38：右键「添加」——未版本控制文件与深层目录 --parents 补齐上级');
+  const lab38 = makeSvnLab();
+  const wc38 = lab38.checkout('wc38');
+  writeFileSync(join(wc38, 'base.txt'), 'base\n');
+  svn(['add', '-q', '--parents', 'base.txt'], wc38);
+  svn(['commit', '-q', '-m', 'init'], wc38);
+  writeFileSync(join(wc38, 'fresh.txt'), 'fresh\n');
+  await state.registered.get('svnAnywhere.add')({ fsPath: join(wc38, 'fresh.txt'), scheme: 'file' });
+  check('未版本控制文件登记 A', svn(['status'], wc38).includes('A       fresh.txt'));
+  check('提示含已登记添加', state.information.some((m) => m.includes('fresh.txt')));
+  mkdirSync(join(wc38, 'deep/inner'), { recursive: true });
+  writeFileSync(join(wc38, 'deep/inner/n.txt'), 'n\n');
+  await state.registered.get('svnAnywhere.add')({ fsPath: join(wc38, 'deep/inner/n.txt'), scheme: 'file' });
+  const status38 = svn(['status'], wc38);
+  check('深层路径 --parents 补齐未纳管上级',
+    status38.includes('A       deep') && status38.includes('A       deep/inner') && status38.includes('A       deep/inner/n.txt'),
+    status38);
+  // 已版本控制目标：提示且不执行。
+  const linesBefore38 = channelText().length;
+  await state.registered.get('svnAnywhere.add')({ fsPath: join(wc38, 'base.txt'), scheme: 'file' });
+  check('已版本控制目标提示不执行', state.information.some((m) => m.includes('已在版本控制')) &&
+    !channelText().slice(linesBefore38).includes('> svn add'));
+  rmSync(lab38.lab, { recursive: true, force: true });
+
+  console.log('场景 39：右键「删除」——确认框写明影响范围与不可逆，默认同时删除本地');
+  const lab39 = makeSvnLab();
+  const wc39 = lab39.checkout('wc39');
+  mkdirSync(join(wc39, 'tree/inner'), { recursive: true });
+  writeFileSync(join(wc39, 'tree/inner/f.txt'), 'v1\n');
+  writeFileSync(join(wc39, 'tree/g.txt'), 'v1\n');
+  writeFileSync(join(wc39, 'mod.txt'), 'v1\n');
+  svn(['add', '-q', '--parents', 'tree/inner/f.txt', 'tree/g.txt', 'mod.txt'], wc39);
+  svn(['commit', '-q', '-m', 'init'], wc39);
+  writeFileSync(join(wc39, 'mod.txt'), 'v2\n');
+  // 取消：不执行。
+  state.confirmResult = undefined;
+  await state.registered.get('svnAnywhere.delete')({ fsPath: join(wc39, 'mod.txt'), scheme: 'file' });
+  check('取消确认不删除', existsSync(join(wc39, 'mod.txt')) && !svn(['status'], wc39).includes('D'));
+  state.confirmResult = '删除';
+  const warningBefore39 = state.warning.length;
+  await state.registered.get('svnAnywhere.delete')({ fsPath: join(wc39, 'mod.txt'), scheme: 'file' });
+  const confirm39 = state.warning.slice(warningBefore39).find((m) => m.includes('mod.txt'));
+  check('确认框写明删除本地文件并登记 SVN 删除', !!confirm39 && confirm39.includes('删除本地文件并登记 SVN 删除'),
+    String(confirm39).slice(0, 200));
+  check('确认框含不可逆说明', !!confirm39 && confirm39.includes('无法从工作副本直接撤销'));
+  check('本地有修改的文件经 --force 删除并登记', !existsSync(join(wc39, 'mod.txt')) &&
+    svn(['status'], wc39).includes('D       mod.txt'));
+  await state.registered.get('svnAnywhere.delete')({ fsPath: join(wc39, 'tree'), scheme: 'file' });
+  const confirmDir = state.warning.slice(warningBefore39).find((m) => m.includes('tree/g.txt'));
+  check('目录确认枚举完整影响子树', !!confirmDir && confirmDir.includes('tree/inner/f.txt'),
+    String(confirmDir).slice(0, 300));
+  check('目录默认本地删除', !existsSync(join(wc39, 'tree')) && svn(['status'], wc39).includes('D       tree'));
+  writeFileSync(join(wc39, 'u.txt'), 'u\n');
+  await state.registered.get('svnAnywhere.delete')({ fsPath: join(wc39, 'u.txt'), scheme: 'file' });
+  check('未版本控制目标不走 SVN 删除', state.information.some((m) => m.includes('未纳入版本控制')) &&
+    existsSync(join(wc39, 'u.txt')));
+  state.confirmResult = undefined;
+  rmSync(lab39.lab, { recursive: true, force: true });
+
+  console.log('场景 40：右键「还原」——确认列出文件数量与路径，单文件与整目录递归');
+  const lab40 = makeSvnLab();
+  const wc40 = lab40.checkout('wc40');
+  mkdirSync(join(wc40, 'tree/inner'), { recursive: true });
+  writeFileSync(join(wc40, 'tree/inner/f.txt'), 'v1\n');
+  writeFileSync(join(wc40, 'mod.txt'), 'v1\n');
+  svn(['add', '-q', '--parents', 'tree/inner/f.txt', 'mod.txt'], wc40);
+  svn(['commit', '-q', '-m', 'init'], wc40);
+  writeFileSync(join(wc40, 'tree/inner/f.txt'), 'v2\n');
+  svn(['propset', '-q', 'svn:ignore', 'zzz', 'tree'], wc40);
+  state.confirmResult = '还原';
+  const warningBefore40 = state.warning.length;
+  await state.registered.get('svnAnywhere.revert')({ fsPath: join(wc40, 'tree'), scheme: 'file' });
+  const confirm40 = state.warning.slice(warningBefore40).find((m) => m.includes('tree'));
+  check('确认框列出数量（2 个路径：目录属性+子文件）', !!confirm40 && confirm40.includes('2 个路径'),
+    String(confirm40).slice(0, 300));
+  check('确认框列出路径清单', !!confirm40 && confirm40.includes('tree/inner/f.txt'));
+  check('确认框含不可逆说明', !!confirm40 && confirm40.includes('无法找回'));
+  check('目录递归还原后 status 干净', svn(['status'], wc40).trim() === '', svn(['status'], wc40));
+  writeFileSync(join(wc40, 'mod.txt'), 'v3\n');
+  state.confirmResult = undefined;
+  await state.registered.get('svnAnywhere.revert')({ fsPath: join(wc40, 'mod.txt'), scheme: 'file' });
+  check('取消确认保留本地修改', readFileSync(join(wc40, 'mod.txt'), 'utf8') === 'v3\n');
+  state.confirmResult = '还原';
+  await state.registered.get('svnAnywhere.revert')({ fsPath: join(wc40, 'mod.txt'), scheme: 'file' });
+  check('单文件确认还原', readFileSync(join(wc40, 'mod.txt'), 'utf8') === 'v1\n');
+  await state.registered.get('svnAnywhere.revert')({ fsPath: join(wc40, 'mod.txt'), scheme: 'file' });
+  check('无修改时提示无可还原', state.information.some((m) => m.includes('没有可还原')));
+
+  // externals 边界：svn revert -R 不跨 external，目录递归还原的确认清单
+  // 须隔离 external 内部条目（status 会递归列出）。
+  const lab40e = makeSvnLab();
+  execFileSync('svn', ['mkdir', '-q', '-m', 'ext base', `${lab40e.repoUrl}/ext-src`]);
+  const extHost40 = lab40e.checkout('ext-host40', 'ext-src');
+  writeFileSync(join(extHost40, 's.txt'), 'v1');
+  svn(['add', '-q', 's.txt'], extHost40);
+  svn(['commit', '-q', '-m', 'ext init'], extHost40);
+  const main40e = lab40e.checkout('main40e');
+  writeFileSync(join(main40e, 'a.txt'), 'v1');
+  svn(['add', '-q', 'a.txt'], main40e);
+  writeFileSync(join(main40e, '.svn', 'ext-def.tmp'), `vendor ${lab40e.repoUrl}/ext-src\n`);
+  svn(['propset', '-q', 'svn:externals', '-F', join(main40e, '.svn', 'ext-def.tmp'), '.'], main40e);
+  rmSync(join(main40e, '.svn', 'ext-def.tmp'));
+  svn(['commit', '-q', '-m', 'init with externals'], main40e);
+  state.confirmResult = '更新';
+  await state.registered.get('svnAnywhere.update')({ fsPath: main40e, scheme: 'file' });
+  writeFileSync(join(main40e, 'vendor', 's.txt'), 'v2 in external');
+  writeFileSync(join(main40e, 'a.txt'), 'v2 main');
+  state.confirmResult = '还原';
+  const warningBefore40e = state.warning.length;
+  await state.registered.get('svnAnywhere.revert')({ fsPath: main40e, scheme: 'file' });
+  const confirm40e = state.warning.slice(warningBefore40e).find((m) => m.includes('a.txt'));
+  check('目录递归还原清单隔离 external 内条目（计数只含主副本）',
+    !!confirm40e && confirm40e.includes('1 个路径') && !confirm40e.includes('vendor/s.txt'),
+    String(confirm40e).slice(0, 300));
+  check('还原后 external 内修改保留（svn revert -R 不跨 external）',
+    readFileSync(join(main40e, 'a.txt'), 'utf8') === 'v1' &&
+    readFileSync(join(main40e, 'vendor', 's.txt'), 'utf8') === 'v2 in external');
+  await state.registered.get('svnAnywhere.revert')({ fsPath: join(main40e, 'vendor', 's.txt'), scheme: 'file' });
+  check('明确选中 external 内文件时 svn revert 作用于该副本',
+    readFileSync(join(main40e, 'vendor', 's.txt'), 'utf8') === 'v1');
+  state.confirmResult = undefined;
+  rmSync(lab40.lab, { recursive: true, force: true });
+  rmSync(lab40e.lab, { recursive: true, force: true });
+
+  console.log('场景 41：右键「移动」——svn move 保留历史；文件系统移动检测提示');
+  const lab41 = makeSvnLab();
+  const wc41 = lab41.checkout('wc41');
+  writeFileSync(join(wc41, 'a.txt'), 'v1\n');
+  writeFileSync(join(wc41, 'b.txt'), 'v1\n');
+  svn(['add', '-q', '--parents', 'a.txt', 'b.txt'], wc41);
+  svn(['commit', '-q', '-m', 'init'], wc41);
+  state.inputResult = join(wc41, 'renamed.txt');
+  await state.registered.get('svnAnywhere.move')({ fsPath: join(wc41, 'a.txt'), scheme: 'file' });
+  const status41 = svn(['status'], wc41);
+  check('svn move 登记 D+A+（保留历史标记）',
+    status41.includes('D       a.txt') && /A\s+\+\s+renamed\.txt/.test(status41), status41);
+  svn(['commit', '-q', '-m', 'rename a'], wc41);
+  check('提交后仓库记录改名来源', svn(['log', '--verbose', '-r', 'HEAD'], wc41).includes('(from /a.txt:'));
+  // 目标已存在：提示并终止。
+  state.inputResult = join(wc41, 'b.txt');
+  const linesBefore41 = channelText().length;
+  await state.registered.get('svnAnywhere.move')({ fsPath: join(wc41, 'renamed.txt'), scheme: 'file' });
+  check('目标已存在拒绝并终止', state.information.some((m) => m.includes('已存在')) &&
+    !channelText().slice(linesBefore41).includes('> svn move'));
+  // 文件系统移动检测：源 missing 时提示改用 svn move。
+  state.inputResult = undefined;
+  const fs = require('node:fs');
+  fs.renameSync(join(wc41, 'b.txt'), join(wc41, 'b-moved-elsewhere.txt'));
+  const warningBefore41 = state.warning.length;
+  await state.registered.get('svnAnywhere.move')({ fsPath: join(wc41, 'b.txt'), scheme: 'file' });
+  const hint41 = state.warning.slice(warningBefore41).find((m) => m.includes('b.txt'));
+  check('文件系统移动检测：提示移回原位置后用 svn move',
+    !!hint41 && hint41.includes('移回原位置') && hint41.includes('保留历史'), String(hint41).slice(0, 300));
+  fs.renameSync(join(wc41, 'b-moved-elsewhere.txt'), join(wc41, 'b.txt'));
+  rmSync(lab41.lab, { recursive: true, force: true });
+
+  console.log('场景 42：右键「在 Finder 中显示」转发 revealFileInOS；命令面板回退活动编辑器');
+  const executedBefore42 = state.executedCommands.length;
+  await state.registered.get('svnAnywhere.revealInFinder')({ fsPath: '/tmp/svn-anywhere-reveal-target.txt', scheme: 'file' });
+  check('右键路径直接转发 revealFileInOS',
+    state.executedCommands.slice(executedBefore42).some(([cmd, uri]) =>
+      cmd === 'revealFileInOS' && uri && uri.fsPath === '/tmp/svn-anywhere-reveal-target.txt'),
+    JSON.stringify(state.executedCommands.slice(executedBefore42)));
+  await state.registered.get('svnAnywhere.revealInFinder')(undefined);
+  check('无 uri 且无活动编辑器时静默返回（不转发）',
+    state.executedCommands.length === executedBefore42 + 1);
   rmSync(igLab.lab, { recursive: true, force: true });
 
   rmSync(panelLab.lab, { recursive: true, force: true });
