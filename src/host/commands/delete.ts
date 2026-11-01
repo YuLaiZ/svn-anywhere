@@ -10,7 +10,7 @@ import { runStatus } from '../../core/status';
 import { runOrThrow } from '../../core/svnCli';
 import { readSvnPath, readTimeoutMs } from '../config';
 import { format, strings } from '../i18n';
-import { createLineBuffer, logCommand, logExitCode, showOutput } from '../output';
+import { createLineBuffer, decodingRunOptions, logCommand, logExitCode, showOutput } from '../output';
 import { confirmModal } from '../ui/confirm';
 import { resolveWorkingCopyTarget } from './target';
 import { beginDailyWrite, finishDailyWrite, nodeKindFor, targetRelOf } from './dailyCommon';
@@ -26,7 +26,7 @@ export async function commandDelete(uri?: vscode.Uri): Promise<void> {
 
   const svnPath = readSvnPath();
   const relPath = targetRelOf(target);
-  const runOptions = { cwd: target.wcRoot, timeoutMs: readTimeoutMs(), onExit: logExitCode };
+  const runOptions = { cwd: target.wcRoot, timeoutMs: readTimeoutMs(), ...decodingRunOptions('other'), onExit: logExitCode };
   const status = await runStatus(svnPath, relPath, runOptions);
   const own = status.entries.find((entry) => entry.path === relPath);
   if (own && own.wcStatus === 'unversioned') {
@@ -41,8 +41,10 @@ export async function commandDelete(uri?: vscode.Uri): Promise<void> {
   // 目录删除是结构性删除：确认框枚举版本控制子树（missing 目录同样枚举仓库侧清单）。
   let subtree: string[] = [];
   if (kind === 'dir') {
-    logCommand(svnPath, ['list', '-R', '--', relPath], target.wcRoot);
-    subtree = await listVersionedSubtree(svnPath, target.wcRoot, relPath, runOptions);
+    subtree = await listVersionedSubtree(svnPath, target.wcRoot, relPath, {
+      ...runOptions,
+      onExit: logCommand(svnPath, ['list', '-R', '--', relPath], target.wcRoot),
+    });
   }
   const subtreeLines = subtree.length
     ? subtree
@@ -73,11 +75,11 @@ export async function commandDelete(uri?: vscode.Uri): Promise<void> {
   // --force：允许删除本地有修改的条目（确认框已列出影响，与面板行内删除一致）。
   const args = buildDeleteArgs(relPath, { force: true });
   try {
-    logCommand(svnPath, args, target.wcRoot);
     const buffer = createLineBuffer();
     await runOrThrow(svnPath, args, {
       ...runOptions,
       onOutput: (chunk) => buffer.push(chunk),
+      onExit: logCommand(svnPath, args, target.wcRoot),
     });
   } finally {
     await finishDailyWrite(operationId);

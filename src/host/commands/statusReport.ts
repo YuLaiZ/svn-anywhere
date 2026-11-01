@@ -6,17 +6,17 @@
 import type { StatusResult, StatusEntry } from '../../core/status';
 import { isPropertyModified } from '../../core/status';
 import { format, strings } from '../i18n';
-import { logLine } from '../output';
+import { logLine, type OutputKind } from '../output';
 
 /** 把状态结果写入输出频道；干净副本写「无本地变更」。 */
-export function writeStatusReport(result: StatusResult): void {
-  logLine(format(strings.status.header, { path: result.targetPath }));
+export function writeStatusReport(result: StatusResult, kind: OutputKind = 'status'): void {
+  logLine(format(strings.status.header, { path: result.targetPath }), kind);
   if (result.entries.length === 0) {
-    logLine(strings.status.clean);
+    logLine(strings.status.clean, kind);
     return;
   }
   for (const entry of result.entries) {
-    logLine(statusEntryLine(entry));
+    logLine(statusEntryLine(entry), kind);
   }
 }
 

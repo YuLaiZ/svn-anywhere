@@ -10,7 +10,7 @@ import { getOperationRegistry } from '../../core/operations';
 import { escapePeg } from '../../core/workspace';
 import { readSvnPath, readTimeoutMs } from '../config';
 import { format, strings } from '../i18n';
-import { createLineBuffer, logCommand, logExitCode, logLine, showOutput } from '../output';
+import { createLineBuffer, decodingRunOptions, logCommand, logLine, showOutput } from '../output';
 import { resolveWorkingCopyTarget } from './target';
 import { confirmModal } from '../ui/confirm';
 
@@ -75,12 +75,12 @@ async function runCleanup(
     },
     async () => {
       const buffer = createLineBuffer();
-      logCommand(svnPath, args, target.wcRoot);
       await runOrThrow(svnPath, args, {
         cwd: target.wcRoot,
         timeoutMs: readTimeoutMs(),
+        ...decodingRunOptions('other'),
         onOutput: (chunk) => buffer.push(chunk),
-        onExit: logExitCode,
+        onExit: logCommand(svnPath, args, target.wcRoot),
       });
     },
   );

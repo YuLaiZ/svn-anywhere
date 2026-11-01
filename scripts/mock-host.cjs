@@ -50,6 +50,10 @@ const state = {
   globalStateMap: new Map(),
   /** 面板意图自增序号（requestId 去重要求每次不同）。 */
   intentSeq: 0,
+  /** getConfiguration 覆盖项（按场景注入，如 svnPath 指向包装脚本）。 */
+  configOverrides: undefined,
+  /** 全部频道的追加式写入序列（分频道后保持 channelText() 的追加语义）。 */
+  allLines: [],
 };
 
 const fakeVscode = {
@@ -74,7 +78,7 @@ const fakeVscode = {
         title,
         lines: [],
         shown: 0,
-        appendLine(line) { ch.lines.push(line); },
+        appendLine(line) { ch.lines.push(line); state.allLines.push(line); },
         show() { ch.shown += 1; },
         dispose() {},
       };
@@ -241,7 +245,8 @@ const fakeVscode = {
       return { dispose() {} };
     },
     getConfiguration() {
-      return { get: (_key, fallback) => fallback };
+      // state.configOverrides 可按场景覆盖配置项（如 svnPath 指向包装脚本）。
+      return { get: (key, fallback) => (Object.prototype.hasOwnProperty.call(state.configOverrides ?? {}, key) ? state.configOverrides[key] : fallback) };
     },
     fs: {
       // 真实文件系统探查（冲突路径定位用）；不存在时抛错，与宿主语义一致。
@@ -307,7 +312,9 @@ function svn(args, cwd) {
 }
 
 function channelText() {
-  return state.channels.map((c) => c.lines.join('\n')).join('\n');
+  // 输出按操作域分频道后，各频道内容不再是全局追加式；用写入序列聚合，
+  // 保持既有场景「slice(之前长度) 取本次增量」的断言语义。
+  return state.allLines.join('\n');
 }
 
 /** 等待面板收到包含指定文本的 render 帧；超时返回 undefined。 */
@@ -1996,6 +2003,149 @@ async function main() {
   state.confirmResult = undefined;
   state.warningChoice = undefined;
   rmSync(lab47.lab, { recursive: true, force: true });
+
+  console.log('场景 48：分频道输出与操作日志——状态/更新/其它互不覆盖，日志含时间|命令|退出码|耗时');
+  // 场景 17 deactivate 后场景 18 二次 activate 会重建同名频道：取最新实例。
+  const channelByTitle = (title) => [...state.channels].reverse().find((c) => c.title === title);
+  const channelTextOf = (title) => (channelByTitle(title) ? channelByTitle(title).lines.join('\n') : '');
+  const lab48 = makeSvnLab();
+  const wc48 = lab48.checkout('wc48');
+  writeFileSync(join(wc48, 'a.txt'), 'v1');
+  svn(['add', '-q', '--parents', 'a.txt'], wc48);
+  svn(['commit', '-q', '-m', 'init'], wc48);
+  writeFileSync(join(wc48, 'a.txt'), 'v2');
+  const remote48 = lab48.checkout('remote48');
+  writeFileSync(join(remote48, 'b.txt'), 'new');
+  svn(['add', '-q', '--parents', 'b.txt'], remote48);
+  svn(['commit', '-q', '-m', 'remote b'], remote48);
+  await state.registered.get('svnAnywhere.showStatus')({ fsPath: join(wc48, 'a.txt'), scheme: 'file' });
+  const statusText48 = channelTextOf('SVN Anywhere · 状态');
+  check('状态频道含 modified 明细', statusText48.includes('[modified] a.txt'), statusText48.slice(-300));
+  state.confirmResult = '更新';
+  state.inputQueue = ['HEAD'];
+  await state.registered.get('svnAnywhere.update')({ fsPath: wc48, scheme: 'file' });
+  const updateText48 = channelTextOf('SVN Anywhere · 更新');
+  check('更新频道含 update 命令回显与 revision 汇总',
+    updateText48.includes('> svn update --non-interactive') && updateText48.includes('更新完成，当前 revision'),
+    updateText48.slice(-400));
+  check('状态频道不含 update 输出（互不覆盖）', !statusText48.includes('> svn update'), statusText48.slice(-200));
+  check('更新频道不含状态明细（互不覆盖）', !updateText48.includes('[modified] a.txt'), updateText48.slice(-300));
+  state.confirmResult = '清理';
+  await state.registered.get('svnAnywhere.cleanup')({ fsPath: wc48, scheme: 'file' });
+  const otherText48 = channelTextOf('SVN Anywhere');
+  check('其它频道（SVN Anywhere）含清理输出', otherText48.includes('清理完成。'), otherText48.slice(-300));
+  const opLog48 = channelTextOf('SVN Anywhere · 操作日志');
+  const opLogLines48 = opLog48.split('\n').filter((l) => l.trim());
+  const opLogLineRe = /^\d{2}:\d{2}:\d{2}\.\d{3} \| .+ \| 退出码 \d+ \| \d+ms$/;
+  check('操作日志行均为 时间 | 命令 | 退出码 | 耗时 结构',
+    opLogLines48.length >= 3 && opLogLines48.every((l) => opLogLineRe.test(l)),
+    opLogLines48.filter((l) => !opLogLineRe.test(l)).slice(0, 5).map((l) => JSON.stringify(l.slice(0, 120))).join('\n'));
+  check('操作日志含状态与更新命令（跨频道统一记录）',
+    opLog48.includes('status --xml') && opLog48.includes('update --non-interactive'),
+    opLogLines48.slice(-6).join('\n'));
+  check('操作日志命令列已脱敏（无 --password 场景下不出现明文标记）',
+    !opLog48.includes('--password '), '');
+  state.confirmResult = undefined;
+  rmSync(lab48.lab, { recursive: true, force: true });
+
+  console.log('场景 49：GBK 输出解码回退——svn 包装脚本输出 GBK 字节，状态频道正确显示中文');
+  // 逐双字节反查目标汉字的 GBK 编码（宿主 Node 无 GBK 编码器，只有解码器）。
+  const gbkBytesOf = (text) => {
+    const decoder = new TextDecoder('gbk');
+    const bytes = [];
+    for (const ch of text) {
+      let found = null;
+      for (let b1 = 0x81; b1 <= 0xfe && !found; b1 += 1) {
+        for (let b2 = 0x40; b2 <= 0xfe && !found; b2 += 1) {
+          if (decoder.decode(Buffer.from([b1, b2])) === ch) found = [b1, b2];
+        }
+      }
+      if (!found) throw new Error(`no gbk bytes for ${ch}`);
+      bytes.push(...found);
+    }
+    return bytes;
+  };
+  const gbkName = '中文文件.txt';
+  const gbkEsc = gbkBytesOf('中文文件').map((b) => `\\x${b.toString(16).padStart(2, '0')}`).join('');
+  const wrapDir = makeTempDir('svn-anywhere-gbkwrap-');
+  const wrapSvn = join(wrapDir, 'svn-gbk.sh');
+  writeFileSync(wrapSvn, [
+    '#!/bin/sh',
+    'case "$1" in',
+    "  --version) printf 'svn, version 1.15.0 (mock-gbk)\\n'; exit 0 ;;",
+    '  status) printf \'<?xml version="1.0"?>\\n<status>\\n<target path=".">\\n<entry path="' + gbkEsc + '.txt">\\n<wc-status item="modified" props="none"></wc-status>\\n</entry>\\n</target>\\n</status>\\n\'; exit 0 ;;',
+    '  *) exit 1 ;;',
+    'esac',
+    '',
+  ].join('\n'), { mode: 0o755 });
+  const wc49 = makeTempDir('svn-anywhere-mock-wc49-');
+  mkdirSync(join(wc49, '.svn'), { recursive: true });
+  writeFileSync(join(wc49, '.svn', 'wc.db'), 'fake');
+  state.configOverrides = { svnPath: wrapSvn };
+  try {
+    await state.registered.get('svnAnywhere.showStatus')({ fsPath: wc49, scheme: 'file' });
+    const statusText49 = channelTextOf('SVN Anywhere · 状态');
+    check('GBK 字节按回退链解码为中文（不出现乱码替换符）',
+      statusText49.includes(`[modified] ${gbkName}`) && !statusText49.includes('\\uFFFD'),
+      statusText49.slice(-300));
+    check('其它频道同样不含替换符', !channelTextOf('SVN Anywhere').includes('\\uFFFD'), '');
+  } finally {
+    state.configOverrides = undefined;
+    rmSync(wrapDir, { recursive: true, force: true });
+    rmSync(wc49, { recursive: true, force: true });
+  }
+
+  console.log('场景 50：认证补录重试——凭据弹窗、脱敏回显与操作日志两行各自准确');
+  const authWrapDir = makeTempDir('svn-anywhere-authwrap-');
+  const authSvn = join(authWrapDir, 'svn-auth.sh');
+  writeFileSync(authSvn, [
+    '#!/bin/sh',
+    'case "$1" in',
+    "  --version) printf 'svn, version 1.15.0 (mock-auth)\\n'; exit 0 ;;",
+    '  update)',
+    '    case " $* " in',
+    "      *' --password '*) printf \"Updating '.':\\nU    a.txt\\nUpdated to revision 3.\\n\"; exit 0 ;;",
+    "      *) printf 'svn: E170001: Authentication failed\\n' >&2; exit 1 ;;",
+    '    esac ;;',
+    '  *) printf \'mock: unsupported\\n\' >&2; exit 1 ;;',
+    'esac',
+    '',
+  ].join('\n'), { mode: 0o755 });
+  const wc50 = makeTempDir('svn-anywhere-mock-wc50-');
+  mkdirSync(join(wc50, '.svn'), { recursive: true });
+  writeFileSync(join(wc50, '.svn', 'wc.db'), 'fake');
+  state.configOverrides = { svnPath: authSvn };
+  const opLogCountBefore50 = (channelByTitle('SVN Anywhere · 操作日志') || { lines: [] }).lines.length;
+  const updateLinesBefore50 = (channelByTitle('SVN Anywhere · 更新') || { lines: [] }).lines.length;
+  try {
+    state.confirmResult = '更新';
+    // InputBox 顺序：版本号 HEAD → 认证用户名 → 认证密码（password 输入框）。
+    state.inputQueue = ['HEAD', 'reviewer', 'pass123'];
+    await state.registered.get('svnAnywhere.update')({ fsPath: wc50, scheme: 'file' });
+    const updateLines50 = channelByTitle('SVN Anywhere · 更新').lines.slice(updateLinesBefore50);
+    check('重试成功：更新频道含最终 revision 汇总', updateLines50.some((l) => l.includes('更新完成，当前 revision 3')),
+      updateLines50.join('\n').slice(-400));
+    check('频道退出码两行（首执行 1、重试 0）——既有口径不变',
+      updateLines50.includes('退出码: 1') && updateLines50.includes('退出码: 0'),
+      updateLines50.filter((l) => l.startsWith('退出码')).join('|'));
+    check('重试命令回显已脱敏（--password ***，无明文）',
+      updateLines50.some((l) => l.includes('--username reviewer --password ***')) &&
+      !updateLines50.join('\n').includes('pass123'),
+      updateLines50.filter((l) => l.includes('--username')).join('\n'));
+    const opLog50 = channelByTitle('SVN Anywhere · 操作日志').lines.slice(opLogCountBefore50).filter((l) => l.includes('update'));
+    check('操作日志两行：首执行（无凭据、退出码 1）与重试（脱敏凭据、退出码 0）各自准确',
+      opLog50.length === 2 &&
+      /退出码 1 \| \d+ms$/.test(opLog50[0]) && !opLog50[0].includes('--username') &&
+      opLog50[1].includes('--username reviewer --password ***') && /退出码 0 \| \d+ms$/.test(opLog50[1]),
+      opLog50.join('\n'));
+    check('操作日志与频道均无明文密码', !opLog50.join('\n').includes('pass123'), '');
+    state.confirmResult = undefined;
+    state.inputQueue = [];
+  } finally {
+    state.configOverrides = undefined;
+    rmSync(authWrapDir, { recursive: true, force: true });
+    rmSync(wc50, { recursive: true, force: true });
+  }
 
   rmSync(igLab.lab, { recursive: true, force: true });
 

@@ -5,7 +5,17 @@
 export const strings = {
   output: {
     title: 'SVN Anywhere',
+    titleStatus: 'SVN Anywhere · 状态',
+    titleUpdate: 'SVN Anywhere · 更新',
+    titleCommit: 'SVN Anywhere · 提交',
+    titleOperationLog: 'SVN Anywhere · 操作日志',
     exitCode: '退出码: {code}',
+    /** 操作日志行：时间 | 命令（脱敏） | 退出码 | 耗时。 */
+    operationLogLine: '{time} | {command} | 退出码 {code} | {duration}',
+    decodingFallbackNotice:
+      '编码回退失败：{source} 未能按「{encodings}」严格解码，已按 UTF-8 宽松解码，部分字符可能显示为替换符。',
+    sourceStdout: '标准输出',
+    sourceStderr: '标准错误',
   },
   command: {
     showStatus: '显示状态',

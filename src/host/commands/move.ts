@@ -11,7 +11,7 @@ import { runStatus } from '../../core/status';
 import { runOrThrow } from '../../core/svnCli';
 import { readSvnPath, readTimeoutMs } from '../config';
 import { format, strings } from '../i18n';
-import { createLineBuffer, logCommand, logExitCode, showOutput } from '../output';
+import { createLineBuffer, decodingRunOptions, logCommand, logExitCode, showOutput } from '../output';
 import { resolveWorkingCopyTarget } from './target';
 import { beginDailyWrite, finishDailyWrite, nodeKindOf, targetRelOf } from './dailyCommon';
 
@@ -23,7 +23,7 @@ export async function commandMove(uri?: vscode.Uri): Promise<void> {
 
   const svnPath = readSvnPath();
   const relPath = targetRelOf(target);
-  const runOptions = { cwd: target.wcRoot, timeoutMs: readTimeoutMs(), onExit: logExitCode };
+  const runOptions = { cwd: target.wcRoot, timeoutMs: readTimeoutMs(), ...decodingRunOptions('other'), onExit: logExitCode };
   const status = await runStatus(svnPath, relPath, runOptions);
   const own = status.entries.find((entry) => entry.path === relPath);
   if (own && own.wcStatus === 'unversioned') {
@@ -71,11 +71,11 @@ export async function commandMove(uri?: vscode.Uri): Promise<void> {
   }
   const args = buildMoveArgs(relPath, dstRel);
   try {
-    logCommand(svnPath, args, target.wcRoot);
     const buffer = createLineBuffer();
     await runOrThrow(svnPath, args, {
       ...runOptions,
       onOutput: (chunk) => buffer.push(chunk),
+      onExit: logCommand(svnPath, args, target.wcRoot),
     });
   } finally {
     await finishDailyWrite(operationId);

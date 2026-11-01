@@ -6,23 +6,23 @@ import type * as vscode from 'vscode';
 import { runStatus } from '../../core/status';
 import { readSvnPath, readTimeoutMs } from '../config';
 import { strings } from '../i18n';
-import { logCommand, logExitCode, showOutput } from '../output';
+import { decodingRunOptions, logCommand, showOutput } from '../output';
 import { resolveWorkingCopyTarget } from './target';
 import { writeStatusReport } from './statusReport';
 
 export async function commandRefreshStatus(uri?: vscode.Uri): Promise<void> {
-  const target = await resolveWorkingCopyTarget(uri, strings.command.refreshStatus);
+  const target = await resolveWorkingCopyTarget(uri, strings.command.refreshStatus, 'status');
   if (!target) {
     return;
   }
   const svnPath = readSvnPath();
   // 整副本刷新：相对目标固定为 `.`，条目路径为相对形态（F15）。
-  logCommand(svnPath, ['status', '--xml', '.'], target.wcRoot);
   const result = await runStatus(svnPath, '.', {
     cwd: target.wcRoot,
     timeoutMs: readTimeoutMs(),
-    onExit: logExitCode,
+    ...decodingRunOptions('status'),
+    onExit: logCommand(svnPath, ['status', '--xml', '.'], target.wcRoot, 'status'),
   });
-  writeStatusReport(result);
-  showOutput(false);
+  writeStatusReport(result, 'status');
+  showOutput(false, 'status');
 }

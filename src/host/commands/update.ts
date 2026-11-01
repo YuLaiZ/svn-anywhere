@@ -11,13 +11,13 @@ import { getOperationRegistry } from '../../core/operations';
 import { escapePeg } from '../../core/workspace';
 import { readSvnPath, readTimeoutMs } from '../config';
 import { format, strings } from '../i18n';
-import { createLineBuffer, logCommand, logExitCode, logLine, showOutput } from '../output';
+import { createLineBuffer, decodingRunOptions, logCommand, logLine, showOutput } from '../output';
 import { resolveWorkingCopyTarget, type WcTarget } from './target';
 import { confirmModal } from '../ui/confirm';
 import { promptForCredentials } from '../auth';
 
 export async function commandUpdate(uri?: vscode.Uri): Promise<void> {
-  const target = await resolveWorkingCopyTarget(uri, strings.command.update);
+  const target = await resolveWorkingCopyTarget(uri, strings.command.update, 'update');
   if (!target) {
     return;
   }
@@ -155,18 +155,18 @@ async function executeUpdate(
     },
     async (_progress, token) => {
       token.onCancellationRequested(() => abort.abort());
-      const buffer = createLineBuffer();
-      logCommand(svnPath, args, target.wcRoot);
+      const buffer = createLineBuffer(undefined, 'update');
       return runUpdate(svnPath, targetArg, {
         cwd: target.wcRoot,
         signal: abort.signal,
         timeoutMs: readTimeoutMs(),
+        ...decodingRunOptions('update'),
         onOutput: (chunk) => buffer.push(chunk),
-        onExit: logExitCode,
+        onExit: logCommand(svnPath, args, target.wcRoot, 'update'),
         // 认证失败时弹窗补录并重试一次（F67）；密码只在内存。
         getCredentials: promptForCredentials,
         // 重试命令回显到输出频道（logCommand 内置脱敏，密码不外泄）。
-        onCredentialRetry: (args) => logCommand(svnPath, args, target.wcRoot),
+        onCredentialRetry: (retryArgs) => logCommand(svnPath, retryArgs, target.wcRoot, 'update'),
       }, options.revision);
     },
   );
@@ -176,8 +176,9 @@ async function executeUpdate(
     result.finalRevision === undefined
       ? strings.update.doneNoRevision
       : format(strings.update.done, { revision: String(result.finalRevision) }),
+    'update',
   );
-  showOutput(false);
+  showOutput(false, 'update');
 
   if (result.conflicts.length > 0) {
     // conflictPrompt 形态的带按钮警告由 performUpdate 在释放互斥锁后弹出

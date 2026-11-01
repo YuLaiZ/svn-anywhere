@@ -38,7 +38,7 @@ import { SvnError } from '../../../core/errors';
 import { getOperationRegistry } from '../../../core/operations';
 import { readSvnPath, readTimeoutMs } from '../../config';
 import { format, strings } from '../../i18n';
-import { logCommand, logExitCode, logLine, showOutput } from '../../output';
+import { decodingRunOptions, logCommand, logExitCode, logLine, showOutput } from '../../output';
 import { promptForCredentials } from '../../auth';
 import { confirmModal } from '../../ui/confirm';
 import { resolveWorkingCopyTarget } from '../../commands/target';
@@ -89,9 +89,12 @@ function runOptions(cwd: string) {
   return {
     cwd,
     timeoutMs: readTimeoutMs(),
-    onExit: logExitCode,
-    // 命令回显逐条（M1 口径）：core 原语在执行前回调真实 args。
-    onLog: (args: string[], at?: string) => logCommand(readSvnPath(), args, at ?? cwd),
+    // 无 onLog 的命令（远端 revision 读取）走外层退出码兜底。
+    onExit: (code: number) => logExitCode(code, 'commit'),
+    ...decodingRunOptions('commit'),
+    // 命令回显逐条（M1 口径）：core 原语在执行前回调真实 args；返回值绑定
+    // 该命令的退出记录器（操作日志逐命令配对）。
+    onLog: (args: string[], at?: string) => logCommand(readSvnPath(), args, at ?? cwd, 'commit'),
   };
 }
 
@@ -109,7 +112,7 @@ function sessionBusy(): boolean {
  * 目录自身规则的歧义动作）。
  */
 export async function commandShowIgnorePanel(uri?: vscode.Uri): Promise<void> {
-  const target = await resolveWorkingCopyTarget(uri, strings.command.editIgnore);
+  const target = await resolveWorkingCopyTarget(uri, strings.command.editIgnore, 'commit');
   if (!target || !panelContext) {
     return;
   }
@@ -471,7 +474,7 @@ async function saveIgnore(sessionId: string): Promise<boolean> {
         activeOperationId = undefined;
       }
       pushRender();
-      showOutput(false);
+      showOutput(false, 'commit');
       return false;
     }
     const target: PropertySnapshot = { rules: [...s.rules], exists: s.rules.length > 0 };
@@ -529,7 +532,7 @@ async function saveIgnore(sessionId: string): Promise<boolean> {
       activeOperationId = undefined;
     }
     pushRender();
-    showOutput(false);
+    showOutput(false, 'commit');
     return false;
   }
 }
@@ -583,7 +586,7 @@ async function submitIgnore(sessionId: string): Promise<void> {
     s.error = err instanceof Error ? err.message : String(err);
     s.errorKind = 'commit';
     pushRender();
-    showOutput(false);
+    showOutput(false, 'commit');
     return;
   }
   // 节点身份核对：URL/UUID 变化（switch/relocate）时不能沿用旧基线。
@@ -612,7 +615,7 @@ async function submitIgnore(sessionId: string): Promise<void> {
     s.error = strings.ignorePanel.externalDetail;
     s.errorKind = 'external';
     pushRender();
-    showOutput(false);
+    showOutput(false, 'commit');
     return;
   }
   if (!s.localModified) {
@@ -649,7 +652,7 @@ async function submitIgnore(sessionId: string): Promise<void> {
   s.submittedRevision = null;
   s.successVisible = false;
   await registry.markPhase(operationId, 'committing');
-  logLine(strings.ignorePanel.commitStartedNotice);
+  logLine(strings.ignorePanel.commitStartedNotice, 'commit');
   pushRender();
 
   const tempDir = mkdtempSync(join(tmpdir(), 'svn-anywhere-ignore-commit-'));
@@ -659,7 +662,7 @@ async function submitIgnore(sessionId: string): Promise<void> {
     await checkoutDepthEmpty(svnPath, identity.url, identity.revision, tempWc, {
       ...runOptions(s.wcRoot),
       getCredentials: promptForCredentials,
-      onCredentialRetry: (args) => logCommand(svnPath, args, s.wcRoot),
+      onCredentialRetry: (args) => logCommand(svnPath, args, s.wcRoot, 'commit'),
     });
     const pending: PropertySnapshot = { rules: [...s.savedRules], exists: s.savedPropertyExists };
     await applyIgnoreSnapshot(svnPath, '.', pending, { ...runOptions(tempWc) });
@@ -669,7 +672,7 @@ async function submitIgnore(sessionId: string): Promise<void> {
     const revision = await commitTempIgnore(svnPath, tempWc, messageFile, {
       ...runOptions(tempWc),
       getCredentials: promptForCredentials,
-      onCredentialRetry: (args) => logCommand(svnPath, args, s.wcRoot),
+      onCredentialRetry: (args) => logCommand(svnPath, args, s.wcRoot, 'commit'),
     });
     // 成功 revision 先落盘（与面板是否存活无关），再考虑协调：
     // 面板已被用户关闭（handle 置空）时不再自动协调原副本，恢复入口
@@ -678,7 +681,7 @@ async function submitIgnore(sessionId: string): Promise<void> {
       knownRevisions: [revision],
       tempWcPath: tempDir,
     });
-    logLine(format(strings.commit.committed, { revision: String(revision) }));
+    logLine(format(strings.commit.committed, { revision: String(revision) }), 'commit');
     if (!handle || handle.sessionId !== sessionId) {
       return;
     }
@@ -694,7 +697,7 @@ async function submitIgnore(sessionId: string): Promise<void> {
       s.operation = registry.writeRestriction(s.wcRoot) ?? s.operation;
       s.error = null;
       pushRender();
-      showOutput(false);
+      showOutput(false, 'commit');
       return;
     }
     await confirmCommitFailure(operationId, err);
@@ -720,7 +723,7 @@ async function confirmCommitFailure(operationId: string, err: unknown): Promise<
   s.errorKind = 'commit';
   s.successVisible = true;
   pushRender();
-  showOutput(false);
+  showOutput(false, 'commit');
   void vscode.window.showErrorMessage(message.split('\n')[0]?.slice(0, 300) ?? message);
 }
 
@@ -797,7 +800,7 @@ async function runCoordinationUpdate(
   await coordinateUpdate(svnPath, s.dirArg, {
     ...runOptions(s.wcRoot),
     getCredentials: promptForCredentials,
-    onCredentialRetry: (args) => logCommand(svnPath, args, s.wcRoot),
+    onCredentialRetry: (args) => logCommand(svnPath, args, s.wcRoot, 'commit'),
   });
   if (handle && handle.sessionId !== sessionId) {
     return;
@@ -839,7 +842,7 @@ async function blockCoordination(
   s.error = null;
   s.notice = reason;
   pushRender();
-  showOutput(false);
+  showOutput(false, 'commit');
 }
 
 /** 协调完成：BASE 已确认，工作值（含后续修改）保留为新的草稿基线。 */
@@ -923,7 +926,7 @@ async function resolveUnknown(sessionId: string): Promise<void> {
       const head = await readRemoteIgnoreSnapshot(svnPath, identity.url, {
         ...runOptions(s.wcRoot),
         getCredentials: promptForCredentials,
-        onCredentialRetry: (args) => logCommand(svnPath, args, s.wcRoot),
+        onCredentialRetry: (args) => logCommand(svnPath, args, s.wcRoot, 'commit'),
       });
       if (handle && handle.sessionId !== sessionId) {
         return;

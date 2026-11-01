@@ -20,21 +20,23 @@ import { commandUpdate } from './update';
 import { setCommitPanelContext } from '../panel/panels/commit';
 import { setIgnorePanelContext } from '../panel/panels/ignore';
 import { initializeOperationStore } from '../../core/operations';
+import type { OutputKind } from '../output';
 
-const COMMANDS: ReadonlyArray<{ id: string; handler: CommandHandler }> = [
-  { id: 'svnAnywhere.showStatus', handler: commandShowStatus },
-  { id: 'svnAnywhere.commit', handler: commandCommit },
-  { id: 'svnAnywhere.update', handler: commandUpdate },
-  { id: 'svnAnywhere.refreshStatus', handler: commandRefreshStatus },
-  { id: 'svnAnywhere.cleanup', handler: commandCleanup },
-  { id: 'svnAnywhere.relocate', handler: commandRelocate },
-  { id: 'svnAnywhere.editIgnore', handler: commandEditIgnore },
-  { id: 'svnAnywhere.showOutput', handler: commandShowOutput },
-  { id: 'svnAnywhere.add', handler: commandAdd },
-  { id: 'svnAnywhere.delete', handler: commandDelete },
-  { id: 'svnAnywhere.revert', handler: commandRevert },
-  { id: 'svnAnywhere.move', handler: commandMove },
-  { id: 'svnAnywhere.revealInFinder', handler: commandReveal },
+/** 命令的输出频道分类：状态 / 更新 / 提交（含 P1/P2 面板入口）/ 其它。 */
+const COMMANDS: ReadonlyArray<{ id: string; handler: CommandHandler; kind: OutputKind }> = [
+  { id: 'svnAnywhere.showStatus', handler: commandShowStatus, kind: 'status' },
+  { id: 'svnAnywhere.commit', handler: commandCommit, kind: 'commit' },
+  { id: 'svnAnywhere.update', handler: commandUpdate, kind: 'update' },
+  { id: 'svnAnywhere.refreshStatus', handler: commandRefreshStatus, kind: 'status' },
+  { id: 'svnAnywhere.cleanup', handler: commandCleanup, kind: 'other' },
+  { id: 'svnAnywhere.relocate', handler: commandRelocate, kind: 'other' },
+  { id: 'svnAnywhere.editIgnore', handler: commandEditIgnore, kind: 'commit' },
+  { id: 'svnAnywhere.showOutput', handler: commandShowOutput, kind: 'other' },
+  { id: 'svnAnywhere.add', handler: commandAdd, kind: 'other' },
+  { id: 'svnAnywhere.delete', handler: commandDelete, kind: 'other' },
+  { id: 'svnAnywhere.revert', handler: commandRevert, kind: 'other' },
+  { id: 'svnAnywhere.move', handler: commandMove, kind: 'other' },
+  { id: 'svnAnywhere.revealInFinder', handler: commandReveal, kind: 'other' },
 ];
 
 /**
@@ -56,7 +58,7 @@ export function registerAllCommands(context: vscode.ExtensionContext): void {
   // 每次 activate 都重载：记录可能被另一窗口写入同一 globalState，
   // 重跑 loadPending 是幂等的（已落盘记录随 begin/markPhase 即时写入）。
   void initializeOperationStore(context.globalState);
-  for (const { id, handler } of COMMANDS) {
-    registeredDisposables.push(registerCommand(context, id, handler));
+  for (const { id, handler, kind } of COMMANDS) {
+    registeredDisposables.push(registerCommand(context, id, handler, kind));
   }
 }

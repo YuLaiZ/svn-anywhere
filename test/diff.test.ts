@@ -138,12 +138,13 @@ const hostMock = vi.hoisted(() => {
 vi.mock('vscode', () => hostMock.vscode());
 
 vi.mock('../src/host/output', () => ({
-  logCommand: () => {},
+  logCommand: () => () => {},
   logExitCode: () => {},
   logLine: (line: string) => { hostMock.executedCommands.push(['log', line]); },
   showOutput: () => {},
   resetOutputState: () => {},
   disposeOutputChannel: () => {},
+  decodingRunOptions: () => ({ encoding: 'UTF-8', encodingFallback: [], onDecodingFallback: () => {} }),
 }));
 
 vi.mock('../src/host/config', () => ({ readTimeoutMs: () => 1000 }));

@@ -184,7 +184,7 @@ function handleFor(entry: PanelEntry): PanelHandle {
       }
       if (forSessionId !== undefined && forSessionId !== entry.sessionId) {
         // 目标已切换：旧会话的迟到结果不写入新目标。
-        logLine(format(strings.panel.toastStaleSession, {}));
+        logLine(format(strings.panel.toastStaleSession, {}), 'commit');
         return;
       }
       entry.state = next;
@@ -347,7 +347,7 @@ async function handleViewMessage(entry: PanelEntry, raw: unknown): Promise<void>
   try {
     await entry.controller.onIntent(intent, { sessionId: entry.sessionId, busy });
   } catch (err) {
-    logLine(format(strings.error.failed, { message: err instanceof Error ? err.message : String(err) }));
+    logLine(format(strings.error.failed, { message: err instanceof Error ? err.message : String(err) }), 'commit');
   }
 }
 

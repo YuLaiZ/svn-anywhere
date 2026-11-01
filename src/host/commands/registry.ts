@@ -9,7 +9,7 @@ import * as vscode from 'vscode';
 import { SvnError } from '../../core/errors';
 import { readShowOutputOnError } from '../config';
 import { format, strings } from '../i18n';
-import { logExitCode, logLine, showOutput } from '../output';
+import { logExitCode, logLine, showOutput, type OutputKind } from '../output';
 
 export type CommandHandler = (uri?: vscode.Uri) => unknown;
 
@@ -17,13 +17,14 @@ export function registerCommand(
   context: vscode.ExtensionContext,
   id: string,
   handler: CommandHandler,
+  kind: OutputKind = 'other',
 ): vscode.Disposable {
   const disposable = vscode.commands.registerCommand(id, async (uri?: vscode.Uri) => {
     // 回调必须 async：同步抛错也要进统一收口，否则会绕过 showCommandError。
     try {
       await handler(uri);
     } catch (err) {
-      showCommandError(err);
+      showCommandError(err, kind);
     }
   });
   context.subscriptions.push(disposable);
@@ -42,7 +43,7 @@ function errorSummary(message: string): string {
   return first.length > SUMMARY_MAX_CHARS ? `${first.slice(0, SUMMARY_MAX_CHARS)}…` : first;
 }
 
-export function showCommandError(err: unknown): void {
+export function showCommandError(err: unknown, kind: OutputKind = 'other'): void {
   if (err instanceof SvnError && err.code === 'CANCELLED') {
     return;
   }
@@ -52,35 +53,35 @@ export function showCommandError(err: unknown): void {
     // 截断版（tailText），若整段再写一遍 message 会造成最长 2×8K 的重复。
     // 命令以非零退出码结束时补记退出码行（成功路径由 onExit 记录）。
     if (err.exitCode !== undefined) {
-      logExitCode(err.exitCode);
+      logExitCode(err.exitCode, kind);
     }
-    logLine(format(strings.error.failed, { message: errorSummary(err.message) }));
+    logLine(format(strings.error.failed, { message: errorSummary(err.message) }), kind);
     if (err.stderr) {
-      logLine(err.stderr);
+      logLine(err.stderr, kind);
     }
     if (err.code === 'ENOENT') {
       void vscode.window.showWarningMessage(strings.activation.svnMissing);
       return;
     }
-    showErrorSummary(errorSummary(err.message));
+    showErrorSummary(errorSummary(err.message), kind);
     return;
   }
 
   const message = err instanceof Error ? err.message : String(err);
-  logLine(format(strings.error.failed, { message: errorSummary(message) }));
-  showErrorSummary(errorSummary(message));
+  logLine(format(strings.error.failed, { message: errorSummary(message) }), kind);
+  showErrorSummary(errorSummary(message), kind);
 }
 
 /** 弹错误摘要；按配置决定是否先自动切到输出面板（不抢焦点）。 */
-function showErrorSummary(summary: string): void {
+function showErrorSummary(summary: string, kind: OutputKind): void {
   if (readShowOutputOnError()) {
-    showOutput(true);
+    showOutput(true, kind);
   }
   void vscode.window
     .showErrorMessage(summary, strings.error.buttonShowOutput)
     .then((picked) => {
       if (picked === strings.error.buttonShowOutput) {
-        showOutput(false);
+        showOutput(false, kind);
       }
     });
 }

@@ -9,7 +9,7 @@ import { runStatus } from '../../core/status';
 import { runOrThrow } from '../../core/svnCli';
 import { readSvnPath, readTimeoutMs } from '../config';
 import { format, strings } from '../i18n';
-import { createLineBuffer, logCommand, logExitCode, showOutput } from '../output';
+import { createLineBuffer, decodingRunOptions, logCommand, logExitCode, showOutput } from '../output';
 import { confirmModal } from '../ui/confirm';
 import { resolveWorkingCopyTarget } from './target';
 import { beginDailyWrite, finishDailyWrite, nodeKindFor, targetRelOf } from './dailyCommon';
@@ -25,7 +25,7 @@ export async function commandRevert(uri?: vscode.Uri): Promise<void> {
 
   const svnPath = readSvnPath();
   const relPath = targetRelOf(target);
-  const runOptions = { cwd: target.wcRoot, timeoutMs: readTimeoutMs(), onExit: logExitCode };
+  const runOptions = { cwd: target.wcRoot, timeoutMs: readTimeoutMs(), ...decodingRunOptions('other'), onExit: logExitCode };
   const status = await runStatus(svnPath, relPath, runOptions);
   // externals 边界：目录递归还原不跨 external（实测 svn 1.15），主副本目标
   // 的确认清单须隔离 external 内部条目（status 会递归列出）；用户明确选中
@@ -69,11 +69,11 @@ export async function commandRevert(uri?: vscode.Uri): Promise<void> {
   }
   const args = buildRevertArgs(relPath, { recursive: isDir });
   try {
-    logCommand(svnPath, args, target.wcRoot);
     const buffer = createLineBuffer();
     await runOrThrow(svnPath, args, {
       ...runOptions,
       onOutput: (chunk) => buffer.push(chunk),
+      onExit: logCommand(svnPath, args, target.wcRoot),
     });
   } finally {
     await finishDailyWrite(operationId);

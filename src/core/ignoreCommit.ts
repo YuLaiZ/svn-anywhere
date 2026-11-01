@@ -83,8 +83,7 @@ export async function readNodeIdentity(
 ): Promise<NodeIdentity> {
   const { onLog, ...runOptions } = options;
   const args = ['info', '--', escapePeg(target)];
-  onLog?.(args, runOptions.cwd);
-  const result = await runOrThrow(svnPath, args, runOptions);
+  const result = await runOrThrow(svnPath, args, loggedRunOptions(runOptions, onLog?.(args, runOptions.cwd)));
   const identity = parseNodeIdentity(result.stdout);
   if (!identity) {
     throw new SvnError({
@@ -98,8 +97,20 @@ export async function readNodeIdentity(
   return identity;
 }
 
-/** 宿主注入的命令回显钩子：每条实际执行的 svn 命令前回调真实 args（含临时文件路径）。 */
-export type IgnoreCommandLog = (args: string[], cwd: string | undefined) => void;
+/**
+ * 宿主注入的命令回显钩子：每条实际执行的 svn 命令前回调真实 args（含
+ * 临时文件路径）。返回值（若提供）作为该命令的 onExit 记录器，宿主用它
+ * 绑定退出码与耗时（操作日志逐命令配对，不依赖完成顺序）。
+ */
+export type IgnoreCommandLog = (
+  args: string[],
+  cwd: string | undefined,
+) => ((exitCode: number) => void) | undefined;
+
+/** onLog 返回的退出记录器优先于外层 onExit。 */
+function loggedRunOptions(runOptions: RunOptions, exitLog?: (exitCode: number) => void): RunOptions {
+  return exitLog ? { ...runOptions, onExit: exitLog } : runOptions;
+}
 
 /**
  * 读取目标的 svn:ignore 快照。revision 省略读工作值，'BASE'/'HEAD' 或
@@ -118,8 +129,7 @@ export async function readIgnoreSnapshot(
     args.push('-r', options.revision);
   }
   args.push('--', escapePeg(target));
-  onLog?.(args, runOptions.cwd);
-  const result = await run(svnPath, args, runOptions);
+  const result = await run(svnPath, args, loggedRunOptions(runOptions, onLog?.(args, runOptions.cwd)));
   if (result.exitCode !== 0) {
     if (result.stderr.includes('W200017')) {
       return { rules: [], exists: false };
@@ -162,16 +172,14 @@ export async function applyIgnoreSnapshot(
   const { onLog, ...runOptions } = options;
   if (!snapshot.exists || snapshot.rules.length === 0) {
     const delArgs = ['propdel', 'svn:ignore', '--', escapePeg(target)];
-    onLog?.(delArgs, runOptions.cwd);
-    await runOrThrow(svnPath, delArgs, runOptions);
+    await runOrThrow(svnPath, delArgs, loggedRunOptions(runOptions, onLog?.(delArgs, runOptions.cwd)));
     return;
   }
   const temp = options.rulesFile === undefined ? writeRulesTempFile(snapshot.rules) : undefined;
   const rulesFile = options.rulesFile ?? temp?.rulesFile ?? '';
   const setArgs = ['propset', 'svn:ignore', '-F', rulesFile, '--', escapePeg(target)];
   try {
-    onLog?.(setArgs, runOptions.cwd);
-    await runOrThrow(svnPath, setArgs, runOptions);
+    await runOrThrow(svnPath, setArgs, loggedRunOptions(runOptions, onLog?.(setArgs, runOptions.cwd)));
   } finally {
     if (temp) {
       removeRulesTempDir(temp.tempDir);
@@ -189,8 +197,7 @@ export async function checkoutDepthEmpty(
 ): Promise<void> {
   const { onLog, ...runOptions } = options;
   const args = ['checkout', '--depth', 'empty', '-r', String(revision), escapePeg(url), destDir];
-  onLog?.(args, runOptions.cwd);
-  await runOrThrow(svnPath, args, runOptions);
+  await runOrThrow(svnPath, args, loggedRunOptions(runOptions, onLog?.(args, runOptions.cwd)));
 }
 
 /**
@@ -205,8 +212,7 @@ export async function commitTempIgnore(
 ): Promise<number> {
   const { onLog, ...runOptions } = options;
   const args = ['commit', '--non-interactive', '--depth', 'empty', '--file', messageFile, '--encoding', 'UTF-8', '.'];
-  onLog?.(args, tempWc);
-  const result = await runOrThrow(svnPath, args, { cwd: tempWc, ...runOptions });
+  const result = await runOrThrow(svnPath, args, { cwd: tempWc, ...loggedRunOptions(runOptions, onLog?.(args, tempWc)) });
   const revision = parseCommitOutput(result.stdout).revision;
   if (revision === undefined) {
     throw new SvnError({
@@ -241,8 +247,7 @@ export async function coordinateUpdate(
 ): Promise<string> {
   const { onLog, ...runOptions } = options;
   const args = ['update', '--depth', 'empty', '--non-interactive', '--', escapePeg(target)];
-  onLog?.(args, runOptions.cwd);
-  const result = await runOrThrow(svnPath, args, runOptions);
+  const result = await runOrThrow(svnPath, args, loggedRunOptions(runOptions, onLog?.(args, runOptions.cwd)));
   return result.stdout;
 }
 

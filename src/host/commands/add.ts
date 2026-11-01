@@ -9,7 +9,7 @@ import { runStatus } from '../../core/status';
 import { runOrThrow } from '../../core/svnCli';
 import { readSvnPath, readTimeoutMs } from '../config';
 import { format, strings } from '../i18n';
-import { createLineBuffer, logCommand, logExitCode, showOutput } from '../output';
+import { createLineBuffer, decodingRunOptions, logCommand, logExitCode, showOutput } from '../output';
 import { resolveWorkingCopyTarget } from './target';
 import { beginDailyWrite, finishDailyWrite, nodeKindFor, targetRelOf } from './dailyCommon';
 
@@ -21,7 +21,7 @@ export async function commandAdd(uri?: vscode.Uri): Promise<void> {
 
   const svnPath = readSvnPath();
   const relPath = targetRelOf(target);
-  const runOptions = { cwd: target.wcRoot, timeoutMs: readTimeoutMs(), onExit: logExitCode };
+  const runOptions = { cwd: target.wcRoot, timeoutMs: readTimeoutMs(), ...decodingRunOptions('other'), onExit: logExitCode };
   const status = await runStatus(svnPath, relPath, runOptions);
   const own = status.entries.find((entry) => entry.path === relPath);
   if (own && own.wcStatus === 'missing') {
@@ -44,11 +44,11 @@ export async function commandAdd(uri?: vscode.Uri): Promise<void> {
   // 目录递归添加（忽略模式由 svn 按 CLI 语义处理）；A 行流式进输出频道。
   const args = buildAddArgs(relPath, { parents: true });
   try {
-    logCommand(svnPath, args, target.wcRoot);
     const buffer = createLineBuffer();
     await runOrThrow(svnPath, args, {
       ...runOptions,
       onOutput: (chunk) => buffer.push(chunk),
+      onExit: logCommand(svnPath, args, target.wcRoot),
     });
   } finally {
     await finishDailyWrite(operationId);

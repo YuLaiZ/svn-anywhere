@@ -227,6 +227,16 @@
           "minimum": 0,
           "description": "单条 svn 命令超时（毫秒），0 表示不限时"
         },
+        "svnAnywhere.encoding": {
+          "type": "string",
+          "default": "UTF-8",
+          "description": "svn 输出的主编码（严格解码），如 UTF-8、GBK"
+        },
+        "svnAnywhere.encodingFallback": {
+          "type": "string",
+          "default": "gbk,gb2312,big5",
+          "description": "主编码严格解码失败后的回退编码链，逗号分隔，按序尝试；全部失败时按 UTF-8 宽松解码并在输出频道标注"
+        },
         "svnAnywhere.showOutputOnError": {
           "type": "boolean",
           "default": true,

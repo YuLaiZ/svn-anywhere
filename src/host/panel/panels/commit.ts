@@ -28,16 +28,18 @@ import { runStatus } from '../../../core/status';
 import { remoteChangedEntries, runRemoteStatus, type RemoteStatusResult } from '../../../core/remoteStatus';
 import { runOrThrow, type RunOptions } from '../../../core/svnCli';
 import { SvnError } from '../../../core/errors';
+import { decodeBuffer } from '../../../core/encoding';
 import { escapePeg } from '../../../core/workspace';
 import { getOperationRegistry, type OperationRegistry } from '../../../core/operations';
 import {
   readAllowEmptyCommitMessage,
+  readEncodingSettings,
   readRemoteCheckBeforeCommit,
   readSvnPath,
   readTimeoutMs,
 } from '../../config';
 import { format, strings } from '../../i18n';
-import { logCommand, logExitCode, logLine, showOutput } from '../../output';
+import { decodingRunOptions, logCommand, logExitCode, logLine, showOutput } from '../../output';
 import { promptForCredentials } from '../../auth';
 import { confirmModal } from '../../ui/confirm';
 import { resolveWorkingCopyTarget, type WcTarget } from '../../commands/target';
@@ -106,7 +108,7 @@ function sessionBusy(): boolean {
 
 /** 「提交」命令：打开 P1 面板；同目标复用，新目标切换会话，忙碌时拒绝。 */
 export async function commandShowCommitPanel(uri?: vscode.Uri): Promise<void> {
-  const target = await resolveWorkingCopyTarget(uri, strings.command.commit);
+  const target = await resolveWorkingCopyTarget(uri, strings.command.commit, 'commit');
   if (!target || !panelContext) {
     return;
   }
@@ -145,7 +147,9 @@ function onPanelDispose(): void {
 /* ------------------------------ 会话读取 ------------------------------ */
 
 function runOptions(cwd: string): RunOptions {
-  return { cwd, timeoutMs: readTimeoutMs(), onExit: logExitCode };
+  // 外层 onExit 兜底（无独立回显的读取，如提交后刷新）；显式回显的命令
+  // 在调用处用 logCommand 的返回值覆盖，以逐命令记录操作日志。
+  return { cwd, timeoutMs: readTimeoutMs(), ...decodingRunOptions('commit'), onExit: (code) => logExitCode(code, 'commit') };
 }
 
 function metaByPath(path: string): CommitEntryMeta | undefined {
@@ -217,8 +221,10 @@ async function loadSession(
   pushRender();
 
   try {
-    logCommand(svnPath, ['status', '--xml', targetArg], target.wcRoot);
-    const status = await runStatus(svnPath, targetArg, runOptions(target.wcRoot));
+    const status = await runStatus(svnPath, targetArg, {
+      ...runOptions(target.wcRoot),
+      onExit: logCommand(svnPath, ['status', '--xml', targetArg], target.wcRoot, 'commit'),
+    });
     if (isStale()) {
       return;
     }
@@ -272,11 +278,11 @@ async function runRemoteStatusWithAuth(
   targetArg: string,
   target: WcTarget,
 ): Promise<RemoteStatusResult> {
-  logCommand(svnPath, ['status', '-u', '--non-interactive', '--xml', targetArg], target.wcRoot);
   return runRemoteStatus(svnPath, targetArg, {
     ...runOptions(target.wcRoot),
     getCredentials: promptForCredentials,
-    onCredentialRetry: (args) => logCommand(svnPath, args, target.wcRoot),
+    onExit: logCommand(svnPath, ['status', '-u', '--non-interactive', '--xml', targetArg], target.wcRoot, 'commit'),
+    onCredentialRetry: (args) => logCommand(svnPath, args, target.wcRoot, 'commit'),
   });
 }
 
@@ -375,12 +381,13 @@ function enrichMetas(metas: CommitEntryMeta[], wcRoot: string): void {
 /** 同步读 svn:ignore（enrichMetas 是同步路径，用子进程一次读取）。 */
 function readIgnoreRulesSync(svnPath: string, dirPath: string, wcRoot: string): string[] {
   try {
-    const out = execFileSync(svnPath, ['propget', 'svn:ignore', '--', escapePeg(dirPath)], {
+    // 原始字节经解码回退链处理，与 svnCli 收口解码同一套配置。
+    const { encoding, encodingFallback } = readEncodingSettings();
+    const raw = execFileSync(svnPath, ['propget', 'svn:ignore', '--', escapePeg(dirPath)], {
       cwd: wcRoot,
-      encoding: 'utf8',
       env: { ...process.env, LANG: 'en_US.UTF-8', LC_ALL: 'en_US.UTF-8' },
     });
-    return parseIgnoreRules(out);
+    return parseIgnoreRules(decodeBuffer(raw, encoding, encodingFallback).text);
   } catch (err) {
     const stderr = err instanceof Error ? err.message : String(err);
     // 属性不存在（W200017）与目标未纳管（E200005）都按空规则处理。
@@ -748,9 +755,11 @@ async function finishInlineOperation(operationId: string | undefined): Promise<v
 
 /** 删除目录的影响子树清单（svn list -R 的版本控制条目，截断到上限）。 */
 async function listDeletionSubtree(svnPath: string, dirPath: string): Promise<string[]> {
-  logCommand(svnPath, ['list', '-R', '--', escapePeg(dirPath)], session!.wcRoot);
   // 子树枚举失败不阻塞删除确认：core 返回空清单，确认框仍列目录本身。
-  return listVersionedSubtree(svnPath, session!.wcRoot, dirPath, runOptions(session!.wcRoot));
+  return listVersionedSubtree(svnPath, session!.wcRoot, dirPath, {
+    ...runOptions(session!.wcRoot),
+    onExit: logCommand(svnPath, ['list', '-R', '--', escapePeg(dirPath)], session!.wcRoot, 'commit'),
+  });
 }
 
 async function revertEntry(meta: CommitEntryMeta): Promise<void> {
@@ -776,9 +785,11 @@ async function revertEntry(meta: CommitEntryMeta): Promise<void> {
   }
   // 行内还原不递归（只还原目录节点登记），整目录递归还原走右键「还原」命令。
   const args = buildRevertArgs(meta.path);
-  logCommand(svnPath, args, session.wcRoot);
   try {
-    await runOrThrow(svnPath, args, runOptions(session.wcRoot));
+    await runOrThrow(svnPath, args, {
+      ...runOptions(session.wcRoot),
+      onExit: logCommand(svnPath, args, session.wcRoot, 'commit'),
+    });
     handle?.toast('info', format(strings.panel.revertDoneNotice, { path: meta.path }));
   } catch (err) {
     showErrorBanner(err);
@@ -824,9 +835,11 @@ async function deleteEntry(meta: CommitEntryMeta): Promise<void> {
     return;
   }
   const args = buildDeleteArgs(meta.path, { force: true });
-  logCommand(svnPath, args, session.wcRoot);
   try {
-    await runOrThrow(svnPath, args, runOptions(session.wcRoot));
+    await runOrThrow(svnPath, args, {
+      ...runOptions(session.wcRoot),
+      onExit: logCommand(svnPath, args, session.wcRoot, 'commit'),
+    });
     handle?.toast('info', format(strings.panel.deleteDoneNotice, { path: meta.path }));
   } catch (err) {
     showErrorBanner(err);
@@ -897,7 +910,7 @@ function showErrorBanner(err: unknown): void {
   session.error = err instanceof Error ? err.message : String(err);
   session.phase = 'ready';
   pushRender();
-  showOutput(false);
+  showOutput(false, 'commit');
 }
 
 /* ------------------------------ 提交链路 ------------------------------ */
@@ -957,8 +970,10 @@ async function performCommit(sessionId: string): Promise<void> {
   try {
     // 提交前重读本地实际状态：外部客户端可能在面板加载后修改了工作副本
     // （missing 登记、待添加范围都必须以当前事实为准，不信任打开时的快照）。
-    logCommand(svnPath, ['status', '--xml', session.targetArg], session.wcRoot);
-    const freshStatus = await runStatus(svnPath, session.targetArg, runOptions(session.wcRoot));
+    const freshStatus = await runStatus(svnPath, session.targetArg, {
+      ...runOptions(session.wcRoot),
+      onExit: logCommand(svnPath, ['status', '--xml', session.targetArg], session.wcRoot, 'commit'),
+    });
     if (handle.sessionId !== sessionId) {
       return;
     }
@@ -1011,11 +1026,11 @@ async function performCommit(sessionId: string): Promise<void> {
     // missing → svn delete --force（确认已涵盖在范围确认中）。
     for (const meta of selected.filter((item) => item.wcStatus === 'missing')) {
       const args = ['delete', '--force', '--', escapePeg(meta.path)];
-      logCommand(svnPath, args, session.wcRoot);
       await runOrThrow(svnPath, args, {
         ...runOptions(session.wcRoot),
         getCredentials: promptForCredentials,
-        onCredentialRetry: (retryArgs) => logCommand(svnPath, retryArgs, s.wcRoot),
+        onExit: logCommand(svnPath, args, session.wcRoot, 'commit'),
+        onCredentialRetry: (retryArgs) => logCommand(svnPath, retryArgs, s.wcRoot, 'commit'),
       });
       session.missingPrepared.push(meta.path);
     }
@@ -1028,9 +1043,11 @@ async function performCommit(sessionId: string): Promise<void> {
         .sort((a, b) => segmentCount(a) - segmentCount(b) || (a < b ? -1 : a > b ? 1 : 0));
       for (const path of plan) {
         const args = ['add', '--depth', 'empty', '--', escapePeg(path)];
-        logCommand(svnPath, args, session.wcRoot);
         try {
-          await runOrThrow(svnPath, args, runOptions(session.wcRoot));
+          await runOrThrow(svnPath, args, {
+            ...runOptions(session.wcRoot),
+            onExit: logCommand(svnPath, args, session.wcRoot, 'commit'),
+          });
           session.addedPrepared.push(path);
         } catch (err) {
           // 添加失败不继续提交；已添加项保留 A 状态并解释。
@@ -1044,7 +1061,7 @@ async function performCommit(sessionId: string): Promise<void> {
             session.errorKind = 'add';
             pushRender();
           }
-          showOutput(false);
+          showOutput(false, 'commit');
           return;
         }
       }
@@ -1065,14 +1082,14 @@ async function performCommit(sessionId: string): Promise<void> {
       for (let offset = 0; offset < paths.length; offset += COMMIT_BATCH_SIZE) {
         const batch = paths.slice(offset, offset + COMMIT_BATCH_SIZE);
         const args = buildCommitArgs(messageFile, batch);
-        logCommand(svnPath, args, session.wcRoot);
         try {
           const result = await runOrThrow(svnPath, args, {
             ...runOptions(session.wcRoot),
             getCredentials: promptForCredentials,
-            onCredentialRetry: (retryArgs) => logCommand(svnPath, retryArgs, s.wcRoot),
+            onExit: logCommand(svnPath, args, session.wcRoot, 'commit'),
+            onCredentialRetry: (retryArgs) => logCommand(svnPath, retryArgs, s.wcRoot, 'commit'),
           });
-          logLine(result.stdout.trimEnd());
+          logLine(result.stdout.trimEnd(), 'commit');
           const revision = parseCommitOutput(result.stdout).revision;
           if (revision !== undefined) {
             revisions.push(revision);
@@ -1089,14 +1106,14 @@ async function performCommit(sessionId: string): Promise<void> {
           ) {
             // 空说明兜底（M1 保留）：-m "" 重试一次。
             const retryArgs = ['commit', '--non-interactive', '-m', '', ...batch.map((p) => escapePeg(p))];
-            logCommand(svnPath, retryArgs, session.wcRoot);
             try {
               const result = await runOrThrow(svnPath, retryArgs, {
                 ...runOptions(session.wcRoot),
                 getCredentials: promptForCredentials,
-                onCredentialRetry: (retryArgs2) => logCommand(svnPath, retryArgs2, s.wcRoot),
+                onExit: logCommand(svnPath, retryArgs, session.wcRoot, 'commit'),
+                onCredentialRetry: (retryArgs2) => logCommand(svnPath, retryArgs2, s.wcRoot, 'commit'),
               });
-              logLine(result.stdout.trimEnd());
+              logLine(result.stdout.trimEnd(), 'commit');
               const revision = parseCommitOutput(result.stdout).revision;
               if (revision !== undefined) {
                 revisions.push(revision);
@@ -1133,7 +1150,7 @@ async function performCommit(sessionId: string): Promise<void> {
         session.result = { kind: 'partial', revisions, committedIds: committed.map((path) => path) };
       }
       pushRender();
-      showOutput(false);
+      showOutput(false, 'commit');
       return;
     }
 
@@ -1145,7 +1162,7 @@ async function performCommit(sessionId: string): Promise<void> {
       const failureText = failure instanceof Error ? failure.message : String(failure);
       session.error = failureText;
       pushRender();
-      showOutput(false);
+      showOutput(false, 'commit');
       void vscode.window.showErrorMessage(errorFirstLine(failureText));
       return;
     }
@@ -1187,7 +1204,7 @@ async function performCommit(sessionId: string): Promise<void> {
     const failureText = err instanceof Error ? err.message : String(err);
     session.error = failureText;
     pushRender();
-    showOutput(false);
+    showOutput(false, 'commit');
     if (session.phase !== 'unknown') {
       void vscode.window.showErrorMessage(errorFirstLine(failureText));
     }
@@ -1208,10 +1225,10 @@ async function finishCommitRefresh(registry: OperationRegistry, success: boolean
     return;
   }
   const svnPath = readSvnPath();
-  logLine(strings.commit.refreshHeader);
+  logLine(strings.commit.refreshHeader, 'commit');
   try {
     const after = await runStatus(svnPath, session.targetArg, runOptions(session.wcRoot));
-    writeStatusReport(after);
+    writeStatusReport(after, 'commit');
     const committedPaths = new Set(session.result?.committedIds ?? []);
     session.selectedPaths = new Set([...session.selectedPaths].filter((path) => !committedPaths.has(path)));
     session.missingPrepared = session.missingPrepared.filter((path) =>
@@ -1239,7 +1256,7 @@ async function finishCommitRefresh(registry: OperationRegistry, success: boolean
       }
       pushRender();
     }
-    showOutput(false);
+    showOutput(false, 'commit');
     if (keepResult) {
       const revisions = (keepResult.revisions ?? []).map((revision) => `r${revision}`).join('、');
       void vscode.window.showInformationMessage(
@@ -1257,7 +1274,7 @@ async function finishCommitRefresh(registry: OperationRegistry, success: boolean
       activeOperationId = undefined;
     }
     pushRender();
-    showOutput(false);
+    showOutput(false, 'commit');
     // 提交本身已成功：即使刷新失败也要回显 revision，不把刷新失败误读为提交失败。
     const committedResult = session.result;
     if (committedResult) {
@@ -1286,6 +1303,7 @@ async function remoteCheckBeforeCommitPanel(
       count: String(remoteChanges.length),
       against: remote.against === undefined ? '—' : String(remote.against),
     }),
+    'commit',
   );
   if (remoteChanges.length === 0) {
     return 'checked';
@@ -1373,8 +1391,10 @@ async function resolveUnknown(sessionId: string): Promise<void> {
   session.phase = 'refreshing';
   pushRender();
   try {
-    logCommand(svnPath, ['status', '--xml', session.targetArg], session.wcRoot);
-    const status = await runStatus(svnPath, session.targetArg, runOptions(session.wcRoot));
+    const status = await runStatus(svnPath, session.targetArg, {
+      ...runOptions(session.wcRoot),
+      onExit: logCommand(svnPath, ['status', '--xml', session.targetArg], session.wcRoot, 'commit'),
+    });
     const explicit = restriction?.explicitPaths ?? [...session.selectedPaths];
     const stillDirty = explicit.filter((path) =>
       status.entries.some((entry) => entry.path === path && (entry.wcStatus !== 'normal' || entry.props === 'modified')),

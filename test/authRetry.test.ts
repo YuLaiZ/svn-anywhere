@@ -138,7 +138,9 @@ describe('runOrThrow 认证重试（F66/F67）', () => {
     await runOrThrowWithRunner('svn', ['update', '.'], {
       cwd: '/wc',
       getCredentials: vi.fn().mockResolvedValue({ username: 'yu', password: 's3cret' }),
-      onCredentialRetry: (args) => observed.push({ args, callsWhenFired: fake.calls.length }),
+      onCredentialRetry: (args) => {
+        observed.push({ args, callsWhenFired: fake.calls.length });
+      },
     }, fake.runner);
 
     // 回调恰好一次；触发时机在首次执行结束之后、重试执行之前（回显先于执行）。
@@ -167,6 +169,81 @@ describe('runOrThrow 认证重试（F66/F67）', () => {
       }, cancelled.runner),
     ).rejects.toBeInstanceOf(SvnError);
     expect(cancelledRetry).not.toHaveBeenCalled();
+  });
+
+  it('onCredentialRetry 返回函数时，重试执行改用它作为 onExit（操作日志记录器绑定重试命令行）', async () => {
+    // 捕获每次执行收到的完整 options：重试 run 的 onExit 必须是
+    // onCredentialRetry 返回的记录器，而不是复用首执行的 onExit 闭包
+    // （否则操作日志第二行的命令行是首执行命令，与实际执行不符）。
+    const responses: RunResult[] = [];
+    const observedExits: Array<unknown> = [];
+    const mainExit = vi.fn();
+    const retryExit = vi.fn();
+    const runner = (async (_svnPath: string, _args: string[], opts: RunOptions) => {
+      observedExits.push(opts.onExit);
+      const next = responses.shift();
+      if (!next) {
+        throw new Error('runner 无预设响应');
+      }
+      if (next.exitCode !== 0) {
+        throw new SvnError({
+          message: next.stderr.split('\n')[0] ?? '失败',
+          command: _args,
+          exitCode: next.exitCode,
+          stderr: next.stderr,
+          code: 'E170001',
+        });
+      }
+      return next;
+    }) as Runner;
+
+    responses.push(runResult({ exitCode: 1, stderr: 'svn: E170001: Authentication failed' }));
+    responses.push(runResult({ stdout: 'ok', exitCode: 0 }));
+    await runOrThrowWithRunner('svn', ['update', '.'], {
+      getCredentials: vi.fn().mockResolvedValue({ username: 'yu', password: 's3cret' }),
+      onExit: mainExit,
+      onCredentialRetry: () => retryExit,
+    }, runner);
+
+    expect(observedExits).toHaveLength(2);
+    expect(observedExits[0]).toBe(mainExit);
+    expect(observedExits[1]).toBe(retryExit);
+  });
+
+  it('onCredentialRetry 未返回函数时，重试执行维持复用外层 onExit（兼容既有回调）', async () => {
+    const responses: RunResult[] = [];
+    const observedExits: Array<unknown> = [];
+    const mainExit = vi.fn();
+    const runner = (async (_svnPath: string, _args: string[], opts: RunOptions) => {
+      observedExits.push(opts.onExit);
+      const next = responses.shift();
+      if (!next) {
+        throw new Error('runner 无预设响应');
+      }
+      if (next.exitCode !== 0) {
+        throw new SvnError({
+          message: next.stderr.split('\n')[0] ?? '失败',
+          command: _args,
+          exitCode: next.exitCode,
+          stderr: next.stderr,
+          code: 'E170001',
+        });
+      }
+      return next;
+    }) as Runner;
+
+    responses.push(runResult({ exitCode: 1, stderr: 'svn: E170001: Authentication failed' }));
+    responses.push(runResult({ stdout: 'ok', exitCode: 0 }));
+    // 回调返回数字（非函数）：不得被误当作记录器。
+    await runOrThrowWithRunner('svn', ['update', '.'], {
+      getCredentials: vi.fn().mockResolvedValue({ username: 'yu', password: 's3cret' }),
+      onExit: mainExit,
+      onCredentialRetry: () => 42 as unknown as void,
+    }, runner);
+
+    expect(observedExits).toHaveLength(2);
+    expect(observedExits[0]).toBe(mainExit);
+    expect(observedExits[1]).toBe(mainExit);
   });
 });
 

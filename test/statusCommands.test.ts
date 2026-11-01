@@ -149,11 +149,16 @@ import { commandCleanup } from '../src/host/commands/cleanup';
 const makeUri = (fsPath: string): vscode.Uri => ({ fsPath, scheme: 'file' }) as unknown as vscode.Uri;
 
 const channelLines = (): string[] => {
-  const channel = getOutputChannel();
-  if (!channel) {
-    throw new Error('输出频道不存在');
+  // 输出按操作域分频道（状态/更新/其它）：聚合全部频道行，断言语义不变。
+  const all = vscodeMock.channels.flatMap((ch) => ch.lines);
+  if (all.length === 0 && vscodeMock.channels.length === 0) {
+    // 保持「频道必须存在」的强断言：命令执行后至少建有一个频道。
+    const channel = getOutputChannel();
+    if (!channel) {
+      throw new Error('输出频道不存在');
+    }
   }
-  return (channel as unknown as { lines: string[] }).lines;
+  return all;
 };
 
 vi.mocked(runStatus).mockResolvedValue({ targetPath: '.', entries: [], externals: [] });

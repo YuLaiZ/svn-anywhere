@@ -9,6 +9,7 @@
  * - 所有包含命令与 args 的错误消息都经过 redactArgs，--password 不进明文。
  */
 import { spawn, type ChildProcess } from 'node:child_process';
+import { DEFAULT_ENCODING_FALLBACK, DEFAULT_OUTPUT_ENCODING, decodeBuffer, type DecodingFallbackNotice } from './encoding';
 import { SvnError, assertSuccess, isAuthFailure, tailText } from './errors';
 import { redactArgs } from './redact';
 
@@ -29,8 +30,18 @@ export interface RunOptions {
   timeoutMs?: number;
   /** 取消信号；宿主负责从 vscode.CancellationToken 桥接。 */
   signal?: AbortSignal;
-  /** 增量输出回调，宿主写 OutputChannel（建议配合 LineBuffer 按行脱敏）。 */
+  /**
+   * 输出回调：进程结束后按编码回退链解码出的整段文本（stdout、stderr
+   * 各一次；解码收口在 svnCli，面板与命令拿到的都是已解码字符串）。
+   * 建议配合 LineBuffer 按行脱敏。
+   */
   onOutput?: (chunk: string, source: 'stdout' | 'stderr') => void;
+  /** 输出解码主编码（严格解码），默认 UTF-8；详见 core/encoding。 */
+  encoding?: string;
+  /** 主编码严格解码失败后的回退编码链（按序尝试），默认不回退。 */
+  encodingFallback?: readonly string[];
+  /** 任一输出流回退链全部失败、按 UTF-8 宽松解码时回调（宿主写频道标注）。 */
+  onDecodingFallback?: (notice: DecodingFallbackNotice) => void;
   /**
    * 命令正常结束（含非零退出码）时的回调，宿主用于在输出频道记录退出码；
    * 超时、取消、启动失败不回调。认证补录重试是第二次执行，会再次回调。
@@ -47,8 +58,11 @@ export interface RunOptions {
    * 认证补录重试执行前的回调，参数为追加 --username/--password 后的重试
    * args（含明文密码）；宿主用于回显命令行，记录前必须脱敏
    * （host 层 logCommand 已内置 redactArgs）。未提供或未发生重试不调用。
+   * 返回值（若为函数）将作为重试执行的 onExit：宿主 logCommand 返回的
+   * 退出记录器借此让操作日志第二行使用重试命令行（脱敏后）与真实耗时，
+   * 而不是复用首执行记录器导致命令行失真。
    */
-  onCredentialRetry?: (args: string[]) => void;
+  onCredentialRetry?: (args: string[]) => ((exitCode: number) => void) | void;
 }
 
 export interface RunResult {
@@ -137,8 +151,8 @@ export function run(svnPath: string, args: string[], options: RunOptions = {}): 
     }
     activeChildren.add(child);
 
-    let stdout = '';
-    let stderr = '';
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
     let timedOut = false;
     let aborted = false;
     let settled = false;
@@ -192,15 +206,13 @@ export function run(svnPath: string, args: string[], options: RunOptions = {}): 
       }));
       return;
     }
-    stdoutStream.setEncoding('utf8');
-    stderrStream.setEncoding('utf8');
-    stdoutStream.on('data', (chunk: string) => {
-      stdout += chunk;
-      options.onOutput?.(chunk, 'stdout');
+    // 输出收集原始字节：解码统一在本函数收口（编码回退链必须看到全量
+    // 字节才能判定），回调与结果拿到的都是已解码字符串。
+    stdoutStream.on('data', (chunk: Buffer) => {
+      stdoutChunks.push(chunk);
     });
-    stderrStream.on('data', (chunk: string) => {
-      stderr += chunk;
-      options.onOutput?.(chunk, 'stderr');
+    stderrStream.on('data', (chunk: Buffer) => {
+      stderrChunks.push(chunk);
     });
 
     child.on('error', (err: NodeJS.ErrnoException) => {
@@ -220,12 +232,29 @@ export function run(svnPath: string, args: string[], options: RunOptions = {}): 
       settled = true;
       cleanup();
       activeChildren.delete(child);
+      // 收口解码：主编码严格解码 → 回退链 → UTF-8 宽松兜底。
+      const primary = options.encoding ?? DEFAULT_OUTPUT_ENCODING;
+      const fallback = options.encodingFallback ?? DEFAULT_ENCODING_FALLBACK;
+      const stdoutDecoded = decodeBuffer(Buffer.concat(stdoutChunks), primary, fallback);
+      const stderrDecoded = decodeBuffer(Buffer.concat(stderrChunks), primary, fallback);
+      if (stdoutDecoded.lenient) {
+        options.onDecodingFallback?.({ source: 'stdout', primary, fallback });
+      }
+      if (stderrDecoded.lenient) {
+        options.onDecodingFallback?.({ source: 'stderr', primary, fallback });
+      }
+      if (stdoutDecoded.text) {
+        options.onOutput?.(stdoutDecoded.text, 'stdout');
+      }
+      if (stderrDecoded.text) {
+        options.onOutput?.(stderrDecoded.text, 'stderr');
+      }
       if (timedOut) {
         reject(new SvnError({
           message: `svn ${redactArgs(args).join(' ')} 超时（${timeoutMs} 毫秒），进程已终止`,
           command: args,
           cwd: options.cwd,
-          stderr: tailText(stderr),
+          stderr: tailText(stderrDecoded.text),
           code: 'TIMEOUT',
         }));
         return;
@@ -235,14 +264,14 @@ export function run(svnPath: string, args: string[], options: RunOptions = {}): 
           message: `svn ${redactArgs(args).join(' ')} 已被取消`,
           command: args,
           cwd: options.cwd,
-          stderr: tailText(stderr),
+          stderr: tailText(stderrDecoded.text),
           code: 'CANCELLED',
         }));
         return;
       }
       const exitCode = code ?? -1;
       options.onExit?.(exitCode);
-      resolve({ stdout, stderr, exitCode });
+      resolve({ stdout: stdoutDecoded.text, stderr: stderrDecoded.text, exitCode });
     });
   });
 }
@@ -281,8 +310,12 @@ export async function runOrThrowWithRunner(
       throw err;
     }
     const retryArgs = [...args, '--username', credentials.username, '--password', credentials.password];
-    options.onCredentialRetry?.(retryArgs);
-    const result = await runner(svnPath, retryArgs, options);
+    // onCredentialRetry 返回退出记录器时（host 层 logCommand 的返回值），
+    // 重试执行改用它作为 onExit：操作日志第二行记录重试命令（脱敏）与
+    // 各自真实耗时；否则维持复用外层 onExit 的既有行为。
+    const retryExit = options.onCredentialRetry?.(retryArgs);
+    const retryOptions = typeof retryExit === 'function' ? { ...options, onExit: retryExit } : options;
+    const result = await runner(svnPath, retryArgs, retryOptions);
     return assertSuccess(result, retryArgs, options.cwd);
   }
 }

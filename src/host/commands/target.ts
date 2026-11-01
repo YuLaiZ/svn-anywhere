@@ -7,7 +7,7 @@
 import * as vscode from 'vscode';
 import { findWorkingCopy } from '../../core/workspace';
 import { format, strings } from '../i18n';
-import { logLine } from '../output';
+import { logLine, type OutputKind } from '../output';
 
 export interface WcTarget {
   /** 命中的工作副本根（realpath 后）。 */
@@ -18,11 +18,13 @@ export interface WcTarget {
 
 /**
  * 解析命令目标并定位工作副本；任一步不成立（取消、非副本）时返回 undefined，
- * 命令实现应直接返回。commandLabel 只用于输出频道与提示中的命令名。
+ * 命令实现应直接返回。commandLabel 只用于输出频道与提示中的命令名；
+ * kind 是该命令的输出频道分类（定位留痕写入同一频道）。
  */
 export async function resolveWorkingCopyTarget(
   uri: vscode.Uri | undefined,
   commandLabel: string,
+  kind: OutputKind = 'other',
 ): Promise<WcTarget | undefined> {
   const fsPath = await pickTargetFsPath(uri);
   if (!fsPath) {
@@ -33,7 +35,7 @@ export async function resolveWorkingCopyTarget(
     void vscode.window.showInformationMessage(strings.error.notWorkingCopy);
     return undefined;
   }
-  logLine(format(strings.target.resolved, { command: commandLabel, target: fsPath, wcRoot }));
+  logLine(format(strings.target.resolved, { command: commandLabel, target: fsPath, wcRoot }), kind);
   return { wcRoot, targetPath: fsPath };
 }
 

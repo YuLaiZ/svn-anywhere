@@ -212,7 +212,8 @@ import { setCommitPanelContext } from '../src/host/panel/panels/commit';
 const makeUri = (fsPath: string): vscode.Uri => ({ fsPath, scheme: 'file' }) as unknown as vscode.Uri;
 
 const channelLines = (): string[] => {
-  const channel = getOutputChannel();
+  // P1 提交面板链路输出按操作域路由到「提交」频道。
+  const channel = getOutputChannel('commit');
   if (!channel) {
     throw new Error('输出频道不存在');
   }

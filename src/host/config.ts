@@ -3,6 +3,7 @@
  * 用户可能填入非法类型，读取处做防御，不让激活路径抛未处理异常。
  */
 import * as vscode from 'vscode';
+import { DEFAULT_ENCODING_FALLBACK, DEFAULT_OUTPUT_ENCODING } from '../core/encoding';
 import { DEFAULT_TIMEOUT_MS } from '../core/svnCli';
 
 export function getConfiguration(): vscode.WorkspaceConfiguration {
@@ -41,4 +42,26 @@ export function readRemoteCheckBeforeCommit(): boolean {
 export function readAllowEmptyCommitMessage(): boolean {
   const raw: unknown = getConfiguration().get('allowEmptyCommitMessage', true);
   return typeof raw === 'boolean' ? raw : true;
+}
+
+/** svn 输出解码设置：主编码与回退链（编码 label 不区分大小写）。 */
+export interface EncodingSettings {
+  encoding: string;
+  encodingFallback: string[];
+}
+
+/**
+ * 读取输出编码配置：主编码严格解码、失败按回退链逐个重试。
+ * 类型非法或留空时回退默认值（UTF-8 / gbk,gb2312,big5）；回退链按
+ * 逗号分隔，忽略空白段。编码 label 的合法性由解码层判定并跳过。
+ */
+export function readEncodingSettings(): EncodingSettings {
+  const rawPrimary: unknown = getConfiguration().get('encoding', DEFAULT_OUTPUT_ENCODING);
+  const primary = typeof rawPrimary === 'string' && rawPrimary.trim() ? rawPrimary.trim() : DEFAULT_OUTPUT_ENCODING;
+  const rawFallback: unknown = getConfiguration().get('encodingFallback', DEFAULT_ENCODING_FALLBACK.join(','));
+  const fallback = (typeof rawFallback === 'string' ? rawFallback : '')
+    .split(',')
+    .map((label) => label.trim())
+    .filter(Boolean);
+  return { encoding: primary, encodingFallback: fallback };
 }

@@ -9,7 +9,7 @@ import { SvnError } from '../../core/errors';
 import { escapePeg } from '../../core/workspace';
 import { readSvnPath, readTimeoutMs } from '../config';
 import { format, strings } from '../i18n';
-import { logCommand, logExitCode, logLine, showOutput } from '../output';
+import { decodingRunOptions, logCommand, logExitCode, logLine, showOutput } from '../output';
 import { resolveWorkingCopyTarget } from './target';
 import { confirmModal } from '../ui/confirm';
 import { promptForCredentials } from '../auth';
@@ -21,11 +21,13 @@ export async function commandRelocate(uri?: vscode.Uri): Promise<void> {
   }
 
   const svnPath = readSvnPath();
-  const runOptions = { cwd: target.wcRoot, timeoutMs: readTimeoutMs(), onExit: logExitCode };
+  const runOptions = { cwd: target.wcRoot, timeoutMs: readTimeoutMs(), ...decodingRunOptions('other'), onExit: logExitCode };
 
   // relocate 作用于副本根，从副本根读当前地址。
-  logCommand(svnPath, ['info', '--show-item', 'url', escapePeg(target.wcRoot)], target.wcRoot);
-  const oldUrl = await readRepositoryUrl(svnPath, target.wcRoot, runOptions);
+  const oldUrl = await readRepositoryUrl(svnPath, target.wcRoot, {
+    ...runOptions,
+    onExit: logCommand(svnPath, ['info', '--show-item', 'url', escapePeg(target.wcRoot)], target.wcRoot),
+  });
 
   const newUrl = await vscode.window.showInputBox({
     prompt: format(strings.relocate.inputPrompt, { oldUrl }),
@@ -62,10 +64,10 @@ export async function commandRelocate(uri?: vscode.Uri): Promise<void> {
         cancellable: false,
       },
       async () => {
-        logCommand(svnPath, args, target.wcRoot);
         const result = await runOrThrow(svnPath, args, {
           ...runOptions,
           getCredentials: promptForCredentials,
+          onExit: logCommand(svnPath, args, target.wcRoot),
           // 重试命令回显到输出频道（logCommand 内置脱敏，密码不外泄）。
           onCredentialRetry: (retryArgs) => logCommand(svnPath, retryArgs, target.wcRoot),
         });

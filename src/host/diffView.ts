@@ -21,7 +21,7 @@ import { looksBinary, parseCopiedFrom, readBaseContent, readInfoText, removeDiff
 import { runOrThrow } from '../core/svnCli';
 import { readTimeoutMs } from './config';
 import { format, strings } from './i18n';
-import { logCommand, logExitCode, logLine, showOutput } from './output';
+import { decodingRunOptions, logCommand, logLine, showOutput } from './output';
 
 export interface DiffTarget {
   svnPath: string;
@@ -150,12 +150,12 @@ async function openDiffEditor(left: vscode.Uri, right: vscode.Uri, title: string
 /** 纯属性差异：svn diff 原样写入输出频道并展示（实测 1.15 无 --properties 选项；纯属性条目的 diff 输出只含属性段）。 */
 async function showPropertyDiff(svnPath: string, wcRoot: string, relPath: string): Promise<DiffOutcome> {
   const args = ['diff', '--', relPath];
-  logCommand(svnPath, args, wcRoot);
   try {
     const result = await runOrThrow(svnPath, args, {
       cwd: wcRoot,
       timeoutMs: readTimeoutMs(),
-      onExit: logExitCode,
+      ...decodingRunOptions('other'),
+      onExit: logCommand(svnPath, args, wcRoot),
     });
     logLine(format(strings.panel.propDiffHeader, { path: relPath }));
     logLine(result.stdout.trim() || strings.commit.diffClean);
