@@ -305,3 +305,58 @@ const PLAIN_CODE_TO_ITEM: Record<string, string> = {
   '?': 'unversioned',
   R: 'replaced',
 };
+
+describe('多目标 status（资源管理器多选批量）', () => {
+  it('多 <target> 段条目合并；顶层 changelist 容器跨目标收拢；targetPath 拼接展示', () => {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<status>
+<target path="dir1">
+<entry path="dir1/b.txt">
+<wc-status item="modified" props="none"></wc-status>
+</entry>
+</target>
+<target path="dir2">
+<entry path="dir2/c.txt">
+<wc-status item="modified" props="none"></wc-status>
+</entry>
+</target>
+<changelist name="cl-x">
+<entry path="dir1/a.txt">
+<wc-status item="modified" props="none"></wc-status>
+</entry>
+</changelist>
+</status>
+`;
+    const result = parseStatusXml(xml);
+    expect(result.targetPath).toBe('dir1、dir2');
+    expect(result.entries.map((entry) => entry.path)).toEqual(['dir1/b.txt', 'dir2/c.txt', 'dir1/a.txt']);
+    expect(result.entries[2]?.changelist).toBe('cl-x');
+  });
+
+  it('单目标样本行为不变：targetPath 保持原值', () => {
+    const result = parseStatusXml(SAMPLE_WITH_ENTRIES);
+    expect(result.targetPath).toBe('.');
+    expect(result.entries).toHaveLength(2);
+  });
+
+  it('runStatus 数组目标一次查询两个不相邻目录：条目合并、路径相对副本根', async () => {
+    const wc = lab.checkout('multi-target-wc');
+    writeFile(wc, 'd1/a.txt', 'v1', true);
+    writeFile(wc, 'd1/inner/b.txt', 'v1', true);
+    writeFile(wc, 'd2/c.txt', 'v1', true);
+    writeFile(wc, 'outside.txt', 'v1', true);
+    lab.svn(['commit', '-q', '-m', 'init'], wc);
+    writeFile(wc, 'd1/a.txt', 'v2');
+    writeFile(wc, 'd1/inner/b.txt', 'v2');
+    writeFile(wc, 'd2/c.txt', 'v2');
+    writeFile(wc, 'outside.txt', 'v2');
+    const result = await runStatus('svn', ['d1', 'd2'], { cwd: wc });
+    expect(result.entries.map((entry) => entry.path).sort()).toEqual([
+      'd1/a.txt',
+      'd1/inner/b.txt',
+      'd2/c.txt',
+    ]);
+    // 目标外的修改不混入（批量会话范围 = 选区目标范围）。
+    expect(result.entries.some((entry) => entry.path === 'outside.txt')).toBe(false);
+  });
+});

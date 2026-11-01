@@ -232,7 +232,7 @@ afterEach(() => {
 describe('P1 提交面板 提交前检查', () => {
   it('开关默认开启：面板加载即含远端分组数据，频道写远端检查汇总', async () => {
     const panel = await openPanelAndWait(join(wcRoot, 'a.txt'), 'a.txt');
-    expect(vi.mocked(runRemoteStatus)).toHaveBeenCalledWith('svn', 'a.txt', expect.objectContaining({ cwd: wcRoot }));
+    expect(vi.mocked(runRemoteStatus)).toHaveBeenCalledWith('svn', ['a.txt'], expect.objectContaining({ cwd: wcRoot }));
     // 远端无变化：远端分组不渲染。
     const html = String([...panel.posted].reverse().find((m) => m.type === 'render')?.html);
     expect(html).not.toContain(strings.panel.groupRemote);

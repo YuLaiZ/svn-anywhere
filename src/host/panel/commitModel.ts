@@ -15,7 +15,7 @@
  *   必要父目录（unversioned/added 目录）；
  * - 导航目录只组织路径，不是提交目标；聚合勾选作用于筛选后子树。
  */
-import { basename, relative } from 'node:path';
+import { basename } from 'node:path';
 import type { StatusEntry } from '../../core/status';
 import type { RemoteStatusEntry } from '../../core/remoteStatus';
 import { matchesIgnoreRules } from '../../core/ignore';
@@ -53,9 +53,10 @@ export interface CommitEntryMeta {
 export interface CommitSessionState {
   sessionId: string;
   wcRoot: string;
-  targetPath: string;
-  /** 相对副本根的执行目标（'.' 表示根）。 */
-  targetArg: string;
+  /** 会话目标（绝对路径）：单目标右键为 1 个；资源管理器多选为去重后的多个。 */
+  targetPaths: string[];
+  /** 相对副本根的执行目标（'.' 表示根），与 targetPaths 一一对应。 */
+  targetArgs: string[];
   metas: CommitEntryMeta[];
   selectedPaths: Set<string>;
   viewMode: 'tree' | 'list';
@@ -493,7 +494,10 @@ function groupLabel(groupId: CommitGroup): string {
 
 export function targetLabelOf(session: CommitSessionState): string {
   const name = basename(session.wcRoot) || session.wcRoot;
-  const rel = relative(session.wcRoot, session.targetPath) || '.';
+  if (session.targetArgs.length > 1) {
+    return format(strings.panel.targetLabelMulti, { name, count: String(session.targetArgs.length) });
+  }
+  const rel = session.targetArgs[0] ?? '.';
   return rel === '.'
     ? format(strings.panel.targetLabelRoot, { name })
     : format(strings.panel.targetLabelPath, { name, rel });

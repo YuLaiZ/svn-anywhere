@@ -116,3 +116,49 @@ describe('runRemoteStatus 集成（本地 file:// 副本）', () => {
 function headRevision(): number {
   return Number(lab.svn(['info', '--show-item', 'revision', lab.repoUrl]).trim());
 }
+
+describe('多目标远端检查（多选批量会话）', () => {
+  it('多 <target> 段条目合并，against 取各段最大值', () => {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<status>
+<target path="d1">
+<entry path="d1/a.txt">
+<wc-status item="normal" props="none"></wc-status>
+<repos-status item="modified" props="none"></repos-status>
+</entry>
+<against revision="5"/>
+</target>
+<target path="d2">
+<entry path="d2/b.txt">
+<wc-status item="none" props="none"></wc-status>
+<repos-status item="added" props="none"></repos-status>
+</entry>
+<against revision="7"/>
+</target>
+</status>
+`;
+    const result = parseRemoteStatusXml(xml);
+    expect(result.against).toBe(7);
+    expect(remoteChangedEntries(result).map((entry) => entry.path)).toEqual(['d1/a.txt', 'd2/b.txt']);
+  });
+
+  it('runRemoteStatus 数组目标一次查询两个目录的远端变化', async () => {
+    const base = lab.checkout('r-multi-base');
+    writeFile(base, 'd1/a.txt', 'v1', true);
+    writeFile(base, 'd2/b.txt', 'v1', true);
+    writeFile(base, 'd3/c.txt', 'v1', true);
+    lab.svn(['commit', '-q', '-m', 'init'], base);
+    const other = lab.checkout('r-multi-other');
+    writeFile(other, 'd1/a.txt', 'v2');
+    writeFile(other, 'd3/c.txt', 'v2');
+    lab.svn(['commit', '-q', '-m', 'remote change'], other);
+
+    const result = await runRemoteStatus('svn', ['d1', 'd2'], { cwd: base });
+    expect(result.against).toBe(headRevision());
+    const changed = remoteChangedEntries(result).map((entry) => entry.path);
+    expect(changed).toContain('d1/a.txt');
+    // 目标 d2 无远端变化；目标外目录（d3）的远端变化不混入。
+    expect(changed.some((path) => path.startsWith('d2/'))).toBe(false);
+    expect(changed.some((path) => path.startsWith('d3/'))).toBe(false);
+  });
+});

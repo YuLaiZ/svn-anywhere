@@ -61,3 +61,21 @@ export function escapePeg(path: string): string {
   const target = path.startsWith('-') ? `./${path}` : path;
   return target.includes('@') ? `${target}@` : target;
 }
+
+/**
+ * 批量操作的嵌套路径去重：任一路径已经是集合中另一路径的祖先（按路径
+ * 分段前缀判定，`/a/b` 包含 `/a/b/c` 但不包含 `/a/bb`）时丢弃内层，
+ * 只保留最外层；重复路径只保留一份。返回顺序与输入一致。
+ * 输入是本地文件系统绝对路径（VSCode 选区 Uri 的 fsPath），去除末尾
+ * 分隔符仅用于包含判定，不影响返回的原值。
+ */
+export function dedupeNestedPaths(paths: string[]): string[] {
+  // 去重 + 保持顺序的包含判定基元：末尾分隔符不影响祖先关系。
+  const keys = [...new Set(paths)].map((path) => ({
+    original: path,
+    key: path.length > 1 && path.endsWith('/') ? path.slice(0, -1) : path,
+  }));
+  return keys
+    .filter(({ key }) => !keys.some(({ key: other }) => other !== key && key.startsWith(`${other}/`)))
+    .map(({ original }) => original);
+}

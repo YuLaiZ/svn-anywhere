@@ -12,17 +12,49 @@ import { escapePeg } from '../../core/workspace';
 import { readSvnPath, readTimeoutMs } from '../config';
 import { format, strings } from '../i18n';
 import { createLineBuffer, decodingRunOptions, logCommand, logLine, showOutput } from '../output';
-import { resolveWorkingCopyTarget, type WcTarget } from './target';
+import { resolveBatchTargetGroups, resolveWorkingCopyTarget, summarizePaths, type WcTarget } from './target';
 import { confirmModal } from '../ui/confirm';
 import { promptForCredentials } from '../auth';
 
-export async function commandUpdate(uri?: vscode.Uri): Promise<void> {
+export async function commandUpdate(uri?: vscode.Uri, uris?: vscode.Uri[]): Promise<void> {
+  const svnPath = readSvnPath();
+
+  // 资源管理器多选批量：选区先去重嵌套路径（只保留最外层）再按工作副本分组，
+  // 一次确认与一次版本号输入，逐组执行多目标更新（输出按目标逐项可见）。
+  if (uris && uris.length > 0) {
+    const groups = resolveBatchTargetGroups(uris, strings.command.update, 'update');
+    if (groups.length === 0) {
+      return;
+    }
+    const allTargets = groups.flatMap((group) => group.targetPaths);
+    const confirmed = await confirmModal(
+      format(strings.update.confirmTitle, { target: summarizePaths(allTargets) }),
+      strings.update.confirmButton,
+    );
+    if (!confirmed) {
+      return;
+    }
+    const revision = await promptUpdateRevision();
+    if (revision === undefined) {
+      return;
+    }
+    for (const group of groups) {
+      await performUpdatePaths(
+        group.wcRoot,
+        group.targetPaths.map((path) => relative(group.wcRoot, path) || '.'),
+        summarizePaths(group.targetPaths),
+        svnPath,
+        { revision, conflictPrompt: true },
+      );
+    }
+    return;
+  }
+
   const target = await resolveWorkingCopyTarget(uri, strings.command.update, 'update');
   if (!target) {
     return;
   }
 
-  const svnPath = readSvnPath();
   const confirmed = await confirmModal(
     format(strings.update.confirmTitle, { target: target.targetPath }),
     strings.update.confirmButton,
@@ -102,46 +134,65 @@ export interface UpdateRunOptions {
 /**
  * 执行一次更新并完成回显：进度通知（可取消）、流式明细、最终 revision
  * 与冲突汇总都写输出频道；有冲突时弹警告列出文件。返回执行结果供
- * 提交流程判断是否继续。
+ * 提交流程判断是否继续。单目标形态，内部走多目标实现。
  */
 export async function performUpdate(
   target: WcTarget,
   svnPath: string,
   options: UpdateRunOptions = {},
 ): Promise<UpdateRunResult> {
+  const targetArg = relative(target.wcRoot, target.targetPath) || '.';
+  return performUpdatePaths(target.wcRoot, [targetArg], target.targetPath, svnPath, options);
+}
+
+/**
+ * 多目标更新执行（批量与单目标共用）：同一副本一次 svn update 携带全部
+ * 目标，输出按目标逐项回显；注册表互斥按副本粒度登记，冲突提示在锁
+ * 释放后弹出。targetArgs 须相对同一 wcRoot。
+ */
+export async function performUpdatePaths(
+  wcRoot: string,
+  targetArgs: string[],
+  displayTarget: string,
+  svnPath: string,
+  options: UpdateRunOptions = {},
+): Promise<UpdateRunResult> {
   // 注册表互斥：同一副本有在途/受限操作时拒绝更新（含从资源管理器入口）。
-  const operationId = await beginUpdateOperation(target.wcRoot);
+  const operationId = await beginUpdateOperation(wcRoot);
   if (!operationId) {
     return { stdout: '', stderr: '', exitCode: 0, items: [], conflicts: [] };
   }
   let result: UpdateRunResult;
   try {
-    result = await executeUpdate(target, svnPath, options);
+    result = await executeUpdate(wcRoot, targetArgs, displayTarget, svnPath, options);
   } finally {
     await finishUpdateOperation(operationId);
   }
   // 带按钮的冲突提示在互斥锁释放后进行：通知会停留到用户处理，等待期间
   // 不能持有同副本写锁（否则还原/清理/提交等会被「未完成操作」拒绝）。
   if (options.conflictPrompt && result.conflicts.length > 0) {
-    await promptConflictOpen(target.wcRoot, result.conflicts);
+    await promptConflictOpen(wcRoot, result.conflicts);
   }
   return result;
 }
 
 async function executeUpdate(
-  target: WcTarget,
+  wcRoot: string,
+  targetArgs: string[],
+  displayTarget: string,
   svnPath: string,
   options: UpdateRunOptions = {},
 ): Promise<UpdateRunResult> {
   // 与终端 svn update 一致：以副本根为 cwd 传相对目标，明细路径为相对形态；
   // 目标是副本根时归一为 `.`，避免空参数。
   // core 的 runUpdate 内部做 peg 转义，这里日志记录转义后的实际命令。
-  const targetArg = relative(target.wcRoot, target.targetPath) || '.';
   const args = ['update', '--non-interactive'];
   if (options.revision) {
     args.push('-r', options.revision);
   }
-  args.push(escapePeg(targetArg));
+  for (const targetArg of targetArgs) {
+    args.push(escapePeg(targetArg));
+  }
 
   // 进度通知的取消按钮桥接 AbortSignal，传给 core 的 svn 执行层。
   const abort = new AbortController();
@@ -149,24 +200,24 @@ async function executeUpdate(
     {
       location: vscode.ProgressLocation.Notification,
       title: options.revision
-        ? format(strings.update.progressRevision, { target: target.targetPath, revision: options.revision })
-        : format(strings.update.progress, { target: target.targetPath }),
+        ? format(strings.update.progressRevision, { target: displayTarget, revision: options.revision })
+        : format(strings.update.progress, { target: displayTarget }),
       cancellable: true,
     },
     async (_progress, token) => {
       token.onCancellationRequested(() => abort.abort());
       const buffer = createLineBuffer(undefined, 'update');
-      return runUpdate(svnPath, targetArg, {
-        cwd: target.wcRoot,
+      return runUpdate(svnPath, targetArgs, {
+        cwd: wcRoot,
         signal: abort.signal,
         timeoutMs: readTimeoutMs(),
         ...decodingRunOptions('update'),
         onOutput: (chunk) => buffer.push(chunk),
-        onExit: logCommand(svnPath, args, target.wcRoot, 'update'),
+        onExit: logCommand(svnPath, args, wcRoot, 'update'),
         // 认证失败时弹窗补录并重试一次（F67）；密码只在内存。
         getCredentials: promptForCredentials,
         // 重试命令回显到输出频道（logCommand 内置脱敏，密码不外泄）。
-        onCredentialRetry: (retryArgs) => logCommand(svnPath, retryArgs, target.wcRoot, 'update'),
+        onCredentialRetry: (retryArgs) => logCommand(svnPath, retryArgs, wcRoot, 'update'),
       }, options.revision);
     },
   );

@@ -39,8 +39,8 @@ const parser = new XMLParser({
   // SVN 用数字实体表示路径控制字符；解码一次，保留 &amp; 编码的字面实体。
   htmlEntities: true,
   // status XML 里 entry 一定按集合处理，单个条目也要保持数组形态；
-  // changelist 容器同理（多个分组必然是数组，单个分组保持数组形态）。
-  isArray: (name) => name === 'entry' || name === 'changelist',
+  // changelist/target 容器同理（多目标调用时 target 出现多个，单目标也保持数组）。
+  isArray: (name) => name === 'entry' || name === 'changelist' || name === 'target',
 });
 
 /** 不进面板/展示的条目：svn 默认参数不输出 ignored；external 在入口单独收集。 */
@@ -64,29 +64,34 @@ export function commitableEntries(result: StatusResult): StatusEntry[] {
   return result.entries.filter((entry) => COMMITTABLE_ITEMS.has(entry.wcStatus) || isPropertyModified(entry));
 }
 
-/** 解析 `svn status --xml` 输出；结构异常时按空结果处理，不抛解析异常。 */
+/** 解析 `svn status --xml` 输出；结构异常时按空结果处理，不抛解析异常。
+ * 多目标调用时 SVN 输出多个 <target> 元素，条目分别挂各自的 target；
+ * <changelist> 容器与 <target> 平级、跨目标收拢分组条目。 */
 export function parseStatusXml(xml: string): StatusResult {
   const parsed = parser.parse(xml) as {
     status?: {
-      target?: {
-        path?: string;
-        entry?: StatusXmlEntry[];
-      };
+      target?: StatusXmlTarget | StatusXmlTarget[];
       /** 与 <target> 平级的分组容器：svn 把分了 changelist 的条目挪进来。 */
       changelist?: Array<{ name?: string; entry?: StatusXmlEntry[] }>;
     };
   };
 
-  const target = parsed.status?.target;
+  const targets = parsed.status?.target === undefined
+    ? []
+    : Array.isArray(parsed.status.target)
+      ? parsed.status.target
+      : [parsed.status.target];
   const entries: StatusEntry[] = [];
   const externals: string[] = [];
-  for (const entry of target?.entry ?? []) {
-    // 未分组条目直挂 <target>；externals 边界目录单独记录（副本边界隔离用）。
-    if (entry['wc-status']?.item === 'external' && entry.path) {
-      externals.push(entry.path);
-      continue;
+  for (const target of targets) {
+    for (const entry of target?.entry ?? []) {
+      // 未分组条目直挂 <target>；externals 边界目录单独记录（副本边界隔离用）。
+      if (entry['wc-status']?.item === 'external' && entry.path) {
+        externals.push(entry.path);
+        continue;
+      }
+      pushEntry(entries, entry, null);
     }
-    pushEntry(entries, entry, null);
   }
   for (const group of parsed.status?.changelist ?? []) {
     for (const entry of group.entry ?? []) {
@@ -94,7 +99,14 @@ export function parseStatusXml(xml: string): StatusResult {
       pushEntry(entries, entry, typeof group.name === 'string' ? group.name : null);
     }
   }
-  return { targetPath: target?.path ?? '', entries, externals };
+  // 单目标行为不变；多目标的 targetPath 用于状态报告标题，拼接展示。
+  const paths = targets.map((target) => target?.path).filter((path): path is string => typeof path === 'string');
+  return { targetPath: paths.join('、'), entries, externals };
+}
+
+interface StatusXmlTarget {
+  path?: string;
+  entry?: StatusXmlEntry[];
 }
 
 interface StatusXmlEntry {
@@ -122,12 +134,14 @@ function pushEntry(entries: StatusEntry[], entry: StatusXmlEntry, changelist: st
   });
 }
 
-/** 对目标路径执行 `svn status --xml` 并解析。target 须经 escapePeg 转义。 */
+/** 对目标路径执行 `svn status --xml` 并解析。target 须经 escapePeg 转义；
+ * 批量操作传入数组时一次查询多个目标（SVN 输出多个 <target> 段）。 */
 export async function runStatus(
   svnPath: string,
-  target: string,
+  target: string | string[],
   options: RunOptions = {},
 ): Promise<StatusResult> {
-  const result = await runOrThrow(svnPath, ['status', '--xml', escapePeg(target)], options);
+  const targets = typeof target === 'string' ? [target] : target;
+  const result = await runOrThrow(svnPath, ['status', '--xml', ...targets.map(escapePeg)], options);
   return parseStatusXml(result.stdout);
 }

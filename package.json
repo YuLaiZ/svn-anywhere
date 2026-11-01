@@ -2,7 +2,7 @@
   "name": "svn-anywhere",
   "displayName": "SVN Anywhere",
   "description": "在 VS Code 里管理任意布局的 SVN 工作副本",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "yulaiz",
   "private": true,
   "engines": {

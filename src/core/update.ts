@@ -123,18 +123,22 @@ export function normalizeUpdateRevision(input: string): string | undefined {
 }
 
 /** 对目标路径执行 `svn update`（固定 --non-interactive）并解析结果；
- * revision 传入已归一化的正整数字符串或 `HEAD` 时追加 `-r <rev>`。 */
+ * revision 传入已归一化的正整数字符串或 `HEAD` 时追加 `-r <rev>`；
+ * 批量操作传入数组时一次更新多个目标（输出按目标分段、明细路径相对 cwd）。 */
 export async function runUpdate(
   svnPath: string,
-  target: string,
+  target: string | string[],
   options: RunOptions = {},
   revision?: string,
 ): Promise<UpdateRunResult> {
+  const targets = typeof target === 'string' ? [target] : target;
   const args = ['update', '--non-interactive'];
   if (revision) {
     args.push('-r', revision);
   }
-  args.push(escapePeg(target));
+  for (const item of targets) {
+    args.push(escapePeg(item));
+  }
   const result = await runOrThrow(svnPath, args, options);
   return { ...result, ...parseUpdateOutput(result.stdout) };
 }

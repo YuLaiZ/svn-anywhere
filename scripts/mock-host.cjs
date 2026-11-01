@@ -2147,6 +2147,127 @@ async function main() {
     rmSync(wc50, { recursive: true, force: true });
   }
 
+  console.log('场景 51：资源管理器多选批量更新——第二参数 Uri[] 形态、嵌套去重只保留最外层、一次执行逐项可见');
+  const lab51 = makeSvnLab();
+  const base51 = lab51.checkout('base51');
+  mkdirSync(join(base51, 'd1', 'sub'), { recursive: true });
+  mkdirSync(join(base51, 'd2'), { recursive: true });
+  for (const rel of ['d1/a.txt', 'd1/sub/b.txt', 'd2/c.txt']) {
+    writeFileSync(join(base51, rel), 'v1\n');
+  }
+  svn(['add', '-q', '--parents', 'd1', 'd2'], base51);
+  svn(['commit', '-q', '-m', 'init'], base51);
+  const other51 = lab51.checkout('other51');
+  writeFileSync(join(other51, 'd1/a.txt'), 'v2\n');
+  writeFileSync(join(other51, 'd2/c.txt'), 'v2\n');
+  svn(['commit', '-q', '-m', 'remote change'], other51);
+  const head51 = Number(svn(['info', '--show-item', 'revision', lab51.repoUrl]).trim());
+  const uri51 = (p) => ({ fsPath: p, scheme: 'file' });
+  state.confirmResult = '更新';
+  state.inputQueue = ['HEAD'];
+  const warningBefore51 = state.warning.length;
+  const linesBefore51 = channelText().length;
+  // 多选形态：(uri, uris[])，选区含嵌套（d1/a.txt、d1/sub 在 d1 内）与并列目标 d2。
+  await state.registered.get('svnAnywhere.update')(
+    uri51(join(base51, 'd1/a.txt')),
+    [uri51(join(base51, 'd1/a.txt')), uri51(join(base51, 'd1/sub')), uri51(join(base51, 'd1')), uri51(join(base51, 'd2'))],
+  );
+  const confirmMsg51 = state.warning[warningBefore51] ?? '';
+  check('确认框列出全部去重后目标（d1、d2），嵌套内层不重复出现',
+    confirmMsg51.includes('d1') && confirmMsg51.includes(join(base51, 'd2')) &&
+    !confirmMsg51.includes(join(base51, 'd1/a.txt')),
+    confirmMsg51);
+  const out51 = channelText().slice(linesBefore51);
+  check('一次 svn update 携带去重后的两个目标（一次执行）',
+    out51.includes('update --non-interactive -r HEAD d1 d2'), out51.slice(-400));
+  check('结果逐项可见：两个目标下的明细路径都出现在频道',
+    out51.includes('d1/a.txt') && out51.includes('d2/c.txt'), out51.slice(-400));
+  check('两处内容都已更新到远端版本',
+    readFileSync(join(base51, 'd1/a.txt'), 'utf8') === 'v2\n' &&
+    readFileSync(join(base51, 'd2/c.txt'), 'utf8') === 'v2\n');
+  check('两个目标目录 revision 都到 HEAD',
+    Number(svn(['info', '--show-item', 'revision', 'd1'], base51).trim()) === head51 &&
+    Number(svn(['info', '--show-item', 'revision', 'd2'], base51).trim()) === head51);
+  state.confirmResult = undefined;
+  state.inputQueue = [];
+  rmSync(lab51.lab, { recursive: true, force: true });
+
+  console.log('场景 52：资源管理器多选批量提交——多目标面板会话、目标外不混入、跨副本选区拒绝');
+  const mwc52 = panelLab.checkout('batch-wc');
+  mkdirSync(join(mwc52, 'd1', 'sub'), { recursive: true });
+  mkdirSync(join(mwc52, 'd2'), { recursive: true });
+  for (const rel of ['d1/a.txt', 'd1/sub/b.txt', 'd2/c.txt', 'outside.txt']) {
+    writeFileSync(join(mwc52, rel), 'v1\n');
+  }
+  svn(['add', '-q', '--parents', 'd1', 'd2', 'outside.txt'], mwc52);
+  svn(['commit', '-q', '-m', 'batch base'], mwc52);
+  writeFileSync(join(mwc52, 'd1/a.txt'), 'v2\n');
+  writeFileSync(join(mwc52, 'd2/c.txt'), 'v2\n');
+  writeFileSync(join(mwc52, 'outside.txt'), 'v2\n');
+  const otherWc52 = panelLab.checkout('batch-other');
+  const uri52 = (p) => ({ fsPath: p, scheme: 'file' });
+  /** 以多选数组形态驱动「提交」并等待目标数据帧（同 openCommitPanel 的重试语义）。 */
+  const openCommitPanelBatch = async (uris, expectText) => {
+    let panel;
+    let render;
+    for (let attempt = 0; attempt < 8 && !render; attempt += 1) {
+      await state.registered.get('svnAnywhere.commit')(uris[0], uris);
+      panel = [...state.panels].reverse().find((p) => p.viewType === 'svn-anywhere-commit');
+      if (!panel) {
+        throw new Error(`提交面板未创建（panels=${state.panels.length}）`);
+      }
+      panel.sendReady();
+      render = await waitRender(panel, expectText, 20);
+    }
+    if (!render || !panel) {
+      throw new Error(`多选面板数据帧未出现：${expectText}`);
+    }
+    return { panel, render };
+  };
+  // 多选两个并列目标（d1/a.txt 与 d2 不嵌套）：面板建立多目标会话。
+  const batch52 = await openCommitPanelBatch(
+    [uri52(join(mwc52, 'd1/a.txt')), uri52(join(mwc52, 'd2'))],
+    'data-row-id="d1/a.txt"',
+  );
+  check('多目标会话：两个目标下的变更都进面板，标题显示 2 个目标',
+    batch52.render.html.includes('data-row-id="d1/a.txt"') &&
+    batch52.render.html.includes('data-row-id="d2/c.txt"') &&
+    batch52.render.html.includes('2 个目标'),
+    (batch52.render.html.match(/·[^<]{0,20}/g) ?? []).slice(0, 4).join('|'));
+  check('目标外的修改不混入（outside.txt 不在面板）',
+    !batch52.render.html.includes('data-row-id="outside.txt"'));
+  // 提交两个目标下的各一项：一次 commit 携带两个显式路径，目标外保留本地。
+  const info52 = state.information.length;
+  await commitViaPanel(batch52.panel, ['d1/a.txt', 'd2/c.txt'], 'batch commit two targets');
+  await waitNewInfo('提交成功', info52);
+  check('批量提交一次入库两个目标路径，目标外修改保留本地',
+    svn(['cat', '-r', 'HEAD', 'd1/a.txt'], mwc52) === 'v2\n' &&
+    svn(['cat', '-r', 'HEAD', 'd2/c.txt'], mwc52) === 'v2\n' &&
+    svn(['status'], mwc52).includes('outside.txt'),
+    svn(['status'], mwc52));
+  // 跨工作副本选区：提示分开执行，面板不切换目标。
+  await waitPanelIdle(batch52.panel);
+  const infoBefore52b = state.information.length;
+  await state.registered.get('svnAnywhere.commit')(
+    uri52(join(mwc52, 'd1/a.txt')),
+    [uri52(join(mwc52, 'd1/a.txt')), uri52(otherWc52)],
+  );
+  check('跨副本多选提交被拒绝并提示同一工作副本要求',
+    state.information.slice(infoBefore52b).some((m) => m.includes('同一个工作副本')),
+    JSON.stringify(state.information.slice(infoBefore52b)));
+  // 嵌套选区（d1 与 d1/a.txt）：去重后只剩最外层 d1，单目标形态。
+  writeFileSync(join(mwc52, 'd1/sub/b.txt'), 'v2\n');
+  await openCommitPanelBatch(
+    [uri52(join(mwc52, 'd1')), uri52(join(mwc52, 'd1/a.txt'))],
+    'data-row-id="d1/sub/b.txt"',
+  );
+  const dedupPanel = [...state.panels].reverse().find((p) => p.viewType === 'svn-anywhere-commit');
+  const dedupRender = [...dedupPanel.webview.posted].reverse().find(
+    (m) => m.type === 'render' && m.html.includes('data-row-id="d1/sub/b.txt"'),
+  );
+  check('嵌套选区去重后为单目标（不显示多目标标签），面板正常打开',
+    !!dedupRender && !dedupRender.html.includes('2 个目标'));
+
   rmSync(igLab.lab, { recursive: true, force: true });
 
   rmSync(panelLab.lab, { recursive: true, force: true });

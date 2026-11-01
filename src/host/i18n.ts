@@ -157,6 +157,10 @@ export const strings = {
     commitPanelTitle: '提交',
     targetLabelRoot: '{name} · 工作副本根',
     targetLabelPath: '{name} · {rel}',
+    /** 多选批量提交会话的标题标签（具体目标清单在目标行展开显示）。 */
+    targetLabelMulti: '{name} · {count} 个目标',
+    /** 多选提交跨越多个工作副本时的拒绝提示。 */
+    commitBatchSingleWcOnly: '多选提交的目标须位于同一个工作副本内；请分开执行。',
     rootEntryLabel: '工作副本根',
     filterStatus: '状态',
     filterExt: '后缀',

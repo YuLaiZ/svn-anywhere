@@ -42,8 +42,8 @@ function sessionOf(metas: CommitEntryMeta[], patch: Partial<CommitSessionState> 
   return {
     sessionId: 's1',
     wcRoot: '/wc',
-    targetPath: '/wc',
-    targetArg: '.',
+    targetPaths: ['/wc'],
+    targetArgs: ['.'],
     metas,
     selectedPaths: new Set(),
     viewMode: 'tree',

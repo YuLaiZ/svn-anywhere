@@ -281,10 +281,10 @@ describe('commandUpdate（更新）', () => {
     expect(vscodeMock.progressCalls).toEqual([
       strings.update.progressRevision.replace('{target}', filePath).replace('{revision}', 'HEAD'),
     ]);
-    // core 的 runUpdate 内部负责 peg 转义，宿主传原始相对目标与归一化版本号。
+    // core 的 runUpdate 内部负责 peg 转义，宿主传原始相对目标数组与归一化版本号。
     expect(vi.mocked(runUpdate)).toHaveBeenCalledWith(
       'svn',
-      'a.txt',
+      ['a.txt'],
       expect.objectContaining({ cwd: wcRoot }),
       'HEAD',
     );
@@ -307,7 +307,7 @@ describe('commandUpdate（更新）', () => {
 
     expect(vi.mocked(runUpdate)).toHaveBeenCalledWith(
       'svn',
-      'a.txt',
+      ['a.txt'],
       expect.objectContaining({ cwd: wcRoot }),
       '12',
     );
@@ -330,9 +330,40 @@ describe('commandUpdate（更新）', () => {
     expect(vscodeMock.inputPrompts).toHaveLength(4);
     expect(vi.mocked(runUpdate)).toHaveBeenCalledWith(
       'svn',
-      'a.txt',
+      ['a.txt'],
       expect.objectContaining({ cwd: wcRoot }),
       '3',
+    );
+  });
+
+  it('资源管理器多选批量：第二参数 Uri[] 去重嵌套只保留最外层，一次携带多目标', async () => {
+    const d1 = join(wcRoot, 'd1');
+    const d2 = join(wcRoot, 'd2');
+    mkdirSync(d1, { recursive: true });
+    mkdirSync(d2, { recursive: true });
+    writeFileSync(join(d1, 'a.txt'), 'x');
+    vscodeMock.confirmResult = strings.update.confirmButton;
+    vscodeMock.inputResult = 'HEAD';
+    vi.mocked(runUpdate).mockResolvedValueOnce({
+      stdout: '', stderr: '', exitCode: 0,
+      items: [], finalRevision: 7, conflicts: [],
+    });
+
+    // 选区含嵌套（d1/a.txt、d1 内层）与并列目标 d2：去重后只剩 d1、d2。
+    await commandUpdate(
+      makeUri(join(d1, 'a.txt')),
+      [makeUri(join(d1, 'a.txt')), makeUri(d1), makeUri(join(d1, 'sub')), makeUri(d2)],
+    );
+
+    // 确认框列出全部去重后目标，嵌套内层不出现。
+    expect(vscodeMock.warning[0]).toContain(d1);
+    expect(vscodeMock.warning[0]).toContain(d2);
+    expect(vscodeMock.warning[0]).not.toContain(join(d1, 'a.txt'));
+    expect(vi.mocked(runUpdate)).toHaveBeenCalledWith(
+      'svn',
+      ['d1', 'd2'],
+      expect.objectContaining({ cwd: wcRoot }),
+      'HEAD',
     );
   });
 

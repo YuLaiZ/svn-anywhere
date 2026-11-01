@@ -42,8 +42,13 @@ import { format, strings } from '../../i18n';
 import { decodingRunOptions, logCommand, logExitCode, logLine, showOutput } from '../../output';
 import { promptForCredentials } from '../../auth';
 import { confirmModal } from '../../ui/confirm';
-import { resolveWorkingCopyTarget, type WcTarget } from '../../commands/target';
-import { performUpdate } from '../../commands/update';
+import {
+  resolveBatchTargetGroups,
+  resolveWorkingCopyTarget,
+  summarizePaths,
+  type WcTargetGroup,
+} from '../../commands/target';
+import { performUpdatePaths } from '../../commands/update';
 import { writeStatusReport } from '../../commands/statusReport';
 import { diffOutcomeNotice, openEntryDiff, type DiffTarget } from '../../diffView';
 import { createPanel, type PanelHandle } from '../host';
@@ -106,14 +111,35 @@ function sessionBusy(): boolean {
   return ['loading', 'refreshing', 'checking', 'committing', 'unknown'].includes(session.phase);
 }
 
-/** 「提交」命令：打开 P1 面板；同目标复用，新目标切换会话，忙碌时拒绝。 */
-export async function commandShowCommitPanel(uri?: vscode.Uri): Promise<void> {
-  const target = await resolveWorkingCopyTarget(uri, strings.command.commit, 'commit');
+/** 「提交」命令：打开 P1 面板；同目标复用，新目标切换会话，忙碌时拒绝。
+ * 资源管理器多选时按选区去重嵌套路径（只保留最外层）建立多目标会话；
+ * 选区跨多个工作副本时面板无法承载（会话绑定单副本），提示分开执行。 */
+export async function commandShowCommitPanel(uri?: vscode.Uri, uris?: vscode.Uri[]): Promise<void> {
+  let target: WcTargetGroup | undefined;
+  if (uris && uris.length > 0) {
+    const groups = resolveBatchTargetGroups(uris, strings.command.commit, 'commit');
+    if (groups.length === 0) {
+      return;
+    }
+    if (groups.length > 1) {
+      void vscode.window.showInformationMessage(strings.panel.commitBatchSingleWcOnly);
+      return;
+    }
+    target = groups[0];
+  } else {
+    const single = await resolveWorkingCopyTarget(uri, strings.command.commit, 'commit');
+    if (!single) {
+      return;
+    }
+    target = { wcRoot: single.wcRoot, targetPaths: [single.targetPath] };
+  }
   if (!target || !panelContext) {
     return;
   }
   const sameTarget =
-    session?.wcRoot === target.wcRoot && session?.targetPath === target.targetPath;
+    session?.wcRoot === target.wcRoot &&
+    session?.targetPaths.length === target.targetPaths.length &&
+    target.targetPaths.every((path) => session?.targetPaths.includes(path));
   if (handle && sameTarget && session) {
     // 同目标复用：reveal 并重读状态（保留说明与仍有效的勾选），
     // 保证命令入口与面板入口看到同一份工作副本实际状态。
@@ -125,7 +151,7 @@ export async function commandShowCommitPanel(uri?: vscode.Uri): Promise<void> {
   }
   if (handle && !sameTarget && !handle.switchSession()) {
     void vscode.window.showWarningMessage(
-      format(strings.panel.panelBusySwitchRejected, { target: target.targetPath }),
+      format(strings.panel.panelBusySwitchRejected, { target: summarizePaths(target.targetPaths) }),
     );
     return;
   }
@@ -162,7 +188,7 @@ let loadSessionGeneration = 0;
 /** 读取目标状态（含可选远端分组与未版本控制目录枚举）并推送渲染。 */
 async function loadSession(
   sessionId: string,
-  target: WcTarget,
+  target: WcTargetGroup,
   options: { initial: boolean },
 ): Promise<void> {
   // 入口立即校验会话：调用点求值（sessionId/target）与真正执行之间可能
@@ -181,7 +207,8 @@ async function loadSession(
   const keepDraft = !options.initial && session !== undefined;
   const previous = session;
   const svnPath = readSvnPath();
-  const targetArg = relative(target.wcRoot, target.targetPath) || '.';
+  // 多目标会话：相对参数与绝对目标一一对应（'.' 表示副本根本身）。
+  const targetArgs = target.targetPaths.map((path) => relative(target.wcRoot, path) || '.');
 
   // 操作注册表限制（unknown/待协调）跨面板保持：受限时进入写锁定会话。
   const restriction = getOperationRegistry().writeRestriction(target.wcRoot);
@@ -194,8 +221,8 @@ async function loadSession(
   session = {
     sessionId,
     wcRoot: target.wcRoot,
-    targetPath: target.targetPath,
-    targetArg,
+    targetPaths: target.targetPaths,
+    targetArgs,
     metas: [],
     selectedPaths: new Set(),
     viewMode: keepDraft ? (previous?.viewMode ?? 'tree') : 'tree',
@@ -221,16 +248,16 @@ async function loadSession(
   pushRender();
 
   try {
-    const status = await runStatus(svnPath, targetArg, {
+    const status = await runStatus(svnPath, targetArgs, {
       ...runOptions(target.wcRoot),
-      onExit: logCommand(svnPath, ['status', '--xml', targetArg], target.wcRoot, 'commit'),
+      onExit: logCommand(svnPath, ['status', '--xml', ...targetArgs], target.wcRoot, 'commit'),
     });
     if (isStale()) {
       return;
     }
     let remote: RemoteStatusResult | undefined;
     if (session.remoteIncluded) {
-      remote = await runRemoteStatusWithAuth(svnPath, targetArg, target);
+      remote = await runRemoteStatusWithAuth(svnPath, targetArgs, target);
       if (isStale()) {
         return;
       }
@@ -275,13 +302,13 @@ function allFilters(): CommitSessionState['filters'] {
 
 async function runRemoteStatusWithAuth(
   svnPath: string,
-  targetArg: string,
-  target: WcTarget,
+  targetArgs: string[],
+  target: WcTargetGroup,
 ): Promise<RemoteStatusResult> {
-  return runRemoteStatus(svnPath, targetArg, {
+  return runRemoteStatus(svnPath, targetArgs, {
     ...runOptions(target.wcRoot),
     getCredentials: promptForCredentials,
-    onExit: logCommand(svnPath, ['status', '-u', '--non-interactive', '--xml', targetArg], target.wcRoot, 'commit'),
+    onExit: logCommand(svnPath, ['status', '-u', '--non-interactive', '--xml', ...targetArgs], target.wcRoot, 'commit'),
     onCredentialRetry: (args) => logCommand(svnPath, args, target.wcRoot, 'commit'),
   });
 }
@@ -595,8 +622,8 @@ async function onIntent(intent: Intent, context: { sessionId: string; busy: bool
   }
 }
 
-function targetOf(current: CommitSessionState): WcTarget {
-  return { wcRoot: current.wcRoot, targetPath: current.targetPath };
+function targetOf(current: CommitSessionState): WcTargetGroup {
+  return { wcRoot: current.wcRoot, targetPaths: current.targetPaths };
 }
 
 /* --------------------------- 前缀与历史存储 --------------------------- */
@@ -738,7 +765,7 @@ async function beginInlineOperation(path: string, kind: 'file' | 'dir'): Promise
   }
   const begin = await registry.begin({
     wcRoot: session!.wcRoot,
-    targetRelPath: session!.targetArg,
+    targetRelPath: session!.targetArgs.join(','),
     nodeKind: kind,
     explicitPaths: [path],
   });
@@ -970,9 +997,9 @@ async function performCommit(sessionId: string): Promise<void> {
   try {
     // 提交前重读本地实际状态：外部客户端可能在面板加载后修改了工作副本
     // （missing 登记、待添加范围都必须以当前事实为准，不信任打开时的快照）。
-    const freshStatus = await runStatus(svnPath, session.targetArg, {
+    const freshStatus = await runStatus(svnPath, session.targetArgs, {
       ...runOptions(session.wcRoot),
-      onExit: logCommand(svnPath, ['status', '--xml', session.targetArg], session.wcRoot, 'commit'),
+      onExit: logCommand(svnPath, ['status', '--xml', ...session.targetArgs], session.wcRoot, 'commit'),
     });
     if (handle.sessionId !== sessionId) {
       return;
@@ -1010,7 +1037,7 @@ async function performCommit(sessionId: string): Promise<void> {
     // 操作登记：同副本互斥；写入失败（持久化异常）不发起提交。
     const begin = await registry.begin({
       wcRoot: session.wcRoot,
-      targetRelPath: session.targetArg,
+      targetRelPath: session.targetArgs.join(','),
       nodeKind: 'dir',
       baseRevision: commitBaseAgainst,
       explicitPaths: selected.map((meta) => meta.path),
@@ -1227,7 +1254,7 @@ async function finishCommitRefresh(registry: OperationRegistry, success: boolean
   const svnPath = readSvnPath();
   logLine(strings.commit.refreshHeader, 'commit');
   try {
-    const after = await runStatus(svnPath, session.targetArg, runOptions(session.wcRoot));
+    const after = await runStatus(svnPath, session.targetArgs, runOptions(session.wcRoot));
     writeStatusReport(after, 'commit');
     const committedPaths = new Set(session.result?.committedIds ?? []);
     session.selectedPaths = new Set([...session.selectedPaths].filter((path) => !committedPaths.has(path)));
@@ -1288,14 +1315,14 @@ async function finishCommitRefresh(registry: OperationRegistry, success: boolean
 
 /** 面板内提交前远端检查：返回 cancelled/updateOnly/conflict/updated/checked。 */
 async function remoteCheckBeforeCommitPanel(
-  target: WcTarget,
+  target: WcTargetGroup,
   svnPath: string,
 ): Promise<'cancelled' | 'updateOnly' | 'conflict' | 'updated' | 'checked'> {
   if (!session || !handle) {
     return 'cancelled';
   }
-  const targetArg = session.targetArg;
-  const remote = await runRemoteStatusWithAuth(svnPath, targetArg, target);
+  const targetArgs = session.targetArgs;
+  const remote = await runRemoteStatusWithAuth(svnPath, targetArgs, target);
   const remoteChanges = remoteChangedEntries(remote);
   commitBaseAgainst = remote.against;
   logLine(
@@ -1318,7 +1345,13 @@ async function remoteCheckBeforeCommitPanel(
   if (choice === undefined || choice === strings.commitCheck.cancel) {
     return 'cancelled';
   }
-  const result = await performUpdate(target, svnPath);
+  // 「更新并继续」更新会话全部目标（多目标一次携带；输出按目标逐项可见）。
+  const result = await performUpdatePaths(
+    target.wcRoot,
+    session.targetArgs,
+    summarizePaths(session.targetArgs),
+    svnPath,
+  );
   const unresolved =
     result.conflicts.length === 0 && Object.values(result.conflictSummary ?? {}).some((n) => (n ?? 0) > 0);
   if (result.conflicts.length > 0 || unresolved) {
@@ -1391,9 +1424,9 @@ async function resolveUnknown(sessionId: string): Promise<void> {
   session.phase = 'refreshing';
   pushRender();
   try {
-    const status = await runStatus(svnPath, session.targetArg, {
+    const status = await runStatus(svnPath, session.targetArgs, {
       ...runOptions(session.wcRoot),
-      onExit: logCommand(svnPath, ['status', '--xml', session.targetArg], session.wcRoot, 'commit'),
+      onExit: logCommand(svnPath, ['status', '--xml', ...session.targetArgs], session.wcRoot, 'commit'),
     });
     const explicit = restriction?.explicitPaths ?? [...session.selectedPaths];
     const stillDirty = explicit.filter((path) =>
@@ -1402,7 +1435,7 @@ async function resolveUnknown(sessionId: string): Promise<void> {
     let remoteChangedOnExplicit = false;
     let remoteReachable = false;
     try {
-      const remote = await runRemoteStatusWithAuth(svnPath, session.targetArg, target);
+      const remote = await runRemoteStatusWithAuth(svnPath, session.targetArgs, target);
       remoteReachable = true;
       const changedPaths = new Set(remoteChangedEntries(remote).map((entry) => entry.path));
       remoteChangedOnExplicit = explicit.some((path) => changedPaths.has(path));

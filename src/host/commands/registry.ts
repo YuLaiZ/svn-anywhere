@@ -11,7 +11,11 @@ import { readShowOutputOnError } from '../config';
 import { format, strings } from '../i18n';
 import { logExitCode, logLine, showOutput, type OutputKind } from '../output';
 
-export type CommandHandler = (uri?: vscode.Uri) => unknown;
+/**
+ * 命令回调签名：资源管理器单选传 uri；多选时 VSCode 额外把完整选区作为
+ * 第二个参数传入（Uri[]，含 uri 自身），需要批量的命令消费该数组。
+ */
+export type CommandHandler = (uri?: vscode.Uri, uris?: vscode.Uri[]) => unknown;
 
 export function registerCommand(
   context: vscode.ExtensionContext,
@@ -19,10 +23,10 @@ export function registerCommand(
   handler: CommandHandler,
   kind: OutputKind = 'other',
 ): vscode.Disposable {
-  const disposable = vscode.commands.registerCommand(id, async (uri?: vscode.Uri) => {
+  const disposable = vscode.commands.registerCommand(id, async (uri?: vscode.Uri, uris?: vscode.Uri[]) => {
     // 回调必须 async：同步抛错也要进统一收口，否则会绕过 showCommandError。
     try {
-      await handler(uri);
+      await handler(uri, uris);
     } catch (err) {
       showCommandError(err, kind);
     }

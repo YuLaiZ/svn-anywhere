@@ -245,6 +245,26 @@ describe('runUpdate 集成（本地 file:// 副本）', () => {
     expect(toHead.finalRevision).toBe(head);
     expect(infoRevision()).toBe(head);
   });
+
+  it('多目标一次更新：两个目录都到最新，明细按目标逐项可见', async () => {
+    const wc = lab.checkout('u-multi-wc');
+    writeFile(wc, 'd1/a.txt', 'v1\n', true);
+    writeFile(wc, 'd2/b.txt', 'v1\n', true);
+    lab.svn(['commit', '-q', '-m', 'multi base'], wc);
+    const other = lab.checkout('u-multi-other');
+    writeFile(other, 'd1/a.txt', 'v2\n');
+    writeFile(other, 'd2/b.txt', 'v2\n');
+    lab.svn(['commit', '-q', '-m', 'multi remote'], other);
+    const head = headRevision(lab);
+
+    const result = await runUpdate('svn', ['d1', 'd2'], { cwd: wc });
+    expect(result.finalRevision).toBe(head);
+    // 明细路径相对 cwd（副本根），两个目标逐项可见（批量结果逐项要求）。
+    expect(result.items.map((item) => item.path).sort()).toEqual(['d1/a.txt', 'd2/b.txt']);
+    expect(result.conflicts).toEqual([]);
+    expect(Number(lab.svn(['info', '--show-item', 'revision', 'd1'], wc).trim())).toBe(head);
+    expect(Number(lab.svn(['info', '--show-item', 'revision', 'd2'], wc).trim())).toBe(head);
+  });
 });
 
 /** 取仓库 HEAD revision（共享 repo 下用例间提交数不固定，动态比对；
