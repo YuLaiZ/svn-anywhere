@@ -16,24 +16,22 @@
  *   （超时/取消/启动失败）进入结果未知，冻结全部写意图只允许核实。
  */
 import * as vscode from 'vscode';
-import { execFile, execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { existsSync, lstatSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { promisify } from 'node:util';
-import { matchesIgnoreRules, parseIgnoreRules } from '../../../core/ignore';
+import { matchesIgnoreRules, readIgnoreRules } from '../../../core/ignore';
 import { buildCommitArgs, COMMIT_BATCH_SIZE, parseCommitOutput } from '../../../core/commit';
 import { buildDeleteArgs, buildRevertArgs, listVersionedSubtree } from '../../../core/dailyOps';
 import { runStatus } from '../../../core/status';
 import { remoteChangedEntries, runRemoteStatus, type RemoteStatusResult } from '../../../core/remoteStatus';
 import { runOrThrow, type RunOptions } from '../../../core/svnCli';
 import { SvnError } from '../../../core/errors';
-import { decodeBuffer } from '../../../core/encoding';
 import { escapePeg } from '../../../core/workspace';
 import { getOperationRegistry, type OperationRegistry } from '../../../core/operations';
 import {
   readAllowEmptyCommitMessage,
-  readEncodingSettings,
   readRemoteCheckBeforeCommit,
   readSvnPath,
   readTimeoutMs,
@@ -64,6 +62,7 @@ import {
   mergeStatusEntries,
   selectionKeyOf,
   sessionChanged,
+  UNVERSIONED_ENUM_LIMIT,
   visibleMetas,
   type CommitEntryMeta,
   type CommitSessionState,
@@ -76,8 +75,6 @@ const HISTORY_KEY = 'svnAnywhere.commitHistory';
 const PREFIX_KEY = 'svnAnywhere.commitPrefixes';
 const MAX_PREFIXES = 10;
 const MAX_HISTORY = 20;
-/** 未版本控制目录递归枚举的防御上限（超出部分不进面板，避免巨型目录卡死）。 */
-const UNVERSIONED_ENUM_LIMIT = 500;
 /** 删除目录确认框中影响子树的最大列举条数。 */
 const SUBTREE_LIST_LIMIT = 50;
 
@@ -233,13 +230,16 @@ async function loadSession(
     history,
     phase: 'loading',
     error: null,
-    result: null,
+    // 重读保留上次结果卡片（成功/部分成功）：同目标 reveal 触发的重读
+    // 不应丢掉用户还没确认关闭的提交结果回显；全新会话才清空。
+    result: keepDraft ? (previous?.result ?? null) : null,
     addedPrepared: keepDraft ? (previous?.addedPrepared ?? []) : [],
     missingPrepared: keepDraft ? (previous?.missingPrepared ?? []) : [],
     initialMessage: keepDraft ? (previous?.initialMessage ?? '') : '',
     initialSelectionKey: keepDraft ? (previous?.initialSelectionKey ?? '') : '',
     remoteIncluded: readRemoteCheckBeforeCommit(),
     externalPrefixes: keepDraft ? (previous?.externalPrefixes ?? []) : [],
+    unversionedTruncated: false,
   };
   if (restriction) {
     session.phase = 'unknown';
@@ -264,7 +264,12 @@ async function loadSession(
     }
     session.externalPrefixes = status.externals ?? [];
     const metas = mergeStatusEntries(status.entries, remote?.entries, session.externalPrefixes);
-    enrichMetas(metas, target.wcRoot);
+    session.unversionedTruncated = await enrichMetas(metas, target.wcRoot);
+    if (isStale()) {
+      // enrichMetas 是异步恢复点（每个未版本控制目录一次子进程，可秒级）：
+      // 挂起期间会话可能被销毁重开，旧目标的迟到数据不得写进当前 session。
+      return;
+    }
     if (restriction) {
       // 结果未知恢复：不重置选择（核实流程读取实际状态判断）。
       session.metas = metas;
@@ -318,12 +323,16 @@ async function runRemoteStatusWithAuth(
  * - 符号链接标记为叶节点（不跟随）；
  * - 嵌套工作副本（unversioned 且其下有 .svn）按副本边界隔离、不可勾选；
  * - svn status 不进入未版本控制目录，这里递归枚举其子项（忽略项按该目录
- *   的 svn:ignore 规则排除；嵌套副本目录整棵隔离不再展开）。
+ *   的 svn:ignore 规则排除；嵌套副本目录整棵隔离不再展开）。规则读取走
+ *   svnCli 的 readIgnoreRules（异步）：解码只发生在 svnCli 输出收口处，
+ *   「编码回退失败」标注同样由收口回调写入提交频道，面板不旁路解码。
+ * 返回枚举是否达到防御上限（超出部分被截断不进面板）。
  */
-function enrichMetas(metas: CommitEntryMeta[], wcRoot: string): void {
+async function enrichMetas(metas: CommitEntryMeta[], wcRoot: string): Promise<boolean> {
   const svnPath = readSvnPath();
   const queue = [...metas];
   let enumerated = 0;
+  let truncated = false;
   while (queue.length > 0) {
     const meta = queue.shift();
     if (!meta) {
@@ -349,6 +358,7 @@ function enrichMetas(metas: CommitEntryMeta[], wcRoot: string): void {
       continue;
     }
     if (enumerated >= UNVERSIONED_ENUM_LIMIT) {
+      truncated = true;
       continue;
     }
     // 未版本控制目录：枚举真实子项（svn status 不会进入）。
@@ -360,7 +370,13 @@ function enrichMetas(metas: CommitEntryMeta[], wcRoot: string): void {
     }
     let rules: string[] = [];
     try {
-      rules = readIgnoreRulesSync(svnPath, meta.path, wcRoot);
+      // 与面板其余 svn 调用同一套超时与解码配置；属性不存在/目标未纳管
+      // 由 readIgnoreRules 容错为空规则，其余失败同样退化为空规则不阻塞面板。
+      rules = await readIgnoreRules(svnPath, meta.path, {
+        cwd: wcRoot,
+        timeoutMs: readTimeoutMs(),
+        ...decodingRunOptions('commit'),
+      });
     } catch {
       rules = [];
     }
@@ -372,7 +388,11 @@ function enrichMetas(metas: CommitEntryMeta[], wcRoot: string): void {
         continue;
       }
       const childPath = meta.path === '.' ? name : `${meta.path}/${name}`;
-      if (metas.some((existing) => existing.path === childPath) || enumerated >= UNVERSIONED_ENUM_LIMIT) {
+      if (enumerated >= UNVERSIONED_ENUM_LIMIT) {
+        truncated = true;
+        continue;
+      }
+      if (metas.some((existing) => existing.path === childPath)) {
         continue;
       }
       let childKind: 'file' | 'dir' = 'file';
@@ -403,26 +423,7 @@ function enrichMetas(metas: CommitEntryMeta[], wcRoot: string): void {
       enumerated += 1;
     }
   }
-}
-
-/** 同步读 svn:ignore（enrichMetas 是同步路径，用子进程一次读取）。 */
-function readIgnoreRulesSync(svnPath: string, dirPath: string, wcRoot: string): string[] {
-  try {
-    // 原始字节经解码回退链处理，与 svnCli 收口解码同一套配置。
-    const { encoding, encodingFallback } = readEncodingSettings();
-    const raw = execFileSync(svnPath, ['propget', 'svn:ignore', '--', escapePeg(dirPath)], {
-      cwd: wcRoot,
-      env: { ...process.env, LANG: 'en_US.UTF-8', LC_ALL: 'en_US.UTF-8' },
-    });
-    return parseIgnoreRules(decodeBuffer(raw, encoding, encodingFallback).text);
-  } catch (err) {
-    const stderr = err instanceof Error ? err.message : String(err);
-    // 属性不存在（W200017）与目标未纳管（E200005）都按空规则处理。
-    if (stderr.includes('W200017') || stderr.includes('E200005')) {
-      return [];
-    }
-    throw err;
-  }
+  return truncated;
 }
 
 /* ------------------------------ 渲染推送 ------------------------------ */
@@ -755,17 +756,23 @@ async function rowMoreActions(itemId: string): Promise<void> {
 /**
  * 行内写操作（还原/删除/回收站）的注册表包裹：同一工作副本有在途或
  * 受限操作（提交中/结果未知/待协调）时拒绝；本操作执行期间登记互斥。
+ * 目标在操作入口捕获后传入：确认框 await 期间面板可能被 dispose
+ * （会话已清空），不再依赖模块级 session。
  */
-async function beginInlineOperation(path: string, kind: 'file' | 'dir'): Promise<string | undefined> {
+async function beginInlineOperation(
+  target: WcTargetGroup,
+  path: string,
+  kind: 'file' | 'dir',
+): Promise<string | undefined> {
   const registry = getOperationRegistry();
-  const held = registry.writeRestriction(session!.wcRoot);
+  const held = registry.writeRestriction(target.wcRoot);
   if (held) {
     handle?.toast('info', format(strings.panel.operationHeldBusy, { phase: held.phase }));
     return undefined;
   }
   const begin = await registry.begin({
-    wcRoot: session!.wcRoot,
-    targetRelPath: session!.targetArgs.join(','),
+    wcRoot: target.wcRoot,
+    targetRelPath: serializeTargetArgs(targetArgsOf(target)),
     nodeKind: kind,
     explicitPaths: [path],
   });
@@ -776,16 +783,26 @@ async function beginInlineOperation(path: string, kind: 'file' | 'dir'): Promise
   return begin.operationId;
 }
 
+/** 会话目标 → 相对副本根的执行参数（'.' 表示根本身），与 loadSession 同一口径。 */
+function targetArgsOf(target: WcTargetGroup): string[] {
+  return target.targetPaths.map((path) => relative(target.wcRoot, path) || '.');
+}
+
+/** 操作登记的目标序列化：JSON 数组字符串（路径可含逗号，不能用逗号拼接）。 */
+function serializeTargetArgs(targetArgs: string[]): string {
+  return JSON.stringify(targetArgs);
+}
+
 async function finishInlineOperation(operationId: string | undefined): Promise<void> {
   await getOperationRegistry().finish(operationId);
 }
 
 /** 删除目录的影响子树清单（svn list -R 的版本控制条目，截断到上限）。 */
-async function listDeletionSubtree(svnPath: string, dirPath: string): Promise<string[]> {
+async function listDeletionSubtree(svnPath: string, wcRoot: string, dirPath: string): Promise<string[]> {
   // 子树枚举失败不阻塞删除确认：core 返回空清单，确认框仍列目录本身。
-  return listVersionedSubtree(svnPath, session!.wcRoot, dirPath, {
-    ...runOptions(session!.wcRoot),
-    onExit: logCommand(svnPath, ['list', '-R', '--', escapePeg(dirPath)], session!.wcRoot, 'commit'),
+  return listVersionedSubtree(svnPath, wcRoot, dirPath, {
+    ...runOptions(wcRoot),
+    onExit: logCommand(svnPath, ['list', '-R', '--', escapePeg(dirPath)], wcRoot, 'commit'),
   });
 }
 
@@ -806,7 +823,7 @@ async function revertEntry(meta: CommitEntryMeta): Promise<void> {
   if (!confirmed) {
     return;
   }
-  const operationId = await beginInlineOperation(meta.path, meta.kind);
+  const operationId = await beginInlineOperation(startedTarget, meta.path, meta.kind);
   if (!operationId) {
     return;
   }
@@ -814,8 +831,8 @@ async function revertEntry(meta: CommitEntryMeta): Promise<void> {
   const args = buildRevertArgs(meta.path);
   try {
     await runOrThrow(svnPath, args, {
-      ...runOptions(session.wcRoot),
-      onExit: logCommand(svnPath, args, session.wcRoot, 'commit'),
+      ...runOptions(startedTarget.wcRoot),
+      onExit: logCommand(svnPath, args, startedTarget.wcRoot, 'commit'),
     });
     handle?.toast('info', format(strings.panel.revertDoneNotice, { path: meta.path }));
   } catch (err) {
@@ -841,7 +858,7 @@ async function deleteEntry(meta: CommitEntryMeta): Promise<void> {
   // 目录删除是结构性删除：确认框枚举完整影响子树（版本控制条目清单）。
   let subtree: string[] = [];
   if (meta.kind === 'dir') {
-    subtree = await listDeletionSubtree(svnPath, meta.path);
+    subtree = await listDeletionSubtree(svnPath, startedTarget.wcRoot, meta.path);
   }
   const subtreeLines = subtree.length
     ? subtree.slice(0, SUBTREE_LIST_LIMIT).map((path) => `· ${meta.path}/${path}`).join('\n') +
@@ -857,15 +874,15 @@ async function deleteEntry(meta: CommitEntryMeta): Promise<void> {
   if (!confirmed) {
     return;
   }
-  const operationId = await beginInlineOperation(meta.path, meta.kind);
+  const operationId = await beginInlineOperation(startedTarget, meta.path, meta.kind);
   if (!operationId) {
     return;
   }
   const args = buildDeleteArgs(meta.path, { force: true });
   try {
     await runOrThrow(svnPath, args, {
-      ...runOptions(session.wcRoot),
-      onExit: logCommand(svnPath, args, session.wcRoot, 'commit'),
+      ...runOptions(startedTarget.wcRoot),
+      onExit: logCommand(svnPath, args, startedTarget.wcRoot, 'commit'),
     });
     handle?.toast('info', format(strings.panel.deleteDoneNotice, { path: meta.path }));
   } catch (err) {
@@ -895,7 +912,7 @@ async function trashEntry(meta: CommitEntryMeta): Promise<void> {
   if (!confirmed) {
     return;
   }
-  const operationId = await beginInlineOperation(meta.path, meta.kind);
+  const operationId = await beginInlineOperation(startedTarget, meta.path, meta.kind);
   if (!operationId) {
     return;
   }
@@ -1005,7 +1022,12 @@ async function performCommit(sessionId: string): Promise<void> {
       return;
     }
     const freshMetas = mergeStatusEntries(freshStatus.entries, undefined, session.externalPrefixes);
-    enrichMetas(freshMetas, session.wcRoot);
+    await enrichMetas(freshMetas, session.wcRoot);
+    if (handle.sessionId !== sessionId) {
+      // enrichMetas 是异步恢复点：挂起期间面板可能销毁重开（会话已切换），
+      // 旧会话的重读结果不得写进新会话对象，也不再继续发起提交。
+      return;
+    }
     session.metas = freshMetas;
     session.selectedPaths = new Set([...session.selectedPaths].filter((path) =>
       freshMetas.some((meta) => meta.path === path && isSelectableEntry(meta)),
@@ -1037,7 +1059,7 @@ async function performCommit(sessionId: string): Promise<void> {
     // 操作登记：同副本互斥；写入失败（持久化异常）不发起提交。
     const begin = await registry.begin({
       wcRoot: session.wcRoot,
-      targetRelPath: session.targetArgs.join(','),
+      targetRelPath: serializeTargetArgs(session.targetArgs),
       nodeKind: 'dir',
       baseRevision: commitBaseAgainst,
       explicitPaths: selected.map((meta) => meta.path),
@@ -1121,7 +1143,10 @@ async function performCommit(sessionId: string): Promise<void> {
           if (revision !== undefined) {
             revisions.push(revision);
             committed.push(...batch);
-            await registry.markPhase(activeOperationId ?? begin.operationId, 'committing', { knownRevisions: [...revisions] });
+            await registry.markPhase(activeOperationId ?? begin.operationId, 'committing', {
+              knownRevisions: [...revisions],
+              committedPaths: [...committed],
+            });
           }
         } catch (err) {
           if (err instanceof SvnError && (err.code === 'TIMEOUT' || err.code === 'SPAWN_ERROR' || err.code === 'CANCELLED')) {
@@ -1145,7 +1170,10 @@ async function performCommit(sessionId: string): Promise<void> {
               if (revision !== undefined) {
                 revisions.push(revision);
                 committed.push(...batch);
-                await registry.markPhase(activeOperationId ?? begin.operationId, 'committing', { knownRevisions: [...revisions] });
+                await registry.markPhase(activeOperationId ?? begin.operationId, 'committing', {
+                  knownRevisions: [...revisions],
+                  committedPaths: [...committed],
+                });
               }
               continue;
             } catch (retryErr) {
@@ -1169,8 +1197,12 @@ async function performCommit(sessionId: string): Promise<void> {
     }
 
     if (unknown) {
-      // 结果未知：保留操作记录并冻结写意图，只允许核实。
-      await registry.markPhase(activeOperationId ?? begin.operationId, 'unknown', { knownRevisions: [...revisions] });
+      // 结果未知：保留操作记录并冻结写意图，只允许核实；已成功批次的
+      // 路径与 revision 一并落盘，核实「已提交」时据此精确回显。
+      await registry.markPhase(activeOperationId ?? begin.operationId, 'unknown', {
+        knownRevisions: [...revisions],
+        ...(committed.length > 0 ? { committedPaths: [...committed] } : {}),
+      });
       session.phase = 'unknown';
       session.error = null;
       if (committed.length > 0) {
@@ -1447,14 +1479,18 @@ async function resolveUnknown(sessionId: string): Promise<void> {
     }
     if (stillDirty.length === 0) {
       // 本地确认：显式路径全部干净说明客户端已确认提交结果。
+      // 已提交集合优先取操作记录中逐批确认的路径（部分成功拆批时后续
+      // 批次可能实际未提交、被人工还原，不能随全量显式路径一起夸大）；
+      // 记录无已确认路径时回退显式路径集合（单批行为不变）。
       const revisions = restriction?.knownRevisions ?? [];
+      const committedIds = restriction?.committedPaths?.length ? restriction.committedPaths : explicit;
       await registry.finish(restriction?.operationId ?? activeOperationId ?? '');
       activeOperationId = undefined;
       handle.toast(
         'info',
         format(strings.panel.verifyCommitted, { revisions: revisions.map((r) => `r${r}`).join('、r') || '—' }),
       );
-      const verified: CommitSessionState['result'] = { kind: 'success', revisions, committedIds: explicit };
+      const verified: CommitSessionState['result'] = { kind: 'success', revisions, committedIds };
       // unknown 期 busy=false、目标可切换：用已核对的会话 ID 重读，
       // loadSession 入口校验拦截切换后的迟到执行。
       await loadSession(sessionId, target, { initial: false });

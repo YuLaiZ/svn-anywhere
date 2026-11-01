@@ -4,7 +4,7 @@
  * 读取/草稿/写回、外部修改拒绝、保存失败不进提交、隔离提交与协调、
  * 结果未知冻结与核实、协调受阻恢复、草稿确认与目标切换。
  */
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -636,6 +636,58 @@ describe('P2 面板：草稿保护与生命周期', () => {
       rmSync(lab, { recursive: true, force: true });
     }
   });
+
+  it('有草稿切换目标先弹丢弃确认：取消后停留原目标且不重读', async () => {
+    const lab = makeFakeWc();
+    try {
+      mkdirSync(join(lab, 'lib'), { recursive: true });
+      enqueue(snap(['*.log']), snap(['*.log']));
+      const panel = await openPanel(join(lab, 'src'), '*.log');
+      panel.sendIntent({ kind: 'syncInput', fieldId: 'draft', value: '.idea', inputRevision: 1 });
+      await settle();
+      const sessionId = panel.lastSessionId();
+      const readsBefore = vi.mocked(readIgnoreSnapshot).mock.calls.length;
+      // 确认框取消（未点「放弃并切换」）。
+      vscodeMock.confirmResult = undefined;
+      await commandEditIgnore(makeUri(join(lab, 'lib')));
+      await settle(20);
+      expect(vscodeMock.warning).toContain(strings.ignorePanel.switchDiscardTitle);
+      // 停留原目标：会话未切换、渲染仍是 src、没有发起重读。
+      expect(panel.lastSessionId()).toBe(sessionId);
+      expect(panel.lastRender()!.html).toContain('· src');
+      expect(panel.lastRender()!.html).not.toContain('· lib');
+      expect(vi.mocked(readIgnoreSnapshot).mock.calls.length).toBe(readsBefore);
+    } finally {
+      rmSync(lab, { recursive: true, force: true });
+    }
+  });
+
+  it('确认丢弃草稿后切换到新目标并读取其规则', async () => {
+    const lab = makeFakeWc();
+    try {
+      mkdirSync(join(lab, 'lib'), { recursive: true });
+      enqueue(snap(['*.log']), snap(['*.log']));
+      const panel = await openPanel(join(lab, 'src'), '*.log');
+      const oldSessionId = panel.lastSessionId();
+      panel.sendIntent({ kind: 'syncInput', fieldId: 'draft', value: '.idea', inputRevision: 1 });
+      await settle();
+      vscodeMock.confirmResult = strings.ignorePanel.switchDiscardButton;
+      enqueue(snap(['lib-*']), snap(['lib-*']));
+      await commandEditIgnore(makeUri(join(lab, 'lib')));
+      await settle(40);
+      // 复用同一面板实例，切换出新的会话代次并读取新目标。
+      expect(vscodeMock.panels.length).toBe(1);
+      expect(panel.lastSessionId()).not.toBe(oldSessionId);
+      const html = panel.lastRender()!.html;
+      expect(html).toContain('· lib');
+      expect(html).not.toContain('· src');
+      expect(html).toContain('lib-*');
+      // 旧目标的待加入草稿随切换丢弃。
+      expect(html).not.toMatch(/value="\.idea"/);
+    } finally {
+      rmSync(lab, { recursive: true, force: true });
+    }
+  });
 });
 
 function sapEmpty(): PropertySnapshot {
@@ -729,6 +781,95 @@ describe('P2 面板：提交进行中用户关闭面板', () => {
       expect(vi.mocked(coordinateUpdate)).not.toHaveBeenCalled();
     } finally {
       rmSync(lab, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('P2 面板：重启恢复清理临时副本', () => {
+  /** 预置一条带临时副本登记的持久化限制记录（模拟重启后 loadPending 恢复）。 */
+  async function seedRestrictedRecord(
+    lab: string,
+    phase: 'unknown' | 'committed-pending-coordination' | 'coordination-blocked',
+    tempWc: string,
+  ): Promise<void> {
+    const registry = getOperationRegistry();
+    const begin = await registry.begin({
+      wcRoot: lab,
+      targetRelPath: 'src',
+      nodeKind: 'dir',
+      property: {
+        name: 'svn:ignore',
+        originalExists: true,
+        originalValue: ['*.log'],
+        pendingExists: true,
+        pendingValue: ['*.log', '.idea'],
+      },
+    });
+    if (!begin.ok) {
+      throw new Error(`预置受限记录失败：副本被 ${begin.heldBy.phase} 记录占用`);
+    }
+    await registry.markPhase(begin.operationId, phase, { knownRevisions: [9], tempWcPath: tempWc });
+  }
+
+  it('协调受阻重启后恢复：BASE 已是提交值，幂等完成并清理登记的临时副本', async () => {
+    const lab = makeFakeWc();
+    const tempWc = mkdtempSync(join(tmpdir(), 'svn-anywhere-ignore-commit-'));
+    try {
+      await seedRestrictedRecord(lab, 'coordination-blocked', tempWc);
+      const panel = await openPanel(join(lab, 'src'), '尚未协调完成');
+      expect(panel.lastRender()!.html).toContain('r9');
+      // 恢复入口核对读 working+BASE，幂等完成后 finish 再读 working+BASE。
+      const pending = snap(['*.log', '.idea']);
+      enqueue(pending, pending, pending, pending);
+      panel.sendIntent({ kind: 'resolveUnknown' });
+      await settle(60);
+      expect(existsSync(tempWc)).toBe(false);
+      expect(getRegistryRestricted(lab)).toBe(false);
+      expect(panel.lastRender()!.html).toContain('忽略规则已提交到 SVN');
+    } finally {
+      rmSync(lab, { recursive: true, force: true });
+      rmSync(tempWc, { recursive: true, force: true });
+    }
+  });
+
+  it('unknown 重启后核实已提交：恢复协调完成并清理登记的临时副本', async () => {
+    const lab = makeFakeWc();
+    const tempWc = mkdtempSync(join(tmpdir(), 'svn-anywhere-ignore-commit-'));
+    try {
+      await seedRestrictedRecord(lab, 'unknown', tempWc);
+      const panel = await openPanel(join(lab, 'src'), '提交结果未知');
+      // 远端 HEAD 已是待提交值：核实为已提交，走恢复协调（update + BASE 读回）。
+      vi.mocked(readRemoteIgnoreSnapshot).mockResolvedValue(snap(['*.log', '.idea']));
+      const pending = snap(['*.log', '.idea']);
+      enqueue(pending, pending, pending, pending);
+      panel.sendIntent({ kind: 'resolveUnknown' });
+      await settle(80);
+      expect(vi.mocked(coordinateUpdate)).toHaveBeenCalledWith('svn', 'src', expect.anything());
+      expect(existsSync(tempWc)).toBe(false);
+      expect(getRegistryRestricted(lab)).toBe(false);
+      expect(panel.lastRender()!.html).toContain('忽略规则已提交到 SVN');
+    } finally {
+      rmSync(lab, { recursive: true, force: true });
+      rmSync(tempWc, { recursive: true, force: true });
+    }
+  });
+
+  it('unknown 重启后核实未提交：解锁重试并清理登记的临时副本', async () => {
+    const lab = makeFakeWc();
+    const tempWc = mkdtempSync(join(tmpdir(), 'svn-anywhere-ignore-commit-'));
+    try {
+      await seedRestrictedRecord(lab, 'unknown', tempWc);
+      const panel = await openPanel(join(lab, 'src'), '提交结果未知');
+      // 远端 HEAD 仍是原始值：确认未提交，解锁允许重试。
+      vi.mocked(readRemoteIgnoreSnapshot).mockResolvedValue(snap(['*.log']));
+      panel.sendIntent({ kind: 'resolveUnknown' });
+      await settle(60);
+      expect(existsSync(tempWc)).toBe(false);
+      expect(getOperationRegistry().writeRestriction(lab)).toBeUndefined();
+      expect(panel.lastRender()!.html).toContain('已确认未提交');
+    } finally {
+      rmSync(lab, { recursive: true, force: true });
+      rmSync(tempWc, { recursive: true, force: true });
     }
   });
 });

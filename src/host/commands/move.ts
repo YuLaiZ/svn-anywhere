@@ -51,15 +51,20 @@ export async function commandMove(uri?: vscode.Uri): Promise<void> {
     void vscode.window.showInformationMessage(strings.move.sameTarget);
     return;
   }
-  if (existsSync(dstAbs)) {
+  // 副本根本身是合法的移动目标（把源移入根目录）：该目录必然存在，
+  // 不按「目标已存在」拦截；其余已存在路径保持原提示。
+  if (existsSync(dstAbs) && dstAbs !== target.wcRoot) {
     void vscode.window.showInformationMessage(format(strings.move.targetExists, { target: dstAbs }));
     return;
   }
   const dstRel = relative(target.wcRoot, dstAbs);
-  if (!dstRel || dstRel.startsWith('..')) {
+  if (dstRel.startsWith('..')) {
     void vscode.window.showInformationMessage(strings.move.outsideWorkingCopy);
     return;
   }
+  // 目标即副本根时 relative 返回空串：归一为 '.' 传参与展示（与
+  // targetRelOf 的副本根约定一致），svn move 将源移入根目录。
+  const dstArg = dstRel === '' ? '.' : dstRel;
 
   const operationId = await beginDailyWrite(
     target.wcRoot,
@@ -69,7 +74,7 @@ export async function commandMove(uri?: vscode.Uri): Promise<void> {
   if (!operationId) {
     return;
   }
-  const args = buildMoveArgs(relPath, dstRel);
+  const args = buildMoveArgs(relPath, dstArg);
   try {
     const buffer = createLineBuffer();
     await runOrThrow(svnPath, args, {
@@ -81,7 +86,7 @@ export async function commandMove(uri?: vscode.Uri): Promise<void> {
     await finishDailyWrite(operationId);
   }
   void vscode.window.showInformationMessage(
-    format(strings.move.done, { src: relPath, dst: dstRel }),
+    format(strings.move.done, { src: relPath, dst: dstArg }),
   );
   showOutput(false);
 }

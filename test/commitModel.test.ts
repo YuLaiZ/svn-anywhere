@@ -61,6 +61,7 @@ function sessionOf(metas: CommitEntryMeta[], patch: Partial<CommitSessionState> 
     initialSelectionKey: '',
     remoteIncluded: false,
     externalPrefixes: [],
+    unversionedTruncated: false,
     ...patch,
   };
 }
@@ -205,6 +206,21 @@ describe('buildGroupRows 树形构建', () => {
     });
     expect(buildPanelState(emptyBlocked).footer?.primary?.disabled).toBe(true);
     expect(buildPanelState(emptyBlocked).footer?.primary?.disabledReason).toContain('说明');
+  });
+
+  it('未版本控制子项枚举超限时展示截断提示横幅（含上限值）', () => {
+    const truncated = sessionOf([meta('u', { wcStatus: 'unversioned', group: 'unversioned' })], {
+      unversionedTruncated: true,
+    });
+    const banner = buildPanelState(truncated).banners.find((item) => item.id === 'unversionedTruncated');
+    expect(banner?.level).toBe('warn');
+    expect(banner?.title).toContain('未版本控制子项枚举已达上限 500');
+    // 未超限时不出现提示。
+    expect(
+      buildPanelState(sessionOf([meta('u', { wcStatus: 'unversioned', group: 'unversioned' })])).banners.some(
+        (item) => item.id === 'unversionedTruncated',
+      ),
+    ).toBe(false);
   });
 
   it('changelist 整组选择动作只在筛选为具体分组时出现', () => {

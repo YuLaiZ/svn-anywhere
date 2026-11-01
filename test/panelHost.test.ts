@@ -329,6 +329,25 @@ describe('复用与销毁', () => {
     expect(handle.switchSession()).toBeUndefined();
     handle.dispose();
   });
+
+  it('switchSession 面板已销毁时返回 undefined（与忙碌分支同口径）', () => {
+    const handle = createPanel('t1', { title: 'T' }, { onIntent: () => {} }, context);
+    panelsCreated[0].fireDispose();
+    expect(handle.switchSession()).toBeUndefined();
+  });
+
+  it('resetPanelRegistry 显式销毁 panel 本体并清空注册表', () => {
+    createPanel('t1', { title: 'T' }, { onIntent: () => {} }, context);
+    expect(panelsCreated[0].disposed).toBe(false);
+    resetPanelRegistry();
+    // panel 本体被显式 dispose，而非只做宿主侧条目清理。
+    expect(panelsCreated[0].disposed).toBe(true);
+    // 注册表已清空：同 panelId 再创建是全新面板而非复用 reveal。
+    const h2 = createPanel('t1', { title: 'T' }, { onIntent: () => {} }, context);
+    expect(panelsCreated).toHaveLength(2);
+    expect(panelsCreated[1].revealed).toBe(0);
+    h2.dispose();
+  });
 });
 
 describe('panelHtmlTemplate', () => {

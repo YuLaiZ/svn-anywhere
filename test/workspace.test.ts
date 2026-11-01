@@ -84,6 +84,21 @@ describe('findWorkingCopy', () => {
     expect(findWorkingCopy('/definitely/not/exist/path')).toBeUndefined();
   });
 
+  it('副本内本地缺失的路径退现存父目录定位（missing 目标解析）', () => {
+    const root = makeRoot();
+    makeWorkingCopy(root);
+    // 已登记文件被本地删除：文件本身不存在，但退到现存父目录即可定位副本。
+    expect(findWorkingCopy(join(root, 'missing.txt'))).toBe(root);
+    // 深层缺失路径：中间目录也不存在，逐级退到副本根。
+    expect(findWorkingCopy(join(root, 'a', 'b', 'gone'))).toBe(root);
+  });
+
+  it('非副本内的缺失路径仍返回 undefined', () => {
+    const root = makeRoot();
+    // 对照组：同样的逐级回退，但沿途没有工作副本，不能误定位。
+    expect(findWorkingCopy(join(root, 'plain', 'gone.txt'))).toBeUndefined();
+  });
+
   it('完全不在副本内时返回 undefined', () => {
     const root = makeRoot();
     mkdirSync(join(root, 'plain'), { recursive: true });

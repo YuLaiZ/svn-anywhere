@@ -38,7 +38,11 @@ export interface RunOptions {
   onOutput?: (chunk: string, source: 'stdout' | 'stderr') => void;
   /** 输出解码主编码（严格解码），默认 UTF-8；详见 core/encoding。 */
   encoding?: string;
-  /** 主编码严格解码失败后的回退编码链（按序尝试），默认不回退。 */
+  /**
+   * 主编码严格解码失败后的回退编码链（按序尝试）；未传时默认回退
+   * DEFAULT_ENCODING_FALLBACK（gbk→gb2312→big5），传空数组可显式关闭回退
+   * （严格解码失败即按 UTF-8 宽松兜底并触发 onDecodingFallback）。
+   */
   encodingFallback?: readonly string[];
   /** 任一输出流回退链全部失败、按 UTF-8 宽松解码时回调（宿主写频道标注）。 */
   onDecodingFallback?: (notice: DecodingFallbackNotice) => void;

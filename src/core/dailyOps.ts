@@ -57,7 +57,10 @@ export async function listVersionedSubtree(
     const result = await runOrThrow(svnPath, args, { ...options, cwd: wcRoot, timeoutMs: 10_000 });
     return result.stdout
       .split('\n')
-      .map((line) => line.trim())
+      // 按行协议解析：只剥离行尾 CR（Windows 换行），保留名称首尾空格
+      // 原值——svn list 对含首尾空格的文件名原样输出且不包裹引号，
+      // trim 会让删除确认框展示与真实文件名不一致的路径。
+      .map((line) => line.replace(/\r$/, ''))
       .filter((line) => line.length > 0 && !line.endsWith('/'));
   } catch {
     return [];

@@ -93,6 +93,21 @@ describe('OperationRegistry：状态与限制', () => {
     expect(registry.writeRestriction('/wc/a')?.knownRevisions).toEqual([128, 129]);
   });
 
+  it('拆批提交的已成功路径随 revision 逐批追加落盘（committedPaths）', async () => {
+    const store = memoryStore();
+    const registry = new OperationRegistry(store);
+    const begun = await registry.begin({ wcRoot: '/wc/a', targetRelPath: '.', nodeKind: 'dir' });
+    const operationId = (begun as { operationId: string }).operationId;
+    await registry.markPhase(operationId, 'committing', { knownRevisions: [21], committedPaths: ['a.txt'] });
+    await registry.markPhase(operationId, 'unknown', {
+      knownRevisions: [21, 22],
+      committedPaths: ['a.txt', 'b.txt'],
+    });
+    const record = store.data.get(operationId);
+    expect(record?.committedPaths).toEqual(['a.txt', 'b.txt']);
+    expect(registry.writeRestriction('/wc/a')?.committedPaths).toEqual(['a.txt', 'b.txt']);
+  });
+
   it('finish 幂等并清理记录', async () => {
     const store = memoryStore();
     const registry = new OperationRegistry(store);

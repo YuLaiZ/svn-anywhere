@@ -2,6 +2,8 @@
 .idea/**
 # 本地 AI 开发工具的工作流脚本目录，不属于扩展产物
 .zcode/**
+# vitest 的 json reporter / coverage 输出目录，不属于扩展产物
+.vitest/**
 src/**
 test/**
 scripts/**

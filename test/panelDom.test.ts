@@ -280,6 +280,26 @@ describe('瞬时提示与销毁', () => {
     app.dispose();
   });
 
+  it('旧会话迟到 toast 被忽略；首帧前握手期 toast 放行', () => {
+    vi.useFakeTimers();
+    document.body.innerHTML = '<div id="app"></div>';
+    const { api } = makeApi();
+    const app = mountPanel(document, api);
+    // 首帧 render 之前（currentSessionId 为空）的 toast 放行，避免丢首个提示。
+    app.handleHostMessage({ type: 'toast', protocolVersion: 1, sessionId: 's1', level: 'info', message: '首提示' });
+    expect(document.querySelector('.toast.info')?.textContent).toBe('首提示');
+    // 新会话首帧 render 落地后会话跟随 s2。
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's2', revision: 1, formRevision: 0, html: render(stateOf()),
+    });
+    app.handleHostMessage({ type: 'toast', protocolVersion: 1, sessionId: 's1', level: 'error', message: '旧会话提示' });
+    expect(document.querySelector('.toast.error')).toBeNull();
+    app.handleHostMessage({ type: 'toast', protocolVersion: 1, sessionId: 's2', level: 'error', message: '新会话提示' });
+    expect(document.querySelector('.toast.error')?.textContent).toBe('新会话提示');
+    vi.useRealTimers();
+    app.dispose();
+  });
+
   it('旧会话迟到 render 后点击以新会话发送（会话跟随最新 render）', () => {
     const { app, sent } = setup();
     const next = stateOf();

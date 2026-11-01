@@ -102,17 +102,19 @@ export function literalIgnorePattern(name: string): string {
 
 /**
  * 读取目标的 svn:ignore 规则。属性不存在时 svn 报 W200017 且退出码非 0
- * （实测 svn 1.15），属正常情形按空规则处理；其余失败原样抛出。
+ * （实测 svn 1.15），目标未纳管（如提交面板对未版本控制目录枚举子项前
+ * 读规则）报 E200005，都属无属性可读的常态，按空规则处理；其余失败原样
+ * 抛出。`--` 防止以 `-` 开头的相对路径被解析为选项。
  */
 export async function readIgnoreRules(
   svnPath: string,
   dir: string,
   options: RunOptions = {},
 ): Promise<string[]> {
-  const args = ['propget', 'svn:ignore', escapePeg(dir)];
+  const args = ['propget', 'svn:ignore', '--', escapePeg(dir)];
   const result = await run(svnPath, args, options);
   if (result.exitCode !== 0) {
-    if (result.stderr.includes('W200017')) {
+    if (result.stderr.includes('W200017') || result.stderr.includes('E200005')) {
       return [];
     }
     throw new SvnError({

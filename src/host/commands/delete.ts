@@ -5,6 +5,7 @@
  * 目录删除是结构性删除：确认框枚举完整影响子树。
  */
 import * as vscode from 'vscode';
+import { existsSync } from 'node:fs';
 import { buildDeleteArgs, listVersionedSubtree } from '../../core/dailyOps';
 import { runStatus } from '../../core/status';
 import { runOrThrow } from '../../core/svnCli';
@@ -32,6 +33,12 @@ export async function commandDelete(uri?: vscode.Uri): Promise<void> {
   if (own && own.wcStatus === 'unversioned') {
     // SVN 删除仅适用于已版本控制路径；未版本控制文件不走本命令。
     void vscode.window.showInformationMessage(format(strings.deleteOp.unversionedTarget, { path: relPath }));
+    return;
+  }
+  if (!own && !existsSync(target.targetPath)) {
+    // status 对不存在路径输出空 target 且退出 0（own 为 undefined），本地
+    // 也无此文件：路径既不存在又无任何登记，没有可删除的内容，无需确认框。
+    void vscode.window.showInformationMessage(format(strings.deleteOp.notExistsTarget, { path: relPath }));
     return;
   }
   // 干净目录 status 无条目，类型以 stat 为准；missing 时由子条目前缀兜底。

@@ -1448,11 +1448,17 @@ async function main() {
   writeFileSync(join(igWc, 'src', '.keep'), '');
   writeFileSync(join(igLab.lab, 'rules-old.txt'), 'old\n');
   svn(['add', '-q', '--parents', join('src', '.keep')], igWc);
+  // 嵌套子目录随基线纳管：保存后验证父目录规则只作用于直接子项，
+  // 不递归隐藏子目录内的同名未版本控制项（非递归语义）。
+  mkdirSync(join(igWc, 'src', 'sub'), { recursive: true });
+  svn(['add', '-q', join('src', 'sub')], igWc);
   svn(['propset', '-q', 'svn:ignore', '-F', join(igLab.lab, 'rules-old.txt'), 'src'], igWc);
   svn(['propset', '-q', 'custom:keep', 'v1', 'src'], igWc);
   svn(['commit', '-q', '-m', 'ig base'], igWc);
   writeFileSync(join(igWc, 'src', 'noise.log'), 'log');
   writeFileSync(join(igWc, 'src', 'keep.log'), 'log');
+  // 与被忽略直接子项同名的嵌套未版本控制项：验证规则不递归作用。
+  writeFileSync(join(igWc, 'src', 'sub', 'noise.log'), 'log');
   const panelsBefore33 = state.panels.length;
   const p33 = await openIgnorePanel(join(igWc, 'src', 'noise.log'), 'rule-text');
   const base33 = p33.webview.posted.length;
@@ -1472,6 +1478,15 @@ async function main() {
   const status33 = svn(['status', '--no-ignore'], igWc);
   check('保存后匹配的未版本控制直接子项被忽略',
     /^I\s+src\/noise\.log$/m.test(status33),
+    status33);
+  check('已版本控制子项不受忽略规则影响（src/.keep 无状态条目）',
+    !status33.includes('src/.keep'),
+    status33);
+  check('不匹配规则的直接子项保持未版本控制（未被 I 隐藏）',
+    /^\?\s+src\/keep\.log$/m.test(status33) && !/^I\s+src\/keep\.log$/m.test(status33),
+    status33);
+  check('嵌套子目录内同名未版本控制项不被父目录规则误隐藏（保持 ? 而非 I）',
+    /^\?\s+src\/sub\/noise\.log$/m.test(status33) && !/^I\s+src\/sub\/noise\.log$/m.test(status33),
     status33);
   check('保存仅本机：远端属性未变',
     svn(['propget', '-r', 'HEAD', 'svn:ignore', `${igLab.repoUrl}/src`]).trim() === 'old');
@@ -2086,9 +2101,9 @@ async function main() {
     await state.registered.get('svnAnywhere.showStatus')({ fsPath: wc49, scheme: 'file' });
     const statusText49 = channelTextOf('SVN Anywhere · 状态');
     check('GBK 字节按回退链解码为中文（不出现乱码替换符）',
-      statusText49.includes(`[modified] ${gbkName}`) && !statusText49.includes('\\uFFFD'),
+      statusText49.includes(`[modified] ${gbkName}`) && !statusText49.includes('\uFFFD'),
       statusText49.slice(-300));
-    check('其它频道同样不含替换符', !channelTextOf('SVN Anywhere').includes('\\uFFFD'), '');
+    check('其它频道同样不含替换符', !channelTextOf('SVN Anywhere').includes('\uFFFD'), '');
   } finally {
     state.configOverrides = undefined;
     rmSync(wrapDir, { recursive: true, force: true });

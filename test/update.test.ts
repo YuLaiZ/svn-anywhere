@@ -49,6 +49,7 @@ Summary of conflicts:
       { status: 'A', path: 'src/added-remote.txt' },
     ]);
     expect(result.finalRevision).toBe(4);
+    expect(result.finalRevisions).toEqual([4]);
     expect(result.conflicts).toEqual(['src/a.txt']);
   });
 
@@ -139,6 +140,28 @@ At revision 5.
 `);
     expect(result.items).toEqual([{ status: 'U', path: 'src/g.txt' }]);
     expect(result.finalRevision).toBe(5);
+    // externals 段的 revision 行不进收集（只保留主副本段）。
+    expect(result.finalRevisions).toEqual([5]);
+  });
+
+  it('多目标输出多段 revision：finalRevisions 按序收集全部，finalRevision 保留最后值', () => {
+    const result = parseUpdateOutput(`Updating 'd1':
+U    d1/a.txt
+Updated to revision 5.
+Updating 'd2':
+U    d2/b.txt
+At revision 7.
+`);
+    expect(result.finalRevisions).toEqual([5, 7]);
+    expect(result.finalRevision).toBe(7);
+  });
+
+  it('无 revision 行时 finalRevisions 与 finalRevision 均为 undefined', () => {
+    const result = parseUpdateOutput(`Updating 'd1':
+U    d1/a.txt
+`);
+    expect(result.finalRevisions).toBeUndefined();
+    expect(result.finalRevision).toBeUndefined();
   });
 });
 
@@ -259,6 +282,8 @@ describe('runUpdate 集成（本地 file:// 副本）', () => {
 
     const result = await runUpdate('svn', ['d1', 'd2'], { cwd: wc });
     expect(result.finalRevision).toBe(head);
+    // 多目标按目标分段各报一次最终 revision（两组都到 head）。
+    expect(result.finalRevisions).toEqual([head, head]);
     // 明细路径相对 cwd（副本根），两个目标逐项可见（批量结果逐项要求）。
     expect(result.items.map((item) => item.path).sort()).toEqual(['d1/a.txt', 'd2/b.txt']);
     expect(result.conflicts).toEqual([]);

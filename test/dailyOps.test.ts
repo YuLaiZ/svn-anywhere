@@ -190,6 +190,25 @@ describe('真实 SVN 执行链路（本地 file:// 临时仓库）', () => {
     expect(await listVersionedSubtree('svn', wc, 'no-such-dir', {})).toEqual([]);
   });
 
+  it('listVersionedSubtree 保留首尾空格文件名原值（确认框展示不失真）', async () => {
+    // svn list 对含首尾空格的文件名原样输出且不包裹引号：解析必须保留
+    // 原值，否则删除确认框展示的子树清单与真实文件名不一致。
+    const padded = ' padded .txt ';
+    writeFile(`tree/${padded}`, 'v1\n');
+    execFileSync('svn', ['add', '-q', '--parents', `tree/${padded}`], { cwd: wc });
+    execFileSync('svn', ['commit', '-q', '-m', 'add padded names'], { cwd: wc });
+    // commit 只提升被提交条目的 BASE，父目录 tree 的 BASE 仍落后；list 按
+    // 工作副本 BASE 解析，须先 update 同步，否则新文件不进清单。
+    execFileSync('svn', ['update', '-q'], { cwd: wc });
+    const subtree = await listVersionedSubtree('svn', wc, 'tree', {});
+    expect(subtree).toContain(padded);
+    // 防恒真：确有行保留着首尾空格（未被 trim 归一）。
+    expect(subtree.some((line) => line !== line.trim())).toBe(true);
+    // 基线恢复：删除登记并提交，不留残留影响后续用例。
+    execFileSync('svn', ['delete', '-q', '--force', `tree/${padded}`], { cwd: wc });
+    execFileSync('svn', ['commit', '-q', '-m', 'remove padded names'], { cwd: wc });
+  });
+
   it('isVersioned：normal 与深层 unversioned（status 均无条目）可靠区分', async () => {
     // normal 已提交文件：status 无条目，svn info 成功。
     expect(await isVersioned('svn', wc, 'tree/g.txt', {})).toBe(true);

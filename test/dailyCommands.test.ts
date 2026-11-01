@@ -215,6 +215,13 @@ describe('commandDelete（删除）', () => {
     expect(vscodeMock.information.some((m) => m.includes('未纳入版本控制'))).toBe(true);
     expect(existsSync(join(wc, 'u.txt'))).toBe(true);
   });
+
+  it('不存在且无任何登记的路径：提示不可删除，不弹确认框', async () => {
+    await commandDelete(makeUri(join(wc, 'ghost.txt')));
+    expect(vscodeMock.information.some((m) => m.includes('ghost.txt') && m.includes('不存在'))).toBe(true);
+    expect(vscodeMock.warning).toHaveLength(0);
+    expect(channelText()).not.toContain('> svn delete');
+  });
 });
 
 describe('commandRevert（还原）', () => {
@@ -348,6 +355,20 @@ describe('commandMove（移动）', () => {
     await commandMove(makeUri(join(wc, 'mod.txt')));
     expect(vscodeMock.information.some((m) => m.includes('已存在'))).toBe(true);
     expect(channelText()).not.toContain('> svn move');
+  });
+
+  it('目标为副本根本身：不误报跨副本，svn move 以 . 传参移入根目录', async () => {
+    vscodeMock.inputResult = wc;
+    await commandMove(makeUri(join(wc, 'tree/inner')));
+    expect(vscodeMock.information.some((m) => m.includes('不在同一工作副本'))).toBe(false);
+    expect(channelText()).toContain('> svn move -- tree/inner .');
+    expect(existsSync(join(wc, 'inner'))).toBe(true);
+    expect(existsSync(join(wc, 'tree/inner'))).toBe(false);
+    const status = svnCli(['status']);
+    expect(status).toMatch(/^D\s+tree\/inner/m);
+    expect(status).toMatch(/^A\s+\+\s+inner/m);
+    // 基线恢复：撤销本地 move（删除移入的登记副本、恢复源目录）。
+    execFileSync('svn', ['revert', '-q', '-R', '.'], { cwd: wc });
   });
 });
 

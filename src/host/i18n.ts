@@ -53,12 +53,16 @@ export const strings = {
     progress: '正在更新 {target}…',
     progressRevision: '正在更新 {target} 至 revision {revision}…',
     done: '更新完成，当前 revision {revision}。',
+    /** 多目标更新输出多段 revision 且互不相同时的汇总（全部相同仍用 done 单值）。 */
+    doneRevisions: '更新完成，各目标最终 revision：{revisions}。',
     doneNoRevision: '更新完成。',
     conflicts: '更新完成，但有 {count} 个冲突需要先解决：{paths}',
     conflictsUnresolved: '更新输出报告了 {count} 个冲突，但未能定位冲突文件，请在输出面板确认。',
     openConflictButton: '打开冲突文件',
     conflictPickPlaceholder: '选择要打开的冲突文件',
     conflictMissingLocal: '{path} 的本地文件不存在，无法打开。',
+    /** 冲突路径存在但 workspace.fs.stat 因权限等原因失败（非 FileNotFound）。 */
+    conflictInaccessibleLocal: '{path} 的本地路径无法访问（{message}），未打开。',
   },
   cleanup: {
     progress: '正在清理 {target}…',
@@ -73,6 +77,7 @@ export const strings = {
   },
   deleteOp: {
     unversionedTarget: '{path} 未纳入版本控制，SVN 删除仅适用于已版本控制路径。',
+    notExistsTarget: '{path} 本地不存在且无任何 SVN 登记，没有可删除的内容。',
     confirmDetail: '将删除本地文件并登记 SVN 删除（提交后从仓库移除）：',
     confirmDetailMissing: '{path} 的本地文件已缺失，将登记 SVN 删除（提交后从仓库移除）：',
     dirNote: '目标为目录：删除会登记整个目录子树，不能保留其中未选的子项。',
@@ -255,6 +260,8 @@ export const strings = {
     reviewDirDeleteNote: '删除目录涉及列出的整个删除子树，不能保留该目录内未选的子项。',
     reviewMissingNote: '其中 missing 项将先登记 SVN 删除；之后若提交失败，这些删除登记仍会保留。',
     missingBanner: '已选 {count} 个 missing 项；提交前会列出路径，确认后登记为 SVN 删除。',
+    /** 未版本控制子项枚举达到防御上限（横幅提示，其余子项未进面板）。 */
+    unversionedEnumTruncated: '未版本控制子项枚举已达上限 {limit}，其余未显示',
     addedPreparedBanner: '已有 {count} 项登记 SVN 添加；尚未提交成功，失败不会自动撤销添加。请核对 A 状态后重试。',
     missingPreparedBanner: '已有 {count} 项登记为 SVN 删除；提交失败不会自动撤销登记。请核对列表后重试。',
     conflictBanner: '目标范围内存在冲突，暂不能提交。筛选不会解除阻止。',

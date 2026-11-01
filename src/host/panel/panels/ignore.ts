@@ -35,7 +35,7 @@ import {
   type PropertySnapshot,
 } from '../../../core/ignoreCommit';
 import { SvnError } from '../../../core/errors';
-import { getOperationRegistry } from '../../../core/operations';
+import { getOperationRegistry, type OperationRecord } from '../../../core/operations';
 import { readSvnPath, readTimeoutMs } from '../../config';
 import { format, strings } from '../../i18n';
 import { decodingRunOptions, logCommand, logExitCode, logLine, showOutput } from '../../output';
@@ -734,6 +734,15 @@ function cleanupTempDir(): void {
   }
 }
 
+/** 清理操作记录登记的临时副本目录：unknown/协调受阻经重启恢复并完成的
+ *  路径上，现场参数 activeTempDir 已丢失，目录位置只能从持久化记录读取；
+ *  记录未登记或目录已不存在时静默（rmSync force 幂等）。 */
+function cleanupRecordedTempDir(record: OperationRecord | null | undefined): void {
+  if (record?.tempWcPath) {
+    rmSync(record.tempWcPath, { recursive: true, force: true });
+  }
+}
+
 /* ------------------------------ 协调 ------------------------------ */
 
 /**
@@ -938,7 +947,7 @@ async function resolveUnknown(sessionId: string): Promise<void> {
           knownRevisions: [lastChangedRevision],
         });
         toastSafely('info', format(strings.ignorePanel.noticeVerifyCommitted, { revision: String(lastChangedRevision) }));
-        await coordinateAfterCommit(sessionId, restriction.operationId, lastChangedRevision, pending, '');
+        await coordinateAfterCommit(sessionId, restriction.operationId, lastChangedRevision, pending, restriction.tempWcPath ?? '');
         return;
       }
       if (snapshotEqual(head, original)) {
@@ -946,6 +955,8 @@ async function resolveUnknown(sessionId: string): Promise<void> {
         await registry.markPhase(restriction.operationId, 'failed-unconfirmed');
         activeOperationId = undefined;
         cleanupTempDir();
+        // 重启恢复的路径上 activeTempDir 已丢失：按记录登记位置清理临时副本。
+        cleanupRecordedTempDir(restriction);
         s.phase = 'ready';
         s.notice = strings.ignorePanel.noticeVerifyNotCommitted;
         s.successVisible = true;
@@ -1003,7 +1014,7 @@ async function resolveUnknown(sessionId: string): Promise<void> {
       s.repositoryPropertyExists = base.exists;
       if (snapshotEqual(base, pending)) {
         // BASE 已是已提交值：协调幂等完成（不重复 update、不重复提交）。
-        await finishCoordination(restriction.operationId, revision);
+        await finishCoordination(restriction.operationId, revision, restriction.tempWcPath);
         return;
       }
       if (!snapshotEqual(working, pending)) {
@@ -1013,10 +1024,10 @@ async function resolveUnknown(sessionId: string): Promise<void> {
           await blockCoordination(restriction.operationId, revision, pending, strings.ignorePanel.reconcileBlockedLocalEdit);
           return;
         }
-        await runCoordinationUpdate(sessionId, restriction.operationId, revision, pending, working, true, '');
+        await runCoordinationUpdate(sessionId, restriction.operationId, revision, pending, working, true, restriction.tempWcPath ?? '');
         return;
       }
-      await runCoordinationUpdate(sessionId, restriction.operationId, revision, pending, working, false, '');
+      await runCoordinationUpdate(sessionId, restriction.operationId, revision, pending, working, false, restriction.tempWcPath ?? '');
     } catch (err) {
       if (handle && handle.sessionId !== sessionId) {
         return;

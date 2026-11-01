@@ -13,7 +13,7 @@ import { runStatus } from '../src/core/status';
 import { runUpdate } from '../src/core/update';
 import { runOrThrow } from '../src/core/svnCli';
 import { disposeOutputChannel, getOutputChannel, resetOutputState } from '../src/host/output';
-import { strings } from '../src/host/i18n';
+import { format, strings } from '../src/host/i18n';
 
 vi.mock('../src/core/status', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/core/status')>();
@@ -49,6 +49,11 @@ const vscodeMock = vi.hoisted(() => ({
   quickPickPlaceholders: [] as string[],
   /** workspace.fs.stat 的类型表（fsPath → FileType）；不在表内视为不存在。 */
   fsTypes: new Map<string, number>(),
+  /**
+   * workspace.fs.stat 的注入错误表（fsPath → 模拟 FileSystemError）；
+   * 优先于 fsTypes，用于权限等非 FileNotFound 失败的形态。
+   */
+  fsStatErrors: new Map<string, Error & { code?: string }>(),
   /** executeCommand 转发记录（vscode.open / revealFileInOS）。 */
   executedCommands: [] as Array<Array<unknown>>,
   progressCalls: [] as string[],
@@ -120,9 +125,14 @@ vi.mock('vscode', () => ({
     getConfiguration: () => ({ get: (_key: string, fallback: unknown) => fallback }),
     fs: {
       stat: async (uri: { fsPath: string }) => {
+        const injected = vscodeMock.fsStatErrors.get(uri.fsPath);
+        if (injected) {
+          throw injected;
+        }
         const type = vscodeMock.fsTypes.get(uri.fsPath);
         if (type === undefined) {
-          throw new Error('ENOENT');
+          // 对齐真实宿主行为：路径不存在抛 code 为 FileNotFound 的 FileSystemError。
+          throw Object.assign(new Error('EntryNotFound (FileSystemError)'), { code: 'FileNotFound' });
         }
         return { type, ctime: 0, mtime: 0, size: 0 };
       },
@@ -184,6 +194,7 @@ beforeEach(() => {
   vscodeMock.quickPickChoice = undefined;
   vscodeMock.quickPickPlaceholders.length = 0;
   vscodeMock.fsTypes.clear();
+  vscodeMock.fsStatErrors.clear();
   vscodeMock.executedCommands.length = 0;
   vscodeMock.progressCalls.length = 0;
   vscodeMock.openDialogCalls = 0;
@@ -367,6 +378,43 @@ describe('commandUpdate（更新）', () => {
     );
   });
 
+  it('多目标更新多段 revision：频道汇总逐个列出，不折叠为最后值', async () => {
+    const d1 = join(wcRoot, 'd1');
+    const d2 = join(wcRoot, 'd2');
+    mkdirSync(d1, { recursive: true });
+    mkdirSync(d2, { recursive: true });
+    vscodeMock.confirmResult = strings.update.confirmButton;
+    vscodeMock.inputResult = 'HEAD';
+    vi.mocked(runUpdate).mockResolvedValueOnce({
+      stdout: '', stderr: '', exitCode: 0,
+      items: [], finalRevision: 7, finalRevisions: [5, 7], conflicts: [],
+    });
+
+    await commandUpdate(makeUri(d1), [makeUri(d1), makeUri(d2)]);
+
+    const output = channelLines().join('\n');
+    expect(output).toContain(format(strings.update.doneRevisions, { revisions: '5、7' }));
+  });
+
+  it('多目标更新 revision 全部相同：汇总折叠为单值文案', async () => {
+    const d1 = join(wcRoot, 'd1');
+    const d2 = join(wcRoot, 'd2');
+    mkdirSync(d1, { recursive: true });
+    mkdirSync(d2, { recursive: true });
+    vscodeMock.confirmResult = strings.update.confirmButton;
+    vscodeMock.inputResult = 'HEAD';
+    vi.mocked(runUpdate).mockResolvedValueOnce({
+      stdout: '', stderr: '', exitCode: 0,
+      items: [], finalRevision: 7, finalRevisions: [7, 7], conflicts: [],
+    });
+
+    await commandUpdate(makeUri(d1), [makeUri(d1), makeUri(d2)]);
+
+    const output = channelLines().join('\n');
+    expect(output).toContain(format(strings.update.done, { revision: '7' }));
+    expect(output).not.toContain(strings.update.doneRevisions.split('{revisions')[0]);
+  });
+
   it('版本号输入取消（Esc）：不执行更新', async () => {
     const filePath = join(wcRoot, 'a.txt');
     writeFileSync(filePath, 'x');
@@ -494,7 +542,40 @@ describe('commandUpdate（更新）', () => {
     await commandUpdate(makeUri(wcRoot));
 
     expect(vscodeMock.executedCommands).toHaveLength(0);
-    expect(vscodeMock.information.some((m) => m.includes('gone.txt'))).toBe(true);
+    // stat 抛 FileNotFound 形态的 FileSystemError 时走「本地文件不存在」文案。
+    expect(vscodeMock.information).toContain(
+      format(strings.update.conflictMissingLocal, { path: 'gone.txt' }),
+    );
+  });
+
+  it('冲突路径 stat 因权限等失败：提示无法访问并附原因，不误述为文件不存在', async () => {
+    const lockedPath = join(wcRoot, 'locked.txt');
+    writeFileSync(lockedPath, 'x');
+    vscodeMock.confirmResult = strings.update.confirmButton;
+    vscodeMock.inputResult = 'HEAD';
+    vscodeMock.warningChoice = strings.update.openConflictButton;
+    vscodeMock.fsStatErrors.set(
+      lockedPath,
+      Object.assign(new Error('Permission denied (FileSystemError)'), { code: 'NoPermissions' }),
+    );
+    vi.mocked(runUpdate).mockResolvedValueOnce({
+      stdout: '', stderr: '', exitCode: 0,
+      items: [],
+      finalRevision: 6,
+      conflicts: ['locked.txt'],
+    });
+
+    await commandUpdate(makeUri(wcRoot));
+
+    expect(vscodeMock.executedCommands).toHaveLength(0);
+    expect(vscodeMock.information).not.toContain(
+      format(strings.update.conflictMissingLocal, { path: 'locked.txt' }),
+    );
+    expect(
+      vscodeMock.information.some(
+        (m) => m.includes('locked.txt') && m.includes('无法访问') && m.includes('Permission denied'),
+      ),
+    ).toBe(true);
   });
 
   it('冲突通知等待用户处理期间不持有副本互斥锁：同副本清理可立即执行', async () => {

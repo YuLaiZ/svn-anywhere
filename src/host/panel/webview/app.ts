@@ -336,7 +336,13 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
       return;
     }
     if (message.type === 'toast') {
-      showToast(String(message.level ?? 'info'), String(message.message ?? ''));
+      // 与 render 分支同口径校验会话：首帧 render 之前 currentSessionId 为空串，
+      // 握手期放行避免丢首个提示；其余旧会话的迟到 toast 直接丢弃，
+      // 不落入目标切换后的新会话界面。
+      const messageSessionId = String(message.sessionId ?? '');
+      if (currentSessionId === '' || messageSessionId === currentSessionId) {
+        showToast(String(message.level ?? 'info'), String(message.message ?? ''));
+      }
     }
   };
 

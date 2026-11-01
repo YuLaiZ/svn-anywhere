@@ -22,8 +22,13 @@ export interface ConflictSummaryCounts {
 
 export interface UpdateResult {
   items: UpdateItem[];
-  /** 最终 revision（`Updated to revision N` / `At revision N`）。 */
+  /**
+   * 最终 revision（`Updated to revision N` / `At revision N`）；多目标输出
+   * 多段时保留最后一段的值（兼容单目标消费方，单目标两者一致）。
+   */
   finalRevision?: number;
+  /** 按输出顺序收集的全部最终 revision（多目标一段一个）；无 revision 行时为 undefined。 */
+  finalRevisions?: number[];
   /** 产生冲突的路径（明细状态 C 或树冲突行）。 */
   conflicts: string[];
   /**
@@ -49,7 +54,7 @@ const SUMMARY_COUNT_LINE = /^\s+(Text|Property|Tree) conflicts: (\d+)$/;
 
 export function parseUpdateOutput(text: string): UpdateResult {
   const items: UpdateItem[] = [];
-  let finalRevision: number | undefined;
+  const finalRevisions: number[] = [];
   let conflictSummary: ConflictSummaryCounts | undefined;
   let inSummary = false;
 
@@ -85,7 +90,7 @@ export function parseUpdateOutput(text: string): UpdateResult {
 
     const revision = FINAL_REVISION.exec(line);
     if (revision) {
-      finalRevision = Number(revision[1]);
+      finalRevisions.push(Number(revision[1]));
       continue;
     }
 
@@ -96,7 +101,8 @@ export function parseUpdateOutput(text: string): UpdateResult {
 
   return {
     items,
-    finalRevision,
+    finalRevision: finalRevisions.at(-1),
+    finalRevisions: finalRevisions.length > 0 ? finalRevisions : undefined,
     conflicts: items.filter((item) => item.status === 'C').map((item) => item.path),
     conflictSummary,
   };

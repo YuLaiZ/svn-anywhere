@@ -138,6 +138,18 @@ export function showOutput(preserveFocus = false, kind: OutputKind = 'other'): v
   getOutputChannel(kind)?.show(preserveFocus);
 }
 
+/** 解码回退失败（宽松兜底）时向 kind 频道写「编码回退失败」标注行。 */
+export function logDecodingFallback(kind: OutputKind, notice: DecodingFallbackNotice): void {
+  const encodings = [notice.primary, ...notice.fallback].join('、');
+  logLine(
+    format(strings.output.decodingFallbackNotice, {
+      source: notice.source === 'stdout' ? strings.output.sourceStdout : strings.output.sourceStderr,
+      encodings,
+    }),
+    kind,
+  );
+}
+
 /**
  * 按当前配置组装解码选项（展开进 RunOptions）：主编码、回退链与
  * 「编码回退失败」标注回调（写入 kind 频道）。
@@ -149,15 +161,6 @@ export function decodingRunOptions(kind: OutputKind): {
 } {
   return {
     ...readEncodingSettings(),
-    onDecodingFallback: (notice) => {
-      const encodings = [notice.primary, ...notice.fallback].join('、');
-      logLine(
-        format(strings.output.decodingFallbackNotice, {
-          source: notice.source === 'stdout' ? strings.output.sourceStdout : strings.output.sourceStderr,
-          encodings,
-        }),
-        kind,
-      );
-    },
+    onDecodingFallback: (notice) => logDecodingFallback(kind, notice),
   };
 }

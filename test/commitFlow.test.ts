@@ -17,7 +17,7 @@ import { runOrThrow } from '../src/core/svnCli';
 import { SvnError } from '../src/core/errors';
 import { resetPanelRegistry } from '../src/host/panel/host';
 import { disposeOutputChannel, getOutputChannel, resetOutputState } from '../src/host/output';
-import { setOperationRegistryForTest } from '../src/core/operations';
+import { OperationRegistry, setOperationRegistryForTest, type OperationRecord } from '../src/core/operations';
 import { strings } from '../src/host/i18n';
 
 vi.mock('../src/core/status', async (importOriginal) => {
@@ -32,12 +32,17 @@ vi.mock('../src/core/remoteStatus', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/core/remoteStatus')>();
   return { ...actual, runRemoteStatus: vi.fn() };
 });
-vi.mock('../src/core/svnCli', () => ({
-  run: vi.fn(),
-  runOrThrow: vi.fn(),
-  DEFAULT_TIMEOUT_MS: 120_000,
-  killAllActive: vi.fn(),
-}));
+// run 保留真实实现作为 vi.fn 默认行为：面板的 svn propget（读取未版本控制
+// 目录的 svn:ignore）经 svnCli 输出收口解码，测试需要真实子进程与收口链路；
+// runOrThrow 替身为 vi.fn 由各用例按命令分发模拟。
+vi.mock('../src/core/svnCli', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/core/svnCli')>();
+  return {
+    ...actual,
+    run: vi.fn(actual.run),
+    runOrThrow: vi.fn(),
+  };
+});
 
 interface FakePanel {
   viewType: string;
@@ -125,6 +130,8 @@ const vscodeMock = vi.hoisted(() => ({
   errorMessages: [] as string[],
   /** 单按钮模态（确认）返回值；undefined 表示取消。 */
   confirmResult: undefined as string | undefined,
+  /** 可控确认实现：设置后单按钮确认模态走它（测试可在确认框处挂起）。 */
+  confirmImpl: undefined as ((message: string) => Promise<string | undefined>) | undefined,
   /** 三按钮模态（提交前检查）返回值。 */
   commitChoice: undefined as string | undefined,
   /** QuickPick 选择（label）。 */
@@ -167,6 +174,9 @@ vi.mock('vscode', () => ({
     },
     showWarningMessage: (message: string, _options?: unknown, ...items: string[]) => {
       vscodeMock.warning.push(message);
+      if (vscodeMock.confirmImpl && items.length < 3) {
+        return vscodeMock.confirmImpl(message);
+      }
       return Promise.resolve(items.length >= 3 ? vscodeMock.commitChoice : vscodeMock.confirmResult);
     },
     showErrorMessage: (message: string) => {
@@ -263,6 +273,7 @@ beforeEach(() => {
   vscodeMock.warning.length = 0;
   vscodeMock.errorMessages.length = 0;
   vscodeMock.confirmResult = undefined;
+  vscodeMock.confirmImpl = undefined;
   vscodeMock.commitChoice = undefined;
   vscodeMock.quickPickChoice = undefined;
   vscodeMock.inputResult = undefined;
@@ -760,5 +771,307 @@ describe('P1 提交面板 部分成功与刷新失败', () => {
     const unknownHtml = String([...panel.posted].reverse().find((m) => m.type === 'render')?.html);
     expect(unknownHtml).toContain('r21');
     expect(unknownHtml).toMatch(/data-intent="submit"[^>]*disabled/);
+  });
+});
+
+describe('P1 提交面板 枚举上限与结果保留', () => {
+  it('未版本控制子项枚举超过防御上限：出现截断提示横幅，超限子项不进面板', async () => {
+    mkdirSync(join(wcRoot, 'bigdir'), { recursive: true });
+    for (let i = 0; i < 501; i += 1) {
+      writeFileSync(join(wcRoot, 'bigdir', `f${String(i).padStart(3, '0')}.txt`), 'x');
+    }
+    vi.mocked(runStatus).mockResolvedValue({
+      targetPath: '.',
+      entries: [
+        { path: 'a.txt', wcStatus: 'modified', props: 'none', changelist: null },
+        { path: 'bigdir', wcStatus: 'unversioned', props: 'none', changelist: null },
+      ],
+      externals: [],
+    });
+    const panel = await openPanelAndWait(join(wcRoot, 'a.txt'), 'f499.txt');
+    const html = String([...panel.posted].reverse().find((m) => m.type === 'render' && String(m.html ?? '').includes('f499.txt'))?.html);
+    expect(html).toContain('未版本控制子项枚举已达上限 500');
+    // 前 500 个子项进面板（f000–f499），第 501 个被截断。
+    expect(html).toContain('f000.txt');
+    expect(html).not.toContain('f500.txt');
+  });
+
+  it('提交成功卡片显示后同目标 reveal 重读：成功卡片保留', async () => {
+    vi.mocked(runOrThrow).mockResolvedValue({ stdout: 'Committed revision 5.\n', stderr: '', exitCode: 0 });
+    const panel = await openPanelAndWait(join(wcRoot, 'a.txt'), 'a.txt');
+    panel.sendIntent({ kind: 'syncInput', fieldId: 'message', value: '保留卡片', inputRevision: 1 }, 'in-keep');
+    panel.sendIntent({ kind: 'submit' }, 'sub-keep');
+    await vi.waitFor(() => {
+      const ok = [...panel.posted].reverse().find((m) => m.type === 'render' && String(m.html ?? '').includes('success-card'));
+      expect(ok).toBeDefined();
+    });
+    // 同目标再次执行「提交」命令：reveal 并重读状态，成功卡片不得丢失。
+    await commandCommit(makeUri(join(wcRoot, 'a.txt')));
+    await vi.waitFor(() => {
+      const latest = String([...panel.posted].reverse().find((m) => m.type === 'render')?.html);
+      expect(latest).toContain('success-card');
+      expect(latest).toContain('r5');
+    });
+  });
+
+  it('部分成功+结果未知后核实已提交：成功卡片只列操作记录中已确认的批次路径', async () => {
+    const entries = Array.from({ length: 120 }, (_, i) => ({
+      path: `f${String(i).padStart(3, '0')}.txt`,
+      wcStatus: 'modified',
+      props: 'none',
+      changelist: null,
+    }));
+    vi.mocked(runStatus).mockResolvedValue({ targetPath: '.', entries, externals: [] });
+    const panel = await openPanelAndWait(join(wcRoot, 'a.txt'), 'f119.txt');
+    let commitCount = 0;
+    vi.mocked(runOrThrow).mockImplementation(async (_svn, args) => {
+      if (args[0] === 'commit') {
+        commitCount += 1;
+        if (commitCount === 1) {
+          return { stdout: 'Committed revision 31.', stderr: '', exitCode: 0 };
+        }
+        throw new SvnError({ message: 'svn commit 超时', command: args, code: 'TIMEOUT' });
+      }
+      return { stdout: '', stderr: '', exitCode: 0 };
+    });
+    panel.sendIntent({ kind: 'syncInput', fieldId: 'message', value: '部分成功后核实', inputRevision: 1 }, 'in-pu');
+    panel.sendIntent({ kind: 'submit' }, 'sub-pu');
+    await vi.waitFor(() => {
+      const unknownRender = [...panel.posted].reverse().find((m) => m.type === 'render' && String(m.html ?? '').includes('提交结果未知'));
+      expect(unknownRender).toBeDefined();
+    });
+    // 核实时本地显式路径全部干净（第二批可能实际未提交而被人工还原）。
+    vi.mocked(runStatus).mockResolvedValue({ targetPath: '.', entries: [], externals: [] });
+    panel.sendIntent({ kind: 'resolveUnknown' }, 'verify-pu');
+    await vi.waitFor(() => {
+      const toast = [...panel.posted].reverse().find((m) => m.type === 'toast' && String(m.message ?? '').includes('已核实提交成功'));
+      expect(toast).toBeDefined();
+    });
+    const verifiedHtml = String([...panel.posted].reverse().find((m) => m.type === 'render' && String(m.html ?? '').includes('success-card'))?.html);
+    // 已提交集合 = 记录中逐批确认的第一批 100 项（f000–f099），不含第二批。
+    expect(verifiedHtml).toContain('已提交 100 项');
+    expect(verifiedHtml).toContain('r31');
+    expect(verifiedHtml).not.toContain('已提交 120 项');
+    expect(verifiedHtml).not.toContain('f119.txt');
+  });
+});
+
+describe('P1 提交面板 行内操作与会话销毁', () => {
+  it('行内还原确认框挂起期间面板被 dispose：不抛异常，已确认的还原仍执行', async () => {
+    const panel = await openPanelAndWait(join(wcRoot, 'a.txt'), 'a.txt');
+    let releaseConfirm!: (value: string | undefined) => void;
+    vscodeMock.confirmImpl = () => new Promise((resolve) => { releaseConfirm = resolve; });
+    vscodeMock.quickPickChoice = strings.panel.actRevert;
+    panel.sendIntent({ kind: 'rowMore', itemId: 'a.txt' }, 'more-dispose');
+    // 等确认框挂起（还原确认已弹出，流程停在 await 上）。
+    await vi.waitFor(() => expect(vscodeMock.warning.length).toBeGreaterThan(0));
+    panel.dispose();
+    releaseConfirm(strings.commit.continueButton);
+    // 会话已销毁也不得在登记处抛 TypeError：已确认的还原照常执行并结束登记。
+    await vi.waitFor(() => {
+      expect(vi.mocked(runOrThrow).mock.calls.some(([, args]) => args[0] === 'revert')).toBe(true);
+    });
+  });
+});
+
+describe('P1 提交面板 收口解码', () => {
+  it('propget 解码全失败：svnCli 收口在提交频道出现「编码回退失败」标注（无面板旁路解码）', async () => {
+    const lab = mkdtempSync(join(tmpdir(), 'svn-anywhere-decode-'));
+    try {
+      // 假 svn：propget 输出无法被 UTF-8/gbk/gb2312/big5 严格解码的字节序列。
+      // 面板读 svn:ignore 走 svnCli 收口（run），解码与宽松兜底标注都发生在
+      // 收口处，面板文件不做任何旁路解码。
+      const fakeSvn = join(lab, 'svn-fake.sh');
+      writeFileSync(fakeSvn, [
+        '#!/bin/sh',
+        "printf '\\303(\\303(\\n'",
+        '',
+      ].join('\n'), { mode: 0o755 });
+      vscodeMock.config = { svnPath: fakeSvn };
+      mkdirSync(join(wcRoot, 'udir'), { recursive: true });
+      vi.mocked(runStatus).mockResolvedValue({
+        targetPath: '.',
+        entries: [
+          { path: 'a.txt', wcStatus: 'modified', props: 'none', changelist: null },
+          { path: 'udir', wcStatus: 'unversioned', props: 'none', changelist: null },
+        ],
+        externals: [],
+      });
+      await openPanelAndWait(join(wcRoot, 'a.txt'), 'udir');
+      const lines = channelLines().join('\n');
+      expect(lines).toContain('编码回退失败');
+      expect(lines).toContain('已按 UTF-8 宽松解码');
+    } finally {
+      rmSync(lab, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('P1 提交面板 enrichMetas 异步化竞态守卫', () => {
+  /** 假 svn：propget 时累加计数文件并挂起 0.8 秒（其余命令立即成功）。 */
+  function writeSlowPropgetSvn(lab: string): string {
+    const fakeSvn = join(lab, 'svn-fake.sh');
+    const counter = join(lab, 'propget-count');
+    writeFileSync(fakeSvn, [
+      '#!/bin/sh',
+      'if [ "$1" = "propget" ]; then',
+      `  n=$(cat "${counter}" 2>/dev/null || echo 0)`,
+      '  n=$((n+1))',
+      `  echo "$n" > "${counter}"`,
+      '  sleep 0.8',
+      'fi',
+      'exit 0',
+      '',
+    ].join('\n'), { mode: 0o755 });
+    return fakeSvn;
+  }
+
+  function propgetCount(lab: string): number {
+    const counter = join(lab, 'propget-count');
+    try {
+      return Number.parseInt(readFileSync(counter, 'utf8').trim() || '0', 10) || 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /** 第二个工作副本（独立根，切换目标/重开面板时落到不同会话）。 */
+  function makeSecondWc(): string {
+    const wcRoot2 = realpathSync(mkdtempSync(join(tmpdir(), 'svn-anywhere-commitflow-')));
+    mkdirSync(join(wcRoot2, '.svn'), { recursive: true });
+    writeFileSync(join(wcRoot2, '.svn', 'wc.db'), 'fake');
+    writeFileSync(join(wcRoot2, 'b.txt'), 'x');
+    return wcRoot2;
+  }
+
+  const unversionedEntries = [
+    { path: 'a.txt', wcStatus: 'modified', props: 'none', changelist: null },
+    { path: 'udir', wcStatus: 'unversioned', props: 'none', changelist: null },
+  ];
+
+  it('loadSession 的 enrichMetas 挂起期间销毁面板并重开新目标：旧加载恢复后不污染新会话', async () => {
+    const lab = mkdtempSync(join(tmpdir(), 'svn-anywhere-race-'));
+    const wcRoot2 = makeSecondWc();
+    try {
+      vscodeMock.config = { svnPath: writeSlowPropgetSvn(lab) };
+      mkdirSync(join(wcRoot, 'udir'), { recursive: true });
+      vi.mocked(runStatus)
+        .mockResolvedValueOnce({ targetPath: '.', entries: unversionedEntries, externals: [] })
+        .mockResolvedValue({
+          targetPath: '.',
+          entries: [{ path: 'b.txt', wcStatus: 'modified', props: 'none', changelist: null }],
+          externals: [],
+        });
+      // 打开面板 A（不等待完成）：loadSession 在 udir 的 propget 上挂起。
+      void commandCommit(makeUri(join(wcRoot, 'a.txt')));
+      await vi.waitFor(() => {
+        expect(vscodeMock.panels.length).toBeGreaterThan(0);
+      });
+      const panelA = lastPanel();
+      // 等第一次 propget 已发出（挂起中）再销毁面板，避免 dispose 早于挂起点。
+      await vi.waitFor(() => {
+        expect(propgetCount(lab)).toBeGreaterThanOrEqual(1);
+      });
+      panelA.dispose();
+      // 重开新目标：新会话 B 建立（wcRoot2/b.txt 就绪）。
+      await commandCommit(makeUri(join(wcRoot2, 'b.txt')));
+      const panelB = lastPanel();
+      expect(panelB).not.toBe(panelA);
+      await vi.waitFor(() => {
+        const ready = [...panelB.posted].reverse().find((m) => m.type === 'render' && String(m.html ?? '').includes('b.txt'));
+        expect(ready).toBeDefined();
+      });
+      // 等 A 的 propget（0.8 秒）结束恢复：旧目标的迟到数据不得写进新会话或向新面板推帧。
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      const staleRender = [...panelB.posted].find((m) => m.type === 'render' && String(m.html ?? '').includes('a.txt'));
+      expect(staleRender).toBeUndefined();
+      const latest = String([...panelB.posted].reverse().find((m) => m.type === 'render')?.html);
+      expect(latest).toContain('b.txt');
+    } finally {
+      rmSync(wcRoot2, { recursive: true, force: true });
+      rmSync(lab, { recursive: true, force: true });
+    }
+  });
+
+  it('提交前重读的 enrichMetas 挂起期间销毁面板并重开：旧提交流程恢复后不写新会话、不发起提交', async () => {
+    const lab = mkdtempSync(join(tmpdir(), 'svn-anywhere-race-'));
+    const wcRoot2 = makeSecondWc();
+    try {
+      vscodeMock.config = { svnPath: writeSlowPropgetSvn(lab), remoteCheckBeforeCommit: false };
+      mkdirSync(join(wcRoot, 'udir'), { recursive: true });
+      vi.mocked(runStatus)
+        .mockResolvedValueOnce({ targetPath: '.', entries: unversionedEntries, externals: [] })
+        .mockResolvedValueOnce({ targetPath: '.', entries: unversionedEntries, externals: [] })
+        .mockResolvedValue({
+          targetPath: '.',
+          entries: [{ path: 'b.txt', wcStatus: 'modified', props: 'none', changelist: null }],
+          externals: [],
+        });
+      // 打开面板 A 并等就绪（第一次 propget 挂起计入计数）。
+      const panelA = await openPanelAndWait(join(wcRoot, 'a.txt'), 'a.txt');
+      panelA.sendIntent({ kind: 'syncInput', fieldId: 'message', value: '竞态守卫', inputRevision: 1 }, 'in-race');
+      panelA.sendIntent({ kind: 'submit' }, 'sub-race');
+      // 等提交前重读后的第二次 propget 已发出（performCommit 挂起中）。
+      await vi.waitFor(() => {
+        expect(propgetCount(lab)).toBeGreaterThanOrEqual(2);
+      });
+      panelA.dispose();
+      // 销毁后重开新目标：新会话 B 建立（wcRoot2/b.txt 就绪）。
+      await commandCommit(makeUri(join(wcRoot2, 'b.txt')));
+      const panelB = lastPanel();
+      expect(panelB).not.toBe(panelA);
+      await vi.waitFor(() => {
+        const ready = [...panelB.posted].reverse().find((m) => m.type === 'render' && String(m.html ?? '').includes('b.txt'));
+        expect(ready).toBeDefined();
+      });
+      // 等挂起的 propget（0.8 秒）结束恢复：旧会话的提交流程不得写新会话、
+      // 不得向新面板推旧目标帧、也不得继续发起 svn commit。
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      const staleRender = [...panelB.posted].find((m) => m.type === 'render' && String(m.html ?? '').includes('a.txt'));
+      expect(staleRender).toBeUndefined();
+      const latest = String([...panelB.posted].reverse().find((m) => m.type === 'render')?.html);
+      expect(latest).toContain('b.txt');
+      expect(commitCalls().length).toBe(0);
+    } finally {
+      rmSync(wcRoot2, { recursive: true, force: true });
+      rmSync(lab, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('P1 提交面板 操作登记序列化', () => {
+  it('多目标会话的操作登记 targetRelPath 用 JSON 数组（路径含逗号无歧义）', async () => {
+    writeFileSync(join(wcRoot, 'b.txt'), 'x');
+    writeFileSync(join(wcRoot, 'c,d.txt'), 'x');
+    vi.mocked(runStatus).mockResolvedValue({
+      targetPath: '.',
+      entries: [
+        { path: 'b.txt', wcStatus: 'modified', props: 'none', changelist: null },
+        { path: 'c,d.txt', wcStatus: 'modified', props: 'none', changelist: null },
+      ],
+      externals: [],
+    });
+    const saved: OperationRecord[] = [];
+    const registry = new OperationRegistry({
+      load: () => [],
+      save: (record) => { saved.push(record); },
+      remove: () => undefined,
+    });
+    setOperationRegistryForTest(registry);
+    await commandCommit(
+      makeUri(join(wcRoot, 'b.txt')),
+      [makeUri(join(wcRoot, 'b.txt')), makeUri(join(wcRoot, 'c,d.txt'))],
+    );
+    const panel = lastPanel();
+    await vi.waitFor(() => {
+      const dataRender = [...panel.posted].reverse().find((m) => m.type === 'render' && String(m.html ?? '').includes('c,d.txt'));
+      expect(dataRender).toBeDefined();
+    });
+    panel.sendIntent({ kind: 'syncInput', fieldId: 'message', value: '登记序列化', inputRevision: 1 }, 'in-json');
+    panel.sendIntent({ kind: 'submit' }, 'sub-json');
+    await vi.waitFor(() => expect(commitCalls().length).toBeGreaterThan(0));
+    // 提交登记：多目标整体为 JSON 数组字符串，含逗号路径不产生拼接歧义。
+    expect(saved[0]?.targetRelPath).toBe(JSON.stringify(['b.txt', 'c,d.txt']));
+    expect(saved[0]?.targetRelPath).not.toBe('b.txt,c,d.txt');
   });
 });

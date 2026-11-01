@@ -109,6 +109,11 @@ describe('svnCli 收口解码（真实子进程）', () => {
     });
     expect(gbkResult.stdout).toBe('中文');
 
+    // 不传 encodingFallback：同样走 DEFAULT_ENCODING_FALLBACK 默认回退链
+    // （锁定 RunOptions 注释所述「未传时默认回退」的行为契约）。
+    const defaultFallbackResult = await run('/bin/sh', ['-c', 'printf \'\\xd6\\xd0\\xce\\xc4\'']);
+    expect(defaultFallbackResult.stdout).toBe('中文');
+
     // 全部候选失败：宽恕解码 + onDecodingFallback 回调（标注写入哪个流）。
     const notices: Array<{ source: 'stdout' | 'stderr'; primary: string }> = [];
     const lenientResult = await run('/bin/sh', ['-c', 'printf \'\\xfe\\xfe\\xfe\' >&2; printf \'\\xfe\\xfe\\xfe\''], {

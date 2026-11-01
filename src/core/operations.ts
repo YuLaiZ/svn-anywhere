@@ -48,6 +48,9 @@ export interface OperationRecord {
   property?: PropertyRecord;
   /** P1 批次与显式路径。 */
   explicitPaths?: string[];
+  /** 拆批提交中已确认成功的路径（每批追加，与 knownRevisions 同步落盘）：
+   * 结果未知核实「已提交」时据此精确回显，不随全量显式路径夸大。 */
+  committedPaths?: string[];
   phase: OperationPhase;
   /** 隔离提交用的临时副本位置；临时副本登记为原操作的资源。 */
   tempWcPath?: string;
@@ -159,7 +162,7 @@ export class OperationRegistry {
   async markPhase(
     operationId: string,
     phase: OperationPhase,
-    patch: Partial<Pick<OperationRecord, 'knownRevisions' | 'tempWcPath' | 'baseRevision'>> = {},
+    patch: Partial<Pick<OperationRecord, 'knownRevisions' | 'tempWcPath' | 'baseRevision' | 'committedPaths'>> = {},
     now?: number,
   ): Promise<OperationRecord | undefined> {
     const record = this.records.get(operationId);

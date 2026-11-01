@@ -45,10 +45,10 @@ function session(patch: Partial<IgnoreSessionState> = {}): IgnoreSessionState {
 }
 
 describe('P2 四层值比较', () => {
-  it('dirty：清空列表与未修改不同（属性存在性参与比较）', () => {
+  it('dirty：清空列表与未修改不同（规则列表维度比较）', () => {
     expect(dirtyOf(session())).toBe(false);
     expect(dirtyOf(session({ rules: ['*.log', 'build', '.idea'] }))).toBe(true);
-    // 清空：rules=[] 且基线存在 → dirty。
+    // 清空：rules=[] 且基线非空 → dirty。
     expect(dirtyOf(session({ rules: [] }))).toBe(true);
     // 基线本来就没有属性、列表也为空 → 不 dirty。
     expect(dirtyOf(session({
@@ -56,6 +56,33 @@ describe('P2 四层值比较', () => {
       savedRules: [],
       savedPropertyExists: false,
     }))).toBe(false);
+  });
+
+  it('空属性加载即不 dirty：基线形态「存在但为空」与「不存在」对编辑等价', () => {
+    const emptyProperty = session({
+      rules: [],
+      savedRules: [],
+      savedPropertyExists: true,
+      workingSnapshot: { rules: [], exists: true },
+      repositoryRules: [],
+      repositoryPropertyExists: true,
+    });
+    expect(dirtyOf(emptyProperty)).toBe(false);
+    expect(hasUnsavedDraft(emptyProperty)).toBe(false);
+    // 渲染态：保存禁用、无「保存将删除属性」误导摘要，空态按未设置呈现。
+    const state = buildIgnorePanelState(emptyProperty);
+    expect(state.footer?.secondary?.find((a) => a.id === 'saveIgnore')?.disabled).toBe(true);
+    expect(state.footer?.summary).toBe('规则列表无修改');
+    expect(state.footer?.summary).not.toBe('保存将删除 svn:ignore 属性');
+    expect(state.ignoreEditor?.empty.title).toBe('此目录未设置 svn:ignore');
+  });
+
+  it('非空清空后仍 dirty：渲染「保存将删除属性」且保存可用', () => {
+    const cleared = session({ rules: [] });
+    expect(dirtyOf(cleared)).toBe(true);
+    const state = buildIgnorePanelState(cleared);
+    expect(state.footer?.secondary?.find((a) => a.id === 'saveIgnore')?.disabled).toBe(false);
+    expect(state.footer?.summary).toBe('保存将删除 svn:ignore 属性');
   });
 
   it('localModified：保存基线与 BASE 比较（外部改动只更新实际快照，不写 BASE）', () => {

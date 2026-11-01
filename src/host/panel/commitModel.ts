@@ -32,6 +32,8 @@ export const CHANGELIST_UNASSIGNED = 'unassigned';
 export const CHANGELIST_VALUE_PREFIX = 'name:';
 /** 状态筛选的属性伪值（svn 没有 props 状态词，不会与原词冲突）。 */
 export const STATUS_PROPS = 'props';
+/** 未版本控制目录递归枚举的防御上限（超出部分不进面板，避免巨型目录卡死）。 */
+export const UNVERSIONED_ENUM_LIMIT = 500;
 
 export interface CommitEntryMeta {
   /** 相对副本根的原始路径（含首尾空格），同时是条目 ID 与提交目标身份。 */
@@ -80,6 +82,8 @@ export interface CommitSessionState {
   remoteIncluded: boolean;
   /** externals 边界目录（相对副本根）：其内部条目按副本边界隔离，不进面板。 */
   externalPrefixes: string[];
+  /** 本次数据的未版本控制子项枚举达到防御上限（其余未显示，横幅提示）。 */
+  unversionedTruncated: boolean;
 }
 
 /* ------------------------- 分组与默认选择规则 ------------------------- */
@@ -687,6 +691,13 @@ function buildBanners(
     });
   }
   const missingSelected = selectedMetas.filter((meta) => meta.wcStatus === 'missing');
+  if (session.unversionedTruncated) {
+    banners.push({
+      id: 'unversionedTruncated',
+      level: 'warn',
+      title: format(strings.panel.unversionedEnumTruncated, { limit: String(UNVERSIONED_ENUM_LIMIT) }),
+    });
+  }
   if (missingSelected.length > 0) {
     banners.push({
       id: 'missing',

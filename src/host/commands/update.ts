@@ -223,10 +223,18 @@ async function executeUpdate(
   );
 
   // 明细行已随流式输出进频道，这里补最终 revision 与冲突汇总。
+  // 多目标更新按目标分段输出 revision：全部相同展示单值，不同则逐个列出。
+  const uniqueRevisions = [
+    ...new Set(result.finalRevisions ?? (result.finalRevision === undefined ? [] : [result.finalRevision])),
+  ];
   logLine(
-    result.finalRevision === undefined
+    uniqueRevisions.length === 0
       ? strings.update.doneNoRevision
-      : format(strings.update.done, { revision: String(result.finalRevision) }),
+      : uniqueRevisions.length === 1
+        ? format(strings.update.done, { revision: String(uniqueRevisions[0]) })
+        : format(strings.update.doneRevisions, {
+            revisions: uniqueRevisions.map(String).join('、'),
+          }),
     'update',
   );
   showOutput(false, 'update');
@@ -292,12 +300,25 @@ async function openConflictFiles(wcRoot: string, conflicts: string[]): Promise<v
   const absPath = join(wcRoot, relPath);
   const uri = vscode.Uri.file(absPath);
   let stat: vscode.FileStat | undefined;
+  let statFailure: { code?: string; message?: string } | undefined;
   try {
     stat = await vscode.workspace.fs.stat(uri);
-  } catch {
+  } catch (err) {
     stat = undefined;
+    statFailure = err as { code?: string; message?: string };
   }
   if (!stat) {
+    // 按 FileSystemError.code 区分：仅 FileNotFound 判「本地文件不存在」；
+    // 权限（NoPermissions）等其他失败照实提示，不得误述为文件缺失。
+    if (statFailure && statFailure.code !== 'FileNotFound') {
+      void vscode.window.showInformationMessage(
+        format(strings.update.conflictInaccessibleLocal, {
+          path: relPath,
+          message: statFailure.message ?? String(statFailure),
+        }),
+      );
+      return;
+    }
     void vscode.window.showInformationMessage(
       format(strings.update.conflictMissingLocal, { path: relPath }),
     );

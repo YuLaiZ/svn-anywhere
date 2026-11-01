@@ -212,7 +212,8 @@ function handleFor(entry: PanelEntry): PanelHandle {
     },
     switchSession() {
       if (entry.disposed) {
-        return newSessionId();
+        // 面板已销毁：与忙碌分支一致返回 undefined，调用方能区分「切换成功」与「面板已死」。
+        return undefined;
       }
       if (entry.state?.busy) {
         return undefined;
@@ -358,10 +359,10 @@ function intentRequiresItem(intent: Intent): intent is Intent & { itemId: string
 /** 测试辅助：重置面板注册表（真实宿主不需要）。 */
 export function resetPanelRegistry(): void {
   for (const [panelId, entry] of panels) {
+    // disposeEntry 只做宿主侧清理并置 disposed（其后再判 !disposed 恒假），
+    // panel 本体必须在此显式关闭；重复 dispose 幂等无副作用。
     disposeEntry(entry, panelId);
-    if (!entry.disposed) {
-      entry.panel.dispose();
-    }
+    entry.panel.dispose();
   }
   panels.clear();
 }

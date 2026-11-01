@@ -72,12 +72,13 @@ export function hasUnsavedDraft(session: IgnoreSessionState): boolean {
   return dirtyOf(session) || session.draft.length > 0;
 }
 
-/** 草稿与保存基线比较（含属性存在性：清空列表 ≠ 未修改）。 */
+/** 草稿与保存基线比较（规则列表维度）。
+ *  「属性存在但值为空」与「属性不存在」作为基线形态对编辑等价（保存路径
+ *  把空列表归一为删除属性），dirty 只看规则列表是否被实际改动：从非空
+ *  清空时列表不等仍为 dirty；空属性加载（双方都空）不 dirty。 */
 export function dirtyOf(session: IgnoreSessionState): boolean {
-  return !snapshotEqual(
-    { rules: session.rules, exists: session.rules.length > 0 },
-    { rules: session.savedRules, exists: session.savedPropertyExists },
-  );
+  return session.rules.length !== session.savedRules.length
+    || session.rules.some((rule, index) => rule !== session.savedRules[index]);
 }
 
 /** 保存基线与仓库 BASE 比较（本地待提交修改）。 */
