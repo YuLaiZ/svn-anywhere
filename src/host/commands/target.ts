@@ -47,43 +47,50 @@ export async function resolveWorkingCopyTarget(
 }
 
 /**
- * 解析资源管理器多选选区：先做嵌套路径去重（只保留最外层），再按命中的
- * 工作副本分组。不在工作副本内的路径跳过并提示；全部无效时返回空数组，
- * 调用方应直接返回。定位留痕按组写入 kind 频道。
+ * 解析资源管理器多选选区：先按各路径命中的工作副本分组，再在组内做嵌套
+ * 路径去重（只保留最外层）。顺序不能反过来：独立嵌套副本在字符串上是
+ * 外层副本的内层路径，但外层 status 中它是 unversioned、外层 update/
+ * commit 均不作用于它（svn 1.15 实测），纯字符串去重会把该副本的路径
+ * 静默吞掉、丢失操作意图；按副本分组后它自成一组，各组独立执行。
+ * 不在工作副本内的路径跳过并提示；全部无效时返回空数组，调用方应直接
+ * 返回。定位留痕按组写入 kind 频道。
  */
 export function resolveBatchTargetGroups(
   uris: readonly vscode.Uri[],
   commandLabel: string,
   kind: OutputKind = 'other',
 ): WcTargetGroup[] {
-  const deduped = dedupeNestedPaths(uris.map((uri) => uri.fsPath));
-  const groups: WcTargetGroup[] = [];
+  const grouped = new Map<string, string[]>();
   let skipped = false;
-  for (const fsPath of deduped) {
-    const wcRoot = findWorkingCopy(fsPath);
+  for (const uri of uris) {
+    const wcRoot = findWorkingCopy(uri.fsPath);
     if (!wcRoot) {
       skipped = true;
       continue;
     }
-    const group = groups.find((item) => item.wcRoot === wcRoot);
-    if (group) {
-      group.targetPaths.push(fsPath);
+    const paths = grouped.get(wcRoot);
+    if (paths) {
+      paths.push(uri.fsPath);
     } else {
-      groups.push({ wcRoot, targetPaths: [fsPath] });
+      grouped.set(wcRoot, [uri.fsPath]);
     }
   }
   if (skipped) {
     void vscode.window.showInformationMessage(strings.error.notWorkingCopy);
   }
-  for (const group of groups) {
+  const groups: WcTargetGroup[] = [];
+  for (const [wcRoot, paths] of grouped) {
+    // 组内路径同属一个副本：外层目标确实覆盖内层目标，此时嵌套去重安全。
+    const targetPaths = dedupeNestedPaths(paths);
     logLine(
       format(strings.target.resolved, {
         command: commandLabel,
-        target: group.targetPaths.join('、'),
-        wcRoot: group.wcRoot,
+        target: targetPaths.join('、'),
+        wcRoot,
       }),
       kind,
     );
+    groups.push({ wcRoot, targetPaths });
   }
   return groups;
 }

@@ -2268,6 +2268,58 @@ async function main() {
   check('嵌套选区去重后为单目标（不显示多目标标签），面板正常打开',
     !!dedupRender && !dedupRender.html.includes('2 个目标'));
 
+  console.log('场景 53：跨副本嵌套选区——独立嵌套副本不被字符串去重吞掉，更新两组执行、提交提示分开');
+  const lab53 = makeSvnLab();
+  const base53 = lab53.checkout('base53');
+  writeFileSync(join(base53, 'a.txt'), 'v1\n');
+  svn(['add', '-q', '--parents', 'a.txt'], base53);
+  svn(['commit', '-q', '-m', 'init'], base53);
+  // 在外层副本内部 checkout 独立嵌套副本：外层 status 中它是 unversioned，
+  // 外层 update/commit 均不作用于它（svn 1.15 实测），不能被字符串去重吞掉。
+  const nested53 = join(base53, 'nested-wc');
+  svn(['checkout', '-q', lab53.repoUrl, nested53]);
+  const other53 = lab53.checkout('other53');
+  writeFileSync(join(other53, 'a.txt'), 'v2\n');
+  svn(['commit', '-q', '-m', 'remote change'], other53);
+  const head53 = Number(svn(['info', '--show-item', 'revision', lab53.repoUrl]).trim());
+  const uri53 = (p) => ({ fsPath: p, scheme: 'file' });
+  state.confirmResult = '更新';
+  state.inputQueue = ['HEAD'];
+  const warningBefore53 = state.warning.length;
+  const linesBefore53 = channelText().length;
+  // 多选外层副本根 + 嵌套独立副本：字符串上嵌套但分属两个工作副本。
+  await state.registered.get('svnAnywhere.update')(
+    uri53(base53),
+    [uri53(base53), uri53(nested53)],
+  );
+  const confirmMsg53 = state.warning[warningBefore53] ?? '';
+  check('确认框同时列出外层与嵌套副本目标（操作意图不丢失）',
+    confirmMsg53.includes(base53) && confirmMsg53.includes(nested53),
+    confirmMsg53);
+  const out53 = channelText().slice(linesBefore53);
+  check('两个副本各自执行一次 update（两条命令回显）',
+    (out53.match(/> svn update --non-interactive -r HEAD \./g) || []).length === 2,
+    out53.slice(-500));
+  check('外层与嵌套副本 revision 都到 HEAD（修复前嵌套被吞、revision 停留）',
+    Number(svn(['info', '--show-item', 'revision', '.'], base53).trim()) === head53 &&
+    Number(svn(['info', '--show-item', 'revision', '.'], nested53).trim()) === head53,
+    `base=${svn(['info', '--show-item', 'revision', '.'], base53).trim()} nested=${svn(['info', '--show-item', 'revision', '.'], nested53).trim()} head=${head53}`);
+  check('外层内容更新到远端版本', readFileSync(join(base53, 'a.txt'), 'utf8') === 'v2\n');
+  state.confirmResult = undefined;
+  state.inputQueue = [];
+  // 提交侧：跨副本嵌套选区不再静默只剩外层目标，而是明确提示分开执行。
+  writeFileSync(join(base53, 'a.txt'), 'v3\n');
+  writeFileSync(join(nested53, 'a.txt'), 'v3\n');
+  const infoBefore53b = state.information.length;
+  await state.registered.get('svnAnywhere.commit')(
+    uri53(join(base53, 'a.txt')),
+    [uri53(join(base53, 'a.txt')), uri53(nested53)],
+  );
+  check('跨副本多选提交被拒绝并提示同一工作副本要求（嵌套副本不被静默吞掉）',
+    state.information.slice(infoBefore53b).some((m) => m.includes('同一个工作副本')),
+    JSON.stringify(state.information.slice(infoBefore53b)));
+  rmSync(lab53.lab, { recursive: true, force: true });
+
   rmSync(igLab.lab, { recursive: true, force: true });
 
   rmSync(panelLab.lab, { recursive: true, force: true });

@@ -72,6 +72,7 @@ vi.mock('vscode', () => ({
 }));
 
 import { commandAdd } from '../src/host/commands/add';
+import { resolveBatchTargetGroups } from '../src/host/commands/target';
 import { commandDelete } from '../src/host/commands/delete';
 import { commandRevert } from '../src/host/commands/revert';
 import { commandMove } from '../src/host/commands/move';
@@ -367,5 +368,64 @@ describe('commandReveal（在 Finder 中显示）', () => {
   it('无 uri 且无本地文件编辑器：静默返回', async () => {
     await commandReveal(undefined);
     expect(vscodeMock.executedCommands).toHaveLength(0);
+  });
+});
+
+describe('resolveBatchTargetGroups（多选选区分组与去重）', () => {
+  // 独立实验场：外层副本 + 其内部 checkout 的独立嵌套副本（外层 status 中
+  // 为 unversioned，外层 update/commit 均不作用于嵌套副本——svn 1.15 实测）。
+  const labGroups = createSvnLab('svn-anywhere-batchgroup-');
+  const outer = labGroups.checkout('outer');
+  const nestedWc = join(outer, 'nested-wc');
+  execFileSync('svn', ['checkout', '-q', labGroups.repoUrl, nestedWc]);
+  afterAll(() => {
+    labGroups.cleanup();
+  });
+
+  it('同一副本内的嵌套选区：去重只保留最外层，一组多目标', () => {
+    const groups = resolveBatchTargetGroups(
+      [makeUri(join(outer, 'd1/a.txt')), makeUri(join(outer, 'd1')), makeUri(join(outer, 'd2'))],
+      strings.command.update,
+      'update',
+    );
+    expect(groups).toEqual([
+      { wcRoot: outer, targetPaths: [join(outer, 'd1'), join(outer, 'd2')] },
+    ]);
+  });
+
+  it('跨副本嵌套选区：独立嵌套副本不被字符串去重吞掉，自成一组', () => {
+    const groups = resolveBatchTargetGroups(
+      [makeUri(outer), makeUri(nestedWc)],
+      strings.command.update,
+      'update',
+    );
+    expect(groups).toEqual([
+      { wcRoot: outer, targetPaths: [outer] },
+      { wcRoot: nestedWc, targetPaths: [nestedWc] },
+    ]);
+  });
+
+  it('嵌套副本内的深层路径归嵌套组（findWorkingCopy 命中最近副本）', () => {
+    const groups = resolveBatchTargetGroups(
+      [makeUri(outer), makeUri(join(nestedWc, 'sub/f.txt'))],
+      strings.command.commit,
+      'commit',
+    );
+    expect(groups).toHaveLength(2);
+    expect(groups[1]).toEqual({ wcRoot: nestedWc, targetPaths: [join(nestedWc, 'sub/f.txt')] });
+  });
+
+  it('非副本路径跳过并提示；两组各写一条定位留痕', () => {
+    const infoBefore = vscodeMock.information.length;
+    const groups = resolveBatchTargetGroups(
+      [makeUri(join(outer, 'd1')), makeUri('/definitely/not/exist/path')],
+      strings.command.update,
+      'update',
+    );
+    expect(groups).toEqual([{ wcRoot: outer, targetPaths: [join(outer, 'd1')] }]);
+    expect(vscodeMock.information.slice(infoBefore)).toEqual([strings.error.notWorkingCopy]);
+    // 定位留痕写入传入 kind 的频道（与命令的输出频道一致）。
+    const updateChannel = getOutputChannel('update') as unknown as { lines: string[] };
+    expect(updateChannel?.lines.join('\n')).toContain(`[定位] 更新：目标 ${join(outer, 'd1')}`);
   });
 });

@@ -68,6 +68,10 @@ export function escapePeg(path: string): string {
  * 只保留最外层；重复路径只保留一份。返回顺序与输入一致。
  * 输入是本地文件系统绝对路径（VSCode 选区 Uri 的 fsPath），去除末尾
  * 分隔符仅用于包含判定，不影响返回的原值。
+ *
+ * 调用契约：仅对已确认属于同一工作副本的路径集合使用（外层目标在
+ * SVN 语义上覆盖内层目标）。独立嵌套副本与外层路径字符串上也嵌套，
+ * 但分属不同副本，不能用本函数跨副本去重——调用方须先按副本分组。
  */
 export function dedupeNestedPaths(paths: string[]): string[] {
   // 去重 + 保持顺序的包含判定基元：末尾分隔符不影响祖先关系。
