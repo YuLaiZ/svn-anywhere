@@ -145,6 +145,29 @@ describe('事件委托 → 意图', () => {
     app.dispose();
   });
 
+  it('点击未知横幅的核实按钮发送 bannerAction（重启恢复的真实按钮路径）', () => {
+    const { app, sent } = setup({
+      writeLocked: true,
+      banners: [{
+        id: 'unknown',
+        level: 'warn',
+        title: '提交结果未知',
+        actions: [{ id: 'resolveUnknown', label: '核实提交结果' }],
+      }],
+    });
+    const button = document.querySelector<HTMLButtonElement>(
+      '[data-intent="bannerAction"][data-action-id="resolveUnknown"]',
+    );
+    expect(button).not.toBeNull();
+    button?.click();
+    expect(lastIntent(sent)?.intent).toEqual({
+      kind: 'bannerAction',
+      bannerId: 'unknown',
+      actionId: 'resolveUnknown',
+    });
+    app.dispose();
+  });
+
   it('筛选空态的清除筛选按钮发送 clearFilters', () => {
     const { app } = setup({ list: undefined });
     // 手动渲染筛选空态（绕过宿主）：直接调用 render 更贴近视图职责边界。
@@ -253,6 +276,62 @@ describe('输入同步与状态保持', () => {
     app.dispose();
   });
 
+  it('视图重建（viewEpoch 递增）后确认空间重置：旧代大序号不回退新视图连续输入', () => {
+    // 旧视图时代宿主累计了较大确认序号（如 100）；webview 重建后视图是全新
+    // 上下文（本用例即新挂载实例），宿主 ready 归零 formRevision 并递增代次。
+    document.body.innerHTML = '<div id="app"></div>';
+    const { api, sent } = makeApi();
+    const app = mountPanel(document, api);
+    const restored = stateOf();
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's1', revision: 1,
+      formRevision: 0, viewEpoch: 1, html: render(restored),
+    });
+    // 新视图连续输入 abcd（rev 1）、abcde（rev 2），序号从零重启。
+    const area = document.querySelector<HTMLTextAreaElement>('[data-field-id="message"]')!;
+    area.value = 'abcd';
+    area.dispatchEvent(new Event('input', { bubbles: true }));
+    area.value = 'abcde';
+    area.dispatchEvent(new Event('input', { bubbles: true }));
+    const intents = sent.filter((m) => (m as { type?: string }).type === 'intent') as Array<{ intent: Record<string, unknown> }>;
+    expect(intents.map((m) => m.intent.inputRevision)).toEqual([1, 2]);
+    // 宿主先回推较早输入 abcd 的回显帧（formRevision 已归零后按新序号对齐）：
+    // 较新的 abcde 仍是待确认输入，不被该帧回退。
+    const echoedAbcd = stateOf();
+    echoedAbcd.form!.fields[0].value = 'abcd';
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's1', revision: 2,
+      formRevision: 1, viewEpoch: 1, html: render(echoedAbcd),
+    });
+    expect(document.querySelector<HTMLTextAreaElement>('[data-field-id="message"]')!.value).toBe('abcde');
+    // 最新输入的回显帧（formRevision=2）到达后正常收敛。
+    const echoedAbcde = stateOf();
+    echoedAbcde.form!.fields[0].value = 'abcde';
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's1', revision: 3,
+      formRevision: 2, viewEpoch: 1, html: render(echoedAbcde),
+    });
+    expect(document.querySelector<HTMLTextAreaElement>('[data-field-id="message"]')!.value).toBe('abcde');
+    app.dispose();
+  });
+
+  it('视图代次递增的帧清空未确认输入：帧内值直接生效', () => {
+    const { app, sent } = setup();
+    const area = document.querySelector<HTMLTextAreaElement>('[data-field-id="message"]')!;
+    area.value = '旧视图待确认';
+    area.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(sent.filter((m) => (m as { type?: string }).type === 'intent').length).toBe(1);
+    // 新代次帧到达（宿主重建握手）：旧代的待确认输入不再受保护，帧值生效。
+    const nextEpoch = stateOf();
+    nextEpoch.form!.fields[0].value = '新代次宿主值';
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's1', revision: 2,
+      formRevision: 0, viewEpoch: 1, html: render(nextEpoch),
+    });
+    expect(document.querySelector<HTMLTextAreaElement>('[data-field-id="message"]')!.value).toBe('新代次宿主值');
+    app.dispose();
+  });
+
   it('组合输入期间点击不触发意图；compositionend 同步最终值', () => {
     const { app, sent } = setup();
     const area = document.querySelector<HTMLTextAreaElement>('[data-field-id="message"]')!;
@@ -264,6 +343,78 @@ describe('输入同步与状态保持', () => {
     area.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true }));
     const intent = lastIntent(sent);
     expect(intent?.intent).toMatchObject({ kind: 'syncInput', value: '拼音组合结果' });
+    app.dispose();
+  });
+
+  it('组合期间的同会话渲染只暂存；compositionend 应用暂存且输入不回退', () => {
+    const { app, sent } = setup();
+    const area = document.querySelector<HTMLTextAreaElement>('[data-field-id="message"]')!;
+    area.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+    // 组合中间值触发输入同步，宿主据此回推整段渲染（含派生更新，如新标题）。
+    area.value = '组合中';
+    area.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(lastIntent(sent)?.intent).toMatchObject({ kind: 'syncInput', value: '组合中', inputRevision: 1 });
+    const echoed = stateOf({ title: '组合暂存帧' });
+    echoed.form!.fields[0].value = '组合中';
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's1', revision: 2,
+      formRevision: 1, html: render(echoed),
+    });
+    // 组合期间 DOM 不被替换：暂存帧未上屏，本地输入原样保留。
+    expect(document.querySelector('.panel-title')?.textContent).not.toBe('组合暂存帧');
+    expect(area.value).toBe('组合中');
+    // compositionend：同步最终组合值，随后应用暂存帧；最终值不被暂存帧回退。
+    area.value = '组合最终值';
+    area.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true }));
+    expect(lastIntent(sent)?.intent).toMatchObject({ kind: 'syncInput', value: '组合最终值', inputRevision: 2 });
+    expect(document.querySelector('.panel-title')?.textContent).toBe('组合暂存帧');
+    expect(document.querySelector<HTMLTextAreaElement>('[data-field-id="message"]')!.value).toBe('组合最终值');
+    app.dispose();
+  });
+
+  it('组合期间的会话切换帧立即应用（不暂存）', () => {
+    const { app } = setup();
+    const area = document.querySelector<HTMLTextAreaElement>('[data-field-id="message"]')!;
+    area.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+    const switched = stateOf({ sessionId: 's2', title: '新目标帧' });
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's2', revision: 1,
+      formRevision: 0, html: render(switched),
+    });
+    expect(document.querySelector('.panel-title')?.textContent).toBe('新目标帧');
+    app.dispose();
+  });
+
+  it('组合期间切换会话清除组合态：新会话后续渲染立即上屏（旧控件 compositionend 不再冒泡）', () => {
+    const { app, sent } = setup();
+    const area = document.querySelector<HTMLTextAreaElement>('[data-field-id="message"]')!;
+    area.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+    // 同会话回显帧照常暂存（组合进行中）。
+    const echoed = stateOf({ title: 'A 回显帧' });
+    echoed.form!.fields[0].value = '组合中';
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's1', revision: 2,
+      formRevision: 1, html: render(echoed),
+    });
+    expect(document.querySelector('.panel-title')?.textContent).not.toBe('A 回显帧');
+    // 切换到会话 B：切换帧立即上屏；旧输入控件已随 DOM 替换，
+    // 其 compositionend 不再冒泡到根节点（本用例刻意不再派发）。
+    const switched = stateOf({ sessionId: 's2', title: 'B 首帧' });
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's2', revision: 3,
+      formRevision: 0, html: render(switched),
+    });
+    expect(document.querySelector('.panel-title')?.textContent).toBe('B 首帧');
+    // B 的后续同会话渲染不被残留组合态暂存（修复前会一直暂存、视图冻结）。
+    const updated = stateOf({ sessionId: 's2', title: 'B 更新帧' });
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's2', revision: 4,
+      formRevision: 1, html: render(updated),
+    });
+    expect(document.querySelector('.panel-title')?.textContent).toBe('B 更新帧');
+    // 组合态清除后点击守卫恢复：快捷动作不再被 isComposing 拦截。
+    document.querySelector<HTMLButtonElement>('[data-intent="refresh"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'refresh' });
     app.dispose();
   });
 });

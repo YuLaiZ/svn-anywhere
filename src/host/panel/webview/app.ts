@@ -8,7 +8,11 @@
  *   替换 DOM 后按稳定 data-focus 标识恢复；
  * - 待确认的较新输入不被旧 formRevision 覆盖：本地记录每个字段最后
  *   发送的 inputRevision，宿主 render 的 formRevision 更旧时保留本地值；
- * - 输入事件只同步值与输入序号，不触发宿主整段重绘；
+ *   宿主在 ready 握手递增 viewEpoch，视图收到新代次帧即重置确认空间
+ *   （webview 重建后宿主旧的大 formRevision 不会误确认新视图的输入）；
+ * - 输入事件同步值与输入序号，宿主随即回推整段渲染（加入按钮、字数等
+ *   派生展示随输入更新）；输入法组合期间的渲染暂存到组合结束再应用，
+ *   会话切换帧清空组合态（旧控件的 compositionend 不再冒泡到根）；
  * - 快捷动作不抢占输入法组合（compositionstart..end）；
  * - 事件守卫与 DOM 禁用一致：disabled 控件不产生意图。
  */
@@ -62,6 +66,8 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
 
   let currentSessionId = '';
   let lastFormRevision = -1;
+  /** 当前视图代次（宿主 ready 握手递增）；跨代帧到达时重置输入确认空间。 */
+  let currentViewEpoch: number | null = null;
   /** 已折叠的导航目录 key（data-nav-key）；视图瞬时状态，宿主重绘后恢复。 */
   const foldedNavKeys = new Set<string>();
 
@@ -90,6 +96,8 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
 
   /** 输入法组合态：compositionstart 置位、compositionend 复位；组合期间不触发快捷动作。 */
   let isComposing = false;
+  /** 组合期间暂存的最新同会话渲染（宿主输入即回推后，组合中不整段替换 DOM）。 */
+  let pendingComposingRender: string | null = null;
 
   /**
    * 点击类意图的通用转发：按 data-intent 组装载荷，参数取自 data-* 标记。
@@ -209,6 +217,13 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
     isComposing = false;
     // 组合结束后立即同步一次最终值（部分输入法不派发 input）。
     onTextInput(event);
+    // 应用组合期间暂存的最新渲染：pendingInputs 已登记组合最终值，
+    // applyRender 不会回退输入内容；宿主对该次 syncInput 的回推随后收敛。
+    const pending = pendingComposingRender;
+    pendingComposingRender = null;
+    if (pending) {
+      applyRender(pending, lastFormRevision);
+    }
   };
 
   /* --------------------------- 渲染与状态保持 --------------------------- */
@@ -323,14 +338,33 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
     const message = raw as Record<string, unknown>;
     if (message.type === 'render') {
       const nextSessionId = String(message.sessionId ?? '');
-      if (nextSessionId !== currentSessionId) {
+      const sessionChanged = nextSessionId !== currentSessionId;
+      if (sessionChanged) {
         // 目标切换：上一会话的折叠状态不带入新目标。
         foldedNavKeys.clear();
+        // 旧输入控件已随 DOM 替换，其 compositionend 不会再冒泡到根节点：
+        // 清除组合态并丢弃旧会话暂存帧，新目标后续渲染照常上屏。
+        isComposing = false;
+        pendingComposingRender = null;
       }
       currentSessionId = nextSessionId;
+      // 视图代次变化（webview 重建握手）：输入确认空间随视图重启，
+      // 旧代的确认序号与未确认输入不再可比，全部重置后从新基数开始。
+      const viewEpoch = Number(message.viewEpoch);
+      if (Number.isFinite(viewEpoch) && viewEpoch !== currentViewEpoch) {
+        currentViewEpoch = viewEpoch;
+        lastFormRevision = -1;
+        pendingInputs.clear();
+      }
       const formRevision = Number(message.formRevision ?? -1);
       if (Number.isFinite(formRevision) && formRevision >= lastFormRevision) {
         lastFormRevision = formRevision;
+      }
+      if (isComposing && !sessionChanged) {
+        // 组合期间整段替换 DOM 会打断输入法组合：同会话渲染只暂存最新帧，
+        // compositionend 后应用；会话切换帧不暂存，避免组合中切目标丢首帧。
+        pendingComposingRender = String(message.html ?? '');
+        return;
       }
       applyRender(String(message.html ?? ''), lastFormRevision);
       return;

@@ -335,6 +335,41 @@ describe('P1 提交面板 提交闭环', () => {
     expect(String(successRender?.html)).toContain('r5');
   });
 
+  it('syncInput 立即重绘：说明字数随输入更新且 formRevision 对齐（缺陷 A 同源）', async () => {
+    const panel = await openPanelAndWait(join(wcRoot, 'a.txt'), 'a.txt');
+    const before = panel.posted.filter((m) => m.type === 'render').length;
+    panel.sendIntent({ kind: 'syncInput', fieldId: 'message', value: '说明五字内容', inputRevision: 1 }, 'in-c1');
+    await vi.waitFor(() => {
+      const frames = panel.posted.filter((m) => m.type === 'render');
+      expect(frames.length).toBe(before + 1);
+      expect(String(frames.at(-1)?.html)).toContain('说明 6 字');
+      expect(frames.at(-1)).toMatchObject({ formRevision: 1 });
+    });
+  });
+
+  it('ready 重建握手归零 formRevision 并递增 viewEpoch 重推（旧大序号不吞新视图输入确认）', async () => {
+    const panel = await openPanelAndWait(join(wcRoot, 'a.txt'), 'a.txt');
+    panel.sendIntent({ kind: 'syncInput', fieldId: 'message', value: '旧视图累计输入', inputRevision: 9 }, 'in-old-9');
+    await vi.waitFor(() => {
+      expect(panel.posted.filter((m) => m.type === 'render').at(-1)).toMatchObject({ formRevision: 9 });
+    });
+    // webview 重建握手：视图输入序号从零重启，宿主确认序号同步归零，
+    // 重推保留当前会话状态（说明文本不因重建丢失）。
+    await panel.send({ type: 'ready', protocolVersion: 1 });
+    await vi.waitFor(() => {
+      const last = panel.posted.filter((m) => m.type === 'render').at(-1);
+      expect(last).toMatchObject({ formRevision: 0, viewEpoch: 1 });
+      expect(String(last?.html)).toContain('旧视图累计输入');
+    });
+    // 新视图第一条输入按新序号对齐确认（max(0,1)=1，旧值 9 不再参与）。
+    panel.sendIntent({ kind: 'syncInput', fieldId: 'message', value: '验收', inputRevision: 1 }, 'in-new-1');
+    await vi.waitFor(() => {
+      const last = panel.posted.filter((m) => m.type === 'render').at(-1);
+      expect(last).toMatchObject({ formRevision: 1 });
+      expect(String(last?.html)).toContain('说明 2 字');
+    });
+  });
+
   it('嵌套目录的 status 路径相对副本根，missing 与提交不重复拼接目标', async () => {
     mkdirSync(join(wcRoot, 'src'), { recursive: true });
     vi.mocked(runStatus).mockResolvedValue({
@@ -584,6 +619,115 @@ describe('P1 提交面板 提交闭环', () => {
     panel.sendIntent({ kind: 'closePanel' }, 'close-2');
     await vi.waitFor(() => expect(panel.disposed).toBe(true));
   });
+
+  it('命令入口切换目标：说明草稿先确认，取消保留草稿，确认后以空说明加载新目标', async () => {
+    // 真机缺陷复现（验收 5）：batch-a 输入说明后从资源管理器对另一目标
+    // 执行提交，直接切换导致草稿静默丢失；修复后须先弹「放弃并切换」。
+    const panel = await openPanelAndWait(join(wcRoot, 'a.txt'), 'a.txt');
+    panel.sendIntent({ kind: 'syncInput', fieldId: 'message', value: '切换前草稿', inputRevision: 1 }, 'in-sw');
+    await vi.waitFor(() => {
+      expect(String(panel.posted.filter((m) => m.type === 'render').at(-1)?.html)).toContain('说明 5 字');
+    });
+    const sessionIdBefore = panel.lastSessionId();
+
+    mkdirSync(join(wcRoot, 'sub-dir'));
+    vi.mocked(runStatus).mockImplementation(async (_svn, target) =>
+      String(target).includes('sub-dir')
+        ? { targetPath: 'sub-dir', entries: [{ path: 'sub.txt', wcStatus: 'modified', props: 'none', changelist: null }], externals: [] }
+        : { targetPath: '.', entries: [{ path: 'a.txt', wcStatus: 'modified', props: 'none', changelist: null }], externals: [] },
+    );
+
+    // 取消切换：会话不动，草稿仍在（无新目标渲染）。
+    vscodeMock.confirmResult = undefined;
+    await commandCommit(makeUri(join(wcRoot, 'sub-dir')));
+    expect(vscodeMock.warning).toContain(strings.panel.switchDiscardTitle);
+    expect(panel.lastSessionId()).toBe(sessionIdBefore);
+    expect(String(panel.posted.filter((m) => m.type === 'render').at(-1)?.html)).toContain('切换前草稿');
+    expect(String(panel.posted.filter((m) => m.type === 'render').at(-1)?.html)).not.toContain('sub.txt');
+
+    // 确认切换：新会话渲染新目标，说明清零。
+    vscodeMock.confirmResult = strings.panel.switchDiscardButton;
+    await commandCommit(makeUri(join(wcRoot, 'sub-dir')));
+    let subSessionId = '';
+    await vi.waitFor(() => {
+      const subRender = [...panel.posted].reverse().find((m) => m.type === 'render' && String(m.html ?? '').includes('sub.txt'));
+      expect(subRender).toBeDefined();
+      expect(subRender?.sessionId).not.toBe(sessionIdBefore);
+      expect(String(subRender?.html)).toContain('说明 0 字');
+      subSessionId = String(subRender?.sessionId);
+    });
+
+    // 切回原目标按新会话加载（草稿已按用户确认放弃，不再恢复）。
+    const postedBeforeBack = panel.posted.length;
+    await commandCommit(makeUri(join(wcRoot, 'a.txt')));
+    await vi.waitFor(() => {
+      const backRender = [...panel.posted.slice(postedBeforeBack)].reverse().find((m) => m.type === 'render' && String(m.html ?? '').includes('data-row-id="a.txt"'));
+      expect(backRender).toBeDefined();
+      expect(backRender?.sessionId).not.toBe(subSessionId);
+      expect(String(backRender?.html)).toContain('说明 0 字');
+      expect(String(backRender?.html)).not.toContain('切换前草稿');
+    });
+  });
+
+  it('命令入口切换目标：无草稿变化不弹确认直接切换', async () => {
+    const panel = await openPanelAndWait(join(wcRoot, 'a.txt'), 'a.txt');
+    const sessionIdBefore = panel.lastSessionId();
+    mkdirSync(join(wcRoot, 'sub-dir'));
+    vi.mocked(runStatus).mockImplementation(async (_svn, target) =>
+      String(target).includes('sub-dir')
+        ? { targetPath: 'sub-dir', entries: [{ path: 'sub.txt', wcStatus: 'modified', props: 'none', changelist: null }], externals: [] }
+        : { targetPath: '.', entries: [{ path: 'a.txt', wcStatus: 'modified', props: 'none', changelist: null }], externals: [] },
+    );
+    await commandCommit(makeUri(join(wcRoot, 'sub-dir')));
+    await vi.waitFor(() => {
+      const subRender = [...panel.posted].reverse().find((m) => m.type === 'render' && String(m.html ?? '').includes('sub.txt'));
+      expect(subRender?.sessionId).not.toBe(sessionIdBefore);
+    });
+    expect(vscodeMock.warning).not.toContain(strings.panel.switchDiscardTitle);
+  });
+
+  it('切换确认等待期间目标被另一命令切换：本次请求放弃，不覆盖新会话', async () => {
+    const panel = await openPanelAndWait(join(wcRoot, 'a.txt'), 'a.txt');
+    panel.sendIntent({ kind: 'syncInput', fieldId: 'message', value: '竞争草稿', inputRevision: 1 }, 'in-race');
+    await vi.waitFor(() => {
+      expect(String(panel.posted.filter((m) => m.type === 'render').at(-1)?.html)).toContain('竞争草稿');
+    });
+
+    mkdirSync(join(wcRoot, 'sub-dir'));
+    mkdirSync(join(wcRoot, 'other-dir'));
+    vi.mocked(runStatus).mockImplementation(async (_svn, target) => {
+      if (String(target).includes('sub-dir')) {
+        return { targetPath: 'sub-dir', entries: [{ path: 'sub.txt', wcStatus: 'modified', props: 'none', changelist: null }], externals: [] };
+      }
+      if (String(target).includes('other-dir')) {
+        return { targetPath: 'other-dir', entries: [{ path: 'other.txt', wcStatus: 'modified', props: 'none', changelist: null }], externals: [] };
+      }
+      return { targetPath: '.', entries: [{ path: 'a.txt', wcStatus: 'modified', props: 'none', changelist: null }], externals: [] };
+    });
+
+    // 两个切换请求先后挂起在各自的草稿确认框上。
+    const confirmResolvers: Array<(value: string | undefined) => void> = [];
+    vscodeMock.confirmImpl = () => new Promise((resolve) => { confirmResolvers.push(resolve); });
+    const first = commandCommit(makeUri(join(wcRoot, 'sub-dir')));
+    await vi.waitFor(() => expect(confirmResolvers.length).toBe(1));
+    const second = commandCommit(makeUri(join(wcRoot, 'other-dir')));
+    await vi.waitFor(() => expect(confirmResolvers.length).toBe(2));
+
+    // 第二个请求先确认：面板切换到 other-dir。
+    confirmResolvers[1](strings.panel.switchDiscardButton);
+    await second;
+    await vi.waitFor(() => {
+      expect([...panel.posted].reverse().some((m) => m.type === 'render' && String(m.html ?? '').includes('other.txt'))).toBe(true);
+    });
+    const sessionIdAfterSecond = panel.lastSessionId();
+
+    // 第一个请求后确认：会话已被后来者切换，本次请求放弃。
+    confirmResolvers[0](strings.panel.switchDiscardButton);
+    await first;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(panel.lastSessionId()).toBe(sessionIdAfterSecond);
+    expect([...panel.posted].some((m) => m.type === 'render' && String(m.html ?? '').includes('sub.txt'))).toBe(false);
+  });
 });
 
 describe('P1 提交面板 结果未知与核实', () => {
@@ -617,11 +761,20 @@ describe('P1 提交面板 结果未知与核实', () => {
     expect(afterToggle).toMatch(/data-row-id="a\.txt"[^>]*checked/);
 
     // 核实：本地仍有修改 + 远端 HEAD 未前进 → 判定未提交，解锁允许重试。
-    panel.sendIntent({ kind: 'resolveUnknown' }, 'verify-u1');
+    // 走视图真实按钮路径（横幅按钮统一发送 bannerAction），而非直接发内部
+    // resolveUnknown：写锁豁免须按 actionId 放行，否则按钮只会被宿主拒绝。
+    const rejectedBefore = panel.posted.filter(
+      (m) => m.type === 'toast' && String(m.message ?? '').includes('已忽略重复请求'),
+    ).length;
+    panel.sendIntent({ kind: 'bannerAction', bannerId: 'unknown', actionId: 'resolveUnknown' }, 'verify-u1');
     await vi.waitFor(() => {
       const toast = [...panel.posted].reverse().find((m) => m.type === 'toast' && String(m.message ?? '').includes('已核实未提交'));
       expect(toast).toBeDefined();
     });
+    const rejectedAfter = panel.posted.filter(
+      (m) => m.type === 'toast' && String(m.message ?? '').includes('已忽略重复请求'),
+    ).length;
+    expect(rejectedAfter).toBe(rejectedBefore);
     // 解锁后提交按钮恢复可用（仍有选择）。
     const resumed = String([...panel.posted].reverse().find((m) => m.type === 'render' && String(m.html ?? '').includes('a.txt'))?.html);
     expect(resumed).not.toMatch(/data-intent="submit"[^>]*disabled/);

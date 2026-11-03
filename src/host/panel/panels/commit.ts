@@ -146,19 +146,55 @@ export async function commandShowCommitPanel(uri?: vscode.Uri, uris?: vscode.Uri
     }
     return;
   }
-  if (handle && !sameTarget && !handle.switchSession()) {
-    void vscode.window.showWarningMessage(
-      format(strings.panel.panelBusySwitchRejected, { target: summarizePaths(target.targetPaths) }),
-    );
-    return;
+  if (handle && !sameTarget) {
+    // 新目标切换需先处理草稿（验收 5）：说明或勾选相对打开时有变化时，
+    // 与 P2 同口径弹「放弃并切换」确认，取消则保留当前面板与草稿；
+    // busy 在确认框之前判定（确认等待期间的变化由 switchSession 兜底）。
+    const pendingSessionId = handle.sessionId;
+    if (sessionBusy()) {
+      void vscode.window.showWarningMessage(
+        format(strings.panel.panelBusySwitchRejected, { target: summarizePaths(target.targetPaths) }),
+      );
+      return;
+    }
+    if (session && sessionChanged(session)) {
+      const ok = await vscode.window.showWarningMessage(
+        strings.panel.switchDiscardTitle,
+        { modal: true, detail: strings.panel.switchDiscardDetail },
+        strings.panel.switchDiscardButton,
+      );
+      if (ok !== strings.panel.switchDiscardButton) {
+        return;
+      }
+      if (handle && handle.sessionId !== pendingSessionId) {
+        // 确认等待期间另一命令已切换目标：后来者已接管面板，本次请求
+        // 不再覆盖新会话（面板销毁时 handle 为空，落到下方重建路径）。
+        return;
+      }
+    }
+    if (handle && !handle.switchSession()) {
+      void vscode.window.showWarningMessage(
+        format(strings.panel.panelBusySwitchRejected, { target: summarizePaths(target.targetPaths) }),
+      );
+      return;
+    }
   }
   handle ??= createPanel(
     PANEL_ID,
     { title: strings.panel.commitPanelTitle, retainContextWhenHidden: true },
-    { onIntent, onDispose: onPanelDispose },
+    { onIntent, onViewReady, onDispose: onPanelDispose },
     panelContext,
   );
   await loadSession(handle.sessionId, target, { initial: true });
+}
+
+/**
+ * webview 重建握手：视图输入序号从零重启，宿主确认序号同步归零并重推，
+ * 避免旧的大 formRevision 把新视图的待确认输入误判为已确认（输入回退）。
+ */
+function onViewReady(): void {
+  formRevision = 0;
+  pushRender();
 }
 
 function onPanelDispose(): void {
@@ -545,6 +581,8 @@ async function onIntent(intent: Intent, context: { sessionId: string; busy: bool
           formRevision = Math.max(formRevision, intent.inputRevision);
         }
         session.message = intent.value;
+        // 立即重绘：页脚字数等派生展示随输入更新（与 P2 的 draft 同口径）。
+        pushRender();
       }
       return;
     case 'applyPrefix': {
@@ -614,6 +652,12 @@ async function onIntent(intent: Intent, context: { sessionId: string; busy: bool
       return;
     case 'dismissBanner':
     case 'bannerAction':
+      // 横幅按钮以 bannerAction 发送：unknown 横幅的「核实提交结果」必须
+      // 分发到核实流程，否则按钮只触发一次无操作重绘（与 P2 同口径）。
+      if (intent.kind === 'bannerAction' && intent.actionId === 'resolveUnknown') {
+        await resolveUnknown(context.sessionId);
+        return;
+      }
       if (intent.kind === 'bannerAction' && intent.actionId === 'refresh') {
         await loadSession(context.sessionId, targetOf(session), { initial: false });
         return;

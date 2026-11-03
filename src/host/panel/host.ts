@@ -32,6 +32,12 @@ import { render } from './view';
 export interface PanelController {
   /** 视图意图通过全部校验后转发给控制器；路径映射等业务决策在控制器内。 */
   onIntent(intent: Intent, context: IntentContext): void | Promise<void>;
+  /**
+   * 视图重建握手（ready）时回调：webview 重载后视图输入序号从零重启，
+   * 控制器须把表单确认序号（formRevision）归零并重推状态，避免旧大序号
+   * 把新视图的待确认输入误判为已确认。
+   */
+  onViewReady?(): void;
   /** 面板销毁（用户关闭标签）时回调；宿主已完成自身清理。 */
   onDispose?(): void;
 }
@@ -58,6 +64,8 @@ interface PanelEntry {
   sessionId: string;
   state: PanelState | undefined;
   revision: number;
+  /** 视图代次：ready 握手递增（webview 重建即新代），随 render 下发。 */
+  viewEpoch: number;
   /** 已处理的请求 ID：同一请求重复送达直接忽略。 */
   handledRequests: Set<string>;
   messageDisposable: vscode.Disposable;
@@ -146,6 +154,7 @@ export function createPanel(
     sessionId: newSessionId(),
     state: undefined,
     revision: 0,
+    viewEpoch: 0,
     handledRequests: new Set(),
     messageDisposable: { dispose: () => {} },
     disposeDisposable: { dispose: () => {} },
@@ -187,6 +196,13 @@ function handleFor(entry: PanelEntry): PanelHandle {
         logLine(format(strings.panel.toastStaleSession, {}), 'commit');
         return;
       }
+      if (next.sessionId !== entry.sessionId) {
+        // 状态快照自身所属的会话也必须与面板当前会话一致：切换目标的窗口内，
+        // 全局会话可能尚未重建，此时构建出的旧目标快照即使携带了新会话 ID
+        // 也不得上屏（否则标题/列表会展示上一个目标的数据）。
+        logLine(format(strings.panel.toastStaleSession, {}), 'commit');
+        return;
+      }
       entry.state = next;
       entry.revision += 1;
       postToView(entry, {
@@ -195,6 +211,7 @@ function handleFor(entry: PanelEntry): PanelHandle {
         sessionId: entry.sessionId,
         revision: entry.revision,
         formRevision: next.formRevision,
+        viewEpoch: entry.viewEpoch,
         html: render({ ...next, revision: entry.revision }),
       });
     },
@@ -281,7 +298,15 @@ async function handleViewMessage(entry: PanelEntry, raw: unknown): Promise<void>
   const message: ViewToHostMessage = parsed.message;
   if (message.type === 'ready') {
     // 幂等：隐藏重建后视图重新加载会再握手，宿主重推当前状态。
-    if (entry.state) {
+    // 视图的请求序号随重建从 0 重启（retainContextWhenHidden=false 时隐藏即
+    // 销毁 webview），旧去重集合会把新视图的 req-1… 当成重复请求静默吞掉，
+    // 因此每次握手都清空重开（ready 只在全新视图上下文出现，清空无重放风险）。
+    entry.handledRequests.clear();
+    // 视图代次递增：新视图的输入确认空间（formRevision 对比 inputRevision）
+    // 随重启从零开始，控制器同步归零已确认序号，旧大序号不再参与比较。
+    entry.viewEpoch += 1;
+    entry.controller.onViewReady?.();
+    if (entry.state && entry.state.sessionId === entry.sessionId) {
       entry.revision += 1;
       postToView(entry, {
         type: 'render',
@@ -289,9 +314,12 @@ async function handleViewMessage(entry: PanelEntry, raw: unknown): Promise<void>
         sessionId: entry.sessionId,
         revision: entry.revision,
         formRevision: entry.state.formRevision,
+        viewEpoch: entry.viewEpoch,
         html: render({ ...entry.state, revision: entry.revision }),
       });
     }
+    // 快照属于旧会话（切换目标后新会话尚未重建）时不重推：旧目标内容不得
+    // 借视图重建回到界面，等待新会话加载后的正常帧覆盖。
     return;
   }
 
@@ -316,7 +344,7 @@ async function handleViewMessage(entry: PanelEntry, raw: unknown): Promise<void>
     });
     return;
   }
-  if (!busy && entry.state?.writeLocked && intent.kind !== 'resolveUnknown' && intent.kind !== 'refresh') {
+  if (!busy && entry.state?.writeLocked && !writeLockExempt(intent)) {
     // 结果未知/待核实等写锁定期间，连同输入同步在内的全部写意图都被拒绝；
     // 只放行核实/恢复与重读动作（由控制器自行分发）。
     postToView(entry, {
@@ -354,6 +382,21 @@ async function handleViewMessage(entry: PanelEntry, raw: unknown): Promise<void>
 
 function intentRequiresItem(intent: Intent): intent is Intent & { itemId: string } {
   return intent.kind === 'openDiff' || intent.kind === 'openFile' || intent.kind === 'rowMore';
+}
+
+/** 写锁定期间仍可执行的意图：核实/恢复与重读。 */
+const WRITE_LOCK_EXEMPT_KINDS = new Set<Intent['kind']>(['resolveUnknown', 'refresh']);
+/**
+ * 横幅按钮统一以 bannerAction 发送，写锁豁免必须按 actionId 判定：
+ * 只认 kind 会让重启恢复后的「核实提交结果」按钮被宿主当成写意图拒绝。
+ */
+const WRITE_LOCK_EXEMPT_BANNER_ACTIONS = new Set(['resolveUnknown', 'refresh']);
+
+function writeLockExempt(intent: Intent): boolean {
+  if (WRITE_LOCK_EXEMPT_KINDS.has(intent.kind)) {
+    return true;
+  }
+  return intent.kind === 'bannerAction' && WRITE_LOCK_EXEMPT_BANNER_ACTIONS.has(intent.actionId);
 }
 
 /** 测试辅助：重置面板注册表（真实宿主不需要）。 */

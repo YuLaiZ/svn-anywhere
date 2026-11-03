@@ -51,6 +51,8 @@ export interface RenderMessage {
   sessionId: string;
   revision: number;
   formRevision: number;
+  /** 视图代次：ready 握手递增（webview 重建即新代）；视图据此重置输入确认空间。 */
+  viewEpoch: number;
   html: string;
 }
 

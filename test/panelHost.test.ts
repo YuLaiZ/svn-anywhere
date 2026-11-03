@@ -164,7 +164,7 @@ describe('消息链路', () => {
   it('ready 后推送当前状态 render（幂等，隐藏重建同链路）', async () => {
     const intents: unknown[] = [];
     const handle = createPanel('t1', { title: 'T' }, { onIntent: (intent) => { intents.push(intent); } }, context);
-    handle.update(state());
+    handle.update(state({ sessionId: handle.sessionId }));
     const panel = panelsCreated[0];
     panel.posted.length = 0;
     await panel.receive({ type: 'ready', protocolVersion: 1 });
@@ -178,17 +178,39 @@ describe('消息链路', () => {
 
   it('update 携带旧会话 ID 时丢弃（迟到结果不写入新目标）', () => {
     const handle = createPanel('t1', { title: 'T' }, { onIntent: () => {} }, context);
-    handle.update(state(), 'wrong-session');
+    handle.update(state({ sessionId: handle.sessionId }), 'wrong-session');
     expect(renderMessage(panelsCreated[0].posted)).toBeUndefined();
+    handle.dispose();
+  });
+
+  it('update 的状态快照属于其他会话时丢弃（切换窗口内旧快照不上屏）', () => {
+    const handle = createPanel('t1', { title: 'T' }, { onIntent: () => {} }, context);
+    handle.update(state());
+    expect(renderMessage(panelsCreated[0].posted)).toBeUndefined();
+    handle.dispose();
+  });
+
+  it('switchSession 后 ready 不重推上一个目标的旧快照', async () => {
+    const handle = createPanel('t1', { title: 'T' }, { onIntent: () => {} }, context);
+    handle.update(state({ sessionId: handle.sessionId, targetLabel: '旧目标' }));
+    const panel = panelsCreated[0];
+    const nextSessionId = handle.switchSession();
+    expect(nextSessionId).toBeTypeOf('string');
+    panel.posted.length = 0;
+    await panel.receive({ type: 'ready', protocolVersion: 1 });
+    expect(renderMessage(panel.posted)).toBeUndefined();
+    // 新会话的帧照常上屏。
+    handle.update(state({ sessionId: nextSessionId!, targetLabel: '新目标' }));
+    expect(String((renderMessage(panel.posted) as { html?: string }).html)).toContain('新目标');
     handle.dispose();
   });
 
   it('dispose 后不再发送任何消息', () => {
     const handle = createPanel('t1', { title: 'T' }, { onIntent: () => {} }, context);
-    handle.update(state());
+    handle.update(state({ sessionId: handle.sessionId }));
     handle.dispose();
     panelsCreated[0].posted.length = 0;
-    handle.update(state());
+    handle.update(state({ sessionId: handle.sessionId }));
     expect(panelsCreated[0].posted).toHaveLength(0);
   });
 
@@ -208,6 +230,7 @@ describe('意图校验', () => {
     const intents: unknown[] = [];
     const handle = createPanel('t1', { title: 'T' }, { onIntent: (intent) => { intents.push(intent); } }, context);
     handle.update(state({
+      sessionId: handle.sessionId,
       list: {
         id: 'l',
         columns: [],
@@ -253,6 +276,54 @@ describe('意图校验', () => {
     handle.dispose();
   });
 
+  it('ready 重握手清空请求去重集合（视图重建后 req-1 重启不被吞）', async () => {
+    const { handle, panel, intents } = await setup();
+    await panel.receive({
+      type: 'intent', protocolVersion: 1, sessionId: handle.sessionId, requestId: 'req-1',
+      intent: { kind: 'refresh' },
+    });
+    expect(intents).toHaveLength(1);
+    // 隐藏销毁后重显：视图脚本重新加载并再次握手，请求序号空间随视图重启。
+    await panel.receive({ type: 'ready', protocolVersion: 1 });
+    await panel.receive({
+      type: 'intent', protocolVersion: 1, sessionId: handle.sessionId, requestId: 'req-1',
+      intent: { kind: 'refresh' },
+    });
+    expect(intents).toHaveLength(2);
+    // 重握手同时重推当前状态。
+    const renders = panel.posted.filter((m) => (m as { type?: string }).type === 'render');
+    expect(renders.length).toBeGreaterThan(0);
+    handle.dispose();
+  });
+
+  it('ready 重握手递增 viewEpoch、回调 onViewReady，重推与后续帧携带新代次', async () => {
+    const onViewReady = vi.fn();
+    const handle = createPanel(
+      't-epoch',
+      { title: 'T' },
+      { onIntent: () => {}, onViewReady },
+      context,
+    );
+    handle.update(state({ sessionId: handle.sessionId, formRevision: 12 }));
+    const panel = panelsCreated[0];
+    const epoch = () => (renderMessage(panel.posted) as { viewEpoch?: number }).viewEpoch;
+    expect(epoch()).toBe(0);
+    panel.posted.length = 0;
+    await panel.receive({ type: 'ready', protocolVersion: 1 });
+    expect(onViewReady).toHaveBeenCalledTimes(1);
+    // 控制器先于宿主重推收到回调（此时归零 formRevision 重推才有效）。
+    const readyFrame = renderMessage(panel.posted) as { viewEpoch: number };
+    expect(readyFrame.viewEpoch).toBe(1);
+    panel.posted.length = 0;
+    handle.update(state({ sessionId: handle.sessionId, formRevision: 0 }));
+    // 同一视图代次内后续帧沿用新 epoch。
+    expect((renderMessage(panel.posted) as { viewEpoch: number }).viewEpoch).toBe(1);
+    panel.posted.length = 0;
+    await panel.receive({ type: 'ready', protocolVersion: 1 });
+    expect((renderMessage(panel.posted) as { viewEpoch: number }).viewEpoch).toBe(2);
+    handle.dispose();
+  });
+
   it('条目不存在的条目意图被忽略（能力校验）', async () => {
     const { handle, panel, intents } = await setup();
     await panel.receive({
@@ -266,6 +337,7 @@ describe('意图校验', () => {
   it('忙碌期间写意图被拒绝并 toast；syncInput 不受限', async () => {
     const { handle, panel, intents } = await setup();
     handle.update(state({
+      sessionId: handle.sessionId,
       busy: true,
       list: {
         id: 'l',
@@ -287,6 +359,41 @@ describe('意图校验', () => {
       intent: { kind: 'syncInput', fieldId: 'message', value: 'x', inputRevision: 1 },
     });
     expect(intents).toEqual([{ kind: 'syncInput', fieldId: 'message', value: 'x', inputRevision: 1 }]);
+    handle.dispose();
+  });
+
+  it('写锁定期间横幅的核实/重读动作按 actionId 放行，其他横幅动作仍拒绝', async () => {
+    const { handle, panel, intents } = await setup();
+    handle.update(state({
+      sessionId: handle.sessionId,
+      writeLocked: true,
+      banners: [
+        { id: 'unknown', level: 'warn', title: '提交结果未知', actions: [{ id: 'resolveUnknown', label: '核实提交结果' }] },
+        { id: 'other', level: 'warn', title: '其他横幅', actions: [{ id: 'writeSomething', label: '写入' }] },
+      ],
+    }));
+    panel.posted.length = 0;
+    // 重启恢复后视图点击横幅按钮，发出的是 bannerAction 而非内部 resolveUnknown：
+    // 写锁豁免必须按 actionId 判定，否则真实按钮会被当作写意图拒绝。
+    await panel.receive({
+      type: 'intent', protocolVersion: 1, sessionId: handle.sessionId, requestId: 'r-verify',
+      intent: { kind: 'bannerAction', bannerId: 'unknown', actionId: 'resolveUnknown' },
+    });
+    expect(intents).toEqual([{ kind: 'bannerAction', bannerId: 'unknown', actionId: 'resolveUnknown' }]);
+    expect(toastMessages(panel.posted)).toHaveLength(0);
+    // 非豁免的横幅动作仍被写锁拒绝，不进入控制器。
+    await panel.receive({
+      type: 'intent', protocolVersion: 1, sessionId: handle.sessionId, requestId: 'r-write',
+      intent: { kind: 'bannerAction', bannerId: 'other', actionId: 'writeSomething' },
+    });
+    expect(intents).toHaveLength(1);
+    expect(toastMessages(panel.posted)[0]?.message).toContain('忽略重复请求');
+    // 放行不等于无校验：横幅上不存在的动作仍被能力校验拦截。
+    await panel.receive({
+      type: 'intent', protocolVersion: 1, sessionId: handle.sessionId, requestId: 'r-forged',
+      intent: { kind: 'bannerAction', bannerId: 'unknown', actionId: 'refresh' },
+    });
+    expect(intents).toHaveLength(1);
     handle.dispose();
   });
 
@@ -323,9 +430,9 @@ describe('复用与销毁', () => {
 
   it('switchSession 忙碌时拒绝（返回 undefined）', () => {
     const handle = createPanel('t1', { title: 'T' }, { onIntent: () => {} }, context);
-    handle.update(state());
+    handle.update(state({ sessionId: handle.sessionId }));
     expect(handle.switchSession()).toBeTypeOf('string');
-    handle.update(state({ busy: true }));
+    handle.update(state({ sessionId: handle.sessionId, busy: true }));
     expect(handle.switchSession()).toBeUndefined();
     handle.dispose();
   });

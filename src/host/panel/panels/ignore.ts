@@ -60,6 +60,22 @@ import {
 
 const PANEL_ID = 'ignore';
 
+/**
+ * 原生关闭（⌘W/标签 X）暂存的未保存草稿形态；按工作副本+目标目录为键。
+ * 同时保存暂存时的保存基线：恢复沿用原基线，关闭期间的外部属性修改在
+ * 保存前的基线比较中仍能被发现（不会静默覆盖）。
+ */
+interface StashedIgnoreDraft {
+  rules: string[];
+  draft: string;
+  savedRules: string[];
+  savedPropertyExists: boolean;
+}
+
+function stashKey(wcRoot: string, targetDir: string): string {
+  return `ignorePanel.stash|${wcRoot}|${targetDir}`;
+}
+
 interface PanelContext {
   extensionUri: vscode.Uri;
   subscriptions: vscode.Disposable[];
@@ -74,6 +90,8 @@ let formRevision = 0;
 let activeOperationId: string | undefined;
 /** 隔离提交的临时副本目录（协调完成/确认失败后清理）。 */
 let activeTempDir: string | undefined;
+/** 面板内确认「放弃草稿并关闭」后的销毁：不再暂存（区别于原生关闭）。 */
+let discardOnDispose = false;
 
 /** activate 时注入宿主上下文。 */
 export function setIgnorePanelContext(context: PanelContext): void {
@@ -165,13 +183,42 @@ export async function commandShowIgnorePanel(uri?: vscode.Uri): Promise<void> {
   handle ??= createPanel(
     PANEL_ID,
     { title: strings.ignorePanel.editIgnoreTitle, retainContextWhenHidden: false },
-    { onIntent, onDispose: onPanelDispose },
+    { onIntent, onViewReady, onDispose: onPanelDispose },
     panelContext,
   );
   await loadSession(handle.sessionId, target.wcRoot, dirPath, originName);
 }
 
+/**
+ * webview 重建握手：视图输入序号从零重启，宿主确认序号同步归零并重推，
+ * 避免旧的大 formRevision 把新视图的待确认输入误判为已确认（输入回退）。
+ */
+function onViewReady(): void {
+  formRevision = 0;
+  pushRender();
+}
+
+/**
+ * 原生关闭（⌘W/标签 X）无法弹确认（onDidDispose 在关闭后才回调）：
+ * 有未保存草稿且不在受限阶段时暂存到 globalState，重开同目标时恢复；
+ * 暂存连带当时的保存基线，恢复后外部修改检查仍有效。面板内「关闭」
+ * 按钮已确认放弃草稿的销毁（discardOnDispose）不再暂存；受限阶段以
+ * 操作记录恢复优先。
+ */
 function onPanelDispose(): void {
+  const current = session;
+  const shouldStash = !discardOnDispose && panelContext !== undefined
+    && current !== undefined && !recoveryBusy(current) && hasUnsavedDraft(current);
+  discardOnDispose = false;
+  if (shouldStash && current && panelContext) {
+    const stash: StashedIgnoreDraft = {
+      rules: [...current.rules],
+      draft: current.draft,
+      savedRules: [...current.savedRules],
+      savedPropertyExists: current.savedPropertyExists,
+    };
+    void panelContext.globalState.update(stashKey(current.wcRoot, current.targetDir), stash);
+  }
   handle = undefined;
   session = undefined;
   activeOperationId = undefined;
@@ -179,6 +226,44 @@ function onPanelDispose(): void {
 }
 
 /* ------------------------------ 会话读取 ------------------------------ */
+
+/**
+ * 恢复原生关闭时暂存的草稿（同工作副本+目标目录）：规则编辑值、待加入
+ * 输入与暂存时的保存基线一并恢复（不用本次读取值当基线——关闭期间的
+ * 外部属性修改要与原基线比较才能在保存前发现），一次性消费暂存并提示；
+ * 关闭期间属性已变化时提示先重读核对。形态异常的暂存静默丢弃（不阻塞
+ * 正常会话）。
+ */
+function restoreStashedDraft(target: IgnoreSessionState): void {
+  if (!panelContext) {
+    return;
+  }
+  const key = stashKey(target.wcRoot, target.targetDir);
+  const stash = panelContext.globalState.get<StashedIgnoreDraft | undefined>(key);
+  void panelContext.globalState.update(key, undefined);
+  if (
+    !stash ||
+    !Array.isArray(stash.rules) ||
+    stash.rules.some((rule) => typeof rule !== 'string') ||
+    typeof stash.draft !== 'string' ||
+    !Array.isArray(stash.savedRules) ||
+    stash.savedRules.some((rule) => typeof rule !== 'string') ||
+    typeof stash.savedPropertyExists !== 'boolean'
+  ) {
+    return;
+  }
+  target.rules = [...stash.rules];
+  target.draft = stash.draft;
+  target.savedRules = [...stash.savedRules];
+  target.savedPropertyExists = stash.savedPropertyExists;
+  target.submittedRevision = null;
+  target.notice = snapshotEqual(
+    target.workingSnapshot,
+    { rules: target.savedRules, exists: target.savedPropertyExists },
+  )
+    ? strings.ignorePanel.noticeDraftRestored
+    : strings.ignorePanel.noticeDraftRestoredExternal;
+}
 
 /**
  * 读取目标目录的四层值并推送渲染。读取失败独立于空属性（W200017 为
@@ -274,6 +359,7 @@ async function loadSession(
     session.phase = 'ready';
     session.error = null;
     session.successVisible = true;
+    restoreStashedDraft(session);
     pushRender();
   } catch (err) {
     if (handle?.sessionId !== sessionId) {
@@ -329,6 +415,9 @@ async function onIntent(intent: Intent, context: { sessionId: string; busy: bool
           formRevision = Math.max(formRevision, intent.inputRevision);
         }
         session.draft = intent.value;
+        // 立即重绘：加入按钮禁用态、页脚摘要与保存/提交的草稿阻塞联动
+        // 都从 draft 派生，不同步推送会停在旧渲染（视图侧不做本地派生）。
+        pushRender();
       }
       return;
     case 'addRule': {
@@ -398,7 +487,7 @@ async function onIntent(intent: Intent, context: { sessionId: string; busy: bool
       await resolveUnknown(context.sessionId);
       return;
     case 'closePanel':
-      await closePanel();
+      await closePanel(context.sessionId);
       return;
     case 'dismissBanner':
     case 'bannerAction':
@@ -957,10 +1046,14 @@ async function resolveUnknown(sessionId: string): Promise<void> {
         cleanupTempDir();
         // 重启恢复的路径上 activeTempDir 已丢失：按记录登记位置清理临时副本。
         cleanupRecordedTempDir(restriction);
-        s.phase = 'ready';
-        s.notice = strings.ignorePanel.noticeVerifyNotCommitted;
-        s.successVisible = true;
-        pushRender();
+        // 恢复会话的 rules/savedRules 来自操作记录中的待提交快照，与工作副本
+        // 的实际差异无关：解锁后必须重读工作值与 BASE，否则工作副本里仍有
+        // 未提交修改时会被误显示为「规则列表无修改」并禁用提交。
+        await loadSession(sessionId, s.wcRoot, s.targetDir, s.originName);
+        if (session) {
+          session.notice = strings.ignorePanel.noticeVerifyNotCommitted;
+          pushRender();
+        }
         // 成功卡片在场时 info 横幅会被压住，核实结论用 toast 保证可见。
         toastSafely('info', strings.ignorePanel.noticeVerifyNotCommitted);
         return;
@@ -1061,7 +1154,7 @@ async function confirmKeepWorkingValue(
 
 /* ------------------------------ 关闭面板 ------------------------------ */
 
-async function closePanel(): Promise<void> {
+async function closePanel(sessionId: string): Promise<void> {
   if (!session) {
     handle?.dispose();
     return;
@@ -1078,6 +1171,15 @@ async function closePanel(): Promise<void> {
     if (ok !== strings.ignorePanel.closeDiscardButton) {
       return;
     }
+    // 用户已确认放弃：随后的销毁不再暂存草稿（区别于原生关闭）。
+    discardOnDispose = true;
   }
-  handle?.dispose();
+  try {
+    // 确认框期间面板可能已被原生关闭或切换目标：只关闭发起时的会话。
+    if (handle && handle.sessionId === sessionId) {
+      handle.dispose();
+    }
+  } finally {
+    discardOnDispose = false;
+  }
 }

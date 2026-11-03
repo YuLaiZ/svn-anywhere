@@ -5,6 +5,8 @@
  * 明确的信息提示（约定：可预期情况不弹错误对话框）。
  */
 import * as vscode from 'vscode';
+import { realpathSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import { dedupeNestedPaths, findWorkingCopy } from '../../core/workspace';
 import { format, strings } from '../i18n';
 import { logLine, type OutputKind } from '../output';
@@ -12,7 +14,7 @@ import { logLine, type OutputKind } from '../output';
 export interface WcTarget {
   /** 命中的工作副本根（realpath 后）。 */
   wcRoot: string;
-  /** 右键/选择的原始目标路径；传给 svn 前须经 escapePeg 转义。 */
+  /** 与副本根使用相同真实父路径的目标；传给 svn 前须经 escapePeg 转义。 */
   targetPath: string;
 }
 
@@ -43,7 +45,7 @@ export async function resolveWorkingCopyTarget(
     return undefined;
   }
   logLine(format(strings.target.resolved, { command: commandLabel, target: fsPath, wcRoot }), kind);
-  return { wcRoot, targetPath: fsPath };
+  return { wcRoot, targetPath: canonicalTargetPath(fsPath, wcRoot) };
 }
 
 /**
@@ -68,11 +70,12 @@ export function resolveBatchTargetGroups(
       skipped = true;
       continue;
     }
+    const targetPath = canonicalTargetPath(uri.fsPath, wcRoot);
     const paths = grouped.get(wcRoot);
     if (paths) {
-      paths.push(uri.fsPath);
+      paths.push(targetPath);
     } else {
-      grouped.set(wcRoot, [uri.fsPath]);
+      grouped.set(wcRoot, [targetPath]);
     }
   }
   if (skipped) {
@@ -93,6 +96,23 @@ export function resolveBatchTargetGroups(
     groups.push({ wcRoot, targetPaths });
   }
   return groups;
+}
+
+/** 解析目标父目录的别名，同时保留末级符号链接及 missing 路径的 SVN 身份。 */
+function canonicalTargetPath(fsPath: string, wcRoot: string): string {
+  try {
+    const parentRel = relative(wcRoot, realpathSync(dirname(fsPath)));
+    if (realpathSync(fsPath) === wcRoot && (parentRel === '..' || parentRel.startsWith('../') || isAbsolute(parentRel))) return wcRoot;
+  } catch {
+    // missing 目标保留未存在的路径片段。
+  }
+  const parent = dirname(fsPath);
+  if (parent === fsPath) return fsPath;
+  try {
+    return join(realpathSync(parent), basename(fsPath));
+  } catch {
+    return join(canonicalTargetPath(parent, wcRoot), basename(fsPath));
+  }
 }
 
 async function pickTargetFsPath(uri?: vscode.Uri): Promise<string | undefined> {

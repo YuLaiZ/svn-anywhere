@@ -420,7 +420,8 @@ async function waitNewInfo(includes, fromIndex, attempts = 300) {
 
 /** 打开 P2 忽略规则面板并等待「本次打开产生」的数据帧（防历史帧命中）。 */
 async function openIgnorePanel(uriFsPath, expectText) {
-  const panel0 = [...state.panels].reverse().find((p) => p.viewType === 'svn-anywhere-ignore');
+  // 已销毁面板的帧索引不可比（重开是新面板、从 0 计数）：只以存活面板为基线。
+  const panel0 = [...state.panels].reverse().find((p) => p.viewType === 'svn-anywhere-ignore' && !p.disposed);
   const before = panel0 ? panel0.webview.posted.length : 0;
   let panel;
   let render;
@@ -445,16 +446,24 @@ async function openIgnorePanel(uriFsPath, expectText) {
 async function openCommitPanel(uriFsPath, expectText) {
   // P1 面板同类型复用实例：按 viewType 定位（其他类型面板可能更晚创建）。
   // 上一个会话可能仍在重读（busy 拒绝切换）：轮询重试直到目标数据帧出现。
+  // 目标切换遇旧会话草稿会弹「放弃并切换」确认：本辅助代表用户已决定
+  // 打开该目标，临时确认切换并恢复原值（无草稿时不弹、不受影响）。
   let panel;
   let render;
-  for (let attempt = 0; attempt < 8 && !render; attempt += 1) {
-    await state.registered.get('svnAnywhere.commit')({ fsPath: uriFsPath, scheme: 'file' });
-    panel = [...state.panels].reverse().find((p) => p.viewType === 'svn-anywhere-commit');
-    if (!panel) {
-      throw new Error(`提交面板未创建（panels=${state.panels.length}）`);
+  const confirmBefore = state.confirmResult;
+  state.confirmResult = '放弃并切换';
+  try {
+    for (let attempt = 0; attempt < 8 && !render; attempt += 1) {
+      await state.registered.get('svnAnywhere.commit')({ fsPath: uriFsPath, scheme: 'file' });
+      panel = [...state.panels].reverse().find((p) => p.viewType === 'svn-anywhere-commit');
+      if (!panel) {
+        throw new Error(`提交面板未创建（panels=${state.panels.length}）`);
+      }
+      panel.sendReady();
+      render = await waitRender(panel, expectText, 20);
     }
-    panel.sendReady();
-    render = await waitRender(panel, expectText, 20);
+  } finally {
+    state.confirmResult = confirmBefore;
   }
   if (!render || !panel) {
     const frames = (panel?.webview.posted ?? []).filter((m) => m.type === 'render').slice(-2);
@@ -486,8 +495,13 @@ async function main() {
     extensionUri: { scheme: 'file', path: '/mock-ext', toString: () => 'file:///mock-ext' },
     globalState: {
       get: (key, defaultValue) => (state.globalStateMap.has(key) ? state.globalStateMap.get(key) : defaultValue),
+      // 与真实 Memento 语义一致：update(key, undefined) 删除键。
       update: async (key, value) => {
-        state.globalStateMap.set(key, value);
+        if (value === undefined) {
+          state.globalStateMap.delete(key);
+        } else {
+          state.globalStateMap.set(key, value);
+        }
       },
     },
   };
@@ -1194,13 +1208,21 @@ async function main() {
   // 筛选真实组名 all：编码值 name:all 与哨兵不冲突。
   // 上一目标的慢重读（file:// status -u）可能让面板长时间 busy、切换被拒
   // 或短暂停留在旧目标：等待循环检测最新帧不是本目标时重新驱动命令
-  // （等价用户再点一次「提交」），而不是只靠固定次数重试。
+  // （等价用户再点一次「提交」），而不是只靠固定次数重试。重驱与
+  // openCommitPanel 同口径临时确认「放弃并切换」——旧会话勾选有变化时
+  // 不确认会被取消，面板卡在旧目标使本场景必然失败。
   await waitPanelIdle(panel27);
   let filtered27;
   for (let attempt = 0; attempt < 10 && !filtered27; attempt += 1) {
     const latest27 = [...panel27.webview.posted].reverse().find((m) => m.type === 'render');
     if (latest27 && !String(latest27.html).includes('cl-wc')) {
-      await state.registered.get('svnAnywhere.commit')({ fsPath: clWc, scheme: 'file' });
+      const confirmBefore27 = state.confirmResult;
+      state.confirmResult = '放弃并切换';
+      try {
+        await state.registered.get('svnAnywhere.commit')({ fsPath: clWc, scheme: 'file' });
+      } finally {
+        state.confirmResult = confirmBefore27;
+      }
       await waitNewRender(panel27, 'data-row-id="plain.txt"', panel27.webview.posted.length, 150);
     }
     panel27.sendAuto({ kind: 'setFilter', filterId: 'changelist', value: 'name:all' });
@@ -1647,7 +1669,13 @@ async function main() {
   const base37 = p37.webview.posted.length;
   check('unknown 记录恢复写锁定（横幅+核实入口）',
     [...p37.webview.posted].reverse().some((m) => m.type === 'render' && m.html.includes('提交结果未知') && m.html.includes('核实提交结果')));
-  p37.sendAuto({ kind: 'resolveUnknown' });
+  // 重启前工作副本已有额外本地修改（工作值两条，记录里的待提交值只有一条）：
+  // 核实未提交解锁后须按真实工作值与 BASE 重算，保留「待提交」而非「无修改」。
+  writeFileSync(join(lab37.lab, 'r37d.txt'), 'new37\nextra37\n');
+  svn(['propset', '-q', 'svn:ignore', '-F', join(lab37.lab, 'r37d.txt'), 'src'], wc37);
+  // 重启恢复后视图点的是横幅按钮：真实消息为 bannerAction（不是内部
+  // resolveUnknown），宿主写锁须按 actionId 放行，否则按钮会被拒绝。
+  p37.sendAuto({ kind: 'bannerAction', bannerId: 'unknown', actionId: 'resolveUnknown' });
   const toast37 = await new Promise((resolve) => {
     const started = Date.now();
     const timer = setInterval(() => {
@@ -1659,6 +1687,11 @@ async function main() {
     }, 30);
   });
   check('核实未提交后解锁（toast 确认，可重试）', !!toast37);
+  const pendingFrame37 = await waitNewRender(p37, '本地已保存 · 待提交', base37, 300);
+  check('核实未提交后按真实工作值重算待提交状态（不显示无修改）',
+    !!pendingFrame37 && !pendingFrame37.html.includes('规则列表无修改')
+      && !/data-intent="submitIgnore"[^>]*disabled/.test(pendingFrame37.html),
+    pendingFrame37 ? '' : '解锁后未出现待提交帧');
   // b) 真实提交 A' 到仓库（不经面板），原副本不 update；预置协调受阻记录。
   // 真实提交 A'（临时隔离方式）：新检出对齐 BASE 后仅提交属性，原副本不 update。
   const wc37b = join(lab37.lab, 'wc37b');
@@ -1688,7 +1721,8 @@ async function main() {
   writeFileSync(join(lab37.lab, 'r37c.txt'), 'A-prime\nB\n');
   svn(['propset', '-q', 'svn:ignore', '-F', join(lab37.lab, 'r37c.txt'), 'src'], wc37);
   state.confirmResult = '保留这些修改并完成协调';
-  p37b.sendAuto({ kind: 'resolveUnknown' });
+  // 同口径：协调受阻横幅的「恢复协调」按钮也是 bannerAction。
+  p37b.sendAuto({ kind: 'bannerAction', bannerId: 'reconcile', actionId: 'resolveUnknown' });
   const done37 = await waitNewRender(p37b, '忽略规则已提交到 SVN', base37b, 400);
   const doneFrame37 = await waitNewRender(p37b, '后续本地规则修改仍待提交', base37b, 600);
   check('恢复协调幂等完成（保留后续修改，不产生第二次提交）',
@@ -2225,14 +2259,21 @@ async function main() {
   const openCommitPanelBatch = async (uris, expectText) => {
     let panel;
     let render;
-    for (let attempt = 0; attempt < 8 && !render; attempt += 1) {
-      await state.registered.get('svnAnywhere.commit')(uris[0], uris);
-      panel = [...state.panels].reverse().find((p) => p.viewType === 'svn-anywhere-commit');
-      if (!panel) {
-        throw new Error(`提交面板未创建（panels=${state.panels.length}）`);
+    // 与 openCommitPanel 同口径：切换遇旧会话草稿时确认放弃（无草稿不受影响）。
+    const confirmBeforeBatch = state.confirmResult;
+    state.confirmResult = '放弃并切换';
+    try {
+      for (let attempt = 0; attempt < 8 && !render; attempt += 1) {
+        await state.registered.get('svnAnywhere.commit')(uris[0], uris);
+        panel = [...state.panels].reverse().find((p) => p.viewType === 'svn-anywhere-commit');
+        if (!panel) {
+          throw new Error(`提交面板未创建（panels=${state.panels.length}）`);
+        }
+        panel.sendReady();
+        render = await waitRender(panel, expectText, 20);
       }
-      panel.sendReady();
-      render = await waitRender(panel, expectText, 20);
+    } finally {
+      state.confirmResult = confirmBeforeBatch;
     }
     if (!render || !panel) {
       throw new Error(`多选面板数据帧未出现：${expectText}`);
@@ -2334,6 +2375,206 @@ async function main() {
     state.information.slice(infoBefore53b).some((m) => m.includes('同一个工作副本')),
     JSON.stringify(state.information.slice(infoBefore53b)));
   rmSync(lab53.lab, { recursive: true, force: true });
+
+  console.log('场景 54：P2 隐藏重显——输入即时重绘、重推最新草稿、请求序号重启不被去重吞掉');
+  const lab54 = makeSvnLab();
+  const wc54 = lab54.checkout('wc54');
+  writeFileSync(join(wc54, 'origin.txt'), 'x\n');
+  svn(['add', '-q', '--parents', 'origin.txt'], wc54);
+  svn(['commit', '-q', '-m', 'init'], wc54);
+  const panel54 = await openIgnorePanel(join(wc54, 'origin.txt'), '未设置');
+  const sid54 = [...panel54.webview.posted].reverse().find((m) => m.type === 'render').sessionId;
+  // 缺陷 A：syncInput 后立即推送渲染（修复前停在旧帧，加入按钮与输入值不更新）。
+  const postedBeforeDraft = panel54.webview.posted.length;
+  panel54.sendIntent({ kind: 'syncInput', fieldId: 'draft', value: 'draft-test', inputRevision: 1 }, sid54, '1');
+  const draftFrame54 = await waitNewRender(panel54, 'value="draft-test"', postedBeforeDraft);
+  check('syncInput 立即重绘：待加入输入值与启用中的加入按钮同步上屏',
+    Boolean(draftFrame54) && draftFrame54.html.includes('data-focus="add-rule">'),
+    draftFrame54 ? `formRevision=${draftFrame54.formRevision}` : '未出现含草稿的渲染帧');
+  // 缺陷 B：隐藏销毁后重显——ready 重握手清空请求去重集合并重推最新状态。
+  const postedBeforeReload = panel54.webview.posted.length;
+  panel54.sendReady();
+  const reloadFrame54 = await waitNewRender(panel54, 'value="draft-test"', postedBeforeReload);
+  check('重显重握手推最新草稿（重推帧含输入值而非旧空值）', Boolean(reloadFrame54),
+    reloadFrame54 ? '' : 'ready 后未重推含 draft-test 的帧');
+  // 视图重建后请求序号从 req-1 重启：与重建前同 ID 的意图必须仍被处理。
+  const postedBeforeAdd = panel54.webview.posted.length;
+  panel54.sendIntent({ kind: 'addRule' }, sid54, '1');
+  const addedFrame54 = await waitNewRender(panel54, 'rule-text">draft-test', postedBeforeAdd);
+  check('请求序号重启后同 ID 意图不被去重吞掉（addRule 入列）', Boolean(addedFrame54),
+    addedFrame54 ? '' : 'req-1（addRule）未产生新帧（被旧去重集合吞掉）');
+  // closePanel 同样以重启序号发送：dirty 草稿触发关闭确认即证明意图被处理。
+  state.confirmResult = undefined;
+  const warningBefore54 = state.warning.length;
+  panel54.sendIntent({ kind: 'closePanel' }, sid54, '2');
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  check('重启序号的 closePanel 到达控制器并弹出放弃草稿确认',
+    state.warning.slice(warningBefore54).some((m) => m.includes('关闭并放弃未保存修改？')),
+    JSON.stringify(state.warning.slice(warningBefore54)));
+  rmSync(lab54.lab, { recursive: true, force: true });
+  // 关闭场景 54 面板（其草稿会随 dispose 暂存到 lab54 目标键），
+  // 场景 55 用干净的暂存空间断言自己的目标键。
+  panel54.dispose();
+
+  console.log('场景 55：P2 原生关闭暂存草稿——重建握手归零确认序号、⌘W 关闭后重开恢复');
+  for (const key of [...state.globalStateMap.keys()]) {
+    if (key.startsWith('ignorePanel.stash|')) {
+      state.globalStateMap.delete(key);
+    }
+  }
+  const lab55 = makeSvnLab();
+  const wc55 = lab55.checkout('wc55');
+  writeFileSync(join(wc55, 'origin.txt'), 'x\n');
+  svn(['add', '-q', '--parents', 'origin.txt'], wc55);
+  svn(['commit', '-q', '-m', 'init'], wc55);
+  const panel55 = await openIgnorePanel(join(wc55, 'origin.txt'), '未设置');
+  const sid55 = [...panel55.webview.posted].reverse().find((m) => m.type === 'render').sessionId;
+  // 输入并加入：留下未保存草稿（规则 + 确认序号累积）。
+  const postedBeforeAdd55 = panel55.webview.posted.length;
+  panel55.sendIntent({ kind: 'syncInput', fieldId: 'draft', value: 'keep-draft', inputRevision: 1 }, sid55, '1');
+  panel55.sendIntent({ kind: 'addRule' }, sid55, '2');
+  const addedFrame55 = await waitNewRender(panel55, 'rule-text">keep-draft', postedBeforeAdd55);
+  const epochBeforeReload55 = addedFrame55 ? (addedFrame55.viewEpoch ?? 0) : -1;
+  check('加入后规则上屏且携带视图代次', Boolean(addedFrame55) && epochBeforeReload55 >= 1,
+    addedFrame55 ? `viewEpoch=${epochBeforeReload55}` : 'addRule 帧未出现');
+  // webview 重建握手：视图输入序号从零重启，宿主确认序号同步归零并递增代次。
+  const postedBeforeReload55 = panel55.webview.posted.length;
+  panel55.sendReady();
+  const reloadFrame55 = await waitNewRender(panel55, 'rule-text">keep-draft', postedBeforeReload55);
+  check('重建握手帧：formRevision 归零且 viewEpoch 递增（旧大序号不误确认新视图输入）',
+    Boolean(reloadFrame55) && reloadFrame55.formRevision === 0 && reloadFrame55.viewEpoch > epochBeforeReload55,
+    reloadFrame55 ? `formRevision=${reloadFrame55.formRevision} viewEpoch=${reloadFrame55.viewEpoch} before=${epochBeforeReload55}` : 'ready 重推帧未出现');
+  // 原生关闭（⌘W/标签 X → onDidDispose，无面板内确认框）：未保存草稿暂存。
+  panel55.dispose();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const stashKeys55 = [...state.globalStateMap.keys()].filter((k) => k.startsWith('ignorePanel.stash|'));
+  check('原生关闭后未保存草稿已按目标键暂存（globalState）', stashKeys55.length === 1,
+    JSON.stringify(stashKeys55));
+  // 重开同目标：暂存草稿恢复到编辑值并提示，暂存一次性消费。
+  const panel55b = await openIgnorePanel(join(wc55, 'origin.txt'), '已恢复上次关闭面板时未保存的草稿');
+  const html55b = [...panel55b.webview.posted].reverse().find((m) => m.type === 'render').html;
+  check('重开恢复草稿：未保存规则回到列表且未保存徽标在场',
+    html55b.includes('rule-text">keep-draft') && html55b.includes('未保存'),
+    html55b.slice(0, 120));
+  check('暂存一次性消费（globalState 无残留）',
+    ![...state.globalStateMap.keys()].some((k) => k.startsWith('ignorePanel.stash|')), '');
+  rmSync(lab55.lab, { recursive: true, force: true });
+
+  console.log('场景 56：P2 暂存基线与放弃语义——外部修改不静默覆盖、确认放弃不再恢复');
+  // 场景 55 重开的面板还挂着恢复的草稿：先原生关闭（会按目标键暂存）并清空
+  // 暂存空间，场景 56 才能在「无面板 + 无暂存」的初始态下断言自己的键。
+  panel55b.dispose();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  for (const key of [...state.globalStateMap.keys()]) {
+    if (key.startsWith('ignorePanel.stash|')) {
+      state.globalStateMap.delete(key);
+    }
+  }
+  const lab56 = makeSvnLab();
+  const wc56 = lab56.checkout('wc56');
+  writeFileSync(join(wc56, 'origin.txt'), 'x\n');
+  svn(['add', '-q', '--parents', 'origin.txt'], wc56);
+  svn(['commit', '-q', '-m', 'init'], wc56);
+  const stashKeys56 = () => [...state.globalStateMap.keys()].filter((k) => k.startsWith('ignorePanel.stash|'));
+  check('场景前置：暂存空间干净', stashKeys56().length === 0, JSON.stringify(stashKeys56()));
+  // 加入规则形成未保存草稿（基线为初始无属性），原生关闭暂存。
+  const panel56 = await openIgnorePanel(join(wc56, 'origin.txt'), '未设置');
+  const sid56 = [...panel56.webview.posted].reverse().find((m) => m.type === 'render').sessionId;
+  panel56.sendIntent({ kind: 'syncInput', fieldId: 'draft', value: 'restored.tmp', inputRevision: 1 }, sid56, '1');
+  panel56.sendIntent({ kind: 'addRule' }, sid56, '2');
+  await waitNewRender(panel56, 'rule-text">restored.tmp', panel56.webview.posted.length - 4);
+  panel56.dispose();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const stash56 = state.globalStateMap.get(stashKeys56()[0]);
+  check('原生关闭暂存连带暂存时保存基线（savedRules 空 + 属性不存在）',
+    stashKeys56().length === 1 && stash56 && Array.isArray(stash56.savedRules)
+      && stash56.savedRules.length === 0 && stash56.savedPropertyExists === false
+      && JSON.stringify(stash56.rules) === JSON.stringify(['restored.tmp']),
+    JSON.stringify(stash56));
+  // 关闭期间外部 propset 修改规则：重开恢复草稿须提示外部修改。
+  svn(['propset', '-q', 'svn:ignore', 'external.keep', wc56], wc56);
+  const panel56b = await openIgnorePanel(join(wc56, 'origin.txt'), '关闭期间规则已被其他操作修改');
+  const sid56b = [...panel56b.webview.posted].reverse().find((m) => m.type === 'render').sessionId;
+  check('重开恢复草稿且外部修改提示在场（未保存徽标 + 恢复的规则）', (() => {
+    const frame = [...panel56b.webview.posted].reverse().find((m) => m.type === 'render');
+    return frame.html.includes('rule-text">restored.tmp') && frame.html.includes('未保存');
+  })(), '');
+  // 保存：磁盘值与暂存基线不一致 → 拦截写回，external.keep 保留在属性里。
+  const postedBeforeSave56 = panel56b.webview.posted.length;
+  panel56b.sendIntent({ kind: 'saveIgnore' }, sid56b, '1');
+  const blockedFrame56 = await waitNewRender(panel56b, '本次未覆盖', postedBeforeSave56);
+  check('恢复草稿的保存被外部修改拦截（错误横幅提示未覆盖）', Boolean(blockedFrame56), '');
+  const propAfter56 = svn(['propget', 'svn:ignore', wc56], wc56).trim();
+  check('真实 propget 确认 external.keep 未被旧草稿覆盖', propAfter56 === 'external.keep', JSON.stringify(propAfter56));
+  // 面板内确认「放弃草稿并关闭」：销毁后不再暂存刚放弃的草稿。
+  state.confirmResult = '放弃草稿并关闭';
+  panel56b.sendIntent({ kind: 'closePanel' }, sid56b, '2');
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  check('确认放弃并关闭后 globalState 不留暂存（P2 放弃路径）',
+    panel56b.disposed && stashKeys56().length === 0,
+    `disposed=${panel56b.disposed} keys=${JSON.stringify(stashKeys56())}`);
+  state.confirmResult = undefined;
+  rmSync(lab56.lab, { recursive: true, force: true });
+
+  console.log('场景 57：P1 命令入口切换目标——说明草稿先确认，取消保留，确认后空说明加载（真机缺陷复现）');
+  // 复现真机验收 5 缺陷路径：batch-a 输入说明 → 资源管理器对同副本 example.txt
+  // 执行提交。修复前直接切换并静默清空说明；修复后须先弹「放弃并切换」。
+  // 先关闭此前场景遗留的 P1 面板（场景 52 会话的勾选变化会触发切换确认），
+  // 场景 57 在「无面板」初始态下建立自己的会话。
+  const leftoverCommitPanel = [...state.panels].reverse().find((p) => p.viewType === 'svn-anywhere-commit' && !p.disposed);
+  if (leftoverCommitPanel) {
+    leftoverCommitPanel.dispose();
+  }
+  const lab57 = makeSvnLab();
+  const wc57 = lab57.checkout('wc57');
+  mkdirSync(join(wc57, 'batch-a'), { recursive: true });
+  writeFileSync(join(wc57, 'batch-a', 'a.txt'), 'base\n');
+  writeFileSync(join(wc57, 'example.txt'), 'base\n');
+  svn(['add', '-q', '--parents', 'batch-a'], wc57);
+  svn(['commit', '-q', '-m', 'init'], wc57);
+  writeFileSync(join(wc57, 'batch-a', 'a.txt'), 'change\n');
+  writeFileSync(join(wc57, 'example.txt'), 'change\n');
+  const panelsBefore57 = state.panels.length;
+  await state.registered.get('svnAnywhere.commit')({ fsPath: join(wc57, 'batch-a'), scheme: 'file' });
+  const panel57 = state.panels.at(-1);
+  check('P1 打开 batch-a 创建新面板', state.panels.length === panelsBefore57 + 1, '');
+  const frame57 = await waitRender(panel57, 'data-row-id="batch-a/a.txt"');
+  check('batch-a 会话就绪（a.txt 变更在场）', Boolean(frame57), '');
+  const sid57 = frame57.sessionId;
+  // 输入说明草稿：页脚字数即时更新（缺陷 A 修复后的输入即回推链路）。
+  panel57.sendAuto({ kind: 'syncInput', fieldId: 'message', value: '切换前草稿', inputRevision: state.intentSeq + 1000 });
+  const draftFrame57 = await waitRender(panel57, '说明 5 字');
+  check('说明草稿输入后页脚显示 5 字', Boolean(draftFrame57), '');
+  // 取消切换：弹「切换目标并放弃草稿？」，面板会话与草稿不动。
+  state.confirmResult = undefined;
+  const warnBefore57 = state.warning.length;
+  await state.registered.get('svnAnywhere.commit')({ fsPath: join(wc57, 'example.txt'), scheme: 'file' });
+  const sidAfterCancel57 = [...panel57.webview.posted].reverse().find((m) => m.type === 'render').sessionId;
+  check('取消切换：弹出放弃草稿确认且面板会话未变',
+    state.warning.slice(warnBefore57).some((m) => m.includes('切换目标并放弃草稿？')) && sidAfterCancel57 === sid57,
+    JSON.stringify(state.warning.slice(warnBefore57)));
+  check('取消切换后草稿仍在（无 example.txt 渲染帧）',
+    ![...panel57.webview.posted].some((m) => m.type === 'render' && m.html.includes('data-row-id="example.txt"'))
+      && [...panel57.webview.posted].reverse().find((m) => m.type === 'render').html.includes('切换前草稿'),
+    '');
+  // 确认切换：新会话渲染 example.txt，说明清零。
+  state.confirmResult = '放弃并切换';
+  await state.registered.get('svnAnywhere.commit')({ fsPath: join(wc57, 'example.txt'), scheme: 'file' });
+  const switchedFrame57 = await waitRender(panel57, 'data-row-id="example.txt"');
+  check('确认切换：新会话渲染 example.txt 且说明 0 字',
+    Boolean(switchedFrame57) && switchedFrame57.sessionId !== sid57 && switchedFrame57.html.includes('说明 0 字'),
+    switchedFrame57 ? `sessionId 切换=${switchedFrame57.sessionId !== sid57} 说明0字=${switchedFrame57.html.includes('说明 0 字')}` : 'example.txt 帧未出现');
+  // 切回 batch-a：当前会话无草稿，不再确认直接切换，已放弃草稿不复活。
+  const warnBeforeBack57 = state.warning.length;
+  await state.registered.get('svnAnywhere.commit')({ fsPath: join(wc57, 'batch-a'), scheme: 'file' });
+  const postedIndex57 = panel57.webview.posted.indexOf(switchedFrame57) + 1;
+  const backFrame57 = await waitNewRender(panel57, 'data-row-id="batch-a/a.txt"', postedIndex57);
+  check('切回 batch-a：不再弹确认，新会话空说明且草稿不复活',
+    Boolean(backFrame57) && backFrame57.html.includes('说明 0 字') && !backFrame57.html.includes('切换前草稿')
+      && !state.warning.slice(warnBeforeBack57).some((m) => m.includes('切换目标并放弃草稿？')),
+    backFrame57 ? '' : '切回 batch-a 帧未出现');
+  state.confirmResult = undefined;
+  rmSync(lab57.lab, { recursive: true, force: true });
 
   rmSync(igLab.lab, { recursive: true, force: true });
 

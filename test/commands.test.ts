@@ -3,7 +3,7 @@
  * 覆盖目标解析的来源回退与取消、工作副本提示、统一错误收口、
  * 以及同一实例二次注册命令的句柄释放。
  */
-import { mkdtempSync, realpathSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, writeFileSync, mkdirSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -90,7 +90,7 @@ import { SvnError, tailText } from '../src/core/errors';
 import { resetOutputState, disposeOutputChannel, getOutputChannel } from '../src/host/output';
 import { registerCommand, showCommandError } from '../src/host/commands/registry';
 import { registerAllCommands } from '../src/host/commands';
-import { resolveWorkingCopyTarget } from '../src/host/commands/target';
+import { resolveBatchTargetGroups, resolveWorkingCopyTarget } from '../src/host/commands/target';
 import { strings } from '../src/host/i18n';
 
 const makeUri = (fsPath: string): vscode.Uri => ({ fsPath, scheme: 'file' }) as unknown as vscode.Uri;
@@ -151,6 +151,21 @@ describe('resolveWorkingCopyTarget', () => {
     expect(target?.targetPath).toBe(filePath);
     expect(vscodeMock.information).toHaveLength(0);
     expect(channelLines().join('\n')).toContain(wcRoot);
+  });
+
+  it('副本经符号链接访问时单选和多选均归一目标，missing 与符号链接项保留身份', async () => {
+    const alias = join(plainDir, 'alias');
+    symlinkSync(wcRoot, alias, 'dir');
+    writeFileSync(join(wcRoot, 'file.txt'), 'x');
+    symlinkSync('file.txt', join(wcRoot, 'link.txt'));
+    const file = await resolveWorkingCopyTarget(makeUri(join(alias, 'file.txt')), strings.command.commit);
+    expect(file).toEqual({ wcRoot, targetPath: join(wcRoot, 'file.txt') });
+    const groups = resolveBatchTargetGroups(
+      [makeUri(join(alias, 'missing', 'gone.txt')), makeUri(join(alias, 'link.txt'))],
+      strings.command.commit,
+    );
+    expect(groups).toEqual([{ wcRoot, targetPaths: [join(wcRoot, 'missing', 'gone.txt'), join(wcRoot, 'link.txt')] }]);
+    expect((await resolveWorkingCopyTarget(makeUri(alias), strings.command.commit))?.targetPath).toBe(wcRoot);
   });
 
   it('右键 uri 不在任何副本内：弹信息提示，返回 undefined', async () => {

@@ -44,7 +44,7 @@ interface FakePanel {
   send(raw: unknown): Promise<void> | void;
   sendIntent(intent: Record<string, unknown>, requestId?: string): void;
   lastSessionId(): string;
-  lastRender(): { html: string; sessionId: string } | undefined;
+  lastRender(): { html: string; sessionId: string; formRevision: number } | undefined;
 }
 
 function makeFakePanel(viewType: string, title: string): FakePanel {
@@ -86,7 +86,9 @@ function makeFakePanel(viewType: string, title: string): FakePanel {
     lastRender() {
       const frames = panel.posted.filter((m) => m.type === 'render');
       const last = frames[frames.length - 1];
-      return last ? { html: String(last.html), sessionId: String(last.sessionId) } : undefined;
+      return last
+        ? { html: String(last.html), sessionId: String(last.sessionId), formRevision: Number(last.formRevision ?? -1) }
+        : undefined;
     },
   };
   (panel as unknown as { webview: unknown }).webview = {
@@ -204,6 +206,9 @@ import { setIgnorePanelContext } from '../src/host/panel/panels/ignore';
 
 const makeUri = (fsPath: string): vscode.Uri => ({ fsPath, scheme: 'file' }) as unknown as vscode.Uri;
 
+/** globalState 替身存储（草稿暂存等持久化断言用）。 */
+const globalStore = new Map<string, unknown>();
+
 const IDENTITY = {
   url: 'file:///tmp/repo/src',
   repositoryUuid: 'uuid-1',
@@ -269,10 +274,20 @@ beforeEach(() => {
   vi.mocked(readRemoteIgnoreSnapshot).mockResolvedValue(snap([]));
   vi.mocked(readRemoteNodeRevisions).mockResolvedValue({ headRevision: 9, lastChangedRevision: 9 });
   setOperationRegistryForTest(new OperationRegistry());
+  globalStore.clear();
   setIgnorePanelContext({
     extensionUri: { scheme: 'file', path: '/ext', fsPath: '/ext', toString: () => 'file:///ext' } as never,
     subscriptions: [],
-    globalState: { get: () => undefined, update: async () => {} } as never,
+    globalState: {
+      get: <T>(key: string) => (globalStore.has(key) ? (globalStore.get(key) as T) : undefined),
+      update: async (key: string, value: unknown) => {
+        if (value === undefined) {
+          globalStore.delete(key);
+        } else {
+          globalStore.set(key, value);
+        }
+      },
+    } as never,
   });
 });
 
@@ -310,6 +325,163 @@ describe('P2 面板：打开与草稿', () => {
       expect(html).not.toContain('用当前项名');
       expect(html).toContain('自行填写模式');
       expect(html).toContain('其他来源仍可能生效');
+    } finally {
+      rmSync(lab, { recursive: true, force: true });
+    }
+  });
+
+  it('syncInput 立即重绘：加入按钮与页脚摘要随输入更新（缺陷 A）', async () => {
+    const lab = makeFakeWc();
+    try {
+      enqueue(snap(['*.log', 'build']), snap(['*.log', 'build']));
+      const panel = await openPanel(join(lab, 'src'), '*.log');
+      // 初始：待加入输入为空，「加入」禁用。
+      expect(panel.lastRender()!.html).toContain('data-focus="add-rule" disabled');
+      // 手工输入后立即推送渲染（不经后续意图）：按钮启用、页脚提示未加入
+      // 模式、输入值与 formRevision 对齐（webview 防回退的确认序号）。
+      panel.sendIntent({ kind: 'syncInput', fieldId: 'draft', value: '*.m2tmp', inputRevision: 7 });
+      await settle();
+      const frame = panel.lastRender()!;
+      expect(frame.html).toContain('value="*.m2tmp"');
+      expect(frame.html).toContain('data-focus="add-rule">');
+      expect(frame.html).toContain('还有未加入的模式');
+      expect(frame.formRevision).toBe(7);
+      // 清空输入后回到禁用基线。
+      panel.sendIntent({ kind: 'syncInput', fieldId: 'draft', value: '', inputRevision: 8 });
+      await settle();
+      expect(panel.lastRender()!.html).toContain('data-focus="add-rule" disabled');
+      expect(panel.lastRender()!.html).not.toContain('还有未加入的模式');
+    } finally {
+      rmSync(lab, { recursive: true, force: true });
+    }
+  });
+
+  it('ready 重建握手归零 formRevision 并重推（旧大序号不吞新视图输入确认）', async () => {
+    const lab = makeFakeWc();
+    try {
+      enqueue(snap(['*.log']), snap(['*.log']));
+      const panel = await openPanel(join(lab, 'src'), '*.log');
+      panel.sendIntent({ kind: 'syncInput', fieldId: 'draft', value: '*.m2tmp', inputRevision: 7 });
+      await settle();
+      // 模块级 formRevision 跨用例累积：只断言确认序号已对齐到本次输入以上。
+      expect(panel.lastRender()!.formRevision).toBeGreaterThanOrEqual(7);
+      // 隐藏重建：webview 重新加载并再次握手，视图输入序号从零重启。
+      await panel.send({ type: 'ready', protocolVersion: 1 });
+      await settle();
+      const readyFrame = panel.lastRender()!;
+      expect(readyFrame.formRevision).toBe(0);
+      // 重推保留当前草稿值（session 状态不因重建丢失）。
+      expect(readyFrame.html).toContain('value="*.m2tmp"');
+      // 新视图第一条输入按新序号对齐确认（max(0,1)=1，旧大序号不再参与）。
+      panel.sendIntent({ kind: 'syncInput', fieldId: 'draft', value: '*.review', inputRevision: 1 });
+      await settle();
+      expect(panel.lastRender()!.formRevision).toBe(1);
+      expect(panel.lastRender()!.html).toContain('value="*.review"');
+    } finally {
+      rmSync(lab, { recursive: true, force: true });
+    }
+  });
+
+  it('原生关闭暂存未保存草稿，重开同目标恢复并提示（⌘W 不再静默丢草稿）', async () => {
+    const lab = makeFakeWc();
+    try {
+      enqueue(snap(['*.m2tmp']), snap(['*.m2tmp']));
+      const panel = await openPanel(join(lab, 'src'), '*.m2tmp');
+      // 未保存草稿：待加入输入 + 已加入未保存规则。
+      panel.sendIntent({ kind: 'syncInput', fieldId: 'draft', value: '*.review', inputRevision: 1 });
+      await settle();
+      panel.sendIntent({ kind: 'addRule' });
+      await settle();
+      expect(panel.lastRender()!.html).toContain('未保存');
+      // 原生关闭（onDidDispose 路径，无面板内确认框）。
+      panel.dispose();
+      await settle();
+      const stashKey = `ignorePanel.stash|${lab}|${join(lab, 'src')}`;
+      expect(globalStore.has(stashKey)).toBe(true);
+      expect(globalStore.get(stashKey)).toEqual({
+        rules: ['*.m2tmp', '*.review'],
+        draft: '',
+        savedRules: ['*.m2tmp'],
+        savedPropertyExists: true,
+      });
+      // 重开同目标：暂存草稿与暂存时的保存基线一并恢复到编辑值。
+      enqueue(snap(['*.m2tmp']), snap(['*.m2tmp']));
+      const reopened = await openPanel(join(lab, 'src'), '已恢复上次关闭面板时未保存的草稿');
+      const html = reopened.lastRender()!.html;
+      expect(html).toContain('*.review');
+      expect(html).toContain('未保存');
+      // 暂存一次性消费：再次原生关闭（清空草稿后）不再残留旧值。
+      expect(globalStore.has(stashKey)).toBe(false);
+    } finally {
+      rmSync(lab, { recursive: true, force: true });
+    }
+  });
+
+  it('恢复的草稿沿用原保存基线：关闭期间外部修改属性时保存被拦截不覆盖', async () => {
+    const lab = makeFakeWc();
+    try {
+      enqueue(snap(['*.m2tmp']), snap(['*.m2tmp']));
+      const panel = await openPanel(join(lab, 'src'), '*.m2tmp');
+      panel.sendIntent({ kind: 'syncInput', fieldId: 'draft', value: '*.review', inputRevision: 1 });
+      await settle();
+      panel.sendIntent({ kind: 'addRule' });
+      await settle();
+      // 原生关闭暂存（savedRules 为暂存时基线 ['*.m2tmp']）。
+      panel.dispose();
+      await settle();
+      // 关闭期间外部新增 external.keep：重开读取的工作值已变，BASE 未变；
+      // 第三个快照供保存前的磁盘核对读取。
+      enqueue(snap(['*.m2tmp', 'external.keep']), snap(['*.m2tmp']), snap(['*.m2tmp', 'external.keep']));
+      const reopened = await openPanel(join(lab, 'src'), '关闭期间规则已被其他操作修改');
+      // 恢复的草稿显示为未保存（相对暂存时基线）。
+      expect(reopened.lastRender()!.html).toContain('未保存');
+      // 保存：磁盘值与原基线不一致 → 外部修改拦截，不写回（external.keep 保留）。
+      reopened.sendIntent({ kind: 'saveIgnore' });
+      await settle();
+      expect(vi.mocked(applyIgnoreSnapshot)).not.toHaveBeenCalled();
+      const html = reopened.lastRender()!.html;
+      expect(html).toContain('规则已被其他操作修改');
+      expect(html).toContain('本次未覆盖');
+      // 草稿保留，未静默覆盖也未丢失。
+      expect(html).toContain('*.review');
+    } finally {
+      rmSync(lab, { recursive: true, force: true });
+    }
+  });
+
+  it('面板内确认「放弃草稿并关闭」不暂存草稿（含恢复后再次放弃）', async () => {
+    const lab = makeFakeWc();
+    try {
+      enqueue(snap(['*.m2tmp']), snap(['*.m2tmp']));
+      const panel = await openPanel(join(lab, 'src'), '*.m2tmp');
+      panel.sendIntent({ kind: 'syncInput', fieldId: 'draft', value: '*.review', inputRevision: 1 });
+      await settle();
+      panel.sendIntent({ kind: 'addRule' });
+      await settle();
+      const stashKey = `ignorePanel.stash|${lab}|${join(lab, 'src')}`;
+      // 确认放弃并关闭：销毁回调不再暂存刚被放弃的草稿。
+      vscodeMock.confirmResult = strings.ignorePanel.closeDiscardButton;
+      panel.sendIntent({ kind: 'closePanel' });
+      await settle();
+      expect(panel.disposed).toBe(true);
+      expect(globalStore.has(stashKey)).toBe(false);
+      // 原生关闭暂存 → 重开恢复 → 恢复的草稿再次确认放弃：同样不留暂存。
+      enqueue(snap(['*.m2tmp']), snap(['*.m2tmp']));
+      const second = await openPanel(join(lab, 'src'), '*.m2tmp');
+      second.sendIntent({ kind: 'syncInput', fieldId: 'draft', value: '*.review', inputRevision: 1 });
+      await settle();
+      second.sendIntent({ kind: 'addRule' });
+      await settle();
+      second.dispose();
+      await settle();
+      expect(globalStore.has(stashKey)).toBe(true);
+      enqueue(snap(['*.m2tmp']), snap(['*.m2tmp']));
+      const third = await openPanel(join(lab, 'src'), '已恢复上次关闭面板时未保存的草稿');
+      expect(third.lastRender()!.html).toContain('*.review');
+      third.sendIntent({ kind: 'closePanel' });
+      await settle();
+      expect(third.disposed).toBe(true);
+      expect(globalStore.has(stashKey)).toBe(false);
     } finally {
       rmSync(lab, { recursive: true, force: true });
     }
@@ -546,13 +718,24 @@ describe('P2 面板：仅规则提交与协调', () => {
       // unknown 期间写意图被 host 写锁定拒绝（DOM 与事件守卫一致）。
       panel.sendIntent({ kind: 'saveIgnore' });
       await settle();
-      // 核实：远端 HEAD 仍是原始值 → 确认未提交解锁。
+      // 核实：远端 HEAD 仍是原始值 → 确认未提交解锁。走真实横幅按钮消息
+      // （bannerAction），写锁豁免按 actionId 放行后控制器才拿得到核实请求。
       vi.mocked(readRemoteIgnoreSnapshot).mockResolvedValue(snap(['*.log']));
-      panel.sendIntent({ kind: 'resolveUnknown' });
+      // 解锁时按真实工作值与 BASE 重建会话（工作值两条、BASE 一条）。
+      enqueue(snap(['*.log', '.idea']), snap(['*.log']));
+      const rejectedBefore = panel.posted.filter(
+        (m) => m.type === 'toast' && String(m.message).includes('已忽略重复请求'),
+      ).length;
+      panel.sendIntent({ kind: 'bannerAction', bannerId: 'unknown', actionId: 'resolveUnknown' });
       await settle(60);
       const html = panel.lastRender()!.html;
       expect(html).not.toContain('提交结果未知');
       expect(panel.posted.some((m) => m.type === 'toast' && String(m.message).includes('已确认未提交'))).toBe(true);
+      expect(html).toContain('本地已保存 · 待提交');
+      expect(html).not.toMatch(/data-intent="submitIgnore"[^>]*disabled/);
+      expect(panel.posted.filter(
+        (m) => m.type === 'toast' && String(m.message).includes('已忽略重复请求'),
+      ).length).toBe(rejectedBefore);
     } finally {
       rmSync(lab, { recursive: true, force: true });
     }
@@ -854,7 +1037,7 @@ describe('P2 面板：重启恢复清理临时副本', () => {
     }
   });
 
-  it('unknown 重启后核实未提交：解锁重试并清理登记的临时副本', async () => {
+  it('unknown 重启后核实未提交：重读工作值与 BASE 解锁，保留待提交状态', async () => {
     const lab = makeFakeWc();
     const tempWc = mkdtempSync(join(tmpdir(), 'svn-anywhere-ignore-commit-'));
     try {
@@ -862,11 +1045,21 @@ describe('P2 面板：重启恢复清理临时副本', () => {
       const panel = await openPanel(join(lab, 'src'), '提交结果未知');
       // 远端 HEAD 仍是原始值：确认未提交，解锁允许重试。
       vi.mocked(readRemoteIgnoreSnapshot).mockResolvedValue(snap(['*.log']));
+      // 恢复时的会话快照来自操作记录（待提交两条）；工作副本实际是三条、
+      // BASE 只有一条：解锁后必须以真实工作值与 BASE 重建，不能沿用记录。
+      enqueue(snap(['*.log', '.idea', 'external.keep']), snap(['*.log']));
       panel.sendIntent({ kind: 'resolveUnknown' });
       await settle(60);
       expect(existsSync(tempWc)).toBe(false);
       expect(getOperationRegistry().writeRestriction(lab)).toBeUndefined();
-      expect(panel.lastRender()!.html).toContain('已确认未提交');
+      // 结论用 toast 呈现（本地有修改时 info 横幅会被待提交徽标场景压住）。
+      expect(panel.posted.some((m) => m.type === 'toast' && String(m.message).includes('已确认未提交'))).toBe(true);
+      const html = panel.lastRender()!.html;
+      // 修复前这里显示「规则列表无修改」并禁用提交（工作值与 BASE 的差异未重算）。
+      expect(html).toContain('本地已保存 · 待提交');
+      expect(html).toContain('external.keep');
+      expect(html).not.toContain('规则列表无修改');
+      expect(html).not.toMatch(/data-intent="submitIgnore"[^>]*disabled/);
     } finally {
       rmSync(lab, { recursive: true, force: true });
       rmSync(tempWc, { recursive: true, force: true });
