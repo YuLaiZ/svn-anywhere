@@ -601,6 +601,13 @@ async function measureSvnDir(
 // ---------------------------------------------------------------------------
 
 /**
+ * `node:sqlite` 载入失败（宿主不支持）时 `PristineStats.reason` 的固定
+ * 值：宿主侧以该常量判别 unsupported（能力缺失）与 unavailable（副本侧
+ * 不可用）两态——单一来源导出，调用方不得复制文案字符串做比对。
+ */
+export const PRISTINE_UNSUPPORTED_REASON = '当前 VS Code 宿主不支持缓存检测';
+
+/**
  * 只读统计 `.svn/wc.db` 的 PRISTINE 表。
  *
  * `node:sqlite` 以动态 `await import` 在 try/catch 内载入：engines
@@ -624,7 +631,7 @@ export async function readPristineStats(wcRoot: string): Promise<PristineStats> 
     // 动态载入纪律：旧宿主在此收敛 unsupported，不在模块顶层 import。
     ({ DatabaseSync: DatabaseSyncCtor } = await import('node:sqlite'));
   } catch {
-    return { available: false, reason: '当前 VS Code 宿主不支持缓存检测' };
+    return { available: false, reason: PRISTINE_UNSUPPORTED_REASON };
   }
 
   const dbPath = join(wcRoot, '.svn', 'wc.db');

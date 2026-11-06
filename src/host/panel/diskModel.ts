@@ -19,7 +19,7 @@
  *   MetricSpec），清理前后对比卡用同一 metrics 组件。
  */
 import type { OperationKind } from '../../core/operations';
-import type { DiskUsageFile, PristineStats, ScanDiskUsageResult } from '../../core/diskUsage';
+import { PRISTINE_UNSUPPORTED_REASON, type DiskUsageFile, type PristineStats, type ScanDiskUsageResult } from '../../core/diskUsage';
 import { format, strings } from '../i18n';
 import { sliceTableRows } from './state';
 import type {
@@ -220,13 +220,11 @@ function clearScanData(state: DiskPanelState): DiskPanelState {
  * core 结果映射（diskUsage.ts 返回形态 → 模型形状）
  * ------------------------------------------------------------------------- */
 
-/** readPristineStats 的宿主不支持固定文案（core 硬编码，映射 unsupported 的判别基准）。 */
-const PRISTINE_UNSUPPORTED_REASON = '当前 VS Code 宿主不支持缓存检测';
-
 /**
  * PristineStats → 模型 pristine 形状：available=true → ok；不可用时按
- * 固定文案区分 unsupported（宿主无 node:sqlite——能力缺失）与 unavailable
- * （打开失败/无 PRISTINE 表等——副本侧不可用），数值不冒充 0。
+ * core 导出的固定常量区分 unsupported（宿主无 node:sqlite——能力缺失）
+ * 与 unavailable（打开失败/无 PRISTINE 表等——副本侧不可用），数值不
+ * 冒充 0。判别基准单一来源于 core/diskUsage，不在本模块复制文案。
  */
 export function pristineFromStats(stats: PristineStats): DiskPristineState {
   if (stats.available) {
@@ -783,12 +781,6 @@ export function createDiskTableFilters(pathValue = '', extValue = 'all'): TableF
   ];
 }
 
-/** P4 放行表（§7.2）：busy 行不含 rescan/startScan/confirmVacuum（须等待）；writeLocked 行放行重新检测。 */
-export const DISK_PANEL_GATE: { busy: string[]; writeLocked: string[] } = {
-  busy: ['cancelScan', 'viewTaskLog', 'closePanel', 'showScopeHelp', 'setSort', 'setFilter', 'setPage', 'revealFileInOS'],
-  writeLocked: ['rescan', 'startScan', 'showScopeHelp', 'viewTaskLog', 'closePanel', 'setSort', 'setFilter', 'setPage', 'revealFileInOS'],
-};
-
 /** buildDiskPanelState 的宿主侧输入（占用与表格视图由控制器求值喂入）。 */
 export interface BuildDiskPanelOptions {
   /** 占用重算结果（每次 intent/重显喂入；缺省读 state 内值））。 */
@@ -881,7 +873,8 @@ export function buildDiskPanelState(state: DiskPanelState, options: BuildDiskPan
     table,
     footer,
     hint,
-    gate: DISK_PANEL_GATE,
+    // gate 不在模型内持有：P4 放行表由面板注册时注入的 createP4Gates
+    // 单一来源承载，host.renderStateOf 渲染前求值注入（避免双份表漂移）。
   };
 }
 

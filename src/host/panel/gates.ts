@@ -139,6 +139,10 @@ export function createP3Gates(predicates: P3GatePredicates): PanelGates {
       { action: 'addToWorkspace' },
       { action: 'newTask' },
       { action: 'handoffToCheckout' },
+      // 模式切换放行进处理器、由控制器专门分支精确判定（§4「unknown 未终态
+      // → 拒绝」；不靠放行表一刀切——canceled/failed 等终态页可能因他人记录
+      // writeLocked，基线允许该形态确认切换，与 abandonResidue/newTask 同族）。
+      { action: 'switchP3Mode' },
     ],
   };
 }

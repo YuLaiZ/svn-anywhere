@@ -69,8 +69,9 @@ export interface RunOptions {
    */
   getCredentials?: () => Promise<AuthCredentials | undefined>;
   /**
-   * 认证补录重试执行前的回调，参数为追加 --username/--password 后的重试
-   * args（含明文密码）；宿主用于回显命令行，记录前必须脱敏
+   * 认证补录重试执行前的回调，参数为注入 --username/--password 后的重试
+   * args（含明文密码；注入位置见 runOrThrowWithRunner——`--` 之前或尾部）；
+   * 宿主用于回显命令行，记录前必须脱敏
    * （host 层 logCommand 已内置 redactArgs）。未提供或未发生重试不调用。
    * 返回值（若为函数）将作为重试执行的 onExit：宿主 logCommand 返回的
    * 退出记录器借此让操作日志第二行使用重试命令行（脱敏后）与真实耗时，
@@ -296,9 +297,10 @@ export function run(svnPath: string, args: string[], options: RunOptions = {}): 
 /**
  * 非零退出码视为失败的常用封装；成功时原样返回结果。
  * 提供 getCredentials 时，认证失败（E170001/E215004 等）弹窗补录凭据，
- * 保留原始 args 追加 --username/--password 重试一次（重试执行前经
- * onCredentialRetry 回调，宿主可回显脱敏后的命令行）；补录取消或重试
- * 仍失败都按原错误抛出（SvnError.command 构造时脱敏，明文不外泄）。
+ * 在原始 args 的 `--` 分隔符之前（无 `--` 时在尾部）注入
+ * --username/--password 重试一次（重试执行前经 onCredentialRetry 回调，
+ * 宿主可回显脱敏后的命令行）；补录取消或重试仍失败都按原错误抛出
+ * （SvnError.command 构造时脱敏，明文不外泄）。
  */
 export async function runOrThrow(
   svnPath: string,
@@ -326,7 +328,15 @@ export async function runOrThrowWithRunner(
     if (!credentials) {
       throw err;
     }
-    const retryArgs = [...args, '--username', credentials.username, '--password', credentials.password];
+    // svn 把 `--` 分隔符之后的一切参数当位置参数（选项不再生效）：
+    // 原始 args 含 `--` 时（M3 网络命令统一以 `-- <URL>` 收尾防 peg 误
+    // 解析），凭据必须插到 `--` 之前，`--` 及其后参数保持原序在尾部；
+    // 无 `--` 时维持尾部追加（svn 选项支持后置，M1/M2 命令形态不变）。
+    const credentialArgs = ['--username', credentials.username, '--password', credentials.password];
+    const separatorIndex = args.indexOf('--');
+    const retryArgs = separatorIndex >= 0
+      ? [...args.slice(0, separatorIndex), ...credentialArgs, ...args.slice(separatorIndex)]
+      : [...args, ...credentialArgs];
     // onCredentialRetry 返回退出记录器时（host 层 logCommand 的返回值），
     // 重试执行改用它作为 onExit：操作日志第二行记录重试命令（脱敏）与
     // 各自真实耗时；否则维持复用外层 onExit 的既有行为。

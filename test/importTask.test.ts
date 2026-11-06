@@ -573,8 +573,13 @@ describe('执行期认证（§4.3 ② 四态）', () => {
     expect(outcome.result.kind).toBe('success');
     expect(prompt).toHaveBeenCalledTimes(1);
     // 探测 ls 显式带凭据、有界超时（≤120s、不继承 0）、不注入 getCredentials。
+    // 凭据必须在 `--` 分隔符之前——svn 把 `--` 之后的一切当位置参数，
+    // 只断言 toContain('--username') 不校验位置（评审 P1-1）。
     const lsCall = runCalls.find(({ args }) => args[0] === 'ls');
-    expect(lsCall?.args).toContain('--username');
+    const lsArgs = lsCall?.args ?? [];
+    expect(lsArgs).toContain('--username');
+    expect(lsArgs.indexOf('--username')).toBeLessThan(lsArgs.indexOf('--'));
+    expect(lsArgs.indexOf('--password')).toBeLessThan(lsArgs.indexOf('--'));
     expect(lsCall?.options.timeoutMs).toBeLessThanOrEqual(120_000);
     expect(lsCall?.options.getCredentials).toBeUndefined();
   });

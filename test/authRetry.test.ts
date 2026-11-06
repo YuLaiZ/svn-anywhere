@@ -67,6 +67,42 @@ describe('runOrThrow 认证重试（F66/F67）', () => {
     expect(retryArgs.slice(0, 3)).toEqual(fake.calls[0]?.args ?? []);
   });
 
+  it('args 含 -- 分隔符时，重试凭据插到 -- 之前（-- 及其后位置参数保持原序在尾部）', async () => {
+    const fake = runFake();
+    fake.push(runResult({ exitCode: 1, stderr: 'svn: E170001: Authentication failed' }));
+    fake.push(runResult({ stdout: 'ok', exitCode: 0 }));
+    const getCredentials = vi.fn().mockResolvedValue({ username: 'yu', password: 's3cret' });
+
+    // M3 网络命令形态：`-- <URL>` 收尾（peg 防御）。
+    const args = ['info', '--xml', '--non-interactive', '--', 'http://x/repo/trunk@5'];
+    await runOrThrowWithRunner('svn', args, { getCredentials }, fake.runner);
+
+    // svn 把 `--` 之后的一切参数当位置参数：凭据必须在其之前，`--` 与
+    // 其后参数保持原序在尾部，否则凭据对认证不生效。
+    const retryArgs = fake.calls[1]?.args ?? [];
+    expect(retryArgs).toEqual([
+      'info', '--xml', '--non-interactive',
+      '--username', 'yu', '--password', 's3cret',
+      '--', 'http://x/repo/trunk@5',
+    ]);
+    expect(retryArgs.indexOf('--username')).toBeLessThan(retryArgs.indexOf('--'));
+    expect(retryArgs.indexOf('--password')).toBeLessThan(retryArgs.indexOf('--'));
+  });
+
+  it('args 无 -- 分隔符时，重试凭据保持尾部追加（M1/M2 命令形态不变）', async () => {
+    const fake = runFake();
+    fake.push(runResult({ exitCode: 1, stderr: 'svn: E170001: Authentication failed' }));
+    fake.push(runResult({ stdout: 'ok', exitCode: 0 }));
+    const getCredentials = vi.fn().mockResolvedValue({ username: 'yu', password: 's3cret' });
+
+    await runOrThrowWithRunner('svn', ['update', '--non-interactive', '.'], { getCredentials }, fake.runner);
+
+    expect(fake.calls[1]?.args).toEqual([
+      'update', '--non-interactive', '.',
+      '--username', 'yu', '--password', 's3cret',
+    ]);
+  });
+
   it('E215004 / authorization failed / Authentication failed 都识别为认证失败', async () => {
     for (const stderr of [
       'svn: E215004: No more credentials or we tried too many times.',

@@ -2219,6 +2219,28 @@ async function main() {
     "      *' --password '*) printf \"Updating '.':\\nU    a.txt\\nUpdated to revision 3.\\n\"; exit 0 ;;",
     "      *) printf 'svn: E170001: Authentication failed\\n' >&2; exit 1 ;;",
     '    esac ;;',
+    '  info)',
+    '    case "$2" in',
+    '      --show-item)',
+    // 第一步（读节点 URL 定 scheme）：返回 http URL，宿主按凭据 scheme 分支。
+    "        printf 'http://svn.example.com/repo/trunk\\n'; exit 0 ;;",
+    '      *)',
+    // 模拟真实 svn 的 `--` 语义：分隔符之后的一切按位置参数处理，
+    // --username/--password 落在 `--` 之后不生效，按实测形态报 E155007
+    // （P1-1 缺陷形态的回归防线）。
+    '        after=0; misplaced=0',
+    '        for a in "$@"; do',
+    '          if [ "$a" = "--" ]; then after=1; fi',
+    '          if [ "$after" = 1 ] && { [ "$a" = "--username" ] || [ "$a" = "--password" ]; }; then misplaced=1; fi',
+    '        done',
+    '        if [ "$misplaced" = 1 ]; then',
+    "          printf \"svn: E155007: '--username' is not a working copy\\n\" >&2; exit 1;",
+    '        fi',
+    '        case " $* " in',
+    "          *' --password '*) printf 'Path: trunk\\nURL: http://svn.example.com/repo/trunk\\nRepository Root: http://svn.example.com/repo\\nRepository UUID: uuid-50\\nRelative URL: ^/trunk\\n'; exit 0 ;;",
+    "          *) printf 'svn: E170001: Authentication failed\\n' >&2; exit 1 ;;",
+    '        esac ;;',
+    '    esac ;;',
     '  *) printf \'mock: unsupported\\n\' >&2; exit 1 ;;',
     'esac',
     '',
@@ -2252,6 +2274,27 @@ async function main() {
       opLog50.join('\n'));
     check('操作日志与频道均无明文密码', !opLog50.join('\n').includes('pass123'), '');
     state.confirmResult = undefined;
+    state.inputQueue = [];
+
+    // --- `--` 分隔符语义（P1-1 回归防线）：http 副本 remoteInfo 补录重试 ---
+    // 假 svn 按真实 svn 语义把 `--` 之后的 --username/--password 当位置参数
+    // （E155007 拦截）；凭据必须插在 `--` 之前，认证补录重试才能生效。
+    const mainBefore50b = (channelByTitle('SVN Anywhere') || { lines: [] }).lines.length;
+    const pickTitlesBefore50b = state.quickPickTitles.length;
+    state.inputQueue = ['reviewer', 'pass123'];
+    state.quickPickChoice = undefined;
+    await state.registered.get('svnAnywhere.showRemoteInfo')({ fsPath: wc50, scheme: 'file' });
+    const main50b = channelByTitle('SVN Anywhere').lines.slice(mainBefore50b);
+    const retryEcho50b = main50b.filter((l) => l.includes('--username'));
+    check('http 副本 remoteInfo：补录凭据插在 `--` 之前对 svn 生效（信息项弹出、无 E155007 拦截）',
+      state.quickPickTitles.length > pickTitlesBefore50b && !main50b.join('\n').includes('E155007'),
+      main50b.join('\n').slice(-500));
+    check('remoteInfo 重试命令回显：--username 位于 `--` 分隔符之前且密码脱敏',
+      retryEcho50b.length === 1 &&
+      retryEcho50b[0].includes('--username reviewer --password ***') &&
+      retryEcho50b[0].indexOf('--username') < retryEcho50b[0].indexOf(' -- ') &&
+      !main50b.join('\n').includes('pass123'),
+      retryEcho50b.join('\n'));
     state.inputQueue = [];
   } finally {
     state.configOverrides = undefined;

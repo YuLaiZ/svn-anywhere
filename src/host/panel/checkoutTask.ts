@@ -57,54 +57,12 @@ import {
   type TaskPhase,
 } from '../taskRegistry';
 import { saveDraft, type CheckoutFormDraft } from './drafts';
+import { ByteLineBuffer, lenientUtf8, startsWithBytes } from './streamParse';
 
 /* ---------------------------------------------------------------------------
- * 流式进度解析（字节层，形态对齐 test/svnCliStream.test.ts 的行缓冲）
+ * 流式进度解析（字节层三件套见 ./streamParse，形态对齐
+ * test/svnCliStream.test.ts 的行缓冲）
  * ------------------------------------------------------------------------- */
-
-/**
- * 字节层行缓冲：按 0x0A 分行（GBK 双字节的尾字节不会产生 0x0A，UTF-8
- * 多字节字符也不含 0x0A，按字节拆行不会截断多字节字符），跨块拼接完整
- * 行；进程结束后用 flush 取回无换行结尾的残留尾段。
- */
-class ByteLineBuffer {
-  private pending: Buffer = Buffer.alloc(0);
-
-  /** 喂入一块，返回由这块完成的完整行（不含换行符）。 */
-  push(chunk: Buffer): Buffer[] {
-    this.pending = Buffer.concat([this.pending, chunk]);
-    const lines: Buffer[] = [];
-    for (;;) {
-      const idx = this.pending.indexOf(0x0a);
-      if (idx < 0) {
-        return lines;
-      }
-      lines.push(this.pending.subarray(0, idx));
-      this.pending = this.pending.subarray(idx + 1);
-    }
-  }
-
-  /** 取回不完整的尾段（进程结束后的残留），无残留返回 null。 */
-  flush(): Buffer | null {
-    if (this.pending.length === 0) {
-      return null;
-    }
-    const rest = this.pending;
-    this.pending = Buffer.alloc(0);
-    return rest;
-  }
-}
-
-/** 流式阶段的显示解码：UTF-8 宽松（非法字节替换为 U+FFFD），不做编码回退链。 */
-function lenientUtf8(line: Buffer): string {
-  return new TextDecoder('utf-8', { fatal: false }).decode(line);
-}
-
-/** 字节层前缀匹配：前缀为 ASCII 字节，直接比对原始字节，不依赖行内容解码。 */
-function startsWithBytes(line: Buffer, prefix: string): boolean {
-  const prefixBuf = Buffer.from(prefix, 'utf8');
-  return line.subarray(0, prefixBuf.length).equals(prefixBuf);
-}
 
 /** svn 1.15 实测条目前缀：检出为 `A ` + 4 空格；续检 update 另有 U/D/G。 */
 export const CHECKOUT_ENTRY_PREFIXES: readonly string[] = ['A    '];

@@ -25,7 +25,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as vscode from 'vscode';
 import { SvnError } from '../src/core/errors';
-import type { PristineStats, ScanDiskUsageResult } from '../src/core/diskUsage';
+import { PRISTINE_UNSUPPORTED_REASON, type PristineStats, type ScanDiskUsageResult } from '../src/core/diskUsage';
 import {
   OperationRegistry,
   getOperationRegistry,
@@ -600,8 +600,8 @@ describe('P4 磁盘面板 flow：扫描', () => {
     expect(state.pristine.cacheCount).toBeNull();
     const html = lastHtml(panel);
     expect(html).toContain(strings.diskPanel.vacuumReasonUnsupported.replace('{reason}', 'wc.db 打开失败：被占用'));
-    // 宿主不支持 node:sqlite 的 unsupported 形态同款（固定文案判别）。
-    queuePristine(() => Promise.resolve({ available: false, reason: '当前 VS Code 宿主不支持缓存检测' }));
+    // 宿主不支持 node:sqlite 的 unsupported 形态同款（常量判别）。
+    queuePristine(() => Promise.resolve({ available: false, reason: PRISTINE_UNSUPPORTED_REASON }));
     send(panel, { kind: 'rescan' });
     expect(await waitUntil(() => diskSessionSnapshot()?.pristine.state === 'unsupported')).toBe(true);
   });

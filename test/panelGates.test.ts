@@ -97,7 +97,7 @@ describe('P3 放行表（谓词由面板注入）', () => {
     for (const kind of [
       'verifyImport', 'verifyCheckout', 'revealResultDir', 'revealSourceDir',
       'viewTaskLog', 'closePanel', 'openCurrentWindow', 'openNewWindow',
-      'addToWorkspace', 'newTask', 'handoffToCheckout',
+      'addToWorkspace', 'newTask', 'handoffToCheckout', 'switchP3Mode',
     ]) {
       expect(gatePermits(gates, false, true, { kind }), kind).toBe(true);
     }

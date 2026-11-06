@@ -1099,6 +1099,65 @@ describe('P3 导入面板 flow', () => {
     setImportSnapshotDir(undefined);
   });
 
+  it('verify committed 成功页带 targetUrl：关闭重开（②段缓存）→ handoff 目标 URL 回填', async () => {
+    const src = realpathSync(makeSourceDir('verify-committed-handoff'));
+    const snapshotDir = await presetUnknownRecord(src, TARGET_URL, true);
+    const { setImportSnapshotDir } = await import('../src/host/panel/importTask');
+    setImportSnapshotDir(snapshotDir);
+    mockRun(async (args) => {
+      if (args[0] === 'info' && args[1] === '--xml') {
+        return okRun(PARENT_XML(3));
+      }
+      if (args[0] === 'ls') {
+        return okRun('a.txt\n');
+      }
+      if (args[0] === 'info' && args[1] === '--show-item' && args[2] === 'last-changed-revision') {
+        return okRun('7');
+      }
+      if (args[0] === 'info' && args[1] === '--show-item' && args[2] === 'relative-url') {
+        return okRun('^/trunk/src');
+      }
+      if (args[0] === 'log') {
+        return okRun(
+          `<?xml version="1.0"?><log><logentry revision="7"><msg>核实说明</msg>` +
+            `<paths><path action="A" kind="dir">/trunk/src</path>` +
+            `<path action="A" kind="file">/trunk/src/a.txt</path>` +
+            `<path action="A" kind="file">/trunk/src/sub/b.txt</path>` +
+            `<path action="A" kind="dir">/trunk/src/sub</path></paths></logentry></log>`,
+        );
+      }
+      return okRun();
+    });
+    const panel = await openImportPanel(src);
+    send(panel, { kind: 'verifyImport' });
+    await sleep(40);
+    expect(lastHtml(panel)).toContain('核实确认已提交');
+    // 结论成功页写缓存时携带 targetUrl（handoff 的模型外数据源）。
+    const cached = readSessionResult('checkout', { entryKey: src, mode: 'import' });
+    const cachedPage = cached?.page as { kind?: string; revision?: number; targetUrl?: string };
+    expect(cachedPage.kind).toBe('success');
+    expect(cachedPage.revision).toBe(7);
+    expect(cachedPage.targetUrl).toBe(TARGET_URL);
+    // 关闭重开（②段缓存恢复：会话 form 为空）→ handoff 的 URL 回填数据源
+    // 只能来自结果页 targetUrl 字段（会话 form.url 回退链在此形态为空）。
+    panel.dispose();
+    const reopened = await openImportPanel(src);
+    let html = lastHtml(reopened);
+    expect(html).toContain(strings.checkoutPanel.importResultTitles.success);
+    expect(html).toContain('data-intent="handoffToCheckout"');
+    send(reopened, { kind: 'handoffToCheckout' });
+    await sleep(20);
+    // 切 checkout 模式：revMode='number'/revision 回填 + URL 经 targetUrl 回填
+    // （URL 断言走草稿——HTML 中 URL 文本会与历史下拉混同，草稿是唯一精确判别）。
+    html = lastHtml(reopened);
+    expect(html.match(/data-field-id="revMode"[\s\S]*?option value="number" selected/)).toBeTruthy();
+    const draft = readDraft(src, 'checkout');
+    expect(draft?.url).toBe(TARGET_URL);
+    expect(draft?.revMode).toBe('number');
+    expect(draft?.rev).toBe('7');
+    setImportSnapshotDir(undefined);
+  });
+
   it('verifyImport notCommitted：失败页（retryImport 可用）；快照不完整：unknown 页提供放弃出口并收口回表单', async () => {
     const src = realpathSync(makeSourceDir('verify-notcommitted'));
     const snapshotDir = await presetUnknownRecord(src, TARGET_URL, true);
@@ -1119,8 +1178,22 @@ describe('P3 导入面板 flow', () => {
     let html = lastHtml(panel);
     expect(html).toContain(strings.checkoutPanel.importResultTitles.failed);
     expect(html).toContain('data-intent="retryImport"');
-    // 核实结论页写缓存（关闭重开恢复结论页）。
-    expect(readSessionResult('checkout', { entryKey: src, mode: 'import' })).toBeDefined();
+    // 核实结论页写缓存（关闭重开恢复结论页）——字段矩阵：kind/evidence/
+    // detail（锚点文案）/formSnapshot（retryImport 两层回填数据源）/targetUrl。
+    const cached = readSessionResult('checkout', { entryKey: src, mode: 'import' });
+    const cachedPage = cached?.page as {
+      kind?: string;
+      evidence?: string;
+      detail?: string;
+      targetUrl?: string;
+      formSnapshot?: { url: string; message: string; nameMode: string };
+    };
+    expect(cachedPage.kind).toBe('failed');
+    expect(cachedPage.evidence).toBe('verified');
+    expect(cachedPage.detail).toContain('锚点 r3');
+    expect(cachedPage.targetUrl).toBe(TARGET_URL);
+    expect(cachedPage.formSnapshot?.url).toBe(TARGET_URL);
+    expect(cachedPage.formSnapshot?.message).toBe('核实说明');
     expect(store.records.size).toBe(0);
     setImportSnapshotDir(undefined);
 
@@ -1138,6 +1211,11 @@ describe('P3 导入面板 flow', () => {
     html = lastHtml(panel2);
     expect(html).toContain(strings.checkoutPanel.importResultTitles.unknown);
     expect(html).toContain('data-intent="abandonUnknownImport"');
+    // 快照不完整形态的缓存页：kind=unknown ∧ snapshotIncomplete=true（放弃出口的判定载体）。
+    const cachedIncomplete = readSessionResult('checkout', { entryKey: src2, mode: 'import' });
+    const incompletePage = cachedIncomplete?.page as { kind?: string; snapshotIncomplete?: boolean };
+    expect(incompletePage.kind).toBe('unknown');
+    expect(incompletePage.snapshotIncomplete).toBe(true);
     // 确认放弃：记录收口 + 回表单保留表单值（两层回填——会话 form 空按快照回填）。
     vscodeMock.confirmResult = strings.checkoutPanel.abandonVerifyConfirmButton;
     send(panel2, { kind: 'abandonUnknownImport' });
@@ -1192,6 +1270,113 @@ describe('P3 导入面板 flow', () => {
     setImportSnapshotDir(undefined);
   });
 
+  it('merged 页核实证据不唯一：保持 merged 且 revision/detail 保留（页面与缓存同携，关闭重开不丢）', async () => {
+    const src = realpathSync(makeSourceDir('verify-merged-keep'));
+    // merged 记录（unknown ∧ outcome=merged ∧ resolvedRevision=9）+ 完整快照。
+    const snapshotDir = await presetUnknownRecord(src, TARGET_URL, true, true);
+    const { setImportSnapshotDir } = await import('../src/host/panel/importTask');
+    setImportSnapshotDir(snapshotDir);
+    // merged 页经缓存恢复（executor 直落 merged 页的缓存形态：revision+detail 齐备）。
+    writeSessionResult('checkout', { entryKey: src, mode: 'import' }, {
+      mode: 'import',
+      kind: 'merged',
+      revision: 9,
+      path: src,
+      detail: strings.importTask.mergedDetail,
+    }, 'executor');
+    // 核实链：快照 digest 过（第 0 步）→ 目标 ls 存在 → 父目录 info 读取失败
+    // → 证据不唯一（parentUnreachable——非快照不完整形态，不触发 merged 横幅）。
+    mockRun(async (args) => {
+      if (args[0] === 'ls') {
+        return okRun('a.txt\n');
+      }
+      if (args[0] === 'info' && args[1] === '--xml') {
+        throw svnErr('父目录不可达', 'svn: E175002');
+      }
+      return okRun();
+    });
+    const panel = await openImportPanel(src);
+    let html = lastHtml(panel);
+    expect(html).toContain(strings.checkoutPanel.importResultTitles.merged);
+    expect(html).toContain('r9');
+    expect(html).toContain(strings.importTask.mergedDetail);
+    send(panel, { kind: 'verifyImport' });
+    await sleep(40);
+    // 结论「证据不唯一保持 merged」：重建页 revision/detail 不丢、动作集不变。
+    html = lastHtml(panel);
+    expect(html).toContain(strings.checkoutPanel.importResultTitles.merged);
+    expect(html).toContain('r9');
+    expect(html).toContain(strings.importTask.mergedDetail);
+    expect(html).toContain('data-intent="acknowledgeMerged"');
+    expect(html).not.toContain(strings.checkoutPanel.importVerifySnapshotFailedTitle);
+    // 写缓存的结论页同携 revision/detail（关闭重开经②段缓存恢复的数据源）。
+    const cached = readSessionResult('checkout', { entryKey: src, mode: 'import' });
+    const cachedPage = cached?.page as { kind?: string; revision?: number; detail?: string };
+    expect(cachedPage.kind).toBe('merged');
+    expect(cachedPage.revision).toBe(9);
+    expect(cachedPage.detail).toBe(strings.importTask.mergedDetail);
+    // 记录保持 unknown ∧ outcome=merged（证据不唯一不收口）。
+    const record = [...store.records.values()].find((entry) => entry.kind === 'import');
+    expect(record?.phase).toBe('unknown');
+    expect(record?.outcome).toBe('merged');
+    // 关闭重开：缓存恢复的 merged 页仍带 revision/detail。
+    panel.dispose();
+    const reopened = await openImportPanel(src);
+    html = lastHtml(reopened);
+    expect(html).toContain(strings.checkoutPanel.importResultTitles.merged);
+    expect(html).toContain('r9');
+    expect(html).toContain(strings.importTask.mergedDetail);
+    expect(html).toContain('data-intent="acknowledgeMerged"');
+    setImportSnapshotDir(undefined);
+  });
+
+  it('unknown 记录核实证据不唯一：重建页保留 message/formSnapshot，缓存带 targetUrl 且不置 snapshotIncomplete', async () => {
+    const src = realpathSync(makeSourceDir('verify-unknown-keep'));
+    const snapshotDir = await presetUnknownRecord(src, TARGET_URL, true);
+    const { setImportSnapshotDir } = await import('../src/host/panel/importTask');
+    setImportSnapshotDir(snapshotDir);
+    // 核实链：快照 digest 过（第 0 步）→ 目标 ls 存在 → 父 info 不可达
+    // → 证据不唯一（parentUnreachable——非快照不完整形态）。
+    mockRun(async (args) => {
+      if (args[0] === 'ls') {
+        return okRun('a.txt\n');
+      }
+      if (args[0] === 'info' && args[1] === '--xml') {
+        throw svnErr('父目录不可达', 'svn: E175002');
+      }
+      return okRun();
+    });
+    const panel = await openImportPanel(src);
+    send(panel, { kind: 'verifyImport' });
+    await sleep(40);
+    // 页面保持 unknown：detail 为核实 message（证据不唯一不收口、无放弃出口）。
+    const html = lastHtml(panel);
+    expect(html).toContain(strings.checkoutPanel.importResultTitles.unknown);
+    expect(html).toContain('父目录不可达，无法核实');
+    expect(html).toContain('data-intent="verifyImport"');
+    expect(html).not.toContain('data-intent="abandonUnknownImport"');
+    // 缓存页字段矩阵：resolution/formSnapshot（两层回填数据源）/targetUrl；
+    // 非快照不完整形态不置 snapshotIncomplete。
+    const cached = readSessionResult('checkout', { entryKey: src, mode: 'import' });
+    const cachedPage = cached?.page as {
+      kind?: string;
+      resolution?: string;
+      snapshotIncomplete?: boolean;
+      targetUrl?: string;
+      formSnapshot?: { url: string; message: string; nameMode: string };
+    };
+    expect(cachedPage.kind).toBe('unknown');
+    expect(cachedPage.resolution).toBe('unresolved');
+    expect(cachedPage.snapshotIncomplete).toBeUndefined();
+    expect(cachedPage.targetUrl).toBe(TARGET_URL);
+    expect(cachedPage.formSnapshot?.url).toBe(TARGET_URL);
+    expect(cachedPage.formSnapshot?.message).toBe('核实说明');
+    expect(cachedPage.formSnapshot?.nameMode).toBe('manual');
+    // 记录保持 unknown（证据不唯一不收口）。
+    expect([...store.records.values()].some((record) => record.phase === 'unknown')).toBe(true);
+    setImportSnapshotDir(undefined);
+  });
+
   /* ------------------------------ acknowledgeMerged ------------------------------ */
 
   it('acknowledgeMerged：确认后递增先行、记录 done 收口、settled 动作集（新建/日志）', async () => {
@@ -1225,6 +1410,82 @@ describe('P3 导入面板 flow', () => {
     // settled 页写缓存（关闭重开恢复 settled 形态）。
     const cached = readSessionResult('checkout', { entryKey: src, mode: 'import' });
     expect((cached?.page as { settled?: boolean }).settled).toBe(true);
+    setImportSnapshotDir(undefined);
+  });
+
+  it('跨会话递增（acknowledgeMerged）：新会话确认后旧核实结论不顶回 settled 页与缓存', async () => {
+    const src = realpathSync(makeSourceDir('cross-session-ack'));
+    const snapshotDir = await presetUnknownRecord(src, TARGET_URL, true, true);
+    const { setImportSnapshotDir } = await import('../src/host/panel/importTask');
+    setImportSnapshotDir(snapshotDir);
+    // merged 页经缓存恢复（记录 unknown ∧ outcome=merged）。
+    writeSessionResult('checkout', { entryKey: src, mode: 'import' }, {
+      mode: 'import',
+      kind: 'merged',
+      revision: 9,
+      path: src,
+    }, 'executor');
+    // 核实挂起（ls 延迟）：结论为 committed（若未被拦会顶回成功页）。
+    let releaseVerify!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseVerify = resolve;
+    });
+    mockRun(async (args) => {
+      if (args[0] === 'ls') {
+        await gate;
+        return okRun('a.txt\n');
+      }
+      if (args[0] === 'info' && args[1] === '--xml') {
+        return okRun(PARENT_XML(3));
+      }
+      if (args[0] === 'info' && args[1] === '--show-item' && args[2] === 'last-changed-revision') {
+        return okRun('7');
+      }
+      if (args[0] === 'info' && args[1] === '--show-item' && args[2] === 'relative-url') {
+        return okRun('^/trunk/src');
+      }
+      if (args[0] === 'log') {
+        return okRun(
+          `<?xml version="1.0"?><log><logentry revision="7"><msg>核实说明</msg>` +
+            `<paths><path action="A" kind="dir">/trunk/src</path>` +
+            `<path action="A" kind="file">/trunk/src/a.txt</path>` +
+            `<path action="A" kind="file">/trunk/src/sub/b.txt</path>` +
+            `<path action="A" kind="dir">/trunk/src/sub</path></paths></logentry></log>`,
+        );
+      }
+      return okRun();
+    });
+    const first = await openImportPanel(src);
+    expect(lastHtml(first)).toContain(strings.checkoutPanel.importResultTitles.merged);
+    send(first, { kind: 'verifyImport' });
+    await sleep(20);
+    first.dispose();
+    await sleep(0);
+    // 同源目录重开：缓存恢复 merged 页（dispose 本身不递增代次——「重开后
+    // 不动」的迟到结论本可写入，验收 8/12 关闭重开变体；新会话的递增动作
+    // 才使其失效，与上一条（重开后不动）的对照由此成立）。
+    const second = await openImportPanel(src);
+    expect(lastHtml(second)).toContain(strings.checkoutPanel.importResultTitles.merged);
+    // 新会话点「已人工核对，完成」确认：递增先行、记录 done+finish、settled 页写缓存。
+    vscodeMock.confirmResult = strings.checkoutPanel.ackMergedConfirmButton;
+    send(second, { kind: 'acknowledgeMerged' });
+    await sleep(40);
+    expect(store.records.size).toBe(0);
+    const settled = readSessionResult('checkout', { entryKey: src, mode: 'import' });
+    expect((settled?.page as { settled?: boolean }).settled).toBe(true);
+    // 旧控制器的迟到核实结论（committed）返回：settled 页与缓存不被顶回、
+    // 记录不被二次收口（已随 acknowledge 删除——迟到收口经执行器校验跳过）。
+    releaseVerify();
+    await sleep(60);
+    const after = readSessionResult('checkout', { entryKey: src, mode: 'import' });
+    const page = after?.page as { kind?: string; settled?: boolean };
+    expect(page.kind).toBe('merged');
+    expect(page.settled).toBe(true);
+    expect(store.records.size).toBe(0);
+    // 面板保持 settled 动作集（不被顶回成功页）。
+    const html = lastHtml(second);
+    expect(html).not.toContain(strings.checkoutPanel.importResultTitles.success);
+    expect(html).toContain('data-intent="newTask"');
     setImportSnapshotDir(undefined);
   });
 

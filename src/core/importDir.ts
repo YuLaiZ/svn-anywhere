@@ -57,8 +57,10 @@ export interface ImportSourceEntry {
 export interface ImportSourceSummary {
   fileCount: number;
   totalBytes: number;
-  /** kind='special' 条目数（单列，不与四类分列计数混用）。 */
+  /** kind='special' 条目数（单列，不与四类分列计数混用；lstat 失败占位不计）。 */
   specialItemCount: number;
+  /** global-ignores 命中条目数（§4.1 ImportSnapshot.ignoredCount——渲染不现算）。 */
+  ignoredCount: number;
   symlinkCount: number;
   unreadableCount: number;
   nestedCount: number;
@@ -140,6 +142,9 @@ export function enumerateImportSource(sourceDir: string, options: EnumerateOptio
 
   const entries: ImportSourceEntry[] = [];
   const dirs: string[] = [];
+  // lstat 失败条目的相对路径（kind 以 special 占位）：specialItemCount 的
+  // 语义是 FIFO/socket/设备节点数，「无法分类」不计入（§4.1 防混用）。
+  const unclassifiablePaths = new Set<string>();
 
   /**
    * 递归枚举一层目录。dirEntry 是当前目录自身的条目（顶层为 undefined）：
@@ -175,6 +180,7 @@ export function enumerateImportSource(sourceDir: string, options: EnumerateOptio
       } catch {
         // lstat 失败：无法分类，kind 以 special 占位；非 ignored 时标不可读。
         lstatFailed = true;
+        unclassifiablePaths.add(rel);
       }
       const entry: ImportSourceEntry = {
         path: rel,
@@ -218,9 +224,32 @@ export function enumerateImportSource(sourceDir: string, options: EnumerateOptio
   entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   dirs.sort();
 
+  const { summary, blockers } = summarizeEntries(entries, { unclassifiablePaths });
+
+  return {
+    entries,
+    dirs,
+    summary,
+    blockers,
+  };
+}
+
+/**
+ * 条目清单 → 摘要与阻止原因（单一口径来源）：fileCount/totalBytes 只计
+ * file|symlink 且 ignored=false（§4.1——预览「将导入 N 项」与核实期望
+ * 集合同口径，执行器从快照重算摘要也走本函数，不另持口径副本）。
+ * unclassifiablePaths 为枚举时 lstat 失败的条目（kind 以 special 占位），
+ * 不计入 specialItemCount（语义是 FIFO/socket/设备节点数）。
+ */
+export function summarizeEntries(
+  entries: readonly ImportSourceEntry[],
+  options: { unclassifiablePaths?: ReadonlySet<string> } = {},
+): { summary: ImportSourceSummary; blockers: ImportBlockReason[] } {
+  const unclassifiable = options.unclassifiablePaths;
   let fileCount = 0;
   let totalBytes = 0;
   let specialItemCount = 0;
+  let ignoredCount = 0;
   let symlinkCount = 0;
   let unreadableCount = 0;
   let nestedCount = 0;
@@ -231,8 +260,11 @@ export function enumerateImportSource(sourceDir: string, options: EnumerateOptio
       fileCount += 1;
       totalBytes += entry.size;
     }
-    if (entry.kind === 'special') {
+    if (entry.kind === 'special' && !(unclassifiable?.has(entry.path))) {
       specialItemCount += 1;
+    }
+    if (entry.ignored) {
+      ignoredCount += 1;
     }
     if (entry.kind === 'symlink') {
       symlinkCount += 1;
@@ -250,11 +282,8 @@ export function enumerateImportSource(sourceDir: string, options: EnumerateOptio
       blockers.add('unsupported');
     }
   }
-
   return {
-    entries,
-    dirs,
-    summary: { fileCount, totalBytes, specialItemCount, symlinkCount, unreadableCount, nestedCount, unsupportedCount },
+    summary: { fileCount, totalBytes, specialItemCount, ignoredCount, symlinkCount, unreadableCount, nestedCount, unsupportedCount },
     blockers: [...blockers],
   };
 }
@@ -422,6 +451,27 @@ export function loadSnapshot(text: string, expectedDigest?: string): SnapshotLoa
 export function buildImportTargetUrl(parentUrl: string, sourceName: string): string {
   const parent = parentUrl.endsWith('/') ? parentUrl.slice(0, -1) : parentUrl;
   return `${parent}/${encodeURIComponent(sourceName)}`;
+}
+
+/**
+ * 目标 URL 的父 URL（§5）：剥掉最后一个非空路径段；无路径段（仓库根）
+ * → 父即根。单一来源导出——连接检查（面板）与 unknown 核实（执行器）
+ * 共用，不做朴素 `lastIndexOf('/')`（会把仓库根切成 authority 残段）。
+ */
+export function parentUrlOf(targetUrl: string): string {
+  const schemeEnd = targetUrl.indexOf('://');
+  if (schemeEnd < 0) {
+    return targetUrl;
+  }
+  const authorityEnd = targetUrl.indexOf('/', schemeEnd + 3);
+  if (authorityEnd < 0) {
+    return targetUrl;
+  }
+  const path = targetUrl.slice(authorityEnd + 1).replace(/\/+$/, '');
+  if (path === '') {
+    return targetUrl;
+  }
+  return targetUrl.slice(0, authorityEnd + 1 + path.lastIndexOf('/'));
 }
 
 export type ImportTargetResult =
@@ -650,9 +700,14 @@ function credentialedOptions(url: string, options: RunOptions): RunOptions {
   return schemeAcceptsCredentials(url) ? options : { ...options, getCredentials: undefined };
 }
 
-/** E200009：URL 目标不存在（ls 对不存在路径 W160013 + E200009、exit 1）。 */
-function isUrlNotFound(err: SvnError): boolean {
-  return extractSvnErrorCodes(err.stderr).includes('E200009') || err.stderr.includes('W160009');
+/**
+ * URL 目标不存在的统一判定（§11 V7 实测：`svn ls` 对不存在路径 exit 1，
+ * W160013 与 E200009 成对出现）。E200009 为主判据；W160013 兜底覆盖
+ * E 码缺失的警告先行形态。连接检查、重检与结果核实三处共用本函数，
+ * 不在调用方复制实现。
+ */
+export function isUrlNotFound(err: SvnError): boolean {
+  return extractSvnErrorCodes(err.stderr).includes('E200009') || err.stderr.includes('W160013');
 }
 
 async function runInfoXml(svnPath: string, url: string, options: RunOptions): Promise<ParentInfoSummary> {

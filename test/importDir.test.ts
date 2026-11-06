@@ -42,6 +42,22 @@ vi.mock('../src/core/svnCli', async (importOriginal) => {
   return { ...actual, runOrThrow: vi.fn() };
 });
 
+// lstat 失败注入（真实形态：readdir 与 lstat 之间条目消失）：模块级开关，
+// 未设路径时 lstatSync 原样透传，不影响其他用例。
+const lstatFailPath = vi.hoisted(() => ({ path: undefined as string | undefined }));
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return {
+    ...actual,
+    lstatSync: ((p: import('node:fs').PathLike) => {
+      if (lstatFailPath.path !== undefined && String(p) === lstatFailPath.path) {
+        throw Object.assign(new Error(`ENOENT: no such file or directory, lstat '${String(p)}'`), { code: 'ENOENT' });
+      }
+      return actual.lstatSync(p);
+    }) as typeof actual.lstatSync,
+  };
+});
+
 const tempDirs: string[] = [];
 const chmodRestore: string[] = [];
 
@@ -94,9 +110,10 @@ describe('enumerateImportSource', () => {
     expect(typeof file.mtimeMs).toBe('number');
     expect(entryOf(result, 'empty')).toMatchObject({ kind: 'dir', ignored: false });
     expect(entryOf(result, 'ignored.log')).toMatchObject({ kind: 'file', ignored: true });
-    // fileCount/totalBytes 只计 file|symlink 且 ignored=false。
+    // fileCount/totalBytes 只计 file|symlink 且 ignored=false；忽略项只进 ignoredCount。
     expect(result.summary.fileCount).toBe(2);
     expect(result.summary.totalBytes).toBe(11);
+    expect(result.summary.ignoredCount).toBe(1);
     expect(result.summary).toMatchObject({ symlinkCount: 0, unreadableCount: 0, nestedCount: 0, unsupportedCount: 0 });
     expect(result.blockers).toEqual([]);
   });
@@ -129,6 +146,34 @@ describe('enumerateImportSource', () => {
       expect(result.summary.specialItemCount).toBe(1);
       expect(result.summary.unsupportedCount).toBe(1);
       expect(result.blockers).toContain('unsupported');
+    }
+  });
+
+  it('lstat 失败条目 → special 占位 + unreadable，不计入 specialItemCount（§4.1 口径防混用）', async () => {
+    const dir = makeTempDir('svn-anywhere-imp-lstat-');
+    writeFileSync(join(dir, 'a.txt'), 'x');
+    let hasMkfifo = true;
+    try {
+      execSync('mkfifo --version', { stdio: 'ignore' });
+    } catch {
+      hasMkfifo = false;
+    }
+    if (hasMkfifo) {
+      execSync(`mkfifo ${JSON.stringify(join(dir, 'pipe'))}`);
+    }
+    writeFileSync(join(dir, 'gone.txt'), 'y');
+    // 对 gone.txt 注入 lstat 失败（真实形态：readdir 与 lstat 之间条目消失）。
+    lstatFailPath.path = join(dir, 'gone.txt');
+    try {
+      const result = enumerateImportSource(dir);
+      // lstat 失败：kind 以 special 占位、非 ignored 标 unreadable 阻止导入；
+      // 但「无法分类」不是 FIFO/socket/设备——specialItemCount 不计。
+      expect(entryOf(result, 'gone.txt')).toMatchObject({ kind: 'special', unreadable: true, unsupported: false });
+      expect(result.summary.specialItemCount).toBe(hasMkfifo ? 1 : 0);
+      expect(result.summary.unreadableCount).toBe(1);
+      expect(result.blockers).toContain('unreadable');
+    } finally {
+      lstatFailPath.path = undefined;
     }
   });
 
@@ -555,6 +600,21 @@ describe('recheckImportTarget', () => {
     expect(lsCall?.[1].at(-1)).toBe(`${TARGET_URL}@`);
   });
 
+  it('目标 ls 仅 W160013（无 E200009）→ W 码兜底仍判不存在（§11 V7 实测形态）', async () => {
+    vi.mocked(runOrThrow).mockImplementation(async (_svnPath, args) => {
+      if (args[0] === 'info') {
+        return okResult(parentInfoXml(UUID, ROOT, 7));
+      }
+      if (args[0] === 'ls') {
+        // stderr 无任何 E 码：判定只能由 W160013 兜底命中（W160009 笔误形态由此捕获）。
+        throw svnFailureStub('svn: W160013: Path not found');
+      }
+      return okResult();
+    });
+    const result = await recheckImportTarget('svn', PARENT_URL, TARGET_URL, parentIdentity);
+    expect(result).toEqual({ ok: true, parentIdentity: { ...parentIdentity, lastChangedRevision: 7 } });
+  });
+
   it('父身份不一致 → identityChanged；目标已存在 → targetExists', async () => {
     vi.mocked(runOrThrow).mockImplementation(async (_svnPath, args) => {
       if (args[0] === 'info') {
@@ -649,6 +709,8 @@ interface VerifyFixture {
   snapshot?: ImportSnapshot;
   expectedSnapshotDigest?: string;
   targetExists?: boolean;
+  /** 目标 ls 失败时的 stderr 覆盖（默认 W160013+E200009 并存的真实形态）。 */
+  targetLsStderr?: string;
   parentUuid?: string;
   parentCommitRevision?: number;
   lastChangedRevision?: string;
@@ -664,7 +726,8 @@ function setupVerify(fixture: VerifyFixture): void {
   vi.mocked(runOrThrow).mockImplementation(async (_svnPath, args) => {
     if (args[0] === 'ls') {
       if (fixture.targetExists === false) {
-        throw svnFailureStub('svn: W160013: Path not found\nsvn: E200009: Could not list all targets', 'E200009');
+        const stderr = fixture.targetLsStderr ?? 'svn: W160013: Path not found\nsvn: E200009: Could not list all targets';
+        throw svnFailureStub(stderr);
       }
       return okResult();
     }
@@ -712,6 +775,12 @@ describe('verifyImportOutcome', () => {
 
   it('目标不存在 + 父目录三项全一致（UUID/root/revision 锚点）→ notCommitted', async () => {
     setupVerify({ targetExists: false, parentCommitRevision: 3 });
+    const result = await verifyImportOutcome('svn', fixtureInput);
+    expect(result).toEqual({ kind: 'notCommitted', evidence: { parentLastChangedRevision: 3 } });
+  });
+
+  it('目标 ls 仅 W160013（无 E200009）→ W 码兜底判不存在，notCommitted 成立', async () => {
+    setupVerify({ targetExists: false, targetLsStderr: 'svn: W160013: Path not found', parentCommitRevision: 3 });
     const result = await verifyImportOutcome('svn', fixtureInput);
     expect(result).toEqual({ kind: 'notCommitted', evidence: { parentLastChangedRevision: 3 } });
   });

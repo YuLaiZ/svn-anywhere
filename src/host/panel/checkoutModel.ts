@@ -1851,8 +1851,8 @@ function buildReviewSpec(state: CheckoutPanelState): FormSpec {
           row('reviewSourceUnversioned', t.reviewSourceUnversioned, ''),
           row('reviewFileCount', t.reviewFileCountLabel, format(t.reviewFileCountUnit, { count: String(review.previewSummary?.fileCount ?? 0) })),
           row('reviewTotalBytes', t.reviewTotalBytesLabel, review.previewSummary === null ? '—' : formatSize(review.previewSummary.totalBytes)),
-          // 忽略项计数不在 core 摘要字段内（§4.1 ImportSourceSummary 无 ignoredCount），从快照条目现算。
-          row('reviewIgnoredCount', t.reviewIgnoredCountLabel, String(review.snapshot?.entries.filter((entry) => entry.ignored).length ?? 0)),
+          // 忽略项计数走 core 摘要字段（§4.1 ImportSourceSummary.ignoredCount，与 fileCount 同源）。
+          row('reviewIgnoredCount', t.reviewIgnoredCountLabel, String(review.previewSummary?.ignoredCount ?? 0)),
           row('reviewSymlinkCount', t.reviewSymlinkCountLabel, String(review.previewSummary?.symlinkCount ?? 0)),
           row('reviewUnreadableCount', t.reviewUnreadableCountLabel, String(review.previewSummary?.unreadableCount ?? 0)),
           row('reviewNestedCount', t.reviewNestedCountLabel, String(review.previewSummary?.nestedCount ?? 0)),

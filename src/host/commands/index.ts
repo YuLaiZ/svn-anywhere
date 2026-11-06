@@ -28,7 +28,7 @@ import { setDiskPanelContext } from '../panel/panels/disk';
 import { setDraftStorage } from '../panel/drafts';
 import { setDiskMarkerStorage } from '../panel/diskTask';
 import { setImportSnapshotDir } from '../panel/importTask';
-import { initializeOperationStore } from '../../core/operations';
+import { initializeOperationStore, setOperationTriageLogSink } from '../../core/operations';
 import { cleanupOrphanSnapshots } from '../orphanSnapshots';
 import { logLine } from '../output';
 import type { OutputKind } from '../output';
@@ -87,6 +87,8 @@ export async function registerAllCommands(context: vscode.ExtensionContext): Pro
   // 导入快照落盘目录（导入执行器与孤儿快照清理同一 globalStorageUri 根）。
   setImportSnapshotDir(context.globalStorageUri?.fsPath);
   // 未完成操作记录跨会话恢复限制（写锁在面板打开时生效）。
+  // M1 分诊日志接入 update 频道（core 不依赖 vscode，经注入钩子输出）。
+  setOperationTriageLogSink((line) => logLine(line, 'update'));
   // 每次 activate 都重载：记录可能被另一窗口写入同一 globalState，
   // 重跑 loadPending 是幂等的（active 收窄幂等、对运行登记中的键跳过陈旧化）。
   await initializeOperationStore(context.globalState);

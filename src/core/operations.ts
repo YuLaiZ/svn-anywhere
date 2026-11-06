@@ -398,7 +398,8 @@ export class OperationRegistry {
           // M1 命令可安全重跑：转终态后随即移除，不冒充任何结论。
           await this.markPhase(record.operationId, 'failed-unconfirmed');
           await this.finish(record.operationId);
-          console.log(`[svn-anywhere] 重启分诊：${kind} 操作 ${record.operationId}（${key}）未完成，已按可安全重跑移除记录`);
+          const line = `[svn-anywhere] 重启分诊：${kind} 操作 ${record.operationId}（${key}）未完成，已按可安全重跑移除记录`;
+          (triageLogSink ?? ((message: string) => console.log(message)))(line);
           continue;
         }
         const folded: OperationPhase = kind === 'checkout' ? 'residue-pending' : 'unknown';
@@ -667,6 +668,18 @@ export interface MementoLike {
 }
 
 const OPERATIONS_KEY = 'svnAnywhere.operations';
+
+/**
+ * M1 分诊日志的注入钩子（core 不依赖 vscode，输出频道由 host 注入——
+ * activate 时接到 update 频道的 logLine；未注入（单测/无宿主）回退
+ * console，保持既有可观测性下限）。
+ */
+let triageLogSink: ((line: string) => void) | undefined;
+
+/** 注入/卸载分诊日志出口（传 undefined 卸载）。 */
+export function setOperationTriageLogSink(sink: ((line: string) => void) | undefined): void {
+  triageLogSink = sink;
+}
 
 /**
  * 用宿主 globalState 构造操作存储并初始化全局注册表：activate 时调用。

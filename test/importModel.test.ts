@@ -18,12 +18,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { editableURL } from '../src/core/checkout';
-import type {
-  ImportBlockReason,
-  ImportEnumeration,
-  ImportSourceEntry,
-  ParentIdentitySnapshot,
-} from '../src/core/importDir';
+import { summarizeEntries, type ImportEnumeration, type ImportSourceEntry, type ParentIdentitySnapshot } from '../src/core/importDir';
 import { createEmptyFormDraft } from '../src/host/panel/drafts';
 import { strings } from '../src/host/i18n';
 import {
@@ -105,46 +100,10 @@ function entry(path: string, overrides: Partial<ImportSourceEntry> = {}): Import
   };
 }
 
-/** 与 enumerateImportSource 同口径地汇总（模型测试不触文件系统，直接构造枚举数据）。 */
+/** 与 enumerateImportSource 同口径地汇总（直接复用 core 的 summarizeEntries，不复制口径）。 */
 function enumerationOf(entries: ImportSourceEntry[], dirs: string[] = []): ImportEnumeration {
-  let fileCount = 0;
-  let totalBytes = 0;
-  let specialItemCount = 0;
-  let symlinkCount = 0;
-  let unreadableCount = 0;
-  let nestedCount = 0;
-  let unsupportedCount = 0;
-  const blockers = new Set<ImportBlockReason>();
-  for (const item of entries) {
-    if ((item.kind === 'file' || item.kind === 'symlink') && !item.ignored) {
-      fileCount += 1;
-      totalBytes += item.size;
-    }
-    if (item.kind === 'special') {
-      specialItemCount += 1;
-    }
-    if (item.kind === 'symlink') {
-      symlinkCount += 1;
-    }
-    if (item.unreadable) {
-      unreadableCount += 1;
-      blockers.add('unreadable');
-    }
-    if (item.nested) {
-      nestedCount += 1;
-      blockers.add('nested');
-    }
-    if (item.unsupported) {
-      unsupportedCount += 1;
-      blockers.add('unsupported');
-    }
-  }
-  return {
-    entries,
-    dirs,
-    summary: { fileCount, totalBytes, specialItemCount, symlinkCount, unreadableCount, nestedCount, unsupportedCount },
-    blockers: [...blockers],
-  };
+  const { summary, blockers } = summarizeEntries(entries);
+  return { entries, dirs, summary, blockers };
 }
 
 /** 清单 §三 normal 场景：8 文件 + 2 忽略项。 */

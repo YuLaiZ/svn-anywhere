@@ -338,6 +338,15 @@ function toastMessages(panel: FakePanel): string[] {
 
 /** 等待任务相位镜像轮询（连接相位同步间隔 120ms）。 */
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+async function waitFor(cond: () => boolean, ms = 1500): Promise<void> {
+  for (let i = 0; i < Math.ceil(ms / 20); i += 1) {
+    if (cond()) {
+      return;
+    }
+    await sleep(20);
+  }
+  throw new Error('等待条件超时');
+}
 async function waitTaskRunning(): Promise<void> {
   for (let i = 0; i < 30; i += 1) {
     if (getActiveTask('checkout')?.phase === 'running') {
@@ -429,6 +438,46 @@ function residueRecord(overrides: Partial<OperationRecord> = {}): OperationRecor
 async function presetRecord(record: OperationRecord): Promise<void> {
   store.records.set(record.operationId, record);
   await getOperationRegistry().loadPending();
+}
+
+/** 未终态 import 记录（默认 unknown；outcome='merged' 即 merged 形态，§2.2）。 */
+function importRecord(overrides: Partial<OperationRecord> = {}): OperationRecord {
+  const src = join(labRoot, 'src-import');
+  return {
+    operationId: 'op-import-1',
+    wcRoot: src,
+    lockKey: src,
+    kind: 'import',
+    targetRelPath: '.',
+    nodeKind: 'dir',
+    phase: 'unknown',
+    knownRevisions: [],
+    updatedAt: Date.now(),
+    targetPath: src,
+    importIntent: {
+      targetUrl: REPO_URL,
+      parentIdentity: {
+        repositoryUuid: IDENTITY.repositoryUuid,
+        repositoryRootUrl: IDENTITY.repositoryRootUrl,
+        lastChangedRevision: 3,
+      },
+      message: '导入说明',
+      nameMode: 'auto',
+      messageHash: 'hash',
+      startedAt: 1,
+      summary: { fileCount: 1, totalBytes: 1 },
+      snapshotDigest: 'digest',
+      fileRefs: 'op-import-1',
+    },
+    ...overrides,
+  };
+}
+
+/** 从源目录右键「导入」入口打开 P3（第③段分诊 → import unknown/merged 页）。 */
+async function openImportPanelAt(src: string): Promise<FakePanel> {
+  await openCheckoutPanel({ entryKey: src, mode: 'import', sourceDir: src });
+  await sleep(0);
+  return lastPanel();
 }
 
 beforeEach(async () => {
@@ -1131,6 +1180,338 @@ describe('P3 检出面板 flow', () => {
     }
   });
 
+  /* ------------- 旧核验结论 vs 新任务已写缓存（§2.1 两层守卫组合形态） ------------- */
+
+  /** 挂起核验（A 侧 info 命令延迟）+ B 侧检出可完成的统一 mock。 */
+  function mockVerifyGatedWithCheckoutOk(gate: Promise<void>): void {
+    mockRun(async (args) => {
+      if (args[0] === 'info' && args[1] === '--') {
+        await gate;
+        return okRun(
+          `URL: ${REPO_URL}\nRepository UUID: ${IDENTITY.repositoryUuid}\nRepository Root: ${IDENTITY.repositoryRootUrl}\nRevision: 3\nNode Kind: directory\n`,
+        );
+      }
+      if (args[0] === 'info' && args[1] === '--show-item') {
+        await gate;
+        return okRun(args[2] === 'relative-url' ? IDENTITY.relativeUrl : 'infinity');
+      }
+      if (args[0] === 'info' && args[1] === '--xml') {
+        return okRun(INFO_XML(5));
+      }
+      if (args[0] === 'checkout') {
+        return okRun('Checked out revision 5.\n');
+      }
+      return okRun();
+    });
+  }
+
+  it('旧核验结论 vs 新任务已写缓存（B 入口先写）：跨 scope 迟到结论不覆盖 B 成功页', async () => {
+    const t = strings.checkoutPanel;
+    const record = residueRecord();
+    await presetRecord(record);
+    let releaseVerify!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseVerify = resolve;
+    });
+    mockVerifyGatedWithCheckoutOk(gate);
+    const first = await openPanel(labRoot);
+    send(first, { kind: 'verifyCheckout' });
+    await sleep(10);
+    first.dispose();
+    await sleep(0);
+    const entryB = realpathSync(mkdtempSync(join(tmpdir(), 'entry-bwrite-')));
+    try {
+      // B 入口 fresh open（A 无缓存项）→ 发起并完成小检出（任务创建即递增
+      // 代次、执行器终态以 scope B 写入成功页）。
+      const second = await openPanel(entryB);
+      await fillToReview(second, REPO_URL);
+      send(second, { kind: 'startCheckout' });
+      await waitFor(() => rendersOf(second).some((html) => html.includes(t.resultTitles.success)));
+      const cached = readSessionResult('checkout', { entryKey: entryB, mode: 'checkout' });
+      expect((cached?.page as { kind: string }).kind).toBe('success');
+      // 旧核验结论返回：单槽缓存仍为 B 的成功页（任务启动递增 + 跨 scope
+      // 写侧校验双层——即便递增遗漏，scope A ≠ B 的写入也被写侧拦下）。
+      releaseVerify();
+      await sleep(60);
+      const after = readSessionResult('checkout', { entryKey: entryB, mode: 'checkout' });
+      expect((after?.page as { kind: string }).kind).toBe('success');
+      // 关闭并从 B 重开：恢复 B 成功页、不落空白新表单、不恢复 A 的结论页。
+      second.dispose();
+      await sleep(0);
+      const third = await openPanel(entryB);
+      const html = lastHtml(third);
+      expect(html).toContain(t.resultTitles.success);
+      expect(html).not.toContain(t.resultTitles.resumable);
+    } finally {
+      rmSync(entryB, { recursive: true, force: true });
+    }
+  });
+
+  it('旧核验结论 vs 新任务已写缓存（同 scope 对照）：丢弃由任务启动递增承担（写侧放行）', async () => {
+    const t = strings.checkoutPanel;
+    const record = residueRecord();
+    await presetRecord(record);
+    let releaseVerify!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseVerify = resolve;
+    });
+    mockVerifyGatedWithCheckoutOk(gate);
+    const first = await openPanel(labRoot);
+    send(first, { kind: 'verifyCheckout' });
+    await sleep(10);
+    first.dispose();
+    await sleep(0);
+    // 同入口重开：③段分诊 interrupted 页（核验仍挂起、缓存无终态）。
+    const second = await openPanel(labRoot);
+    expect(lastHtml(second)).toContain(t.resultTitles.interrupted);
+    // 经「改用新目录」回表单后同 scope 再次发起任务并完成（scope 一致，
+    // 写侧校验放行——旧结论的丢弃只能由任务创建时的代次递增承担）。
+    vscodeMock.confirmResult = strings.panel.switchDiscardButton;
+    send(second, { kind: 'abandonResidue' });
+    await sleep(20);
+    expect(lastHtml(second)).toContain(t.stepForm);
+    await fillToReview(second, REPO_URL);
+    send(second, { kind: 'startCheckout' });
+    await waitFor(() => rendersOf(second).some((html) => html.includes(t.resultTitles.success)));
+    const cached = readSessionResult('checkout', { entryKey: labRoot, mode: 'checkout' });
+    expect((cached?.page as { kind: string }).kind).toBe('success');
+    // 旧核验结论返回：scope 一致、写侧会放行——若代次守卫缺失会覆盖新成功页。
+    releaseVerify();
+    await sleep(60);
+    const after = readSessionResult('checkout', { entryKey: labRoot, mode: 'checkout' });
+    expect((after?.page as { kind: string }).kind).toBe('success');
+    second.dispose();
+    await sleep(0);
+    const third = await openPanel(labRoot);
+    const html = lastHtml(third);
+    expect(html).toContain(t.resultTitles.success);
+    expect(html).not.toContain(t.resultTitles.resumable);
+  });
+
+  it('A-先到顺序对照：旧结论先占空槽，执行器终态写入不被写侧校验丢弃（模拟递增点遗漏）', async () => {
+    const record = residueRecord();
+    await presetRecord(record);
+    let releaseVerify!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseVerify = resolve;
+    });
+    mockVerifyGatedWithCheckoutOk(gate);
+    const first = await openPanel(labRoot);
+    send(first, { kind: 'verifyCheckout' });
+    await sleep(10);
+    first.dispose();
+    await sleep(0);
+    const entryB = realpathSync(mkdtempSync(join(tmpdir(), 'entry-afirst-')));
+    try {
+      // B 入口打开过但面板已关（任务后台继续的形态——终态写入不依赖面板
+      // 存活）；任务未发起，全程不递增代次（模拟任务启动递增点遗漏形态）。
+      const second = await openPanel(entryB);
+      second.dispose();
+      await sleep(0);
+      const epochBefore = getResultEpoch('checkout');
+      // A 结论先返回（B 尚未写缓存）：代次一致 + 槽空 → 写入 scope A 结论页。
+      releaseVerify();
+      await sleep(40);
+      const early = readSessionResult('checkout', { entryKey: labRoot, mode: 'checkout' });
+      expect((early?.page as { kind: string }).kind).toBe('resumable');
+      expect(getResultEpoch('checkout')).toBe(epochBefore);
+      // B 的执行器终态随后写入：断言不被写侧校验丢弃、覆盖旧结论页（终槽
+      // 为 B 的结果页——「执行器写入同受槽空/同 scope 约束」的实现会让 A
+      // 先占空槽、B 的真实新结果被跨 scope 丢弃，本对照由此捕获）。
+      const { writeSessionResult } = await import('../src/host/sessionResults');
+      writeSessionResult('checkout', { entryKey: entryB, mode: 'checkout' }, {
+        mode: 'checkout',
+        kind: 'success',
+        path: join(entryB, 'trunk'),
+        revision: 5,
+      }, 'executor');
+      const final = readSessionResult('checkout', { entryKey: entryB, mode: 'checkout' });
+      expect((final?.page as { kind: string }).kind).toBe('success');
+    } finally {
+      rmSync(entryB, { recursive: true, force: true });
+    }
+  });
+
+  it('同 scope 新任务代次对照（送达）：新任务成功页不附「核验进行中」提示；旧结论返回后登记清除', async () => {
+    const t = strings.checkoutPanel;
+    const { matchReadonlyVerify } = await import('../src/host/sessionResults');
+    // 先经真实任务产生 canceled 结果页（缓存终态 → 重开②段恢复 + 提示）。
+    mockCheckoutHang();
+    const first = await openPanel(labRoot);
+    await startCheckoutRunning(first, join(labRoot, 'trunk'));
+    vscodeMock.confirmResult = t.cancelConfirmButton;
+    send(first, { kind: 'cancelTask' });
+    await sleep(80);
+    expect(lastHtml(first)).toContain(t.resultTitles.canceled);
+    // 从 canceled 页发起核验（挂起）→ dispose → 同入口立即重开。
+    let releaseVerify!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseVerify = resolve;
+    });
+    mockVerifyGatedWithCheckoutOk(gate);
+    send(first, { kind: 'verifyCheckout' });
+    await sleep(10);
+    first.dispose();
+    await sleep(0);
+    const second = await openPanel(labRoot);
+    const pendingHtml = lastHtml(second);
+    expect(pendingHtml).toContain(t.resultTitles.canceled);
+    expect(pendingHtml).toContain(t.verifyPendingTitle);
+    // 同 scope（入口 A）发起并完成一个小检出：newTask（递增）→ 表单 →
+    // startCheckout（任务创建再递增）→ 执行器终态写 success。
+    send(second, { kind: 'newTask' });
+    await sleep(0);
+    await fillToReview(second, REPO_URL);
+    send(second, { kind: 'startCheckout' });
+    await waitFor(() => rendersOf(second).some((html) => html.includes(t.resultTitles.success)));
+    second.dispose();
+    await sleep(0);
+    // 关闭再重开：②段恢复新任务成功页且不附「核验进行中」提示（登记仍
+    // 存在且 scope 一致，但登记代次已过期——不带代次比对会把旧提示挂到新页）。
+    const third = await openPanel(labRoot);
+    const html = lastHtml(third);
+    expect(html).toContain(t.resultTitles.success);
+    expect(html).not.toContain(t.verifyPendingTitle);
+    // 旧核验结论随后返回：按代次守卫丢弃、登记清除（重开会话不再显示提示）。
+    releaseVerify();
+    await sleep(60);
+    expect(
+      matchReadonlyVerify('checkout', { entryKey: labRoot, mode: 'checkout' }, getResultEpoch('checkout')),
+    ).toBe(false);
+  });
+
+  /* ------------- 跨会话递增使迟到结论失效（§2.1 计数器跨面板会话持续） ------------- */
+
+  it('跨会话递增（abandonResidue）：新会话确认后旧核验结论不重建单槽缓存', async () => {
+    const t = strings.checkoutPanel;
+    // 真实任务 canceled 页（缓存携带 formSnapshot）。
+    mockCheckoutHang();
+    const first = await openPanel(labRoot);
+    await startCheckoutRunning(first, join(labRoot, 'trunk'));
+    vscodeMock.confirmResult = t.cancelConfirmButton;
+    send(first, { kind: 'cancelTask' });
+    await sleep(80);
+    expect(lastHtml(first)).toContain(t.resultTitles.canceled);
+    // canceled 页发起核验（挂起）→ dispose → 同入口重开（②段恢复 + 提示）。
+    let releaseVerify!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseVerify = resolve;
+    });
+    mockVerifyGatedWithCheckoutOk(gate);
+    send(first, { kind: 'verifyCheckout' });
+    await sleep(10);
+    first.dispose();
+    await sleep(0);
+    const second = await openPanel(labRoot);
+    const pendingHtml = lastHtml(second);
+    expect(pendingHtml).toContain(t.resultTitles.canceled);
+    expect(pendingHtml).toContain(t.verifyPendingTitle);
+    // 新会话点「改用新目录」确认：递增（新会话的动作作用于同一计数器）+
+    // 清缓存 + 记录收口 + 草稿写回。
+    vscodeMock.confirmResult = strings.panel.switchDiscardButton;
+    send(second, { kind: 'abandonResidue' });
+    await sleep(20);
+    expect(lastHtml(second)).toContain(t.stepForm);
+    expect([...store.records.values()].some((item) => item.kind === 'checkout')).toBe(false);
+    // 旧控制器的迟到核验结论返回：不写结果页与缓存（新会话已清缓存并终结
+    // 记录，旧结论不得重建单槽——「重开后不动」的迟到结论本可写入的对照
+    // 见上一条用例，新会话的递增动作才使其失效）。
+    releaseVerify();
+    await sleep(60);
+    expect(readSessionResult('checkout', { entryKey: labRoot, mode: 'checkout' })).toBeUndefined();
+    // 重开回表单/草稿恢复，不恢复 resumable 结论页。
+    second.dispose();
+    await sleep(0);
+    const third = await openPanel(labRoot);
+    const html = lastHtml(third);
+    expect(html).toContain(t.stepForm);
+    expect(html).toContain(REPO_URL);
+    expect(html).not.toContain(t.resultTitles.resumable);
+  });
+
+  /* ------------- 续检任务的快照继承（§2.1 续检来源规则的组合形态） ------------- */
+
+  it('续检任务的快照继承：缓存恢复 resumable 页发起续检 → 任务快照非空 → 失败页 abandon 后重开恢复原参数', async () => {
+    const t = strings.checkoutPanel;
+    // 真实任务 canceled 页（终态页携带 formSnapshot，指定版本形态）→ 核验
+    // 转 resumable（透传）。
+    mockCheckoutHang();
+    const first = await openPanel(labRoot);
+    // 指定版本形态：先填 revMode/rev 再发起连接检查（签名含版本——顺序颠倒会使检查失效）。
+    send(first, { kind: 'syncInput', fieldId: 'url', value: REPO_URL, inputRevision: 1 });
+    await sleep(0);
+    send(first, { kind: 'syncInput', fieldId: 'revMode', value: 'number', inputRevision: 2 });
+    await sleep(0);
+    send(first, { kind: 'syncInput', fieldId: 'rev', value: '5', inputRevision: 3 });
+    await sleep(0);
+    send(first, { kind: 'checkoutNext' });
+    await sleep(20);
+    send(first, { kind: 'startCheckout' });
+    await waitTaskRunning();
+    vscodeMock.confirmResult = t.cancelConfirmButton;
+    send(first, { kind: 'cancelTask' });
+    await sleep(80);
+    mockVerifyCommands();
+    send(first, { kind: 'verifyCheckout' });
+    await sleep(30);
+    expect(lastHtml(first)).toContain(t.resultTitles.resumable);
+    first.dispose();
+    await sleep(0);
+    // 重开：缓存恢复 resumable 页（会话内 form 已空——快照继承来源唯一）。
+    const second = await openPanel(labRoot);
+    expect(lastHtml(second)).toContain(t.resultTitles.resumable);
+    // 续检：重核验一致 + cleanup ok + update 挂起（抓任务对象快照后注入失败）。
+    let failUpdate!: () => void;
+    const updateGate = new Promise<void>((resolve) => {
+      failUpdate = resolve;
+    });
+    mockRun(async (args) => {
+      if (args[0] === 'info') {
+        return okRun(
+          args[1] === '--show-item'
+            ? (args[2] === 'relative-url' ? IDENTITY.relativeUrl : 'infinity')
+            : `URL: ${REPO_URL}\nRepository UUID: ${IDENTITY.repositoryUuid}\nRepository Root: ${IDENTITY.repositoryRootUrl}\nRevision: 3\nNode Kind: directory\n`,
+        );
+      }
+      if (args[0] === 'cleanup') {
+        return okRun();
+      }
+      if (args[0] === 'update') {
+        await updateGate;
+        throw new SvnError({
+          message: 'E175002: connection refused',
+          command: [],
+          stderr: 'svn: E175002: connection refused',
+          code: 'E175002',
+        });
+      }
+      return okRun();
+    });
+    send(second, { kind: 'resumeCheckout' });
+    await waitTaskRunning();
+    // 任务对象快照继承自 resumable 页（非空——「仅捕获任务发起时表单状态」
+    // 的字面实现在此得空快照，续检终态页的 abandon 丢原参数）。
+    const snapshot = getActiveTask('checkout')?.formSnapshot as CheckoutFormDraft | undefined;
+    expect(snapshot?.url).toBe(REPO_URL);
+    expect(snapshot?.revMode).toBe('number');
+    expect(snapshot?.rev).toBe('5');
+    // 注入 update 失败 → failed 页（快照随终态页写入缓存）。
+    failUpdate();
+    await waitFor(() => rendersOf(second).some((html) => html.includes(t.resultTitles.failed)));
+    // abandon：草稿写回（数据源 = 结果页 formSnapshot）→ 关闭重开恢复原参数。
+    vscodeMock.confirmResult = strings.panel.switchDiscardButton;
+    send(second, { kind: 'abandonResidue' });
+    await sleep(20);
+    expect(lastHtml(second)).toContain(t.stepForm);
+    second.dispose();
+    await sleep(0);
+    const third = await openPanel(labRoot);
+    const html = lastHtml(third);
+    expect(html).toContain(REPO_URL);
+    expect(html).toContain('value="trunk"');
+    expect(html).toContain('value="5"');
+  });
+
   /* --------------------------- URL 历史 / 配置 / 模式切换 --------------------------- */
 
   it('URL 历史成功才记录（取消不记录），并去重置顶', async () => {
@@ -1219,6 +1600,132 @@ describe('P3 检出面板 flow', () => {
     } finally {
       rmSync(otherRoot, { recursive: true, force: true });
     }
+  });
+
+  it('导入 unknown 页：换目标与模式切换均拒绝并提示，面板保持、记录与核实入口不变', async () => {
+    const src = join(labRoot, 'src-import');
+    await presetRecord(importRecord());
+    const panel = await openImportPanelAt(src);
+    expect(lastHtml(panel)).toContain(strings.checkoutPanel.importResultTitles.unknown);
+    const epochBefore = getResultEpoch('checkout');
+    // 模式切换（switchP3Mode 等同换目标）：专门分支拒绝（§4），面板保持。
+    send(panel, { kind: 'switchP3Mode' });
+    await sleep(20);
+    expect(toastMessages(panel)).toContain(strings.checkoutPanel.unresolvedImportSwitchRejected);
+    let html = lastHtml(panel);
+    expect(html).toContain(strings.checkoutPanel.importResultTitles.unknown);
+    expect(html).toContain(strings.checkoutPanel.actVerifyImport);
+    expect(getResultEpoch('checkout')).toBe(epochBefore);
+    // 新目标入口打开（命令入口路径，不经放行表）：同样拒绝，reveal 当前面板。
+    const otherRoot = realpathSync(mkdtempSync(join(tmpdir(), 'entry-unknown-')));
+    try {
+      await openCheckoutPanel({ entryKey: otherRoot, mode: 'checkout', parentDir: otherRoot });
+      await sleep(0);
+      expect(toastMessages(panel).filter((message) => message === strings.checkoutPanel.unresolvedImportSwitchRejected).length).toBe(2);
+      html = lastHtml(panel);
+      expect(html).toContain(strings.checkoutPanel.importResultTitles.unknown);
+      expect(html).toContain(strings.checkoutPanel.actVerifyImport);
+      expect(panel.revealed).toBeGreaterThan(0);
+      // 记录与缓存不受切换尝试影响：仍处 unknown、核实动作对象不变。
+      expect(store.records.get('op-import-1')?.phase).toBe('unknown');
+    } finally {
+      rmSync(otherRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('merged 未收口页换目标与模式切换拒绝；settled 后恢复确认切换', async () => {
+    const src = join(labRoot, 'src-merged');
+    await presetRecord(
+      importRecord({
+        operationId: 'op-import-merged',
+        outcome: 'merged',
+        resolvedRevision: 9,
+        wcRoot: src,
+        lockKey: src,
+        targetPath: src,
+      }),
+    );
+    const panel = await openImportPanelAt(src);
+    expect(lastHtml(panel)).toContain(strings.checkoutPanel.importResultTitles.merged);
+    // 模式切换拒绝：面板保持、收口与核实入口不变。
+    send(panel, { kind: 'switchP3Mode' });
+    await sleep(20);
+    expect(toastMessages(panel)).toContain(strings.checkoutPanel.unresolvedImportSwitchRejected);
+    let html = lastHtml(panel);
+    expect(html).toContain(strings.checkoutPanel.importResultTitles.merged);
+    expect(html).toContain(strings.checkoutPanel.actAckMerged);
+    // 新目标打开拒绝：面板保持、记录仍在。
+    const otherRoot = realpathSync(mkdtempSync(join(tmpdir(), 'entry-merged-')));
+    try {
+      await openCheckoutPanel({ entryKey: otherRoot, mode: 'checkout', parentDir: otherRoot });
+      await sleep(0);
+      expect(toastMessages(panel).filter((message) => message === strings.checkoutPanel.unresolvedImportSwitchRejected).length).toBe(2);
+      html = lastHtml(panel);
+      expect(html).toContain(strings.checkoutPanel.importResultTitles.merged);
+      expect(html).toContain(strings.checkoutPanel.actVerifyImport);
+      expect(store.records.get('op-import-merged')?.phase).toBe('unknown');
+    } finally {
+      rmSync(otherRoot, { recursive: true, force: true });
+    }
+    // acknowledgeMerged 收口后（记录移除、settled 页缓存承载）：恢复确认切换。
+    panel.dispose();
+    await sleep(0);
+    await getOperationRegistry().finish('op-import-merged');
+    const { writeSessionResult } = await import('../src/host/sessionResults');
+    writeSessionResult('checkout', { entryKey: src, mode: 'import' }, {
+      mode: 'import',
+      kind: 'merged',
+      path: src,
+      settled: true,
+    }, 'executor');
+    const settledPanel = await openImportPanelAt(src);
+    const settledHtml = lastHtml(settledPanel);
+    expect(settledHtml).toContain(strings.checkoutPanel.importResultTitles.merged);
+    expect(settledHtml).toContain(strings.checkoutPanel.actNewTask);
+    const epochBefore = getResultEpoch('checkout');
+    vscodeMock.confirmResult = strings.panel.switchDiscardButton;
+    send(settledPanel, { kind: 'switchP3Mode' });
+    await sleep(20);
+    expect(vscodeMock.warning).toContain(strings.panel.switchDiscardTitle);
+    // 确认后切到 checkout 模式表单、代次递增（离页动作）。
+    expect(lastHtml(settledPanel)).toContain(strings.checkoutPanel.parentDirLabel);
+    expect(getResultEpoch('checkout')).toBe(epochBefore + 1);
+  });
+
+  it('canceled 页因他人记录 writeLocked 时确认切换仍可用（对照：不按笼统 writeLocked 拒绝）', async () => {
+    const target = join(labRoot, 'trunk');
+    const { writeSessionResult } = await import('../src/host/sessionResults');
+    writeSessionResult('checkout', { entryKey: labRoot, mode: 'checkout' }, {
+      mode: 'checkout',
+      kind: 'canceled',
+      path: target,
+    }, 'executor');
+    // 他人记录（M2 commit unknown）占同键：canceled 结果页 writeLocked=true。
+    await presetRecord({
+      operationId: 'op-foreign-commit',
+      wcRoot: target,
+      lockKey: target,
+      kind: 'commit',
+      targetRelPath: '.',
+      nodeKind: 'dir',
+      phase: 'unknown',
+      knownRevisions: [],
+      updatedAt: Date.now(),
+    });
+    const panel = await openPanel(labRoot);
+    expect(lastHtml(panel)).toContain(strings.checkoutPanel.resultTitles.canceled);
+    // writeLocked 事实源：结果页目标键命中他人记录的写限制（§7.1 派生同源）。
+    expect(getOperationRegistry().writeRestriction(target)?.operationId).toBe('op-foreign-commit');
+    // switchP3Mode 过 writeLocked 放行表进处理器：unknown 判定不命中（结果页
+    // 是 checkout canceled），照常走「放弃并切换」确认。
+    const epochBefore = getResultEpoch('checkout');
+    vscodeMock.confirmResult = strings.panel.switchDiscardButton;
+    send(panel, { kind: 'switchP3Mode' });
+    await sleep(20);
+    expect(vscodeMock.warning).toContain(strings.panel.switchDiscardTitle);
+    expect(toastMessages(panel)).not.toContain(strings.checkoutPanel.unresolvedImportSwitchRejected);
+    expect(lastHtml(panel)).toContain(strings.checkoutPanel.sourceDirLabel);
+    expect(getResultEpoch('checkout')).toBe(epochBefore + 1);
   });
 
   it('开始检出被同键在途记录占用（begin busy 预命令出口）：回核对页并提示换目标或等待', async () => {

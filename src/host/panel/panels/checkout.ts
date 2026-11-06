@@ -32,10 +32,12 @@ import {
   type CheckoutDepth,
   type RemoteIdentity,
 } from '../../../core/checkout';
-import { SvnError, extractSvnErrorCodes, isAuthFailure } from '../../../core/errors';
+import { SvnError, isAuthFailure } from '../../../core/errors';
 import {
   enumerateImportSource,
   enumerationToSnapshot,
+  isUrlNotFound,
+  parentUrlOf,
   parseParentInfoXml,
   precheckImportSource,
   recheckImportTarget,
@@ -286,6 +288,27 @@ function recomputeOccupation(state: CheckoutPanelState): CheckoutPanelState {
 }
 
 /**
+ * 换目标/模式切换的硬拒绝判定（§4「unknown 未终态 → 拒绝切换并提示」）：
+ * 当前结果页是 import 的 unknown（未收口）或 merged（未 settled）页、且其
+ * 源目录（= 结果页 path，亦即记录 lockKey）仍命中未终态 import 记录——
+ * 与 P4 hasCleanupUnknownRecord 同款思路（结果页形态 + lockKey 查未决
+ * 记录）。不用笼统 writeLocked：canceled/failed/interrupted 页可能因他人
+ * 记录 writeLocked=true，基线允许该形态确认切换；settled merged 页与
+ * 记录被外部删除的 unknown 页不构成拒绝（无限制即不锁，登记差异 14
+ * 同口径）。openCheckoutPanel 换目标与 handleSwitchMode 共用本判定。
+ */
+function hasUnresolvedImportOutcome(state: CheckoutPanelState): boolean {
+  const result = state.result;
+  if (!result || result.mode !== 'import') {
+    return false;
+  }
+  if (result.kind !== 'unknown' && !(result.kind === 'merged' && result.settled !== true)) {
+    return false;
+  }
+  return importUnknownRecordFor(result.path) !== undefined;
+}
+
+/**
  * 按目标路径取当前未收口的 residue-pending 检出记录（核验/续检/放弃的动作
  * 对象；pendingForWcRoot 同步读内存记录，checkout 记录的键即目标路径）。
  */
@@ -437,6 +460,14 @@ export async function openCheckoutPanel(entry: CheckoutOpenEntry): Promise<void>
     // 新目标或模式切换：运行中拒绝（检出侧「运行中」= taskRegistry 任务）。
     if (hasActiveTask('checkout')) {
       handle.toast('info', format(strings.panel.panelBusySwitchRejected, { target: entryKey }));
+      handle.reveal();
+      return;
+    }
+    // 导入 unknown/merged 未收口：拒绝切换并提示（先核实/收口或改用新窗口，
+    // §4）——面板保持，不落入「放弃并切换」确认（与 P4 cleanupUnknown 换
+    // 副本拒绝同口径）。
+    if (hasUnresolvedImportOutcome(session)) {
+      handle.toast('info', strings.checkoutPanel.unresolvedImportSwitchRejected);
       handle.reveal();
       return;
     }
@@ -1500,6 +1531,15 @@ async function handleSwitchMode(sessionId: string): Promise<void> {
     pushRender();
     return;
   }
+  // 导入 unknown/merged 未收口：专门分支拒绝（§4 模式切换等同换目标）。
+  // switchP3Mode 经 writeLocked 放行表进入处理器后由本判定精确拦截——
+  // 不依赖放行表一刀切的副作用；canceled 等终态页照常走「放弃并切换」
+  // 确认（基线允许该形态确认切换）。
+  if (hasUnresolvedImportOutcome(session)) {
+    handle.toast('info', strings.checkoutPanel.unresolvedImportSwitchRejected);
+    pushRender();
+    return;
+  }
   if (switchNeedsConfirm()) {
     const ok = await vscode.window.showWarningMessage(
       strings.panel.switchDiscardTitle,
@@ -1593,28 +1633,6 @@ async function handlePickSourceDir(sessionId: string): Promise<void> {
   applyIfLive(sessionId, (s) => setSourcePrecheck(s, seq, result));
 }
 
-/** 父 URL 构造（§5）：剥掉目标 URL 最后一个非空路径段；无路径段（仓库根）→ 父即根。 */
-function parentUrlOfImport(targetUrl: string): string {
-  const schemeEnd = targetUrl.indexOf('://');
-  if (schemeEnd < 0) {
-    return targetUrl;
-  }
-  const authorityEnd = targetUrl.indexOf('/', schemeEnd + 3);
-  if (authorityEnd < 0) {
-    return targetUrl;
-  }
-  const path = targetUrl.slice(authorityEnd + 1).replace(/\/+$/, '');
-  if (path === '') {
-    return targetUrl;
-  }
-  return targetUrl.slice(0, authorityEnd + 1 + path.lastIndexOf('/'));
-}
-
-/** E200009/W160009：URL 目标不存在（与 core 判定同口径）。 */
-function isImportUrlNotFound(err: SvnError): boolean {
-  return extractSvnErrorCodes(err.stderr).includes('E200009') || err.stderr.includes('W160009');
-}
-
 /** 命令失败分类：认证失败按 auth 上报（是否弹补录由调用方按协议分支决定）。 */
 function classifyImportConnError(err: unknown, fallback: 'parentUnreachable' | 'connectError'): ImportConnOutcome {
   if (err instanceof SvnError && isAuthFailure(err.stderr)) {
@@ -1652,7 +1670,7 @@ async function runImportConnCheck(
     await runOrThrow(svnPath, ['ls', '--non-interactive', '--', escapeUrlPeg(targetUrl)], options);
     return { ok: false, failure: 'targetExists' };
   } catch (err) {
-    if (err instanceof SvnError && isImportUrlNotFound(err)) {
+    if (err instanceof SvnError && isUrlNotFound(err)) {
       return {
         ok: true,
         parentIdentity: {
@@ -1694,7 +1712,7 @@ async function handleImportNext(sessionId: string): Promise<void> {
     const runOptions: RunOptions = credentials
       ? { ...options, getCredentials: async () => credentials }
       : options;
-    const outcome = await runImportConnCheck(svnPath, parentUrlOfImport(url), url, runOptions);
+    const outcome = await runImportConnCheck(svnPath, parentUrlOf(url), url, runOptions);
     if (outcome.ok || outcome.failure !== 'auth' || !schemeAcceptsCredentials(url)) {
       // 非认证失败（或 svn+ssh/file 的认证形态）：直接结论。
       applyIfLive(sessionId, (s) => importConnSettled(s, seq, outcome));
@@ -1813,7 +1831,7 @@ async function handleStartImport(sessionId: string): Promise<void> {
   const url = s.form.url;
   const message = s.form.message;
   const nameMode = s.form.nameMode;
-  const parentUrl = parentUrlOfImport(url);
+  const parentUrl = parentUrlOf(url);
   const parentIdentity = s.review.parentIdentity;
   const scope: CheckoutResultScope = { entryKey: s.entry.entryKey, mode: 'import' };
   const basisSnapshot = s.review.snapshot;
@@ -2040,43 +2058,58 @@ async function settleImportOnDone(done: Promise<ImportTaskOutcome>, sessionId: s
   pushRender();
 }
 
-/** 核实结论 → 结果页（§5 三分类：committed → 成功页 / notCommitted → 失败页 / unknown 保持；merged 页保持 merged）。 */
-function importVerifyPage(report: ImportVerifyTaskResult, prevPath: string, prevKind: string): P3ResultPage {
+/**
+ * 核实结论 → 结果页（§5 三分类：committed → 成功页 / notCommitted → 失败页 /
+ * unknown 保持；merged 页保持 merged）。merged 保持分支整体透传被核验页——
+ * revision（合并提交的 revision 展示）、detail（人工核对提示）与 settled
+ * 收口标记不因核实重建而丢失（§4.1 merged 页字段），同会话与缓存恢复两形态一致。
+ * 三个结论分支都携带 targetUrl（模型外数据源：handoff 回填与共用 URL 历史，
+ * verifyImportTask 全结论返回——与执行器直落页「全部落点带 targetUrl」同口径，
+ * 结论页重建不因分支不同丢数据源）。
+ */
+function importVerifyPage(
+  report: ImportVerifyTaskResult,
+  prev: Extract<P3ResultPage, { mode: 'import' }>,
+): Extract<P3ResultPage, { mode: 'import' }> & { targetUrl?: string } {
   if (report.conclusion === 'committed') {
     return {
       mode: 'import',
       kind: 'success',
       revision: report.revision,
-      path: prevPath,
+      path: prev.path,
       evidence: 'verified',
       detail: format(strings.checkoutPanel.importVerifyCommittedDetail, {
         revision: String(report.revision ?? ''),
       }),
+      targetUrl: report.targetUrl,
     };
   }
   if (report.conclusion === 'notCommitted') {
     return {
       mode: 'import',
       kind: 'failed',
-      path: prevPath,
+      path: prev.path,
       evidence: 'verified',
       detail: format(strings.checkoutPanel.importVerifyNotCommittedDetail, {
         revision: String(report.evidence?.parentLastChangedRevision ?? ''),
       }),
       formSnapshot: report.formSnapshot,
+      targetUrl: report.targetUrl,
     };
   }
-  if (prevKind === 'merged') {
-    // merged 页核实证据不唯一：保持 merged（不判成功也不降级为普通 unknown）。
-    return { mode: 'import', kind: 'merged', path: prevPath };
+  if (prev.kind === 'merged') {
+    // merged 页核实证据不唯一：保持 merged（不判成功也不降级为普通 unknown），
+    // 被核验页字段原样透传（§5 第 0 步 merged 分支「保持 merged 不变」）。
+    return { ...prev };
   }
-  const page: P3ResultPage = {
+  const page: Extract<P3ResultPage, { mode: 'import' }> & { targetUrl?: string } = {
     mode: 'import',
     kind: 'unknown',
-    path: prevPath,
+    path: prev.path,
     resolution: 'unresolved',
     detail: report.message,
     formSnapshot: report.formSnapshot,
+    targetUrl: report.targetUrl,
   };
   if (report.snapshotIncomplete === true) {
     page.snapshotIncomplete = true;
@@ -2104,8 +2137,6 @@ async function handleVerifyImport(sessionId: string): Promise<void> {
     handle.toast('info', strings.importTask.recordUnavailable);
     return;
   }
-  const prevPath = result.path;
-  const prevKind = result.kind;
   const scope = sessionScopeBaseline();
   const epoch = getResultEpoch('checkout');
   // 发起：unknown 页重置 snapshotIncomplete（模型）+ merged 页横幅标记清除
@@ -2134,14 +2165,14 @@ async function handleVerifyImport(sessionId: string): Promise<void> {
     });
     let written = false;
     if (getResultEpoch('checkout') === epoch) {
-      const page = importVerifyPage(report, prevPath, prevKind);
+      const page = importVerifyPage(report, result);
       written = writeSessionResult('checkout', scope, page, 'controller');
       if (written && handle && session && handle.sessionId === sessionId && session.sessionId === sessionId) {
         session = setResult(session, page);
         // merged 页核实第 0 步失败：保持 merged、以页面横幅提示（不写
         // snapshotIncomplete——该字段仅 unknown 页合法）。
         importVerifySnapshotFailed =
-          report.conclusion === 'unknown' && report.snapshotIncomplete === true && prevKind === 'merged';
+          report.conclusion === 'unknown' && report.snapshotIncomplete === true && result.kind === 'merged';
       }
     }
     // 结论写入或被守卫丢弃后结算登记：写入才向存活会话推送重跑。

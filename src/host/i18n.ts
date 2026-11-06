@@ -692,6 +692,8 @@ export const strings = {
     /* ---------------- 面板控制器：确认框与提示 ---------------- */
     /** 切换确认（同模式换目标 / 模式切换共用，按钮复用 M2「放弃并切换」）。 */
     switchDiscardDetail: '当前表单输入或结果页尚未处理，切换将放弃对应草稿与结果缓存。',
+    /** 导入 unknown/merged 未收口结果页存在时拒绝换目标与模式切换（§4：面板保持，先核实/收口或改用新窗口）。 */
+    unresolvedImportSwitchRejected: '导入结果未知，请先完成核实或收口后再切换，或改用新窗口打开',
     cancelConfirmTitle: '取消检出？',
     cancelConfirmButton: '取消检出',
     cancelConfirmDetail: '已取得的文件将保留在目标目录，之后可核验续检或改用新目录。',

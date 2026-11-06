@@ -14,7 +14,7 @@
  * - 空间概览（metrics/spaceBar）与大文件表（TableSpec）的渲染契约。
  */
 import { describe, expect, it } from 'vitest';
-import type { ScanDiskUsageResult } from '../src/core/diskUsage';
+import { PRISTINE_UNSUPPORTED_REASON, type ScanDiskUsageResult } from '../src/core/diskUsage';
 import type { PanelState } from '../src/host/panel/state';
 import { render } from '../src/host/panel/view';
 import {
@@ -26,7 +26,6 @@ import {
   cleanSettled,
   createDiskPanelState,
   createDiskTableFilters,
-  DISK_PANEL_GATE,
   DISK_TABLE_PAGE_SIZE,
   DISK_TABLE_SORT_DEFAULT,
   enterCleanupUnknown,
@@ -254,7 +253,7 @@ describe('清单 §四 zero：可回收 0 项 / 0 B（cacheCount=0 的派生态�
 
 describe('清单 §四 unsupported：缓存格式不受支持、空间分析可看', () => {
   it('缓存数值显示 —（不冒充 0）、禁用清理', () => {
-    const pristine = pristineFromStats({ available: false, reason: '当前 VS Code 宿主不支持缓存检测' });
+    const pristine = pristineFromStats({ available: false, reason: PRISTINE_UNSUPPORTED_REASON });
     expect(pristine.state).toBe('unsupported');
     const next = scanCompleted(scanStarted(state()), 1, scanResult(), pristine);
     const availability = buildVacuumAvailability(next, { busy: false, writeLocked: false });
@@ -306,10 +305,9 @@ describe('清单 §四 busy：同副本任务运行中（跨面板新鲜度）',
     expect(page.footer?.primary?.disabled).toBe(true);
     const rescan = page.footer?.secondary?.find((action) => action.id === 'rescan');
     expect(rescan?.disabled).toBe(true);
-    // 表格只读意图在放行表内（查看已有分析）。
-    expect(page.gate?.busy).toEqual(DISK_PANEL_GATE.busy);
-    expect(page.gate?.busy).toContain('setSort');
-    expect(page.gate?.busy).not.toContain('confirmVacuum');
+    // 模型不再持有放行表（gate 由 host.renderStateOf 从 createP4Gates
+    // 单一来源注入；表格只读意图的放行断言见 panelGates.test.ts）。
+    expect(page.gate).toBeUndefined();
   });
 
   it('渲染 opts 直接覆盖占用（不依赖 state 内旧值）与 state 内值同源', () => {
@@ -845,14 +843,10 @@ describe('渲染契约：大文件表（TableSpec）', () => {
 /* ------------------------- 放行表与 excluded ------------------------- */
 
 describe('P4 放行表（gate）与排除清单映射', () => {
-  it('busy 行不含 rescan/startScan/confirmVacuum；writeLocked 行放行重新检测', () => {
-    expect(DISK_PANEL_GATE.busy).not.toContain('rescan');
-    expect(DISK_PANEL_GATE.busy).not.toContain('startScan');
-    expect(DISK_PANEL_GATE.busy).not.toContain('confirmVacuum');
-    expect(DISK_PANEL_GATE.writeLocked).toContain('rescan');
-    expect(DISK_PANEL_GATE.writeLocked).toContain('startScan');
-    expect(DISK_PANEL_GATE.writeLocked).not.toContain('confirmVacuum');
-  });
+  // 放行表逐行断言（busy 不含 rescan/startScan/confirmVacuum、
+  // writeLocked 放行重新检测）由 test/panelGates.test.ts 的
+  // createP4Gates 用例承载——模型内不再持第二份表（DISK_PANEL_GATE
+  // 已删除，gate 由 host.renderStateOf 注入）。
 
   it('excludedFromScan：带「（标注）」的条目拆出可读理由、其余给默认理由', () => {
     const entries = excludedFromScan([

@@ -31,11 +31,14 @@ import { SvnError, extractSvnErrorCodes, isAuthFailure } from '../../core/errors
 import {
   buildImportArgs,
   decodePathSegments,
+  isUrlNotFound,
   messageDigest,
+  parentUrlOf,
   parseImportLogXml,
   removeMessageTempDir,
   serializeSnapshot,
   snapshotDigest,
+  summarizeEntries,
   verifyImportOutcome,
   writeMessageTempFile,
   type ImportSnapshot,
@@ -58,6 +61,7 @@ import { beginReadonlyVerify, clearReadonlyVerify, writeSessionResult } from '..
 import { addTask, removeTask, type CheckoutResultScope, type TaskObject } from '../taskRegistry';
 import { saveDraft, type CheckoutFormDraft } from './drafts';
 import type { PreCommandExit } from './checkoutTask';
+import { ByteLineBuffer, lenientUtf8, startsWithBytes } from './streamParse';
 
 /* ---------------------------------------------------------------------------
  * 快照目录注入（globalStorageUri.fsPath；activate 挂载，测试/驱动注入可覆盖）
@@ -143,47 +147,9 @@ export async function deleteImportSnapshot(
 }
 
 /* ---------------------------------------------------------------------------
- * 流式进度解析（字节层行缓冲，形态对齐 checkoutTask；导入仅 Adding 前缀、
+ * 流式进度解析（字节层三件套见 ./streamParse；导入仅 Adding 前缀、
  * 尾行为 Committed revision N.）
  * ------------------------------------------------------------------------- */
-
-/** 字节层行缓冲：按 0x0A 分行（多字节字符不含 0x0A，按字节拆行不截断），跨块拼出完整行。 */
-class ByteLineBuffer {
-  private pending: Buffer = Buffer.alloc(0);
-
-  push(chunk: Buffer): Buffer[] {
-    this.pending = Buffer.concat([this.pending, chunk]);
-    const lines: Buffer[] = [];
-    for (;;) {
-      const idx = this.pending.indexOf(0x0a);
-      if (idx < 0) {
-        return lines;
-      }
-      lines.push(this.pending.subarray(0, idx));
-      this.pending = this.pending.subarray(idx + 1);
-    }
-  }
-
-  flush(): Buffer | null {
-    if (this.pending.length === 0) {
-      return null;
-    }
-    const rest = this.pending;
-    this.pending = Buffer.alloc(0);
-    return rest;
-  }
-}
-
-/** 展示用宽松解码：UTF-8 非法字节替换为 U+FFFD，不做编码回退链。 */
-function lenientUtf8(line: Buffer): string {
-  return new TextDecoder('utf-8', { fatal: false }).decode(line);
-}
-
-/** 字节层前缀匹配（前缀为 ASCII 字节，直接比对原始字节，不依赖行内容解码）。 */
-function startsWithBytes(line: Buffer, prefix: string): boolean {
-  const prefixBuf = Buffer.from(prefix, 'utf8');
-  return line.subarray(0, prefixBuf.length).equals(prefixBuf);
-}
 
 /** svn 1.15 实测导入条目前缀：`Adding `（文件与目录都是条目，计数语义是「项」）。 */
 export const IMPORT_ENTRY_PREFIX = 'Adding ';
@@ -275,7 +241,7 @@ export interface ImportResultPage {
   formSnapshot?: ImportFormSnapshot;
   /** 仅 kind='unknown' 合法：核实第 0 步快照不完整（abandonUnknownImport 的判定载体）。 */
   snapshotIncomplete?: true;
-  /** 目标 URL（成功与 merged 页携带；模型外数据源）。 */
+  /** 目标 URL（全部结论页携带——执行器各落点与面板核实结论页同口径；模型外数据源）。 */
   targetUrl?: string;
 }
 
@@ -454,17 +420,10 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-/** 快照摘要（§4.1 口径：fileCount/totalBytes 只计 file|symlink 且非 ignored 的条目）。 */
+/** 快照摘要（§4.1 口径与枚举摘要单一来源：core 的 summarizeEntries）。 */
 function summaryOfSnapshot(snapshot: ImportSnapshot): { fileCount: number; totalBytes: number } {
-  let fileCount = 0;
-  let totalBytes = 0;
-  for (const entry of snapshot.entries) {
-    if ((entry.kind === 'file' || entry.kind === 'symlink') && !entry.ignored) {
-      fileCount += 1;
-      totalBytes += entry.size;
-    }
-  }
-  return { fileCount, totalBytes };
+  const { summary } = summarizeEntries(snapshot.entries);
+  return { fileCount: summary.fileCount, totalBytes: summary.totalBytes };
 }
 
 /** 导入结果页的表单快照（从任务固定参数/记录派生——直接失败与 unknown 页的数据源）。 */
@@ -864,11 +823,6 @@ function boundedLsTimeoutMs(): number {
 /** 四态判定的外带结论（svnCli 按原认证错误抛出后，执行器据此生成失败页 detail）。 */
 type LsProbeOutcome = 'notFound' | 'targetExists' | 'lsAuthFailed' | 'lsOtherFailed';
 
-/** E200009/W160009：URL 目标不存在（与 core/importDir 的判定同口径）。 */
-function isLsNotFound(err: SvnError): boolean {
-  return extractSvnErrorCodes(err.stderr).includes('E200009') || err.stderr.includes('W160009');
-}
-
 /**
  * 四态标注的失败文案：认证失败原错误之外，按补录回调内 svn ls 的判定
  * 结论附加可读原因（目标已存在/凭据不可用/无法确认远端目标状态）。
@@ -898,8 +852,9 @@ let lastLsProbe: LsProbeOutcome | undefined;
  * 导入的执行期认证提供者（§4.3 ②「先补录、后查远端」，顺序不可倒置）：
  * svn+ssh/file 或未注入弹窗回调时不注入（认证失败按普通失败呈现）；否则
  * 返回包装回调——认证失败发生在传输前（事务未建立），先弹补录，拿到凭据
- * 后用该凭据 `svn ls <目标URL>`（--non-interactive、escapeUrlPeg、显式有
- * 界超时 ≤120s、不注入 getCredentials 防递归弹窗）四态判定：
+ * 后用该凭据 `svn ls <目标URL>`（--non-interactive、凭据参数在 `--` 分隔
+ * 符之前、escapeUrlPeg、显式有界超时 ≤120s、不注入 getCredentials 防递归
+ * 弹窗）四态判定：
  * - E200009（目标不存在）→ 返回凭据，svnCli 带 --username/--password 重试一次；
  * - 目标已存在（ls 成功）→ 返回空值放弃重试（按原错误抛出、可证明未提交
  *   直接失败出口⑦，不向既有目录重试——重试可能静默合并）；
@@ -923,13 +878,17 @@ function importCredentialProvider(
     if (!credentials) {
       return undefined;
     }
-    // 后查远端：用刚拿到的凭据显式执行 svn ls 四态判定。
+    // 后查远端：用刚拿到的凭据显式执行 svn ls 四态判定。凭据参数放在
+    // `--` 分隔符之前——svn 把 `--` 之后的一切当位置参数，放在其后对
+    // 认证不生效（本命令显式携带凭据、不经 svnCli 重试注入，构造层
+    // 自行保证位置；svnCli 层的统一插入见 runOrThrowWithRunner）。
     try {
       await runOrThrow(
         svnPath,
         [
-          'ls', '--non-interactive', '--', escapeUrlPeg(targetUrl),
+          'ls', '--non-interactive',
           '--username', credentials.username, '--password', credentials.password,
+          '--', escapeUrlPeg(targetUrl),
         ],
         {
           timeoutMs: boundedLsTimeoutMs(),
@@ -940,7 +899,7 @@ function importCredentialProvider(
       lastLsProbe = 'targetExists';
       return undefined;
     } catch (err) {
-      if (err instanceof SvnError && isLsNotFound(err)) {
+      if (err instanceof SvnError && isUrlNotFound(err)) {
         lastLsProbe = 'notFound';
         return credentials;
       }
@@ -953,12 +912,6 @@ function importCredentialProvider(
 /* ---------------------------------------------------------------------------
  * unknown 核实（§5 结果未知：verifyImportOutcome 三分类 + 记录收口）
  * ------------------------------------------------------------------------- */
-
-/** 目标 URL 的父 URL（去最后一段；尾斜杠已由表单规范化剥除）。 */
-function parentUrlOf(targetUrl: string): string {
-  const idx = targetUrl.lastIndexOf('/');
-  return idx > 0 ? targetUrl.slice(0, idx) : targetUrl;
-}
 
 async function findRecord(operationId: string): Promise<OperationRecord | undefined> {
   const all = await getOperationRegistry().loadAllRecords();
