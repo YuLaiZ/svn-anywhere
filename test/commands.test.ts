@@ -323,20 +323,22 @@ describe('registerCommand 统一错误处理', () => {
 });
 
 describe('registerAllCommands 二次激活', () => {
-  it('同一实例二次注册：先释放上次句柄再重新注册，不触发重复 ID 报错', () => {
+  it('同一实例二次注册：先释放上次句柄再重新注册，不触发重复 ID 报错', async () => {
     const globalState = {
       get: (_key: string, defaultValue?: unknown) => defaultValue,
       update: async () => undefined,
     };
+    // registerAllCommands 已 async 化（首载折算 + 孤儿快照清理先于命令注册）：
+    // 必须 await 后断言，同步断言会拿到未完成的注册计数。
     const firstContext = { subscriptions: [], globalState } as unknown as vscode.ExtensionContext;
-    registerAllCommands(firstContext);
-    expect(vscodeMock.registered).toHaveLength(13);
+    await registerAllCommands(firstContext);
+    expect(vscodeMock.registered).toHaveLength(14);
     const firstHandles = vscodeMock.registered.map((r) => r.disposable);
 
     const secondContext = { subscriptions: [], globalState } as unknown as vscode.ExtensionContext;
-    expect(() => registerAllCommands(secondContext)).not.toThrow();
+    await expect(registerAllCommands(secondContext)).resolves.toBeUndefined();
     expect(firstHandles.every((d) => d.disposed)).toBe(true);
-    expect(vscodeMock.registered).toHaveLength(26);
-    expect(vscodeMock.activeCommandIds.size).toBe(13);
+    expect(vscodeMock.registered).toHaveLength(28);
+    expect(vscodeMock.activeCommandIds.size).toBe(14);
   });
 });

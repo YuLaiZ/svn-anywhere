@@ -29,7 +29,7 @@ import { remoteChangedEntries, runRemoteStatus, type RemoteStatusResult } from '
 import { runOrThrow, type RunOptions } from '../../../core/svnCli';
 import { SvnError } from '../../../core/errors';
 import { escapePeg } from '../../../core/workspace';
-import { getOperationRegistry, type OperationRegistry } from '../../../core/operations';
+import { getOperationRegistry, kindOf, type OperationKind, type OperationRegistry } from '../../../core/operations';
 import {
   readAllowEmptyCommitMessage,
   readRemoteCheckBeforeCommit,
@@ -276,9 +276,22 @@ async function loadSession(
     remoteIncluded: readRemoteCheckBeforeCommit(),
     externalPrefixes: keepDraft ? (previous?.externalPrefixes ?? []) : [],
     unversionedTruncated: false,
+    // 正常路径显式置空（foreign 指引不跨会话残留）；foreignLocked 同理。
+    notice: null,
+    foreignLocked: false,
   };
   if (restriction) {
-    session.phase = 'unknown';
+    // 按 kind 分流：commit（或无 kind 兜底）照旧进 unknown 会话并提供核实；
+    // 其他面板/命令的记录（vacuum/checkout/ignore 等）不进 unknown、不提供
+    // 核实、不 finish/markPhase——会话保持 ready + foreignLocked 禁用写控件，
+    // notice 横幅给出到对应面板处理的指引（目录列表照常只读展示）。
+    if (kindOf(restriction) === 'commit') {
+      session.phase = 'unknown';
+    } else {
+      session.foreignLocked = true;
+      session.notice = foreignNoticeOf(kindOf(restriction));
+    }
+    // 仅用于提示定位展示（unknown 核实流程读取实际记录，不依赖此值）。
     activeOperationId = restriction.operationId;
   }
   pushRender();
@@ -339,6 +352,20 @@ async function loadSession(
 
 function allFilters(): CommitSessionState['filters'] {
   return { status: 'all', ext: 'all', changelist: 'all' };
+}
+
+/** foreign 记录的分流指引文案（按记录 kind 分列；未预期 kind 用通用占用提示）。 */
+function foreignNoticeOf(kind: OperationKind): string {
+  if (kind === 'vacuum') {
+    return strings.panel.foreignNoticeVacuum;
+  }
+  if (kind === 'checkout') {
+    return strings.panel.foreignNoticeCheckout;
+  }
+  if (kind === 'ignore') {
+    return strings.panel.foreignNoticeIgnore;
+  }
+  return format(strings.panel.operationHeldBusy, { phase: kind });
 }
 
 async function runRemoteStatusWithAuth(
@@ -470,6 +497,16 @@ function pushRender(): void {
   }
   const state: PanelState = buildPanelState(session);
   handle.update({ ...state, formRevision }, handle.sessionId);
+}
+
+/**
+ * 以任务流程启动时捕获的局部会话/面板推帧：面板被原生关闭后
+ * handle.update/toast 以 disposed 空转吞掉（模块级 handle 可能已指向重开的
+ * 新面板，不得读写）；目标切换的迟到帧由 update 的会话校验丢弃。
+ */
+function pushRenderFor(s: CommitSessionState, panel: PanelHandle): void {
+  const state: PanelState = buildPanelState(s);
+  panel.update({ ...state, formRevision }, panel.sessionId);
 }
 
 /* ------------------------------ 意图分发 ------------------------------ */
@@ -819,9 +856,13 @@ async function beginInlineOperation(
     targetRelPath: serializeTargetArgs(targetArgsOf(target)),
     nodeKind: kind,
     explicitPaths: [path],
+    // 行内操作记录按所在面板分类（commit）：漏传会走无 kind 兜底进 P1 误核路径。
+    kind: 'commit',
   });
   if (!begin.ok) {
-    handle?.toast('info', format(strings.panel.operationHeldBusy, { phase: begin.heldBy.phase }));
+    // 判别联合收窄：busy 分支才有 heldBy（本调用不传 operationId，其他分支不可达）。
+    const heldPhase = begin.reason === 'busy' ? begin.heldBy.phase : begin.reason;
+    handle?.toast('info', format(strings.panel.operationHeldBusy, { phase: heldPhase }));
     return undefined;
   }
   return begin.operationId;
@@ -1017,17 +1058,24 @@ async function performCommit(sessionId: string): Promise<void> {
   }
   // 闭包内引用收窄后的会话（模块级 let 在 await 后不再保留流收窄）。
   const s = session;
+  // 任务流程与面板生命周期解耦：流程启动时捕获局部面板引用，后续的
+  // registry 收口与 UI 写入只用局部值——原生标签关闭（onPanelDispose 置空
+  // 模块级句柄）不中断提交流程，收口照常执行、UI 由 handle 空转吞掉。
+  const panel = handle;
   let selected = selectedCommittable();
   if (selected.length === 0) {
     return;
   }
-  const target = targetOf(session);
+  const target = targetOf(s);
   const svnPath = readSvnPath();
+  // 本次提交的操作登记 ID：begin 之后才赋值；catch/收口一律读此局部值
+  // （模块级 activeOperationId 会随面板销毁被置空）。
+  let operationId: string | undefined;
 
   // 空说明口径（M1 保留）：开关关闭直接拒绝；开启时二次确认。
-  if (session.message.trim() === '') {
-    if (!session.allowEmpty) {
-      handle.toast('info', strings.commit.emptyMessageRejected);
+  if (s.message.trim() === '') {
+    if (!s.allowEmpty) {
+      panel.toast('info', strings.commit.emptyMessageRejected);
       return;
     }
     const again = await confirmModal(strings.commit.emptyMessageConfirm, strings.commit.continueButton);
@@ -1037,7 +1085,7 @@ async function performCommit(sessionId: string): Promise<void> {
   }
 
   // 提交范围确认（含待添加、missing、隐藏项与目录时列出明细）。
-  const visible = visibleMetas(session);
+  const visible = visibleMetas(s);
   const hidden = selected.filter((meta) => !visible.some((v) => v.path === meta.path)).length;
   const hasUnversioned = selected.some((meta) => meta.group === 'unversioned');
   const hasMissing = selected.some((meta) => meta.wcStatus === 'missing');
@@ -1050,51 +1098,52 @@ async function performCommit(sessionId: string): Promise<void> {
     }
   }
 
-  session.phase = 'checking';
-  session.error = null;
-  session.result = null;
-  pushRender();
+  s.phase = 'checking';
+  s.error = null;
+  s.result = null;
+  pushRenderFor(s, panel);
 
   try {
     // 提交前重读本地实际状态：外部客户端可能在面板加载后修改了工作副本
     // （missing 登记、待添加范围都必须以当前事实为准，不信任打开时的快照）。
-    const freshStatus = await runStatus(svnPath, session.targetArgs, {
-      ...runOptions(session.wcRoot),
-      onExit: logCommand(svnPath, ['status', '--xml', ...session.targetArgs], session.wcRoot, 'commit'),
+    const freshStatus = await runStatus(svnPath, s.targetArgs, {
+      ...runOptions(s.wcRoot),
+      onExit: logCommand(svnPath, ['status', '--xml', ...s.targetArgs], s.wcRoot, 'commit'),
     });
-    if (handle.sessionId !== sessionId) {
+    if (!handle || handle.sessionId !== sessionId) {
       return;
     }
-    const freshMetas = mergeStatusEntries(freshStatus.entries, undefined, session.externalPrefixes);
-    await enrichMetas(freshMetas, session.wcRoot);
-    if (handle.sessionId !== sessionId) {
-      // enrichMetas 是异步恢复点：挂起期间面板可能销毁重开（会话已切换），
-      // 旧会话的重读结果不得写进新会话对象，也不再继续发起提交。
+    const freshMetas = mergeStatusEntries(freshStatus.entries, undefined, s.externalPrefixes);
+    await enrichMetas(freshMetas, s.wcRoot);
+    if (!handle || handle.sessionId !== sessionId) {
+      // enrichMetas 是异步恢复点：挂起期间面板可能销毁或重开新目标（会话
+      // 已切换），提交命令尚未发出、无登记需要收口——旧目标的流程不再
+      // 继续发起，重读数据也不得写进新会话对象。
       return;
     }
-    session.metas = freshMetas;
-    session.selectedPaths = new Set([...session.selectedPaths].filter((path) =>
+    s.metas = freshMetas;
+    s.selectedPaths = new Set([...s.selectedPaths].filter((path) =>
       freshMetas.some((meta) => meta.path === path && isSelectableEntry(meta)),
     ));
     // missing 登记/待添加判断以重读后的状态为准（选择集合按路径身份保留）。
     const retainedPaths = s.selectedPaths;
     selected = freshMetas.filter((meta) => retainedPaths.has(meta.path) && isSelectableEntry(meta));
     if (selected.length === 0) {
-      session.phase = 'ready';
-      pushRender();
+      s.phase = 'ready';
+      pushRenderFor(s, panel);
       return;
     }
 
     // 提交前远端检查与冲突阻止（M1 口径）。
     const registry = getOperationRegistry();
-    if (session.remoteIncluded) {
+    if (s.remoteIncluded) {
       const outcome = await remoteCheckBeforeCommitPanel(target, svnPath);
       if (outcome !== 'checked') {
         // 更新/取消/冲突都不发起提交：释放操作登记，避免阻塞同副本后续提交。
-        session.phase = 'ready';
-        pushRender();
+        s.phase = 'ready';
+        pushRenderFor(s, panel);
         if (outcome === 'updateOnly' || outcome === 'conflict' || outcome === 'updated') {
-          await loadSession(handle.sessionId, target, { initial: false });
+          await loadSession(panel.sessionId, target, { initial: false });
         }
         return;
       }
@@ -1102,30 +1151,35 @@ async function performCommit(sessionId: string): Promise<void> {
 
     // 操作登记：同副本互斥；写入失败（持久化异常）不发起提交。
     const begin = await registry.begin({
-      wcRoot: session.wcRoot,
-      targetRelPath: serializeTargetArgs(session.targetArgs),
+      wcRoot: s.wcRoot,
+      targetRelPath: serializeTargetArgs(s.targetArgs),
       nodeKind: 'dir',
       baseRevision: commitBaseAgainst,
       explicitPaths: selected.map((meta) => meta.path),
+      // 记录按所在面板分类（commit）：漏传会走无 kind 兜底、被 P1 误核。
+      kind: 'commit',
     });
     if (!begin.ok) {
-      session.phase = 'ready';
-      session.error = format(strings.panel.operationHeldBusy, { phase: begin.heldBy.phase });
-      pushRender();
+      // 判别联合收窄：busy 分支才有 heldBy（本调用不传 operationId，其他分支不可达）。
+      const heldPhase = begin.reason === 'busy' ? begin.heldBy.phase : begin.reason;
+      s.phase = 'ready';
+      s.error = format(strings.panel.operationHeldBusy, { phase: heldPhase });
+      pushRenderFor(s, panel);
       return;
     }
-    activeOperationId = begin.operationId;
+    operationId = begin.operationId;
+    activeOperationId = operationId;
 
     // missing → svn delete --force（确认已涵盖在范围确认中）。
     for (const meta of selected.filter((item) => item.wcStatus === 'missing')) {
       const args = ['delete', '--force', '--', escapePeg(meta.path)];
       await runOrThrow(svnPath, args, {
-        ...runOptions(session.wcRoot),
+        ...runOptions(s.wcRoot),
         getCredentials: promptForCredentials,
-        onExit: logCommand(svnPath, args, session.wcRoot, 'commit'),
+        onExit: logCommand(svnPath, args, s.wcRoot, 'commit'),
         onCredentialRetry: (retryArgs) => logCommand(svnPath, retryArgs, s.wcRoot, 'commit'),
       });
-      session.missingPrepared.push(meta.path);
+      s.missingPrepared.push(meta.path);
     }
 
     // 待添加：目录 --depth empty 只登记节点，勾选子项逐个登记；父目录先加。
@@ -1138,16 +1192,19 @@ async function performCommit(sessionId: string): Promise<void> {
         const args = ['add', '--depth', 'empty', '--', escapePeg(path)];
         try {
           await runOrThrow(svnPath, args, {
-            ...runOptions(session.wcRoot),
-            onExit: logCommand(svnPath, args, session.wcRoot, 'commit'),
+            ...runOptions(s.wcRoot),
+            onExit: logCommand(svnPath, args, s.wcRoot, 'commit'),
           });
-          session.addedPrepared.push(path);
+          s.addedPrepared.push(path);
         } catch (err) {
-          // 添加失败不继续提交；已添加项保留 A 状态并解释。
-          await registry.finish(activeOperationId);
-          activeOperationId = undefined;
+          // 添加失败不继续提交；已添加项保留 A 状态并解释。收口（finish）
+          // 先行：面板关闭/重开不影响登记释放，重读只服务 UI。
+          await registry.finish(operationId);
+          if (activeOperationId === operationId) {
+            activeOperationId = undefined;
+          }
           const failureText = `${err instanceof Error ? err.message : String(err)}\n${strings.panel.addFailedDetail}`;
-          await loadSession(handle.sessionId, target, { initial: false });
+          await loadSession(panel.sessionId, target, { initial: false });
           if (session) {
             session.phase = 'ready';
             session.error = failureText;
@@ -1161,8 +1218,8 @@ async function performCommit(sessionId: string): Promise<void> {
     }
 
     // 分批提交：每批成功即时记录 revision（操作注册表持久化）。
-    session.phase = 'committing';
-    pushRender();
+    s.phase = 'committing';
+    pushRenderFor(s, panel);
     const paths = selected.map((meta) => meta.path);
     const revisions: number[] = [];
     const committed: string[] = [];
@@ -1171,15 +1228,15 @@ async function performCommit(sessionId: string): Promise<void> {
     const tmpDir = mkdtempSync(join(tmpdir(), 'svn-anywhere-commit-'));
     try {
       const messageFile = join(tmpDir, 'message.txt');
-      writeFileSync(messageFile, session.message, 'utf8');
+      writeFileSync(messageFile, s.message, 'utf8');
       for (let offset = 0; offset < paths.length; offset += COMMIT_BATCH_SIZE) {
         const batch = paths.slice(offset, offset + COMMIT_BATCH_SIZE);
         const args = buildCommitArgs(messageFile, batch);
         try {
           const result = await runOrThrow(svnPath, args, {
-            ...runOptions(session.wcRoot),
+            ...runOptions(s.wcRoot),
             getCredentials: promptForCredentials,
-            onExit: logCommand(svnPath, args, session.wcRoot, 'commit'),
+            onExit: logCommand(svnPath, args, s.wcRoot, 'commit'),
             onCredentialRetry: (retryArgs) => logCommand(svnPath, retryArgs, s.wcRoot, 'commit'),
           });
           logLine(result.stdout.trimEnd(), 'commit');
@@ -1187,7 +1244,7 @@ async function performCommit(sessionId: string): Promise<void> {
           if (revision !== undefined) {
             revisions.push(revision);
             committed.push(...batch);
-            await registry.markPhase(activeOperationId ?? begin.operationId, 'committing', {
+            await registry.markPhase(operationId, 'committing', {
               knownRevisions: [...revisions],
               committedPaths: [...committed],
             });
@@ -1196,7 +1253,7 @@ async function performCommit(sessionId: string): Promise<void> {
           if (err instanceof SvnError && (err.code === 'TIMEOUT' || err.code === 'SPAWN_ERROR' || err.code === 'CANCELLED')) {
             unknown = true;
           } else if (
-            session.message.trim() === '' &&
+            s.message.trim() === '' &&
             err instanceof SvnError &&
             /empty commit|空日志/i.test(err.message)
           ) {
@@ -1204,9 +1261,9 @@ async function performCommit(sessionId: string): Promise<void> {
             const retryArgs = ['commit', '--non-interactive', '-m', '', ...batch.map((p) => escapePeg(p))];
             try {
               const result = await runOrThrow(svnPath, retryArgs, {
-                ...runOptions(session.wcRoot),
+                ...runOptions(s.wcRoot),
                 getCredentials: promptForCredentials,
-                onExit: logCommand(svnPath, retryArgs, session.wcRoot, 'commit'),
+                onExit: logCommand(svnPath, retryArgs, s.wcRoot, 'commit'),
                 onCredentialRetry: (retryArgs2) => logCommand(svnPath, retryArgs2, s.wcRoot, 'commit'),
               });
               logLine(result.stdout.trimEnd(), 'commit');
@@ -1214,7 +1271,7 @@ async function performCommit(sessionId: string): Promise<void> {
               if (revision !== undefined) {
                 revisions.push(revision);
                 committed.push(...batch);
-                await registry.markPhase(activeOperationId ?? begin.operationId, 'committing', {
+                await registry.markPhase(operationId, 'committing', {
                   knownRevisions: [...revisions],
                   committedPaths: [...committed],
                 });
@@ -1243,28 +1300,31 @@ async function performCommit(sessionId: string): Promise<void> {
     if (unknown) {
       // 结果未知：保留操作记录并冻结写意图，只允许核实；已成功批次的
       // 路径与 revision 一并落盘，核实「已提交」时据此精确回显。
-      await registry.markPhase(activeOperationId ?? begin.operationId, 'unknown', {
+      await registry.markPhase(operationId, 'unknown', {
         knownRevisions: [...revisions],
         ...(committed.length > 0 ? { committedPaths: [...committed] } : {}),
       });
-      session.phase = 'unknown';
-      session.error = null;
+      s.phase = 'unknown';
+      s.error = null;
       if (committed.length > 0) {
-        session.result = { kind: 'partial', revisions, committedIds: committed.map((path) => path) };
+        s.result = { kind: 'partial', revisions, committedIds: committed.map((path) => path) };
       }
-      pushRender();
+      pushRenderFor(s, panel);
       showOutput(false, 'commit');
       return;
     }
 
     if (failure !== undefined && committed.length === 0) {
-      // 确认失败（服务端拒绝）：说明与勾选保留，可重试。
-      await registry.finish(activeOperationId);
-      activeOperationId = undefined;
-      session.phase = 'ready';
+      // 确认失败（服务端拒绝）：说明与勾选保留，可重试。failed-unconfirmed
+      // 后随即 finish（终态收口、解除限制）。
+      await registry.finalizeOperation(operationId, 'failed-unconfirmed');
+      if (activeOperationId === operationId) {
+        activeOperationId = undefined;
+      }
+      s.phase = 'ready';
       const failureText = failure instanceof Error ? failure.message : String(failure);
-      session.error = failureText;
-      pushRender();
+      s.error = failureText;
+      pushRenderFor(s, panel);
       showOutput(false, 'commit');
       void vscode.window.showErrorMessage(errorFirstLine(failureText));
       return;
@@ -1272,10 +1332,10 @@ async function performCommit(sessionId: string): Promise<void> {
 
     if (failure !== undefined && committed.length > 0) {
       // 部分成功：记录每批 revision；重试前先刷新实际状态。
-      session.result = { kind: 'partial', revisions, committedIds: committed };
-      session.phase = 'ready';
-      session.error = failure instanceof Error ? failure.message : String(failure);
-      await finishCommitRefresh(registry, false);
+      s.result = { kind: 'partial', revisions, committedIds: committed };
+      s.phase = 'ready';
+      s.error = failure instanceof Error ? failure.message : String(failure);
+      await finishCommitRefresh(registry, s, panel, sessionId, operationId, false);
       return;
     }
 
@@ -1288,27 +1348,36 @@ async function performCommit(sessionId: string): Promise<void> {
     s.result = { kind: 'success', revisions, committedIds: committed };
     s.addedPrepared = [];
     s.missingPrepared = [];
-    await finishCommitRefresh(registry, true);
+    await finishCommitRefresh(registry, s, panel, sessionId, operationId, true);
   } catch (err) {
-    if (handle.sessionId !== sessionId) {
-      return;
-    }
-    if (activeOperationId) {
+    // 收口先于任何会话判定（面板关闭/重开不阻断登记释放）：超时/取消与
+    // 任何非 SvnError 的意外异常（防御性保留）统一按 unknown 冻结——不得
+    // 把记录留在 committing/prepared 让运行登记永真；服务端拒绝（SvnError）
+    // 则 finish 解除限制。
+    const processLevel =
+      !(err instanceof SvnError) || err.code === 'TIMEOUT' || err.code === 'SPAWN_ERROR' || err.code === 'CANCELLED';
+    if (operationId) {
       const registry = getOperationRegistry();
-      if (err instanceof SvnError && (err.code === 'TIMEOUT' || err.code === 'SPAWN_ERROR' || err.code === 'CANCELLED')) {
+      if (processLevel) {
         // 准备阶段（missing 登记/添加）进程级失败无法证明未提交，按结果未知冻结。
-        await registry.markPhase(activeOperationId, 'unknown');
+        await registry.markPhase(operationId, 'unknown');
       } else {
-        await registry.finish(activeOperationId);
-        activeOperationId = undefined;
+        await registry.finalizeOperation(operationId, 'failed-unconfirmed');
+        if (activeOperationId === operationId) {
+          activeOperationId = undefined;
+        }
       }
     }
-    session.phase = err instanceof SvnError && (err.code === 'TIMEOUT' || err.code === 'SPAWN_ERROR' || err.code === 'CANCELLED') ? 'unknown' : 'ready';
+    if (panel.sessionId !== sessionId) {
+      // 会话已切换：旧会话的 UI 写入交给空转丢弃，不再向新会话推帧。
+      return;
+    }
+    s.phase = processLevel ? 'unknown' : 'ready';
     const failureText = err instanceof Error ? err.message : String(err);
-    session.error = failureText;
-    pushRender();
+    s.error = failureText;
+    pushRenderFor(s, panel);
     showOutput(false, 'commit');
-    if (session.phase !== 'unknown') {
+    if (s.phase !== 'unknown') {
       void vscode.window.showErrorMessage(errorFirstLine(failureText));
     }
   }
@@ -1322,42 +1391,52 @@ function errorFirstLine(message: string): string {
   return message.split('\n')[0]?.slice(0, 300) ?? message;
 }
 
-/** 提交后的刷新与结果回显；刷新失败进入 stale（不引导盲目重提）。 */
-async function finishCommitRefresh(registry: OperationRegistry, success: boolean): Promise<void> {
-  if (!session || !handle) {
-    return;
-  }
+/**
+ * 提交后的收口与刷新。收口（finish）先于任何 UI 判定执行：成功（含部分
+ * 成功）到达本函数即结束操作登记——成功批次 revision 已逐批落盘并在结果
+ * 中回显，剩余项作为新的提交重试，不得被自身记录以 busy 阻塞；面板被
+ * 原生关闭后收口照常完成，刷新失败进入 stale（不引导盲目重提）。
+ */
+async function finishCommitRefresh(
+  registry: OperationRegistry,
+  s: CommitSessionState,
+  panel: PanelHandle,
+  sessionId: string,
+  operationId: string,
+  success: boolean,
+): Promise<void> {
   const svnPath = readSvnPath();
+  await registry.finish(operationId);
+  if (activeOperationId === operationId) {
+    activeOperationId = undefined;
+  }
   logLine(strings.commit.refreshHeader, 'commit');
   try {
-    const after = await runStatus(svnPath, session.targetArgs, runOptions(session.wcRoot));
+    const after = await runStatus(svnPath, s.targetArgs, runOptions(s.wcRoot));
     writeStatusReport(after, 'commit');
-    const committedPaths = new Set(session.result?.committedIds ?? []);
-    session.selectedPaths = new Set([...session.selectedPaths].filter((path) => !committedPaths.has(path)));
-    session.missingPrepared = session.missingPrepared.filter((path) =>
+    const committedPaths = new Set(s.result?.committedIds ?? []);
+    s.selectedPaths = new Set([...s.selectedPaths].filter((path) => !committedPaths.has(path)));
+    s.missingPrepared = s.missingPrepared.filter((path) =>
       after.entries.some((entry) => entry.path === path && entry.wcStatus === 'missing'),
     );
-    session.addedPrepared = session.addedPrepared.filter((path) =>
+    s.addedPrepared = s.addedPrepared.filter((path) =>
       after.entries.some((entry) => entry.path === path && entry.wcStatus !== 'normal'),
     );
-    // 全部成功与部分成功都结束本次操作登记：成功批次 revision 已逐批落盘
-    // 并在结果中回显，剩余项作为新的提交重试，不得被自身记录以 busy 阻塞。
-    if (success || session.result?.kind === 'partial') {
-      await registry.finish(activeOperationId);
-      activeOperationId = undefined;
-    }
-    // 用重读数据重建面板（保留说明与仍有效的勾选）。
-    const keepResult = session.result;
-    const keepPrepared = { added: session.addedPrepared, missing: session.missingPrepared };
-    await loadSession(handle.sessionId, targetOf(session), { initial: false });
-    if (session) {
-      session.result = keepResult;
-      session.addedPrepared = keepPrepared.added;
-      session.missingPrepared = keepPrepared.missing;
-      if (!success) {
-        session.phase = 'ready';
+    // 用重读数据重建面板（保留说明与仍有效的勾选）；面板已销毁/会话已
+    // 切换时重读由 loadSession 自身守卫拦截，旧会话帧交给空转丢弃。
+    const keepResult = s.result;
+    const keepPrepared = { added: s.addedPrepared, missing: s.missingPrepared };
+    if (panel.sessionId === sessionId) {
+      await loadSession(panel.sessionId, targetOf(s), { initial: false });
+      if (session) {
+        session.result = keepResult;
+        session.addedPrepared = keepPrepared.added;
+        session.missingPrepared = keepPrepared.missing;
+        if (!success) {
+          session.phase = 'ready';
+        }
+        pushRender();
       }
-      pushRender();
     }
     showOutput(false, 'commit');
     if (keepResult) {
@@ -1370,16 +1449,12 @@ async function finishCommitRefresh(registry: OperationRegistry, success: boolean
     }
   } catch (err) {
     // 提交成功（含部分成功）但刷新失败：明确已提交，重读后才能再次提交。
-    session.phase = 'stale';
-    session.error = err instanceof Error ? err.message : String(err);
-    if (success || session.result?.kind === 'partial') {
-      await registry.finish(activeOperationId);
-      activeOperationId = undefined;
-    }
-    pushRender();
+    s.phase = 'stale';
+    s.error = err instanceof Error ? err.message : String(err);
+    pushRenderFor(s, panel);
     showOutput(false, 'commit');
     // 提交本身已成功：即使刷新失败也要回显 revision，不把刷新失败误读为提交失败。
-    const committedResult = session.result;
+    const committedResult = s.result;
     if (committedResult) {
       const revisions = (committedResult.revisions ?? []).map((revision) => `r${revision}`).join('、');
       void vscode.window.showInformationMessage(
@@ -1495,6 +1570,12 @@ async function resolveUnknown(sessionId: string): Promise<void> {
   }
   const registry = getOperationRegistry();
   const restriction = registry.writeRestriction(session.wcRoot);
+  // 按 kind 分流的属性守卫（第二道防线）：foreign 记录本就不进 unknown 会话
+  // （loadSession 分流），万一以 unknown 形态到达也不得被 P1 核实误终结——
+  // vacuum 须先重新检测、checkout 的恢复线索不能丢、ignore 须回 P2 补协调。
+  if (restriction && kindOf(restriction) !== 'commit') {
+    return;
+  }
   const svnPath = readSvnPath();
   const target = targetOf(session);
   session.phase = 'refreshing';

@@ -842,6 +842,63 @@ async function main() {
   );
   check('命令注册集合仍与贡献点一致', state.registered.size === expectedIds.length);
 
+  console.log('场景 18b：预置陈旧记录与孤儿快照后 activate 返回即完成首载折算与清理');
+  {
+    // 陈旧记录（模拟上一进程被 kill 后遗留）：commit 的 committing → 折算 unknown；
+    // update 的 prepared → 按 M1 可安全重跑移除；import 的 running → 折算 unknown 且保留。
+    const staleRecords = [
+      {
+        operationId: 'op-stale-commit', wcRoot: '/mock/stale/wc-a', targetRelPath: '.',
+        nodeKind: 'dir', kind: 'commit', phase: 'committing', knownRevisions: [], updatedAt: 900,
+      },
+      {
+        operationId: 'op-stale-update', wcRoot: '/mock/stale/wc-b', targetRelPath: '.',
+        nodeKind: 'dir', kind: 'update', phase: 'prepared', knownRevisions: [], updatedAt: 901,
+      },
+      {
+        operationId: 'op-live-import', wcRoot: '/mock/stale/src', targetRelPath: '.',
+        nodeKind: 'dir', kind: 'import', phase: 'running', knownRevisions: [], updatedAt: 902,
+      },
+    ];
+    const previousRecords = state.globalStateMap.get('svnAnywhere.operations');
+    state.globalStateMap.set(
+      'svnAnywhere.operations',
+      [...(Array.isArray(previousRecords) ? previousRecords : []), ...staleRecords],
+    );
+    // 快照文件：孤儿（无未终态记录对应）应删；未终态 import 的快照保留；
+    // 不匹配识别形态（op- 命名 ∧ 快照 schema 双条件）的文件一律不动。
+    const storageDir = makeTempDir('svn-anywhere-mock-storage-');
+    const snapshotJson = JSON.stringify({ version: 1, entries: [], dirs: [] });
+    writeFileSync(join(storageDir, 'op-orphan-dead'), snapshotJson);
+    writeFileSync(join(storageDir, 'op-live-import'), snapshotJson);
+    writeFileSync(join(storageDir, 'op-not-json'), 'not json at all');
+    writeFileSync(join(storageDir, 'op-wrong-schema'), JSON.stringify({ hello: 'world' }));
+    writeFileSync(join(storageDir, 'notes.txt'), 'unrelated');
+    const thirdContext = {
+      subscriptions: [],
+      extensionUri: { scheme: 'file', path: '/mock-ext', toString: () => 'file:///mock-ext' },
+      globalState: context.globalState,
+      globalStorageUri: { scheme: 'file', path: storageDir, fsPath: storageDir, toString: () => `file://${storageDir}` },
+    };
+    await extension.activate(thirdContext);
+    const folded = state.globalStateMap.get('svnAnywhere.operations') || [];
+    const foldOf = (id) => (folded.find((r) => r.operationId === id) || {}).phase;
+    check('activate 返回后 commit 的 committing 已折算 unknown', foldOf('op-stale-commit') === 'unknown',
+      JSON.stringify(folded));
+    check('activate 返回后 update 的 prepared 已按可重跑移除',
+      !folded.some((r) => r.operationId === 'op-stale-update'));
+    check('activate 返回后 import 的 running 已折算 unknown 且记录保留',
+      foldOf('op-live-import') === 'unknown');
+    check('孤儿快照（op- 命名 ∧ 快照 schema ∧ 无未终态记录）被删除',
+      !existsSync(join(storageDir, 'op-orphan-dead')));
+    check('未终态记录的快照不被误删', existsSync(join(storageDir, 'op-live-import')));
+    check('op- 命名但非 JSON 的文件不动', existsSync(join(storageDir, 'op-not-json')));
+    check('op- 命名但非快照 schema 的 JSON 不动', existsSync(join(storageDir, 'op-wrong-schema')));
+    check('非 op- 命名的文件不动', existsSync(join(storageDir, 'notes.txt')));
+    check('三次 activate 后命令注册集合仍与贡献点一致', state.registered.size === expectedIds.length);
+    rmSync(storageDir, { recursive: true, force: true });
+  }
+
   console.log('场景 19：P1 面板——嵌套目录与带空格文件的差异、选择提交和 missing 删除范围');
   const nestedLab = makeSvnLab();
   const nestedWc = nestedLab.checkout('nested');

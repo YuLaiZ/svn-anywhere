@@ -17,7 +17,14 @@ import { runOrThrow } from '../src/core/svnCli';
 import { SvnError } from '../src/core/errors';
 import { resetPanelRegistry } from '../src/host/panel/host';
 import { disposeOutputChannel, getOutputChannel, resetOutputState } from '../src/host/output';
-import { OperationRegistry, setOperationRegistryForTest, type OperationRecord } from '../src/core/operations';
+import {
+  OperationRegistry,
+  getOperationRegistry,
+  resetRunningOperationsForTest,
+  setOperationRegistryForTest,
+  type OperationKind,
+  type OperationRecord,
+} from '../src/core/operations';
 import { strings } from '../src/host/i18n';
 
 vi.mock('../src/core/status', async (importOriginal) => {
@@ -268,6 +275,8 @@ beforeEach(() => {
   resetOutputState();
   resetPanelRegistry();
   setOperationRegistryForTest(undefined);
+  // 运行登记是模块级单例：清掉失败路径用例的残留键，防污染后续断言。
+  resetRunningOperationsForTest();
   vscodeMock.panels.length = 0;
   vscodeMock.information.length = 0;
   vscodeMock.warning.length = 0;
@@ -1226,5 +1235,184 @@ describe('P1 提交面板 操作登记序列化', () => {
     // 提交登记：多目标整体为 JSON 数组字符串，含逗号路径不产生拼接歧义。
     expect(saved[0]?.targetRelPath).toBe(JSON.stringify(['b.txt', 'c,d.txt']));
     expect(saved[0]?.targetRelPath).not.toBe('b.txt,c,d.txt');
+  });
+});
+
+describe('P1 提交面板 原生关闭收口（任务流程与面板生命周期解耦）', () => {
+  /** 挂起中的提交进程句柄：resolve=服务端回包，reject=进程级失败/服务端拒绝。 */
+  interface HeldCommit {
+    resolve(value: { stdout: string; stderr: string; exitCode: number }): void;
+    reject(err: unknown): void;
+  }
+
+  function holdCommit(): HeldCommit {
+    const held = {} as HeldCommit;
+    vi.mocked(runOrThrow).mockImplementationOnce(
+      () => new Promise((resolve, reject) => {
+        held.resolve = resolve;
+        held.reject = reject;
+      }),
+    );
+    return held;
+  }
+
+  /** 命令结束后记录不得残留在在途相位（prepared/committing——悬挂即永久 busy）。 */
+  function assertNoInflightResidue(): void {
+    const pending = getOperationRegistry().pendingForWcRoot(wcRoot);
+    expect(pending.some((record) => record.phase === 'prepared' || record.phase === 'committing')).toBe(false);
+  }
+
+  it('结局①成功：commit 在途时原生关闭面板，命令结束后登记释放、同副本 begin 不被拒', async () => {
+    const panel = await openPanelAndWait(join(wcRoot, 'a.txt'), 'a.txt');
+    const held = holdCommit();
+    panel.sendIntent({ kind: 'syncInput', fieldId: 'message', value: '关闭中提交', inputRevision: 1 }, 'in-d1');
+    panel.sendIntent({ kind: 'submit' }, 'sub-d1');
+    await vi.waitFor(() => expect(commitCalls().length).toBeGreaterThan(0));
+    // 提交占用窗口内原生关闭（onPanelDispose 置空模块级句柄），流程不得中断。
+    panel.dispose();
+    held.resolve({ stdout: 'Committed revision 5.\n', stderr: '', exitCode: 0 });
+
+    const registry = getOperationRegistry();
+    await vi.waitFor(() => expect(registry.hasRunning(wcRoot)).toBe(false));
+    assertNoInflightResidue();
+    const again = await registry.begin({ wcRoot, targetRelPath: '.', nodeKind: 'dir', kind: 'commit' });
+    expect(again.ok).toBe(true);
+    if (again.ok) {
+      await registry.finish(again.operationId);
+    }
+  });
+
+  it('结局②服务端拒绝：commit 在途时原生关闭面板，failed-unconfirmed 后随即 finish、begin 不被拒', async () => {
+    const panel = await openPanelAndWait(join(wcRoot, 'a.txt'), 'a.txt');
+    const held = holdCommit();
+    panel.sendIntent({ kind: 'syncInput', fieldId: 'message', value: '会被拒绝', inputRevision: 1 }, 'in-d2');
+    panel.sendIntent({ kind: 'submit' }, 'sub-d2');
+    await vi.waitFor(() => expect(commitCalls().length).toBeGreaterThan(0));
+    panel.dispose();
+    held.reject(new SvnError({ message: 'svn: E160028: out of date', command: ['commit'], code: 'E160028' }));
+
+    const registry = getOperationRegistry();
+    await vi.waitFor(() => expect(registry.hasRunning(wcRoot)).toBe(false));
+    assertNoInflightResidue();
+    expect(registry.writeRestriction(wcRoot)).toBeUndefined();
+    const again = await registry.begin({ wcRoot, targetRelPath: '.', nodeKind: 'dir', kind: 'commit' });
+    expect(again.ok).toBe(true);
+    if (again.ok) {
+      await registry.finish(again.operationId);
+    }
+  });
+
+  it('结局③超时：commit 在途时原生关闭面板，记录转 unknown（hasRunning=false/writeLocked），核实「未提交」后恢复', async () => {
+    const panel = await openPanelAndWait(join(wcRoot, 'a.txt'), 'a.txt');
+    const held = holdCommit();
+    panel.sendIntent({ kind: 'syncInput', fieldId: 'message', value: '会超时', inputRevision: 1 }, 'in-d3');
+    panel.sendIntent({ kind: 'submit' }, 'sub-d3');
+    await vi.waitFor(() => expect(commitCalls().length).toBeGreaterThan(0));
+    panel.dispose();
+    held.reject(new SvnError({ message: 'svn commit 超时', command: ['commit'], code: 'TIMEOUT' }));
+
+    const registry = getOperationRegistry();
+    // 结果未知：运行登记清除、写限制保留（P4 busy=false/writeLocked=true 属预期）。
+    await vi.waitFor(() => expect(registry.hasRunning(wcRoot)).toBe(false));
+    assertNoInflightResidue();
+    expect(registry.writeRestriction(wcRoot)?.phase).toBe('unknown');
+    // 同副本 begin 被 unknown 冻结拦截（不是永久 busy——有核实出口）。
+    const frozen = await registry.begin({ wcRoot, targetRelPath: '.', nodeKind: 'dir', kind: 'commit' });
+    expect(frozen.ok).toBe(false);
+
+    // 重开面板进入 unknown 会话，核实「未提交」（本地仍脏 + 远端无变化）后解锁。
+    const reopened = await openPanelAndWait(join(wcRoot, 'a.txt'), '提交结果未知');
+    reopened.sendIntent({ kind: 'resolveUnknown' }, 'verify-d3');
+    await vi.waitFor(() => {
+      const toast = [...reopened.posted].reverse().find((m) => m.type === 'toast' && String(m.message ?? '').includes('已核实未提交'));
+      expect(toast).toBeDefined();
+    });
+    const after = await registry.begin({ wcRoot, targetRelPath: '.', nodeKind: 'dir', kind: 'commit' });
+    expect(after.ok).toBe(true);
+    if (after.ok) {
+      await registry.finish(after.operationId);
+    }
+  });
+});
+
+describe('P1 提交面板 foreign 记录按 kind 分流', () => {
+  /** 预置一条限制写的外部记录（kind 分流的数据源）。 */
+  async function seedForeignRecord(kind: OperationKind, phase?: 'unknown'): Promise<void> {
+    const registry = getOperationRegistry();
+    const begun = await registry.begin({
+      wcRoot,
+      targetRelPath: '.',
+      nodeKind: 'dir',
+      kind,
+      ...(kind === 'ignore'
+        ? {
+          property: {
+            name: 'svn:ignore',
+            originalExists: false,
+            originalValue: [],
+            pendingExists: true,
+            pendingValue: ['*.log'],
+          },
+        }
+        : {}),
+    });
+    expect(begun.ok).toBe(true);
+    if (begun.ok && phase) {
+      await registry.markPhase(begun.operationId, phase);
+    }
+  }
+
+  const cases: Array<{ kind: OperationKind; phase?: 'unknown'; expectText: string; label: string }> = [
+    { kind: 'vacuum', phase: 'unknown', expectText: '磁盘治理面板重新检测', label: 'vacuum' },
+    { kind: 'checkout', expectText: '回到检出面板核验', label: 'checkout' },
+    { kind: 'ignore', phase: 'unknown', expectText: '到忽略面板核实', label: 'ignore' },
+  ];
+
+  for (const { kind, phase, expectText, label } of cases) {
+    it(`kind=${label} 的受限记录打开 P1：只提示（info 横幅 + refresh、无 ×）、不进 unknown、不 finish`, async () => {
+      await seedForeignRecord(kind, phase);
+      const phaseBefore = phase ?? 'prepared';
+      const panel = await openPanelAndWait(join(wcRoot, 'a.txt'), 'a.txt');
+      const html = String([...panel.posted].reverse().find((m) => m.type === 'render' && String(m.html ?? '').includes('a.txt'))?.html);
+      // 只提示：notice 横幅承载分流指引，含 refresh 动作（foreign 的 ready 态
+      // 无既有刷新入口）、不渲染关闭 ×（dismissable:false）。
+      expect(html).toContain(expectText);
+      expect(html).toContain('class="banner info"');
+      expect(html).toContain('data-banner-id="notice" data-action-id="refresh"');
+      expect(html).not.toContain('data-intent="dismissBanner" data-banner-id="notice"');
+      // 不进 unknown 会话：无「提交结果未知」横幅、无核实动作。
+      expect(html).not.toContain('提交结果未知');
+      expect(html).not.toContain('resolveUnknown');
+      // 写控件禁用（locked 与 writeLocked 同批扩）。
+      expect(html).toMatch(/data-intent="submit"[^>]*disabled/);
+      // 不 finish/markPhase：记录相位与存在性不变。
+      const record = getOperationRegistry().pendingForWcRoot(wcRoot).find((item) => item.kind === kind);
+      expect(record?.phase).toBe(phaseBefore);
+      panel.dispose();
+      await getOperationRegistry().finish(record?.operationId);
+    });
+  }
+
+  it('kind=commit 的受限记录照旧进 unknown 会话并提供核实（对照）', async () => {
+    await seedForeignRecord('commit', 'unknown');
+    const panel = await openPanelAndWait(join(wcRoot, 'a.txt'), '提交结果未知');
+    const html = String([...panel.posted].reverse().find((m) => m.type === 'render' && String(m.html ?? '').includes('提交结果未知'))?.html);
+    expect(html).toContain('resolveUnknown');
+    expect(html).not.toContain('class="banner info"');
+    panel.dispose();
+    const record = getOperationRegistry().pendingForWcRoot(wcRoot).find((item) => item.kind === 'commit');
+    await getOperationRegistry().finish(record?.operationId);
+  });
+
+  it('foreign 期间 status 读取失败：error 横幅照常、notice 指引不丢失（并存）', async () => {
+    await seedForeignRecord('vacuum', 'unknown');
+    vi.mocked(runStatus).mockRejectedValueOnce(new SvnError({ message: 'svn: E155004: locked', command: ['status'], code: 'E155004' }));
+    const panel = await openPanelAndWait(join(wcRoot, 'a.txt'), '磁盘治理面板重新检测');
+    const html = String([...panel.posted].reverse().find((m) => m.type === 'render' && String(m.html ?? '').includes('磁盘治理面板重新检测'))?.html);
+    expect(html).toContain('class="banner error"');
+    expect(html).toContain('磁盘治理面板重新检测');
+    panel.dispose();
+    const record = getOperationRegistry().pendingForWcRoot(wcRoot).find((item) => item.kind === 'vacuum');
+    await getOperationRegistry().finish(record?.operationId);
   });
 });

@@ -113,6 +113,13 @@ export interface BannerSpec {
   /** detail 按预格式文本展示（stderr 等原样输出）。 */
   preformatted?: boolean;
   actions?: ActionSpec[];
+  /**
+   * 是否渲染关闭 ×（默认 true，既有横幅渲染行为不变）。持久的判定性提示
+   * （如 P1 foreign 分流指引）设 false：不渲染 ×——writeLocked 态渲染可点
+   * 被拒的关闭按钮与「事件守卫和 DOM 禁用一致」纪律冲突，且该类提示由
+   * loadSession 判定重写、无手动关闭需求。
+   */
+  dismissable?: boolean;
 }
 
 /** 页脚动作区：摘要 + 主按钮 + 次按钮（关闭/提交等）。 */

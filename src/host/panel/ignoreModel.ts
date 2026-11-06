@@ -9,8 +9,9 @@
  * - 规则按行原样保留（含首尾空格），不逐行 trim。
  */
 import type { OperationRecord, PropertyRecord } from '../../core/operations';
-import type { NodeIdentity, PropertySnapshot } from '../../core/ignoreCommit';
+import type { PropertySnapshot } from '../../core/ignoreCommit';
 import { snapshotEqual } from '../../core/ignoreCommit';
+import type { NodeIdentity } from '../../core/nodeIdentity';
 import { format, strings } from '../i18n';
 import type { BannerSpec, FooterSpec, HeaderBadgeSpec, IgnoreEditorSpec, PanelState } from './state';
 

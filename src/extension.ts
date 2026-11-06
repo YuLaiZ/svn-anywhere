@@ -14,7 +14,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   resetOutputState();
   context.subscriptions.push({ dispose: disposeOutputChannel });
   getOutputChannel();
-  registerAllCommands(context);
+  // await 注册（含操作记录首载折算与孤儿快照清理）：activate 返回后命令
+  // 可用即意味着注册表已折算完成（M3 §2.2 首载时序）。
+  await registerAllCommands(context);
   probeSvn().catch((err: unknown) => {
     logLine(format(strings.activation.probeFailed, {
       message: err instanceof Error ? err.message : String(err),

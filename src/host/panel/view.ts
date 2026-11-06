@@ -150,11 +150,15 @@ function renderBanner(banner: BannerSpec): string {
     }))
     .join('');
   const dismissLabel = strings.panel.dismiss;
-  const dismissHtml = [
-    '<button type="button" class="row-act" data-intent="dismissBanner"',
-    ` data-banner-id="${escapeHtml(banner.id)}"`,
-    ` aria-label="${escapeHtml(dismissLabel)}" title="${escapeHtml(dismissLabel)}">×</button>`,
-  ].join('');
+  // dismissable:false 的横幅不渲染 ×（判定性持久提示，无关闭需求）；
+  // 其余横幅保持默认渲染（M2 既有行为不变）。
+  const dismissHtml = banner.dismissable === false
+    ? ''
+    : [
+      '<button type="button" class="row-act" data-intent="dismissBanner"',
+      ` data-banner-id="${escapeHtml(banner.id)}"`,
+      ` aria-label="${escapeHtml(dismissLabel)}" title="${escapeHtml(dismissLabel)}">×</button>`,
+    ].join('');
   const role = banner.level === 'error' ? 'alert' : 'status';
   return [
     `<div class="banner ${escapeHtml(banner.level)}" role="${role}">`,

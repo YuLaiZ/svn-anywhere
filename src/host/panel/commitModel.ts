@@ -84,6 +84,18 @@ export interface CommitSessionState {
   externalPrefixes: string[];
   /** 本次数据的未版本控制子项枚举达到防御上限（其余未显示，横幅提示）。 */
   unversionedTruncated: boolean;
+  /**
+   * 其他面板/命令（vacuum/checkout/ignore）的受限记录命中本副本：提交
+   * 写控件整体禁用，但会话保持 ready（不冒充「提交结果未知」场景）、不进
+   * unknown 核实流程。关闭走原生标签关闭（与 unknown 同形态）。
+   */
+  foreignLocked?: boolean;
+  /**
+   * loadSession 判定重写的持久提示（foreign 记录的分流指引横幅承载）。
+   * 类型必须含 null：未命中写限制的正常路径显式置 null，防止指引跨会话
+   * 残留到下一个目标的渲染帧。
+   */
+  notice?: string | null;
 }
 
 /* ------------------------- 分组与默认选择规则 ------------------------- */
@@ -428,7 +440,10 @@ export function buildFilterSpecs(session: CommitSessionState): FilterSpec[] {
 /** 会话状态 → 宿主渲染状态（标题、树、分组、筛选、页脚、横幅全量派生）。 */
 export function buildPanelState(session: CommitSessionState): PanelState {
   const busyPhase = session.phase === 'loading' || session.phase === 'refreshing' || session.phase === 'checking' || session.phase === 'committing';
-  const locked = busyPhase || session.phase === 'unknown';
+  // foreign 记录与 unknown 同口径禁用写控件：只扩 writeLocked 时提交按钮
+  // （disabled 取自 locked）仍可点被拒，两项必须同批扩。
+  const foreignLock = session.foreignLocked === true;
+  const locked = busyPhase || session.phase === 'unknown' || foreignLock;
   const selectedMetas = session.metas.filter((meta) => session.selectedPaths.has(meta.path));
   const visible = visibleMetas(session);
   const hiddenSelected = selectedMetas.filter((meta) => !visible.some((v) => v.path === meta.path)).length;
@@ -475,7 +490,7 @@ export function buildPanelState(session: CommitSessionState): PanelState {
     revision: 0,
     formRevision: 0,
     busy: busyPhase,
-    writeLocked: session.phase === 'unknown',
+    writeLocked: session.phase === 'unknown' || foreignLock,
     banners: buildBanners(session, selectedMetas, conflictMetas),
     list,
     form: buildForm(session, locked),
@@ -628,6 +643,19 @@ function buildBanners(
       title: strings.panel.unknownBannerTitle,
       detail: strings.panel.unknownBannerDetail,
       actions: [{ id: 'resolveUnknown', label: strings.panel.verifyAction }],
+    });
+  }
+  if (session.notice) {
+    // foreign 记录的分流指引：info 横幅 + refresh 动作（foreign 的 ready 态
+    // 无既有刷新入口）+ 不渲染关闭 ×（dismissable:false，判定性持久提示、
+    // 无关闭需求；不为 dismissBanner 开 writeLocked 豁免）。与 error 横幅
+    // 并存（foreign 期间 status 读取失败各表一事）。
+    banners.push({
+      id: 'notice',
+      level: 'info',
+      title: session.notice,
+      actions: [{ id: 'refresh', label: strings.panel.refresh }],
+      dismissable: false,
     });
   }
   if (session.result?.kind === 'success') {

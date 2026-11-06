@@ -16,16 +16,15 @@ import {
   checkoutDepthEmpty,
   commitTempIgnore,
   coordinateUpdate,
-  parseNodeIdentity,
   propertyConflicted,
   readIgnoreSnapshot,
-  readNodeIdentity,
   readRemoteIgnoreSnapshot,
   readRemoteNodeRevisions,
   resolvePropertyConflict,
   snapshotEqual,
   writeRulesTempFile,
 } from '../src/core/ignoreCommit';
+import { parseNodeIdentity, readNodeIdentity } from '../src/core/nodeIdentity';
 import { createSvnLab, writeFile } from './helpers';
 
 const labs: Array<() => void> = [];

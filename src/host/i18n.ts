@@ -31,6 +31,7 @@ export const strings = {
     revert: '还原',
     move: '移动',
     revealInFinder: '在 Finder 中显示',
+    showRemoteInfo: '远端信息',
   },
   target: {
     resolved: '[定位] {command}：目标 {target}，副本根 {wcRoot}',
@@ -157,6 +158,23 @@ export const strings = {
   placeholder: {
     notice: '「{command}」将在后续版本提供。已定位到工作副本：{wcRoot}',
   },
+  remoteInfo: {
+    pickPlaceholder: '选择信息项；选中含 URL 或路径的条目即复制原始值',
+    labelLocalPath: '本地路径',
+    labelNodeUrl: '节点 URL',
+    labelRootUrl: '仓库根 URL',
+    labelUuid: '仓库 UUID',
+    labelRelativePath: '相对路径',
+    /** 相对路径展示值含 @ 时的条目说明：svn 把 @ 当 peg 分隔符，命令行须补尾 @。 */
+    pegHint: '路径含 @：直接用于命令行时须在末尾补 @',
+    unavailableDetail: '不可用',
+    unavailableNotice: '{label} 不可用：svn info 未返回该字段。',
+    /** 回显与剪贴板内容一致，都用原始 URI（不二次解码）。 */
+    copied: '已复制：{value}',
+    copyFailed: '复制到剪贴板失败：{message}',
+    copyManualPrompt: '自动复制失败，请在下方输入框中手动选择并复制：',
+    unversioned: '该路径未纳入版本控制，没有远端信息。',
+  },
   panel: {
     statusListTitle: 'SVN 状态',
     commitPanelTitle: '提交',
@@ -271,6 +289,10 @@ export const strings = {
     unknownBannerTitle: '提交结果未知，禁止直接重试',
     unknownBannerDetail: '先核实服务器结果，再决定协调或重试。',
     verifyAction: '核实提交结果',
+    /** 其他面板/命令的受限记录命中本副本（foreign 分流）：只提示、不提供核实。 */
+    foreignNoticeVacuum: '磁盘清理操作未完成或结果未知，本副本的提交暂不可用；请到磁盘治理面板重新检测。',
+    foreignNoticeCheckout: '检出/续检未完成，本副本的提交暂不可用；请回到检出面板核验。',
+    foreignNoticeIgnore: '忽略规则的保存或提交未完成或结果未知，本副本的提交暂不可用；请到忽略面板核实。',
     verifyCommitted: '已核实提交成功 · revision {revisions}，没有重复提交。',
     verifyNotCommitted: '已核实未提交；添加/删除登记可能已生效，请核对后重试。',
     verifyStillUnknown: '目前无法确认结果，继续冻结本次操作。',

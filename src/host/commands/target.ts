@@ -115,7 +115,13 @@ function canonicalTargetPath(fsPath: string, wcRoot: string): string {
   }
 }
 
-async function pickTargetFsPath(uri?: vscode.Uri): Promise<string | undefined> {
+/**
+ * 解析命令目标的本地路径：右键 uri → 活动编辑器（仅 file scheme）→
+ * 文件/目录选择框。任一步取消返回 undefined（调用方静默返回）。
+ * 不要求路径在工作副本内——未版本控制是合法结果的命令（如远端信息）
+ * 也用它做入口解析。
+ */
+export async function pickTargetFsPath(uri?: vscode.Uri): Promise<string | undefined> {
   if (uri) {
     return uri.fsPath;
   }

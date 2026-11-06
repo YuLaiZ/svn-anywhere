@@ -56,9 +56,11 @@ export async function beginDailyWrite(
     void vscode.window.showWarningMessage(format(strings.panel.operationHeldBusy, { phase: held.phase }));
     return undefined;
   }
-  const begin = await registry.begin({ wcRoot, targetRelPath, nodeKind });
+  const begin = await registry.begin({ wcRoot, targetRelPath, nodeKind, kind: 'daily' });
   if (!begin.ok) {
-    void vscode.window.showWarningMessage(format(strings.panel.operationHeldBusy, { phase: begin.heldBy.phase }));
+    // 判别联合收窄：busy 分支才有 heldBy（本调用不传 operationId，其他分支不可达）。
+    const heldPhase = begin.reason === 'busy' ? begin.heldBy.phase : begin.reason;
+    void vscode.window.showWarningMessage(format(strings.panel.operationHeldBusy, { phase: heldPhase }));
     return undefined;
   }
   return begin.operationId;

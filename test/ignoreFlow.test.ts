@@ -10,16 +10,28 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as vscode from 'vscode';
 import { SvnError } from '../src/core/errors';
-import { OperationRegistry, getOperationRegistry, setOperationRegistryForTest } from '../src/core/operations';
+import {
+  OperationRegistry,
+  getOperationRegistry,
+  resetRunningOperationsForTest,
+  setOperationRegistryForTest,
+} from '../src/core/operations';
 import { resetPanelRegistry } from '../src/host/panel/host';
 import { disposeOutputChannel, resetOutputState } from '../src/host/output';
 import { strings } from '../src/host/i18n';
+
+vi.mock('../src/core/nodeIdentity', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/core/nodeIdentity')>();
+  return {
+    ...actual,
+    readNodeIdentity: vi.fn(),
+  };
+});
 
 vi.mock('../src/core/ignoreCommit', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/core/ignoreCommit')>();
   return {
     ...actual,
-    readNodeIdentity: vi.fn(),
     readIgnoreSnapshot: vi.fn(),
     applyIgnoreSnapshot: vi.fn(),
     checkoutDepthEmpty: vi.fn(),
@@ -195,12 +207,12 @@ import {
   coordinateUpdate,
   propertyConflicted,
   readIgnoreSnapshot,
-  readNodeIdentity,
   readRemoteIgnoreSnapshot,
   readRemoteNodeRevisions,
   resolvePropertyConflict,
   type PropertySnapshot,
 } from '../src/core/ignoreCommit';
+import { readNodeIdentity } from '../src/core/nodeIdentity';
 import { commandEditIgnore } from '../src/host/commands/ignore';
 import { setIgnorePanelContext } from '../src/host/panel/panels/ignore';
 
@@ -257,6 +269,8 @@ async function settle(rounds = 20): Promise<void> {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // 运行登记是模块级单例：清掉失败路径用例的残留键，防污染后续断言。
+  resetRunningOperationsForTest();
   vscodeMock.panels.length = 0;
   vscodeMock.information.length = 0;
   vscodeMock.warning.length = 0;
@@ -882,6 +896,186 @@ function getRegistryRestricted(wcRoot: string): boolean {
   return getOperationRegistry().pendingForWcRoot(wcRoot).length > 0;
 }
 
+describe('P2 面板：原生关闭+重开收口（任务流程与面板生命周期解耦）', () => {
+  /** 打开面板、加入一条待保存规则（保存/提交的公共前置）。 */
+  async function openWithPendingRule(lab: string): Promise<FakePanel> {
+    enqueue(snap(['*.log']), snap(['*.log']));
+    const panel = await openPanel(join(lab, 'src'), '*.log');
+    panel.sendIntent({ kind: 'syncInput', fieldId: 'draft', value: '.idea', inputRevision: 1 });
+    await settle();
+    panel.sendIntent({ kind: 'addRule' });
+    await settle();
+    return panel;
+  }
+
+  it('saveIgnore 外部变化分支：覆盖防护读挂起窗口内关闭并重开，照常收口、不残留 saving', async () => {
+    const lab = makeFakeWc();
+    try {
+      const panel = await openWithPendingRule(lab);
+      let releaseRead!: (value: PropertySnapshot) => void;
+      vi.mocked(readIgnoreSnapshot).mockImplementationOnce(
+        () => new Promise((resolve) => { releaseRead = resolve; }),
+      );
+      panel.sendIntent({ kind: 'saveIgnore' });
+      await settle();
+      panel.dispose();
+      // 重开使模块级 handle 指向新面板：旧会话流程不得因 sessionId 不匹配
+      // 早退（否则记录停在 saving、同会话 P4 永久 busy）。
+      await openPanel(join(lab, 'src'), '提交结果未知');
+      releaseRead(snap(['external-change']));
+      await settle(40);
+      const registry = getOperationRegistry();
+      expect(registry.hasRunning(lab)).toBe(false);
+      expect(registry.pendingForWcRoot(lab).some((record) => record.phase === 'saving')).toBe(false);
+      expect(vi.mocked(applyIgnoreSnapshot)).not.toHaveBeenCalled();
+    } finally {
+      rmSync(lab, { recursive: true, force: true });
+    }
+  });
+
+  it('saveIgnore 成功分支：propset 挂起窗口内关闭并重开，保存照常收口、不残留 saving', async () => {
+    const lab = makeFakeWc();
+    try {
+      const panel = await openWithPendingRule(lab);
+      enqueue(snap(['*.log']));
+      let releaseApply!: () => void;
+      vi.mocked(applyIgnoreSnapshot).mockImplementationOnce(
+        () => new Promise((resolve) => { releaseApply = resolve; }),
+      );
+      panel.sendIntent({ kind: 'saveIgnore' });
+      await settle();
+      panel.dispose();
+      enqueue(snap(['*.log', '.idea']));
+      await openPanel(join(lab, 'src'), '提交结果未知');
+      releaseApply();
+      await settle(40);
+      const registry = getOperationRegistry();
+      expect(registry.hasRunning(lab)).toBe(false);
+      expect(registry.pendingForWcRoot(lab).some((record) => record.phase === 'saving')).toBe(false);
+      expect(vi.mocked(applyIgnoreSnapshot)).toHaveBeenCalled();
+    } finally {
+      rmSync(lab, { recursive: true, force: true });
+    }
+  });
+
+  it('saveIgnore 失败分支：propset 挂起窗口内关闭并重开，普通失败照常 finish、不残留 saving', async () => {
+    const lab = makeFakeWc();
+    try {
+      const panel = await openWithPendingRule(lab);
+      enqueue(snap(['*.log']));
+      let rejectApply!: (err: unknown) => void;
+      vi.mocked(applyIgnoreSnapshot).mockImplementationOnce(
+        () => new Promise((resolve, reject) => { rejectApply = reject; }),
+      );
+      panel.sendIntent({ kind: 'saveIgnore' });
+      await settle();
+      panel.dispose();
+      await openPanel(join(lab, 'src'), '提交结果未知');
+      rejectApply(new SvnError({ message: 'svn: E155004: locked', command: ['propset'], code: 'E155004' }));
+      await settle(40);
+      const registry = getOperationRegistry();
+      expect(registry.hasRunning(lab)).toBe(false);
+      expect(registry.pendingForWcRoot(lab).some((record) => record.phase === 'saving')).toBe(false);
+    } finally {
+      rmSync(lab, { recursive: true, force: true });
+    }
+  });
+
+  it('submitIgnore 超时：commit 挂起窗口内关闭并重开，markPhase(unknown) 不早退、重开面板见核实入口', async () => {
+    const lab = makeFakeWc();
+    try {
+      // 已保存待提交：加载读工作值（含新规则）与 BASE（旧值）。
+      enqueue(snap(['*.log', '.idea']), snap(['*.log']));
+      const panel = await openPanel(join(lab, 'src'), 'rule-text');
+      await settle();
+      const committed = snap(['*.log', '.idea']);
+      enqueue(committed, snap(['*.log']));
+      let rejectCommit!: (err: unknown) => void;
+      vi.mocked(commitTempIgnore).mockImplementationOnce(
+        () => new Promise((_resolve, reject) => { rejectCommit = reject; }),
+      );
+      panel.sendIntent({ kind: 'submitIgnore' });
+      await settle();
+      panel.dispose();
+      const reopened = await openPanel(join(lab, 'src'), '提交结果未知');
+      rejectCommit(new SvnError({ message: 'svn commit 超时', command: ['commit'], code: 'TIMEOUT' }));
+      await settle(40);
+      const registry = getOperationRegistry();
+      // 记录转 unknown（hasRunning=false、writeLocked=true 属预期），不残留 committing。
+      expect(registry.hasRunning(lab)).toBe(false);
+      expect(registry.writeRestriction(lab)?.phase).toBe('unknown');
+      expect(registry.pendingForWcRoot(lab).some((record) => record.phase === 'committing')).toBe(false);
+      expect(reopened.lastRender()!.html).toContain('核实提交结果');
+    } finally {
+      rmSync(lab, { recursive: true, force: true });
+    }
+  });
+
+  it('submitIgnore 正常完成：commit 挂起窗口内关闭并重开，协调态落盘、不残留 committing', async () => {
+    const lab = makeFakeWc();
+    try {
+      enqueue(snap(['*.log', '.idea']), snap(['*.log']));
+      const panel = await openPanel(join(lab, 'src'), 'rule-text');
+      await settle();
+      const committed = snap(['*.log', '.idea']);
+      enqueue(committed, snap(['*.log']));
+      let releaseCommit!: (revision: number) => void;
+      vi.mocked(commitTempIgnore).mockImplementationOnce(
+        () => new Promise((resolve) => { releaseCommit = resolve; }),
+      );
+      panel.sendIntent({ kind: 'submitIgnore' });
+      await settle();
+      panel.dispose();
+      // 重开时记录仍在 committing（提交挂起中）→ unknown 会话渲染。
+      await openPanel(join(lab, 'src'), '提交结果未知');
+      releaseCommit(9);
+      await settle(40);
+      const registry = getOperationRegistry();
+      // committed-pending-coordination 先落盘（与面板存活无关）；重开使
+      // sessionId 不匹配 → 只跳过自动协调（协调态非在途、不构成悬挂）。
+      expect(registry.hasRunning(lab)).toBe(false);
+      expect(registry.writeRestriction(lab)?.phase).toBe('committed-pending-coordination');
+      expect(registry.pendingForWcRoot(lab).some((record) => record.phase === 'committing')).toBe(false);
+      expect(vi.mocked(coordinateUpdate)).not.toHaveBeenCalled();
+    } finally {
+      rmSync(lab, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('P2 面板：忽略协调 update 的执行期临时登记', () => {
+  it('协调态相位不判 busy，但 svn update 实际运行窗口 hasRunning=true、命令结束即 false', async () => {
+    const lab = makeFakeWc();
+    try {
+      enqueue(snap(['*.log', '.idea']), snap(['*.log']));
+      const panel = await openPanel(join(lab, 'src'), 'rule-text');
+      await settle();
+      const committed = snap(['*.log', '.idea']);
+      enqueue(committed, snap(['*.log']), committed);
+      let releaseUpdate!: (value: string) => void;
+      vi.mocked(coordinateUpdate).mockImplementationOnce(
+        () => new Promise((resolve) => { releaseUpdate = resolve; }),
+      );
+      panel.sendIntent({ kind: 'submitIgnore' });
+      await vi.waitFor(() => {
+        expect(vi.mocked(coordinateUpdate).mock.calls.length).toBeGreaterThan(0);
+      });
+      const registry = getOperationRegistry();
+      // 提交已落 committed-pending-coordination（非在途、登记已清）——此刻
+      // 命中的只是协调 update 实际运行窗口的临时登记。
+      expect(registry.writeRestriction(lab)?.phase).toBe('committed-pending-coordination');
+      expect(registry.hasRunning(lab)).toBe(true);
+      releaseUpdate('Updated to revision 9.');
+      enqueue(committed, committed, committed);
+      await settle(80);
+      expect(registry.hasRunning(lab)).toBe(false);
+      expect(getRegistryRestricted(lab)).toBe(false);
+    } finally {
+      rmSync(lab, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('P2 面板：表单输入序号（webview 输入防回退）', () => {
   it('宿主主动改输入值时递增 formRevision：加入后渲染携带序号且输入框清空', async () => {
     const lab = makeFakeWc();
@@ -989,7 +1183,9 @@ describe('P2 面板：重启恢复清理临时副本', () => {
       },
     });
     if (!begin.ok) {
-      throw new Error(`预置受限记录失败：副本被 ${begin.heldBy.phase} 记录占用`);
+      // 判别联合收窄：busy 分支才有 heldBy（本调用不传 operationId，其他分支不可达）。
+      const heldPhase = begin.reason === 'busy' ? begin.heldBy.phase : begin.reason;
+      throw new Error(`预置受限记录失败：副本被 ${heldPhase} 记录占用`);
     }
     await registry.markPhase(begin.operationId, phase, { knownRevisions: [9], tempWcPath: tempWc });
   }

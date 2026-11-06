@@ -26,16 +26,15 @@ import {
   coordinateUpdate,
   propertyConflicted,
   readIgnoreSnapshot,
-  readNodeIdentity,
   readRemoteIgnoreSnapshot,
   readRemoteNodeRevisions,
   resolvePropertyConflict,
   snapshotEqual,
-  type NodeIdentity,
   type PropertySnapshot,
 } from '../../../core/ignoreCommit';
+import { readNodeIdentity, type NodeIdentity } from '../../../core/nodeIdentity';
 import { SvnError } from '../../../core/errors';
-import { getOperationRegistry, type OperationRecord } from '../../../core/operations';
+import { getOperationRegistry, runWithRunningKey, type OperationRecord } from '../../../core/operations';
 import { readSvnPath, readTimeoutMs } from '../../config';
 import { format, strings } from '../../i18n';
 import { decodingRunOptions, logCommand, logExitCode, logLine, showOutput } from '../../output';
@@ -382,6 +381,15 @@ function pushRender(): void {
   handle.update({ ...buildIgnorePanelState(session), formRevision }, handle.sessionId);
 }
 
+/**
+ * 以任务流程启动时捕获的局部会话/面板推帧：面板被原生关闭后
+ * update/toast 以 disposed 空转吞掉（模块级 handle 可能已指向重开的新
+ * 面板，不得读写）；目标切换的迟到帧由 update 的会话校验丢弃。
+ */
+function pushRenderFor(s: IgnoreSessionState, panel: PanelHandle): void {
+  panel.update({ ...buildIgnorePanelState(s), formRevision }, panel.sessionId);
+}
+
 /* ------------------------------ 意图分发 ------------------------------ */
 
 async function onIntent(intent: Intent, context: { sessionId: string; busy: boolean }): Promise<void> {
@@ -520,6 +528,10 @@ async function saveIgnore(sessionId: string): Promise<boolean> {
     return false;
   }
   const s = session;
+  // 流程与面板生命周期解耦：收口（markPhase/finish）先于任何会话判定执行、
+  // UI 写入只用流程启动时捕获的局部引用——命令在途时原生关闭 P2 后重开
+  // 不会再让记录停在 saving（本会话 P4 永久 busy、同副本保存/提交被拒）。
+  const panel = handle;
   const svnPath = readSvnPath();
   const registry = getOperationRegistry();
   const begin = await registry.begin({
@@ -527,6 +539,8 @@ async function saveIgnore(sessionId: string): Promise<boolean> {
     targetRelPath: s.dirArg,
     nodeKind: 'dir',
     baseRevision: s.identity?.revision,
+    // 记录按所在面板分类（ignore）：漏传会走无 kind 兜底进 P1 误核路径。
+    kind: 'ignore',
     property: {
       name: 'svn:ignore',
       originalExists: s.repositoryPropertyExists,
@@ -536,7 +550,9 @@ async function saveIgnore(sessionId: string): Promise<boolean> {
     },
   });
   if (!begin.ok) {
-    handle.toast('info', format(strings.panel.operationHeldBusy, { phase: begin.heldBy.phase }));
+    // 判别联合收窄：busy 分支才有 heldBy（本调用不传 operationId，其他分支不可达）。
+    const heldPhase = begin.reason === 'busy' ? begin.heldBy.phase : begin.reason;
+    panel.toast('info', format(strings.panel.operationHeldBusy, { phase: heldPhase }));
     return false;
   }
   // 局部引用：面板销毁会把模块级 activeOperationId 置空，finish 不能依赖它。
@@ -546,13 +562,11 @@ async function saveIgnore(sessionId: string): Promise<boolean> {
   s.phase = 'saving';
   s.error = null;
   s.notice = null;
-  pushRender();
+  pushRenderFor(s, panel);
   try {
     // 覆盖防护：磁盘实际值与保存基线不一致说明外部修改过，不覆盖。
+    // 重开后的旧会话流程照常执行并收口（判定只影响 UI 呈现）。
     const current = await readIgnoreSnapshot(svnPath, s.dirArg, runOptions(s.wcRoot));
-    if (handle && handle.sessionId !== sessionId) {
-      return false;
-    }
     if (!snapshotEqual(current, { rules: s.savedRules, exists: s.savedPropertyExists })) {
       s.workingSnapshot = current;
       s.phase = 'ready';
@@ -562,7 +576,7 @@ async function saveIgnore(sessionId: string): Promise<boolean> {
       if (activeOperationId === operationId) {
         activeOperationId = undefined;
       }
-      pushRender();
+      pushRenderFor(s, panel);
       showOutput(false, 'commit');
       return false;
     }
@@ -570,9 +584,6 @@ async function saveIgnore(sessionId: string): Promise<boolean> {
     await applyIgnoreSnapshot(svnPath, s.dirArg, target, runOptions(s.wcRoot));
     // 保存成功后读回实际值，再更新实际快照与保存基线。
     const actual = await readIgnoreSnapshot(svnPath, s.dirArg, runOptions(s.wcRoot));
-    if (handle && handle.sessionId !== sessionId) {
-      return false;
-    }
     s.workingSnapshot = actual;
     s.savedRules = [...s.rules];
     s.savedPropertyExists = s.rules.length > 0;
@@ -585,12 +596,9 @@ async function saveIgnore(sessionId: string): Promise<boolean> {
     if (activeOperationId === operationId) {
       activeOperationId = undefined;
     }
-    pushRender();
+    pushRenderFor(s, panel);
     return true;
   } catch (err) {
-    if (handle && handle.sessionId !== sessionId) {
-      return false;
-    }
     // 本地写进程级失败：重读实际值即可证明结果（属性是本地状态，无服务端未知）。
     if (err instanceof SvnError && (err.code === 'TIMEOUT' || err.code === 'SPAWN_ERROR' || err.code === 'CANCELLED')) {
       try {
@@ -606,7 +614,7 @@ async function saveIgnore(sessionId: string): Promise<boolean> {
           if (activeOperationId === operationId) {
             activeOperationId = undefined;
           }
-          pushRender();
+          pushRenderFor(s, panel);
           return true;
         }
       } catch {
@@ -620,7 +628,7 @@ async function saveIgnore(sessionId: string): Promise<boolean> {
     if (activeOperationId === operationId) {
       activeOperationId = undefined;
     }
-    pushRender();
+    pushRenderFor(s, panel);
     showOutput(false, 'commit');
     return false;
   }
@@ -642,6 +650,9 @@ async function submitIgnore(sessionId: string): Promise<void> {
     return;
   }
   const s = session;
+  // 与 saveIgnore 同款：隔离提交的收口不依赖面板存活（重开不阻断
+  // markPhase/finish），UI 写入只用流程启动时捕获的局部引用。
+  const panel = handle;
   const svnPath = readSvnPath();
   const registry = getOperationRegistry();
 
@@ -720,6 +731,8 @@ async function submitIgnore(sessionId: string): Promise<void> {
     nodeKind: 'dir',
     repositoryUuid: identity.repositoryUuid,
     baseRevision: identity.revision,
+    // 记录按所在面板分类（ignore）：漏传会走无 kind 兜底进 P1 误核路径。
+    kind: 'ignore',
     property: {
       name: 'svn:ignore',
       originalExists: base.exists,
@@ -729,8 +742,10 @@ async function submitIgnore(sessionId: string): Promise<void> {
     },
   });
   if (!begin.ok) {
+    // 判别联合收窄：busy 分支才有 heldBy（本调用不传 operationId，其他分支不可达）。
+    const heldPhase = begin.reason === 'busy' ? begin.heldBy.phase : begin.reason;
     s.phase = 'ready';
-    handle.toast('info', format(strings.panel.operationHeldBusy, { phase: begin.heldBy.phase }));
+    handle.toast('info', format(strings.panel.operationHeldBusy, { phase: heldPhase }));
     pushRender();
     return;
   }
@@ -776,42 +791,43 @@ async function submitIgnore(sessionId: string): Promise<void> {
     }
     await coordinateAfterCommit(sessionId, operationId, revision, pending, tempDir);
   } catch (err) {
-    if (handle && handle.sessionId !== sessionId) {
-      return;
-    }
+    // 收口先于任何会话判定（重开不阻断 unknown 落盘/失败 finish）：
+    // 判定结果只影响 UI 分支，旧会话的推帧由空转与 update 会话校验丢弃。
     if (isProcessFailure(err)) {
       // 结果未知：保留操作记录并冻结写意图，只允许核实（面板销毁同样落盘）。
       await registry.markPhase(operationId, 'unknown', { tempWcPath: tempDir });
       s.phase = 'unknown';
       s.operation = registry.writeRestriction(s.wcRoot) ?? s.operation;
       s.error = null;
-      pushRender();
+      pushRenderFor(s, panel);
       showOutput(false, 'commit');
       return;
     }
-    await confirmCommitFailure(operationId, err);
+    await confirmCommitFailure(operationId, err, s, panel);
   }
 }
 
 /** 确认未提交的失败：结束操作登记，保留本地规则，可核对后重试。
- *  面板已销毁（用户以原生 X 关闭）时同样完成 finish，操作记录不得滞留。 */
-async function confirmCommitFailure(operationId: string, err: unknown): Promise<void> {
-  const s = session;
+ *  面板已销毁（用户以原生 X 关闭）时同样完成 finish，操作记录不得滞留；
+ *  UI 写入用调用方捕获的局部会话/面板（重开后不写新会话对象）。 */
+async function confirmCommitFailure(
+  operationId: string,
+  err: unknown,
+  s: IgnoreSessionState,
+  panel: PanelHandle,
+): Promise<void> {
   await getOperationRegistry().finish(operationId);
   if (activeOperationId === operationId) {
     activeOperationId = undefined;
   }
   cleanupTempDir();
-  if (!s) {
-    return;
-  }
   s.phase = 'ready';
   const message = err instanceof Error ? err.message : String(err);
   const outOfDate = err instanceof SvnError && /E160028|out of date/i.test(err.stderr || err.message);
   s.error = outOfDate ? `${message}\n${strings.ignorePanel.outOfDateHint}` : message;
   s.errorKind = 'commit';
   s.successVisible = true;
-  pushRender();
+  pushRenderFor(s, panel);
   showOutput(false, 'commit');
   void vscode.window.showErrorMessage(message.split('\n')[0]?.slice(0, 300) ?? message);
 }
@@ -895,11 +911,16 @@ async function runCoordinationUpdate(
     return;
   }
   const svnPath = readSvnPath();
-  await coordinateUpdate(svnPath, s.dirArg, {
-    ...runOptions(s.wcRoot),
-    getCredentials: promptForCredentials,
-    onCredentialRetry: (args) => logCommand(svnPath, args, s.wcRoot, 'commit'),
-  });
+  // 协调 update 实际是写命令：命令执行期临时登记运行键（协调态相位本身
+  // 不判 busy，只是 update 实际运行的窗口 hasRunning 命中——P4 扫描不与
+  // 其并发读 wc.db）；命令结束（成功/失败）即清除。
+  await runWithRunningKey(s.wcRoot, () =>
+    coordinateUpdate(svnPath, s.dirArg, {
+      ...runOptions(s.wcRoot),
+      getCredentials: promptForCredentials,
+      onCredentialRetry: (args) => logCommand(svnPath, args, s.wcRoot, 'commit'),
+    }),
+  );
   if (handle && handle.sessionId !== sessionId) {
     return;
   }

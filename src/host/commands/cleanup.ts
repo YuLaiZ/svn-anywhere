@@ -47,9 +47,11 @@ export async function commandCleanup(uri?: vscode.Uri): Promise<void> {
     void vscode.window.showWarningMessage(format(strings.panel.operationHeldBusy, { phase: held.phase }));
     return;
   }
-  const begin = await registry.begin({ wcRoot: target.wcRoot, targetRelPath: '.', nodeKind: 'dir' });
+  const begin = await registry.begin({ wcRoot: target.wcRoot, targetRelPath: '.', nodeKind: 'dir', kind: 'cleanup' });
   if (!begin.ok) {
-    void vscode.window.showWarningMessage(format(strings.panel.operationHeldBusy, { phase: begin.heldBy.phase }));
+    // 判别联合收窄：busy 分支才有 heldBy（本调用不传 operationId，其他分支不可达）。
+    const heldPhase = begin.reason === 'busy' ? begin.heldBy.phase : begin.reason;
+    void vscode.window.showWarningMessage(format(strings.panel.operationHeldBusy, { phase: heldPhase }));
     return;
   }
   const targetArg = escapePeg(relative(target.wcRoot, cleanupTarget));

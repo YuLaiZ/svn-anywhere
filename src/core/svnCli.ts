@@ -36,6 +36,16 @@ export interface RunOptions {
    * 建议配合 LineBuffer 按行脱敏。
    */
   onOutput?: (chunk: string, source: 'stdout' | 'stderr') => void;
+  /**
+   * 进程运行中 stdout 逐块回调：spawn 的 data 事件每块触发一次，参数为
+   * 原始字节。svnCli 不在此做行缓冲与解码——编码回退链依赖全量字节，
+   * 进程结束前不可用；调用方在回调内自行按 \n 分行（GBK 双字节的尾字节
+   * 不会产生 0x0A，行首 ASCII 前缀不受多字节字符影响），「当前文件名」
+   * 类展示用 UTF-8 宽松解码（GBK 名称可能显示替换符，可接受），条目
+   * 计数与前缀匹配在字节层即可判定。整段 onOutput 行为不受影响，两者
+   * 可同时使用；stderr 无逐块回调（错误呈现由整段回调承担）。
+   */
+  onStdoutChunk?: (chunk: Buffer) => void;
   /** 输出解码主编码（严格解码），默认 UTF-8；详见 core/encoding。 */
   encoding?: string;
   /**
@@ -210,10 +220,13 @@ export function run(svnPath: string, args: string[], options: RunOptions = {}): 
       }));
       return;
     }
-    // 输出收集原始字节：解码统一在本函数收口（编码回退链必须看到全量
-    // 字节才能判定），回调与结果拿到的都是已解码字符串。
+    // 输出收集原始字节：整段解码统一在本函数收口（编码回退链必须看到
+    // 全量字节才能判定），整段回调与结果拿到的都是已解码字符串；逐块
+    // 回调 onStdoutChunk 是唯一例外——运行中透传原始字节，行缓冲与
+    // 解码由调用方收口（见 RunOptions 注释），此处不掺和。
     stdoutStream.on('data', (chunk: Buffer) => {
       stdoutChunks.push(chunk);
+      options.onStdoutChunk?.(chunk);
     });
     stderrStream.on('data', (chunk: Buffer) => {
       stderrChunks.push(chunk);
