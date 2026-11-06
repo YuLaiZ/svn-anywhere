@@ -19,6 +19,13 @@ import {
   startImportTask,
   verifyImportTask,
 } from './host/panel/importTask';
+import {
+  cancelDiskScan,
+  consumeScanMarker,
+  startDiskScan,
+  startVacuumTask,
+} from './host/panel/diskTask';
+import { openDiskPanel } from './host/panel/panels/disk';
 import { readSessionResult } from './host/sessionResults';
 import { format, strings } from './host/i18n';
 import { decodingRunOptions, disposeOutputChannel, getOutputChannel, logCommand, logLine, resetOutputState } from './host/output';
@@ -147,4 +154,22 @@ export const __importTaskApi = {
   /** 读取导入面板（P3 共用面板类别）的会话结果缓存（自动化断言用）。 */
   readCachedResult: (entryKey: string) =>
     readSessionResult('checkout', { entryKey, mode: 'import' }),
+};
+
+/**
+ * 磁盘治理任务执行器的自动化驱动出口（mock-host 真实 svn 场景使用，形态
+ * 对齐 __checkoutTaskApi/__importTaskApi）。P4 面板控制器与命令入口由
+ * 阶段 3 任务 6 接入——接入前执行器经本出口可被 out/extension.js 的宿主
+ * 脚本直接驱动；真实 VSCode 宿主只调用 activate/deactivate，不消费本导出。
+ */
+export const __diskTaskApi = {
+  startDiskScan,
+  cancelDiskScan,
+  startVacuumTask,
+  /** 面板控制器打开入口（mock-host 经面板意图驱动「扫描→确认清理→复测」全链用）。 */
+  openDiskPanel,
+  /** 读取磁盘治理面板的会话结果缓存（自动化断言「后台终态写缓存」用）。 */
+  readCachedResult: (wcRoot: string) => readSessionResult('disk', { wcRoot }),
+  /** 重启模拟：读取并一次性消费「扫描进行中」标记（自动化断言用）。 */
+  consumeScanMarker,
 };

@@ -55,6 +55,8 @@ export function render(state: PanelState): string {
     renderSuccessCard(state),
     state.hint ? `<div class="hint">${escapeHtml(state.hint)}</div>` : '',
     renderBanners(state.banners),
+    renderMetrics(state),
+    renderSpaceBar(state),
   ];
   if (state.form) {
     parts.push(renderForm(state, locked));
@@ -209,6 +211,55 @@ function renderBanner(banner: BannerSpec): string {
 
 function lockedDisabled(locked: boolean): string {
   return locked ? ' disabled' : '';
+}
+
+/**
+ * 数值卡组（P4 空间概览与清理前后对比卡）：value 是宿主格式化后的成品
+ * 文本（业务字节值不进消息），这里只做转义与排版；unit 可选拼在值尾。
+ */
+function renderMetrics(state: PanelState): string {
+  const metrics = state.metrics ?? [];
+  if (metrics.length === 0) {
+    return '';
+  }
+  const items = metrics
+    .map((metric) => {
+      const unit = metric.unit ? `<span class="metric-unit">${escapeHtml(metric.unit)}</span>` : '';
+      return `<div class="metric"><span class="metric-caption">${escapeHtml(metric.caption)}</span>` +
+        `<span class="metric-value">${escapeHtml(metric.value)}${unit}</span></div>`;
+    })
+    .join('');
+  return `<section class="metrics">${items}</section>`;
+}
+
+/** 占比条段内展示文字的最小宽度阈值（百分比）：过窄的段只保留 title。 */
+const SPACE_SEG_LABEL_THRESHOLD = 12;
+
+/**
+ * 占比条：按 segments[].bytes / totalBytes 比例渲染分段宽度；宽度低于
+ * 阈值的段隐藏段内文字（title 保留完整 label 与百分比），颜色按段序取
+ * 主题 chart 色板（宿主可用 color 覆盖）。bytes 只用于比例计算。
+ */
+function renderSpaceBar(state: PanelState): string {
+  const bar = state.spaceBar;
+  if (!bar || bar.segments.length === 0) {
+    return '';
+  }
+  const total = bar.totalBytes > 0 ? bar.totalBytes : 0;
+  const segs = bar.segments
+    .map((segment, index) => {
+      const pct = total > 0 ? (segment.bytes / total) * 100 : 0;
+      const colorOverride = segment.color ? `;background:${escapeHtml(segment.color)}` : '';
+      const label = pct >= SPACE_SEG_LABEL_THRESHOLD
+        ? `<span class="seg-label">${escapeHtml(segment.label)}</span>`
+        : '';
+      const title = `${segment.label} ${Math.round(pct)}%`;
+      return `<span class="space-seg seg-${index % 6}" style="width:${pct.toFixed(3)}%${colorOverride}"` +
+        ` title="${escapeHtml(title)}">${label}</span>`;
+    })
+    .join('');
+  return `<section class="space-bar-block" role="img" aria-label="${escapeHtml(strings.panel.spaceBarLabel)}">` +
+    `<div class="space-bar">${segs}</div></section>`;
 }
 
 /**
@@ -430,6 +481,9 @@ function filterLabel(filterId: string): string {
   }
   if (filterId === 'previewState') {
     return strings.panel.filterPreviewState;
+  }
+  if (filterId === 'path') {
+    return strings.panel.filterPreviewPath;
   }
   return filterId;
 }

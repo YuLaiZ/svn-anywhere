@@ -10,6 +10,7 @@ export const strings = {
     titleCommit: 'SVN Anywhere · 提交',
     titleCheckout: 'SVN Anywhere · 检出',
     titleImport: 'SVN Anywhere · 导入',
+    titleDisk: 'SVN Anywhere · 磁盘治理',
     titleOperationLog: 'SVN Anywhere · 操作日志',
     exitCode: '退出码: {code}',
     /** 操作日志行：时间 | 命令（脱敏） | 退出码 | 耗时。 */
@@ -36,6 +37,8 @@ export const strings = {
     showRemoteInfo: '远端信息',
     checkout: '检出',
     importLocal: '导入本地目录',
+    /** 磁盘治理（P4）：与「清理」（svn cleanup 语义，3_update 组）明确区分——不单用「清理」字样。 */
+    diskUsage: '磁盘治理',
   },
   target: {
     resolved: '[定位] {command}：目标 {target}，副本根 {wcRoot}',
@@ -172,6 +175,14 @@ export const strings = {
     /** 右键文件 URI 的提示：文件不能作导入源，改选目录。 */
     sourceMustBeDir: '导入源必须是目录，请在弹出的选择框中选择目录',
   },
+  diskCommand: {
+    /** 命令面板无路径且无活动编辑器时的目录选择框按钮文案（选中后仍校验副本内）。 */
+    pickDirTitle: '选择要分析的工作副本目录',
+    /** 路径不在任何工作副本内：磁盘治理只能对副本内的路径发起。 */
+    notWorkingCopy: '所选路径不在 SVN 工作副本内，无法进行磁盘治理',
+    /** 活动编辑器文件不在任何工作副本内：直接提示、不回退选择框（§10 回退矩阵）。 */
+    activeEditorNotWorkingCopy: '活动编辑器文件不在 SVN 工作副本内，无法进行磁盘治理',
+  },
   remoteInfo: {
     pickPlaceholder: '选择信息项；选中含 URL 或路径的条目即复制原始值',
     labelLocalPath: '本地路径',
@@ -206,6 +217,8 @@ export const strings = {
     /** 导入预览表筛选器（TableSpec.filters 的 filterId → 标签）。 */
     filterPreviewPath: '路径',
     filterPreviewState: '状态',
+    /** 占比条整体的可访问名称。 */
+    spaceBarLabel: '空间构成占比',
     filterStatusAll: '全部状态',
     filterExtAll: '全部后缀',
     filterChangelistAll: '全部 changelist',
@@ -777,6 +790,114 @@ export const strings = {
     lsAuthFailed: '补录的凭据无法访问仓库，请更换凭据后重新发起导入',
     lsOtherFailed: '无法确认远端目标状态，请检查网络后重试',
     recordUnavailable: '导入记录已不可用，无法核实',
+  },
+  diskPanel: {
+    panelTitle: '磁盘治理',
+    /** 页头目标：当前打开子目录与实际工作副本根分列（§6 顶部目标路径）。 */
+    targetLabel: '当前：{subPath} · 根：{wcRoot}',
+    /** 首次打开（idle）的引导说明。 */
+    idleHint: '分析当前工作副本的磁盘占用与未引用 pristine 缓存。',
+    /* ---------------- 空间概览（metrics/spaceBar 的 caption 与段 label） ---------------- */
+    metricTotal: '总占用',
+    metricBusiness: '业务文件',
+    metricSvn: 'SVN 元数据',
+    metricPristine: '其中 pristine 缓存',
+    metricScanCount: '已读取条目',
+    metricCacheCount: '未引用缓存',
+    metricCacheCountUnit: '{count} 项',
+    metricReclaimable: '可回收空间',
+    metricMissing: '缓存文件缺失',
+    metricMissingUnit: '{count} 项',
+    segBusiness: '业务文件',
+    segSvnOther: 'SVN 其他',
+    segPristine: 'pristine 缓存',
+    hintCurrentPath: '正在读取：{path}',
+    /* ---------------- 清理前后对比卡（cleaned 页，同一 metrics 组件） ---------------- */
+    metricLastBefore: '清理前占用',
+    metricLastAfter: '清理后占用',
+    metricReleased: '实际释放',
+    metricRemainCleanable: '剩余可清理',
+    /* ---------------- 大文件表 ---------------- */
+    columnPath: '路径',
+    columnSize: '大小',
+    columnExt: '类型',
+    tableEmptyTitle: '没有业务文件',
+    tableEmptyDetail: '扫描范围内没有可计量的业务文件',
+    /* ---------------- 各页横幅与动作 ---------------- */
+    scanningBanner: '正在扫描磁盘占用…',
+    scanCanceledBanner: '扫描已取消，未改动任何文件；可以重新分析',
+    scanErrorTitle: '扫描失败',
+    partialBannerTitle: '部分结果',
+    changedBannerTitle: '分析结果已变化',
+    /** changed 页可读原因两来源（§6.2/§6.3）：快照比对不一致 / 重检读取失败——后者不冒充「检测到变化」。 */
+    changedReasonSnapshot: '检测快照已变化（{detail}）',
+    changedReasonSnapshotPlain: '检测快照已变化',
+    changedReasonReadFailure: '无法读取磁盘状态（{reason}），请重新检测',
+    /** 扫描/重新分析入口在 busy 期间的禁用原因（writeLocked 行放行、无此禁用）。 */
+    scanBusyReason: '同副本任务运行中，请等待完成后重试',
+    /** core excluded 清单中无标注条目的默认排除理由。 */
+    excludedDefaultReason: '已排除子树',
+    cleaningBanner: '正在清理未引用 pristine 缓存，完成后将自动复测…',
+    cleanedBanner: '清理完成',
+    cleanupFailedTitle: '清理失败',
+    cleanupUnknownBanner: '清理结果未知，请先重新检测',
+    refreshErrorBanner: '清理命令已完成，但复测失败——实际收益未核实（差值显示 —）',
+    actStartScan: '开始分析',
+    actRescan: '重新分析',
+    actRedetect: '重新检测',
+    actConfirmVacuum: '清理缓存…',
+    actCancelScan: '取消扫描',
+    actScopeHelp: '范围说明',
+    actRevealFile: '在 Finder 中显示',
+    actLog: '日志',
+    /* ---------------- 清理可用性矩阵的禁用原因（DOM 禁用与宿主守卫同源） ---------------- */
+    vacuumReasonIdle: '尚未开始分析',
+    vacuumReasonScanning: '正在分析中…',
+    vacuumReasonScanCanceled: '上次扫描已取消，请重新分析',
+    vacuumReasonScanError: '上次扫描失败，请重新分析',
+    vacuumReasonPartial: '部分结果不可信，修复读取问题并重新分析后才能清理',
+    vacuumReasonUnsupported: '缓存检测不可用：{reason}',
+    vacuumReasonZero: '没有未引用缓存，无需清理',
+    vacuumReasonUndetected: '缓存统计未就绪',
+    vacuumReasonChanged: '检测快照已变化，请重新检测后再确认清理',
+    vacuumReasonCleaning: '正在清理中，禁止重复清理',
+    vacuumReasonCleanupFailed: '清理已失败，请先重新检测',
+    vacuumReasonCleanupUnknown: '清理结果未知，请先重新检测',
+    vacuumReasonRefreshError: '实际收益未核实，请先重新检测',
+    vacuumReasonBusy: '同副本任务运行中，等待完成后再清理',
+    /** writeLocked 命中记录按 kind 分列（§6.2）：不得把 ignore 记录指到提交面板。 */
+    vacuumReasonLockCommit: '副本存在未决提交，请到提交面板核实',
+    vacuumReasonLockIgnore: '副本存在未决忽略操作，请到忽略面板核实',
+    vacuumReasonLockVacuum: '磁盘清理结果未知，请先重新检测',
+    vacuumReasonLockCheckout: '检出/续检命令在途，请等待完成',
+    vacuumReasonLockImport: '导入结果未知，请到导入面板核实',
+    vacuumReasonLockOther: '副本存在未决操作，暂时不能清理',
+    /* ---------------- 清理确认框与预命令出口（§6.2） ---------------- */
+    /** 确认框标题（含检测代次——确认绑定 scanEpoch 的可读呈现）。 */
+    vacuumConfirmTitle: '清理未引用 pristine 缓存（检测代次 {epoch}）',
+    vacuumConfirmDetail: '工作副本：{wcRoot}\n预计清理：{count} 项 / {size}\n保留范围：{keepScope}',
+    vacuumConfirmKeepScope: '仅未引用 pristine 缓存（引用中的缓存与业务文件不受影响）',
+    /** missingCount>0 的预计量偏大标注（实际回收以复测为准）。 */
+    vacuumConfirmMissingSuffix: '\n预计量可能偏大：{count} 个缓存文件缺失，实际回收以复测为准',
+    vacuumConfirmButton: '清理',
+    /** begin 失败的窄窗口提示（busy/写失败分列；不复用 cleanupError，§6.2）。 */
+    vacuumBeginBusyNotice: '副本被任务占用，请等待后重试',
+    vacuumBeginWriteFailedNotice: '记录写入失败，请稍后重试',
+    /** 换副本确认放弃的说明（P4 丢弃的仅是已展示分析结果的本会话视图）。 */
+    switchDiscardDetail: '当前副本的分析结果将被丢弃，切换后需重新分析新副本；旧副本的未决记录不受影响。',
+    /* ---------------- 快照重检的 changed 差异描述（§6.2/§6.3） ---------------- */
+    changedDetailWcDb: '工作副本状态数据库（wc.db）在确认后发生变化',
+    changedDetailPristine: '未引用缓存 {before} → {after}',
+    changedDetailPristinePair: '{count} 项 / {size}',
+    changedReadFailureGeneric: '磁盘状态读取失败',
+    changedReadFailureWcDb: 'wc.db 状态读取失败',
+    /* ---------------- 范围说明弹窗（showScopeHelp） ---------------- */
+    scopeHelpTitle: '扫描范围说明（{wcRoot}）',
+    scopeHelpEmpty: '本次扫描没有排除任何子树。',
+    scopeHelpItem: '· {path}：{reason}',
+    /* ---------------- 扫描中断持久化标记的降级日志（§6.3） ---------------- */
+    scanMarkerWriteFailedLog: '无法持久化扫描标记（{wcRoot}）——宿主中断后重启将无法辨识本次扫描',
+    scanMarkerClearFailedLog: '无法清除扫描标记（{wcRoot}）——重启后至多误报一次扫描已取消',
   },
 } as const;
 

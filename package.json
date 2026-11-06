@@ -2,7 +2,7 @@
   "name": "svn-anywhere",
   "displayName": "SVN Anywhere",
   "description": "在 VS Code 里管理任意布局的 SVN 工作副本",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "publisher": "yulaiz",
   "private": true,
   "engines": {
@@ -26,7 +26,8 @@
     "onCommand:svnAnywhere.revealInFinder",
     "onCommand:svnAnywhere.showRemoteInfo",
     "onCommand:svnAnywhere.checkout",
-    "onCommand:svnAnywhere.importLocal"
+    "onCommand:svnAnywhere.importLocal",
+    "onCommand:svnAnywhere.diskUsage"
   ],
   "contributes": {
     "submenus": [
@@ -115,6 +116,11 @@
         "command": "svnAnywhere.importLocal",
         "title": "导入本地目录",
         "category": "SVN Anywhere"
+      },
+      {
+        "command": "svnAnywhere.diskUsage",
+        "title": "磁盘治理",
+        "category": "SVN Anywhere"
       }
     ],
     "menus": {
@@ -189,6 +195,10 @@
         {
           "command": "svnAnywhere.importLocal",
           "group": "4_obtain@2"
+        },
+        {
+          "command": "svnAnywhere.diskUsage",
+          "group": "4_maintain@1"
         }
       ],
       "commandPalette": [
@@ -239,6 +249,9 @@
         },
         {
           "command": "svnAnywhere.importLocal"
+        },
+        {
+          "command": "svnAnywhere.diskUsage"
         }
       ]
     },

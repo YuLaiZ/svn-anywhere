@@ -13,10 +13,10 @@ import { format, strings } from './i18n';
 
 /**
  * 操作域频道分类；错误收口与探测等无明确域的输出归 other。
- * checkout 频道承载检出/续检任务日志（F128）；import 频道为 P3 导入任务
- * 预留（导入执行器接入时使用，先注册频道标题保持文案集中）。
+ * checkout 频道承载检出/续检任务日志（F128）；import 频道承载 P3 导入
+ * 任务日志；disk 频道承载 P4 磁盘治理（扫描/清理）任务日志。
  */
-export type OutputKind = 'status' | 'update' | 'commit' | 'checkout' | 'import' | 'other';
+export type OutputKind = 'status' | 'update' | 'commit' | 'checkout' | 'import' | 'disk' | 'other';
 
 function kindTitle(kind: OutputKind): string {
   switch (kind) {
@@ -30,6 +30,8 @@ function kindTitle(kind: OutputKind): string {
       return strings.output.titleCheckout;
     case 'import':
       return strings.output.titleImport;
+    case 'disk':
+      return strings.output.titleDisk;
     default:
       return strings.output.title;
   }

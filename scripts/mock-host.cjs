@@ -3409,6 +3409,115 @@ async function main() {
     rmSync(lab64.lab, { recursive: true, force: true });
   }
 
+  console.log('场景 65：P4 磁盘治理——扫描→确认清理→自动复测数值递减→关闭重开恢复（真实 svnadmin 副本）');
+  {
+    const api = extension.__diskTaskApi;
+    if (!api) {
+      throw new Error('扩展未导出 __diskTaskApi（自动化驱动出口缺失）');
+    }
+    // 关闭场景 64 遗留的存活面板，避免单实例逻辑干扰 P4 面板断言。
+    for (const panel of [...state.panels]) {
+      if (!panel.disposed) {
+        panel.dispose();
+      }
+    }
+    const lab65 = makeSvnLab();
+    const seed65 = lab65.checkout('seed');
+    mkdirSync(join(seed65, 'trunk', 'sub'), { recursive: true });
+    writeFileSync(join(seed65, 'trunk', 'a.txt'), 'x'.repeat(2048));
+    writeFileSync(join(seed65, 'trunk', 'sub', 'b.txt'), 'y'.repeat(4096));
+    svn(['add', '-q', 'trunk'], seed65);
+    svn(['commit', '-q', '-m', 'seed'], seed65);
+    // 构造 refcount=0：全量检出后 update --set-depth empty 收缩——被移除
+    // 文件的 pristine 行不再被引用（vacuum 的回收清单）。
+    const wc65 = join(lab65.lab, 'wc');
+    svn(['checkout', '-q', lab65.repoUrl, wc65]);
+    svn(['update', '-q', '--set-depth', 'empty', wc65]);
+    const countPristineFiles = (wcRoot) => {
+      const dir = join(wcRoot, '.svn', 'pristine');
+      if (!existsSync(dir)) return 0;
+      let count = 0;
+      const stack = [dir];
+      while (stack.length > 0) {
+        const current = stack.pop();
+        for (const name of readdirSync(current)) {
+          const p = join(current, name);
+          if (statSync(p).isDirectory()) stack.push(p);
+          else count += 1;
+        }
+      }
+      return count;
+    };
+    const pristineBefore65 = countPristineFiles(wc65);
+
+    // 1) 打开面板（__api 直驱 openDiskPanel；命令入口在任务 6 接入）→ idle。
+    await api.openDiskPanel({ wcRoot: wc65, subPath: wc65 });
+    const panel65 = [...state.panels].reverse().find((p) => p.viewType === 'svn-anywhere-disk' && !p.disposed);
+    if (!panel65) throw new Error('磁盘治理面板未创建');
+    panel65.sendReady();
+    const idle65 = await waitRender(panel65, '开始分析');
+    check('面板打开为 idle（开始分析入口呈现）', Boolean(idle65), 'idle 帧未出现');
+
+    // 2) 扫描 → ready：未引用缓存计数与磁盘构造一致（a.txt/b.txt 两个 pristine）。
+    panel65.sendAuto({ kind: 'startScan' });
+    const ready65 = await waitRender(panel65, '未引用缓存');
+    check('扫描完成 ready（未引用缓存数值卡呈现）', Boolean(ready65));
+    const scanPage65 = api.readCachedResult(wc65)?.page;
+    check(
+      'ready 缓存页：cacheCount=2、unreferencedBytes=6144（两个被收缩移除的 pristine）',
+      scanPage65?.phase === 'ready' && scanPage65?.pristine?.cacheCount === 2 && scanPage65?.pristine?.unreferencedBytes === 6144,
+      JSON.stringify({ phase: scanPage65?.phase, cache: scanPage65?.pristine?.cacheCount, bytes: scanPage65?.pristine?.unreferencedBytes }),
+    );
+    check('扫描结束后标记已清除', !state.globalStateMap.has(`svnAnywhere.diskScanning|${wc65}`));
+
+    // 3) 确认清理（确认框经 state.confirmResult）→ 命令 → 自动复测 → cleaned。
+    const confirmBefore65 = state.confirmResult;
+    state.confirmResult = '清理';
+    try {
+      panel65.sendAuto({ kind: 'confirmVacuum' });
+      const cleaned65 = await waitRender(panel65, '清理完成', 400);
+      check('清理完成 cleaned 页呈现（复测结算后）', Boolean(cleaned65));
+    } finally {
+      state.confirmResult = confirmBefore65;
+    }
+    const cleanedPage65 = api.readCachedResult(wc65)?.page;
+    check(
+      'cleaned 缓存页：releasedBytes>0、剩余可清理归零、cleanBeforeBytes 更新为复测剩余值',
+      cleanedPage65?.phase === 'cleaned'
+        && cleanedPage65?.clean?.releasedBytes > 0
+        && cleanedPage65?.clean?.cleanAfterBytes === 0
+        && cleanedPage65?.clean?.cleanBeforeBytes === 0
+        && cleanedPage65?.pristine?.cacheCount === 0,
+      JSON.stringify(cleanedPage65?.clean),
+    );
+    check('真实磁盘 pristine 文件被回收（复测前构造计数 > 清理后计数）', pristineBefore65 > countPristineFiles(wc65),
+      `before=${pristineBefore65} after=${countPristineFiles(wc65)}`);
+    check('vacuum 记录按出口⑨收口移除',
+      !(state.globalStateMap.get('svnAnywhere.operations') || []).some((r) => r.kind === 'vacuum'),
+      JSON.stringify(state.globalStateMap.get('svnAnywhere.operations')));
+    check('复测结束后标记已清除', !state.globalStateMap.has(`svnAnywhere.diskScanning|${wc65}`));
+    const diskText65 = channelTextOf('SVN Anywhere · 磁盘治理');
+    check('清理命令回显进磁盘治理频道（仅 --vacuum-pristines 选项）',
+      diskText65.includes('cleanup --non-interactive --vacuum-pristines'),
+      diskText65.slice(-300));
+
+    // 4) 关闭重开：会话缓存命中恢复 cleaned 页（结果保留）。
+    panel65.dispose();
+    await api.openDiskPanel({ wcRoot: wc65, subPath: wc65 });
+    const reopened65 = [...state.panels].reverse().find((p) => p.viewType === 'svn-anywhere-disk' && !p.disposed);
+    if (!reopened65) throw new Error('磁盘治理面板重开失败');
+    reopened65.sendReady();
+    const restore65 = await waitRender(reopened65, '清理完成', 100);
+    check('关闭重开经②段缓存恢复 cleaned 页（前后对比数值一致）', Boolean(restore65));
+
+    // 复测中断的「扫描标记残留 → 重启 scanCanceled」形态：单线程 mock-host
+    // 无法 kill 自身构造未结算窗口，由 test/diskPanel.test.ts 单测承载
+    // （验收 28 的取舍先例）。
+
+    reopened65.dispose();
+    rmSync(lab65.lab, { recursive: true, force: true });
+  }
+
   rmSync(igLab.lab, { recursive: true, force: true });
 
   rmSync(panelLab.lab, { recursive: true, force: true });

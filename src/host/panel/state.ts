@@ -256,6 +256,37 @@ export interface TableSlice<R extends TableRowSpec = TableRowSpec> {
 }
 
 /**
+ * 数值卡（P4 空间概览与清理前后对比卡的承载组件）：value 是宿主完成
+ * MiB/GiB 换算后的成品展示文本，业务字节值留在宿主模型内、不进消息；
+ * unit 可选（value 已并入单位时不填）。
+ */
+export interface MetricSpec {
+  caption: string;
+  value: string;
+  unit?: string;
+}
+
+/**
+ * 占比条分段：bytes 原始值仅用于比例计算（webview 按 bytes / totalBytes
+ * 占比渲染分段宽度），从属分层（如 .svn 内再分 pristine/其他）由宿主
+ * 组段表达；color 可选覆盖（缺省按段序取主题 chart 色板）。
+ */
+export interface SpaceBarSegment {
+  /** 稳定段标识（可选，供测试定位）。 */
+  key?: string;
+  label: string;
+  bytes: number;
+  color?: string;
+}
+
+/** 占比条组件：与 metrics 并列的 P4 基线组件（不自造 webview 结构）。 */
+export interface SpaceBarSpec {
+  segments: SpaceBarSegment[];
+  /** 比例计算基准（通常为总量合计）；<= 0 时各段宽度按 0 渲染。 */
+  totalBytes: number;
+}
+
+/**
  * 表格排序/筛选/分页切片（宿主侧执行）：
  * - 筛选按 filters 顺序叠加——text 为作用列单元格值的大小写不敏感
  *   子串匹配，select 为精确匹配（'all' 哨兵不过滤）；
@@ -356,6 +387,13 @@ export interface PanelState {
   ignoreEditor?: IgnoreEditorSpec;
   /** 表格（与大文件/导入核对文件列表并列的展示组件；宿主已切片）。 */
   table?: TableSpec;
+  /**
+   * 数值卡组（P4 空间概览与清理前后对比卡）：宿主完成格式化后填入，
+   * 清理前后对比用同一组件、不另设 before-after 组件；M2 面板不引用。
+   */
+  metrics?: MetricSpec[];
+  /** 占比条（P4 空间构成）：按 segments[].bytes 比例分段渲染；M2 面板不引用。 */
+  spaceBar?: SpaceBarSpec;
   /**
    * 向导步骤条：labels 为各步名称、current 为当前步下标（0 起）。
    * 当前步高亮由步骤条自身承载，不用 headerBadges（其只有 text/warn，

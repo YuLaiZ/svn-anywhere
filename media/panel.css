@@ -735,3 +735,84 @@ button.th-sort.active { color: var(--vscode-textLink-foreground, var(--vscode-fo
   margin-bottom: 6px;
   min-height: 26px;
 }
+
+/* ---------------------------- 数值卡与占比条 ---------------------------- */
+
+.metrics {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 22px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+.metric {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 88px;
+}
+
+.metric-caption {
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  white-space: nowrap;
+}
+
+.metric-value {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--vscode-foreground);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.metric-unit {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--vscode-descriptionForeground);
+  margin-left: 2px;
+}
+
+.space-bar-block {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+.space-bar {
+  display: flex;
+  width: 100%;
+  height: 14px;
+  border-radius: 3px;
+  overflow: hidden;
+  border: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-input-background);
+}
+
+/* 段内文字在过窄段由视图隐藏（只保留 title）；色板按段序循环取主题 chart 色。 */
+.space-seg {
+  height: 100%;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 10px;
+  line-height: 12px;
+  color: #fff;
+  padding: 0 3px;
+  box-sizing: border-box;
+}
+
+.space-seg .seg-label { pointer-events: none; }
+
+.seg-0 { background: var(--vscode-charts-blue, #3794ff); }
+.seg-1 { background: var(--vscode-charts-orange, #d18616); }
+.seg-2 { background: var(--vscode-charts-green, #89d185); }
+.seg-3 { background: var(--vscode-charts-purple, #b180d7); }
+.seg-4 { background: var(--vscode-charts-yellow, #cca700); }
+.seg-5 { background: var(--vscode-charts-red, #f14c4c); }

@@ -1,6 +1,6 @@
 /**
  * 命令注册总表。命令 ID 与 package.json 贡献点一一对应，
- * 顺序按子菜单分组（信息、提交、日常操作、更新、高级、获取）排列。
+ * 顺序按子菜单分组（信息、提交、日常操作、更新、高级、获取、维护）排列。
  */
 import type * as vscode from 'vscode';
 import { commandAdd } from './add';
@@ -8,6 +8,7 @@ import { commandCheckout } from './checkout';
 import { commandCleanup } from './cleanup';
 import { commandCommit } from './commit';
 import { commandDelete } from './delete';
+import { commandDiskUsage } from './diskUsage';
 import { commandEditIgnore } from './ignore';
 import { commandImportLocal } from './importDir';
 import { commandMove } from './move';
@@ -23,7 +24,9 @@ import { commandUpdate } from './update';
 import { setCommitPanelContext } from '../panel/panels/commit';
 import { setIgnorePanelContext } from '../panel/panels/ignore';
 import { setCheckoutPanelContext } from '../panel/panels/checkout';
+import { setDiskPanelContext } from '../panel/panels/disk';
 import { setDraftStorage } from '../panel/drafts';
+import { setDiskMarkerStorage } from '../panel/diskTask';
 import { setImportSnapshotDir } from '../panel/importTask';
 import { initializeOperationStore } from '../../core/operations';
 import { cleanupOrphanSnapshots } from '../orphanSnapshots';
@@ -48,6 +51,7 @@ const COMMANDS: ReadonlyArray<{ id: string; handler: CommandHandler; kind: Outpu
   { id: 'svnAnywhere.revealInFinder', handler: commandReveal, kind: 'other' },
   { id: 'svnAnywhere.checkout', handler: commandCheckout, kind: 'checkout' },
   { id: 'svnAnywhere.importLocal', handler: commandImportLocal, kind: 'import' },
+  { id: 'svnAnywhere.diskUsage', handler: commandDiskUsage, kind: 'disk' },
 ];
 
 /**
@@ -74,8 +78,12 @@ export async function registerAllCommands(context: vscode.ExtensionContext): Pro
   setIgnorePanelContext(context);
   // P3 检出/导入面板（URL 历史 globalState 与面板创建上下文；命令入口在 M3 阶段 1 任务 9 接入）。
   setCheckoutPanelContext(context);
+  // P4 磁盘治理面板（面板创建上下文；命令入口在阶段 3 任务 6 接入）。
+  setDiskPanelContext(context);
   // P3 草稿存储（检出/导入面板共用，执行器预命令出口与面板恢复同源）。
   setDraftStorage(context.globalState);
+  // P4 扫描中断持久化标记（扫描开始写入、结算清除、重启读取消费）。
+  setDiskMarkerStorage(context.globalState);
   // 导入快照落盘目录（导入执行器与孤儿快照清理同一 globalStorageUri 根）。
   setImportSnapshotDir(context.globalStorageUri?.fsPath);
   // 未完成操作记录跨会话恢复限制（写锁在面板打开时生效）。
