@@ -49,14 +49,18 @@ export function render(state: PanelState): string {
     `<span class="spacer"></span>`,
     renderHeaderBadges(state),
     `<span class="counts">${escapeHtml(renderCounts(state))}</span>`,
-    renderHeaderActions(state, locked),
+    renderHeaderActions(state),
     `</header>`,
+    renderSteps(state),
     renderSuccessCard(state),
     state.hint ? `<div class="hint">${escapeHtml(state.hint)}</div>` : '',
     renderBanners(state.banners),
   ];
   if (state.form) {
-    parts.push(renderForm(state.form, busy, locked));
+    parts.push(renderForm(state, locked));
+  }
+  if (state.table) {
+    parts.push(renderTable(state));
   }
   if (state.list) {
     parts.push(renderFilterBar(state, locked));
@@ -73,6 +77,24 @@ export function render(state: PanelState): string {
   return `<main class="panel" data-busy="${busy ? '1' : '0'}" data-revision="${state.revision}">${parts.join('')}</main>`;
 }
 
+/**
+ * 占用态下通用控件的禁用判定：与宿主守卫同一放行表推导（经
+ * PanelState.gate 传入求值后的动作集）。未携带放行视图的面板保持
+ * 「占用即全禁」的现状——守卫放行迟到输入不代表 DOM 解禁输入控件；
+ * 携带视图的面板只禁用表中未放行的动作，避免「可点被拒」的假可用。
+ */
+function actionGated(state: PanelState, action: string): boolean {
+  if (!state.busy && !(state.writeLocked ?? false)) {
+    return false;
+  }
+  const gate = state.gate;
+  if (!gate) {
+    return true;
+  }
+  const allowed = state.busy ? gate.busy : gate.writeLocked;
+  return !allowed.includes(action);
+}
+
 /** 标题区状态徽标（P2：未保存/待提交/待核实/待协调等）。 */
 function renderHeaderBadges(state: PanelState): string {
   return (state.headerBadges ?? [])
@@ -80,15 +102,28 @@ function renderHeaderBadges(state: PanelState): string {
     .join('');
 }
 
-/** 标题区动作（P2「重新读取」等；锁定时禁用）。 */
-function renderHeaderActions(state: PanelState, locked: boolean): string {
+/** 标题区动作（P2「重新读取」、P3「日志」等；占用态按放行视图禁用）。 */
+function renderHeaderActions(state: PanelState): string {
   return (state.headerActions ?? [])
     .map((action) => {
-      const disabled = locked || action.disabled ? ' disabled' : '';
+      const disabled = actionGated(state, action.id) || action.disabled ? ' disabled' : '';
       const title = action.disabledReason ?? action.label;
       return `<button type="button" class="link" data-intent="${escapeHtml(action.id)}" data-focus="header-${escapeHtml(action.id)}" title="${escapeHtml(title)}" aria-label="${escapeHtml(title)}"${disabled}>${escapeHtml(action.label)}</button>`;
     })
     .join('');
+}
+
+/** 向导步骤条：当前步高亮、已过步弱化；labels 与 current 由宿主维护。 */
+function renderSteps(state: PanelState): string {
+  const steps = state.steps;
+  if (!steps || steps.labels.length === 0) {
+    return '';
+  }
+  const items = steps.labels.map((label, index) => {
+    const stage = index < steps.current ? ' done' : index === steps.current ? ' current' : '';
+    return `<li class="step${stage}"><span class="step-index" aria-hidden="true">${index + 1}</span><span class="step-label">${escapeHtml(label)}</span></li>`;
+  });
+  return `<ol class="steps" role="list">${items.join('')}</ol>`;
 }
 
 function renderCounts(state: PanelState): string {
@@ -215,28 +250,38 @@ function renderIgnoreEditor(editor: NonNullable<PanelState['ignoreEditor']>): st
   );
 }
 
-function renderForm(form: PanelState['form'], busy: boolean, locked: boolean): string {
+function renderForm(state: PanelState, locked: boolean): string {
+  const form = state.form;
   if (!form) {
     return '';
   }
   const fields = form.fields.map((field) => {
-    const disabled = locked || field.disabled ? ' disabled' : '';
+    const disabled = actionGated(state, 'syncInput') || field.disabled ? ' disabled' : '';
     const common = `data-field-id="${escapeHtml(field.id)}" data-focus="field-${escapeHtml(field.id)}" id="field-${escapeHtml(field.id)}"`;
     let control: string;
+    let fieldHtml: string;
     if (field.type === 'textarea') {
       const placeholder = field.help ? ` placeholder="${escapeHtml(field.help)}"` : '';
       control = `<textarea class="message-input" rows="4"${placeholder} ${common}${disabled} aria-label="${escapeHtml(field.label)}">${escapeHtml(field.value)}</textarea>`;
+      fieldHtml = `<div class="message-row"><label class="message-label" for="field-${escapeHtml(field.id)}">${escapeHtml(field.label)}</label></div>${control}`;
     } else if (field.type === 'select') {
       const options = (field.options ?? []).map((option) =>
         `<option value="${escapeHtml(option.value)}"${option.value === field.value ? ' selected' : ''}>${escapeHtml(option.label)}</option>`,
       ).join('');
       control = `<select ${common}${disabled} aria-label="${escapeHtml(field.label)}">${options}</select>`;
+      fieldHtml = `<div class="message-row"><label class="message-label" for="field-${escapeHtml(field.id)}">${escapeHtml(field.label)}</label></div>${control}`;
+    } else if (field.type === 'checkbox') {
+      // 勾选态由 value 派生（'true' 即勾选）；勾选变化经 change 事件走
+      // 输入同步通道（视图侧单通道派生 'true'|'false'，不经 input 委托）。
+      control = `<input type="checkbox" ${common}${field.value === 'true' ? ' checked' : ''}${disabled} aria-label="${escapeHtml(field.label)}">`;
+      fieldHtml = `<div class="check-field">${control}<label class="message-label" for="field-${escapeHtml(field.id)}">${escapeHtml(field.label)}</label></div>`;
     } else {
       control = `<input type="text" value="${escapeHtml(field.value)}" ${common}${disabled} aria-label="${escapeHtml(field.label)}">`;
+      fieldHtml = `<div class="message-row"><label class="message-label" for="field-${escapeHtml(field.id)}">${escapeHtml(field.label)}</label></div>${control}`;
     }
     const help = field.type !== 'textarea' && field.help ? `<p class="muted">${escapeHtml(field.help)}</p>` : '';
     const error = field.error ? `<p class="field-error">${escapeHtml(field.error)}</p>` : '';
-    return `<div class="message-row"><label class="message-label" for="field-${escapeHtml(field.id)}">${escapeHtml(field.label)}</label></div>${control}${help}${error}`;
+    return fieldHtml + help + error;
   });
   const tools = (form.tools ?? [])
     .map((tool) => {
@@ -250,6 +295,90 @@ function renderForm(form: PanelState['form'], busy: boolean, locked: boolean): s
     .join('');
   const toolsBar = tools ? `<div class="message-tools">${tools}</div>` : '';
   return `<section class="message-block">${fields.join('')}${toolsBar}</section>`;
+}
+
+/**
+ * 表格：宿主已完成排序/筛选/分页切片，这里只渲染当前页。通用控件
+ * （排序头、筛选、翻页）在占用态按放行视图禁用——扫描或清理进行中
+ * 表格仍可交互的形态由面板放行表表达；行内动作意图只带行 ID。
+ * 窄面板时容器横向滚动（.table-scroll），页面本身不横向溢出。
+ */
+function renderTable(state: PanelState): string {
+  const table = state.table;
+  if (!table) {
+    return '';
+  }
+  const { columns, sort, pagination } = table;
+  const filters = table.filters ?? [];
+  const filterBar = filters.length > 0
+    ? `<div class="table-filter-bar">${filters.map((filter) => {
+        if (filter.kind === 'text') {
+          return `<label class="table-filter text"><span>${escapeHtml(filterLabel(filter.id))}</span>` +
+            `<input type="text" data-intent="setFilter" data-filter-id="${escapeHtml(filter.id)}" data-focus="table-filter-${escapeHtml(filter.id)}" value="${escapeHtml(filter.value)}"${lockedDisabled(actionGated(state, 'setFilter'))}></label>`;
+        }
+        const options = (filter.options ?? []).map((option) =>
+          `<option value="${escapeHtml(option.value)}"${option.value === filter.value ? ' selected' : ''}>${escapeHtml(option.label)}</option>`,
+        ).join('');
+        return `<label class="table-filter"><span>${escapeHtml(filterLabel(filter.id))}</span>` +
+          `<select data-intent="setFilter" data-filter-id="${escapeHtml(filter.id)}" data-focus="table-filter-${escapeHtml(filter.id)}"${lockedDisabled(actionGated(state, 'setFilter'))}>${options}</select></label>`;
+      }).join('')}</div>`
+    : '';
+  if (table.rows.length === 0) {
+    const filterActive = filters.some((filter) => (filter.kind === 'select' ? filter.value !== 'all' : filter.value !== ''));
+    const empty = filterActive
+      ? (table.filterEmpty ?? { title: strings.panel.filterEmptyTitle })
+      : table.empty;
+    const emptyNote = table.note ? `<p class="muted table-note">${escapeHtml(table.note)}</p>` : '';
+    return `<section class="table-block" data-table-id="${escapeHtml(table.id)}">${filterBar}` +
+      `<div class="empty"><h3>${escapeHtml(empty.title)}</h3>${empty.detail ? `<p class="muted">${escapeHtml(empty.detail)}</p>` : ''}</div>${emptyNote}</section>`;
+  }
+  const headCells = columns.map((column) => {
+    const align = column.align ? ` align-${column.align}` : '';
+    if (!column.sortable) {
+      return `<th class="col${align}" scope="col">${escapeHtml(column.label)}</th>`;
+    }
+    const isCurrent = sort.key === column.key;
+    // 点击后目标方向：当前列翻转、其余列从升序开始。
+    const nextDirection = isCurrent && sort.direction === 'asc' ? 'desc' : 'asc';
+    const indicator = isCurrent ? `<span class="sort-indicator" aria-hidden="true">${sort.direction === 'asc' ? '↑' : '↓'}</span>` : '';
+    const ariaLabel = format(
+      nextDirection === 'asc' ? strings.panel.sortAscLabel : strings.panel.sortDescLabel,
+      { label: column.label },
+    );
+    return `<th class="col${align}" scope="col">` +
+      `<button type="button" class="th-sort${isCurrent ? ' active' : ''}" data-intent="setSort" data-sort-key="${escapeHtml(column.key)}" data-sort-direction="${nextDirection}" data-focus="table-sort-${escapeHtml(column.key)}" aria-label="${escapeHtml(ariaLabel)}"${lockedDisabled(actionGated(state, 'setSort'))}>` +
+      `${escapeHtml(column.label)}${indicator}</button></th>`;
+  }).join('');
+  const bodyRows = table.rows.map((row) => {
+    const cells = columns.map((column) => {
+      const align = column.align ? ` align-${column.align}` : '';
+      const text = row.cells[column.key] ?? '';
+      return `<td class="col${align}">${escapeHtml(text)}</td>`;
+    }).join('');
+    const actions = (row.actions ?? []).map((action) =>
+      renderActionButton(action, {
+        intent: action.id,
+        argName: 'data-row-id',
+        argValue: row.id,
+        extraId: '',
+        gated: actionGated(state, action.id),
+      }),
+    ).join('');
+    return `<tr data-row-id="${escapeHtml(row.id)}">${cells}${actions ? `<td class="col acts">${actions}</td>` : ''}</tr>`;
+  }).join('');
+  const hasPrev = pagination.page > 1;
+  const hasNext = pagination.page < pagination.pageCount;
+  const pager = pagination.pageCount > 1
+    ? `<div class="table-pager">` +
+      `<button type="button" class="link" data-intent="setPage" data-page="${pagination.page - 1}" data-focus="table-page-prev"${!hasPrev || actionGated(state, 'setPage') ? ' disabled' : ''}>${escapeHtml(strings.panel.pagerPrev)}</button>` +
+      `<span class="summary">${escapeHtml(format(strings.panel.pagerSummary, { page: String(pagination.page), pageCount: String(pagination.pageCount), total: String(pagination.total) }))}</span>` +
+      `<button type="button" class="link" data-intent="setPage" data-page="${pagination.page + 1}" data-focus="table-page-next"${!hasNext || actionGated(state, 'setPage') ? ' disabled' : ''}>${escapeHtml(strings.panel.pagerNext)}</button>` +
+      `</div>`
+    : '';
+  const note = table.note ? `<p class="muted table-note">${escapeHtml(table.note)}</p>` : '';
+  return `<section class="table-block" data-table-id="${escapeHtml(table.id)}">${filterBar}` +
+    `<div class="table-scroll"><table class="data-table">` +
+    `<thead><tr>${headCells}</tr></thead><tbody>${bodyRows}</tbody></table></div>${pager}${note}</section>`;
 }
 
 function renderFilterBar(state: PanelState, locked: boolean): string {
@@ -472,10 +601,12 @@ interface ActionBinding {
   argName: string;
   argValue: string;
   extraId: string;
+  /** 占用态按放行视图禁用（表格等通用组件的行内动作；缺省不参与）。 */
+  gated?: boolean;
 }
 
 function renderActionButton(action: ActionSpec, binding: ActionBinding): string {
-  const disabled = action.disabled ? ' disabled' : '';
+  const disabled = action.disabled || binding.gated ? ' disabled' : '';
   const title = action.disabledReason ?? action.label;
   const extra = binding.extraId ? ` data-action-id="${escapeHtml(binding.extraId)}"` : '';
   const payload = Object.entries(action.payload ?? {})

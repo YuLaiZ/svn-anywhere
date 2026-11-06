@@ -7,6 +7,13 @@ import { SvnError, tailText } from './core/errors';
 import { escapePeg, findWorkingCopy } from './core/workspace';
 import { readSvnPath, readTimeoutMs } from './host/config';
 import { registerAllCommands } from './host/commands';
+import {
+  cancelCheckoutTask,
+  resumeCheckoutTask,
+  startCheckoutTask,
+  verifyCheckoutOnly,
+} from './host/panel/checkoutTask';
+import { readSessionResult } from './host/sessionResults';
 import { format, strings } from './host/i18n';
 import { decodingRunOptions, disposeOutputChannel, getOutputChannel, logCommand, logLine, resetOutputState } from './host/output';
 
@@ -103,3 +110,19 @@ export function deactivate(): void {
   killAllActive();
   disposeOutputChannel();
 }
+
+/**
+ * 检出/续检任务执行器的自动化驱动出口（mock-host 真实 svn 场景使用）。
+ * P3 面板控制器与命令入口由后续任务接入——接入前执行器经本出口可被
+ * out/extension.js 的宿主脚本直接驱动；真实 VSCode 宿主只调用
+ * activate/deactivate，不消费本导出。
+ */
+export const __checkoutTaskApi = {
+  startCheckoutTask,
+  cancelCheckoutTask,
+  resumeCheckoutTask,
+  verifyCheckoutOnly,
+  /** 读取检出面板的会话结果缓存（自动化断言「后台终态写缓存」用）。 */
+  readCachedResult: (entryKey: string) =>
+    readSessionResult('checkout', { entryKey, mode: 'checkout' }),
+};

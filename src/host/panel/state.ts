@@ -86,7 +86,12 @@ export interface FormFieldSpec {
   id: string;
   label: string;
   value: string;
-  type: 'text' | 'textarea' | 'select';
+  /**
+   * checkbox 是布尔勾选控件：value 仍为 string、取值 'true'/'false'
+   * （勾选态由 value 派生，不引入 boolean 字段造成两份真相）；勾选
+   * 变化经输入同步通道以派生值发送，disabled/error/help 语义沿用。
+   */
+  type: 'text' | 'textarea' | 'select' | 'checkbox';
   options?: Array<{ value: string; label: string }>;
   disabled?: boolean;
   error?: string;
@@ -170,6 +175,156 @@ export interface IgnoreEditorSpec {
   busy?: boolean;
 }
 
+/** 表格列：sortable 缺省不可排序；sortType 声明排序值类型（见 TableSpec.rows）。 */
+export interface TableColumnSpec {
+  key: string;
+  label: string;
+  align?: 'left' | 'right';
+  /** 是否渲染列头排序按钮（缺省不排序）。 */
+  sortable?: boolean;
+  /**
+   * 排序值类型：'number' 列宿主按业务数值排序（如大文件的字节值），
+   * 不按 cells 展示字符串（否则「100 B」会排在「9 GiB」前）；缺省 'string'。
+   * 排序值只存在于宿主侧（见 SortableTableRow.sortValues），不进消息。
+   */
+  sortType?: 'string' | 'number';
+}
+
+/** 表格筛选：kind 决定匹配方式，cellKey 绑定作用列（columns.key）。 */
+export interface TableFilterSpec {
+  id: string;
+  /**
+   * 'text'：作用列单元格值的大小写不敏感子串匹配（宿主侧执行）；
+   * 'select'：作用列单元格值精确匹配（'all' 哨兵不过滤）。
+   */
+  kind: 'text' | 'select';
+  cellKey: string;
+  value: string;
+  /** kind='select' 必填。 */
+  options?: Array<{ value: string; label: string }>;
+}
+
+/** 表格行：cells 恒为展示文本；行内动作按行 ID 由宿主映射目标。 */
+export interface TableRowSpec {
+  id: string;
+  cells: Record<string, string>;
+  actions?: ActionSpec[];
+}
+
+/**
+ * 表格组件：与 list（树/勾选语义）并列的展示组件——排序/筛选/分页
+ * 的语义都在表格上。宿主持有全量数据并完成排序/筛选/分页切片
+ * （sliceTableRows），视图只收当前页行：消息体积与总行数无关。
+ */
+export interface TableSpec {
+  id: string;
+  columns: Array<TableColumnSpec>;
+  /** 当前排序（渲染指示用；切片在宿主侧完成）。 */
+  sort: { key: string; direction: 'asc' | 'desc' };
+  filters?: TableFilterSpec[];
+  /** 分页：page 从 1 起；total 为筛选后总数、pageCount 为筛选后总页数。 */
+  pagination: { page: number; pageSize: number; total: number; pageCount: number };
+  rows: TableRowSpec[];
+  /** 无任何条目时的空态。 */
+  empty: { title: string; detail?: string };
+  /** 有条目但筛选后无匹配的空态。 */
+  filterEmpty?: { title: string; detail?: string };
+  /** 表格下方标注（如「部分结果」）。 */
+  note?: string;
+}
+
+/**
+ * 宿主侧表格切片的输入行：在渲染行之上补充按列的业务排序值——
+ * 数值列（sortType='number'）给业务数值（如字节值），使排序不依赖
+ * 展示文本；sortValues 只存在于宿主内存，不随 TableSpec 进消息。
+ */
+export interface SortableTableRow<R extends TableRowSpec = TableRowSpec> {
+  row: R;
+  /** 列 key → 业务排序值；缺省回退该列展示文本按字符串比较。 */
+  sortValues?: Record<string, string | number>;
+}
+
+/** 表格切片结果：携带收敛后的页码与筛选后计数，供 TableSpec.pagination 填写。 */
+export interface TableSlice<R extends TableRowSpec = TableRowSpec> {
+  rows: R[];
+  /** 筛选后总行数。 */
+  total: number;
+  /** 筛选后总页数（无行时为 1，空态仍占一页）。 */
+  pageCount: number;
+  /** 收敛后的当前页码（越界回收到最后一页）。 */
+  page: number;
+}
+
+/**
+ * 表格排序/筛选/分页切片（宿主侧执行）：
+ * - 筛选按 filters 顺序叠加——text 为作用列单元格值的大小写不敏感
+ *   子串匹配，select 为精确匹配（'all' 哨兵不过滤）；
+ * - 排序先按声明列的排序值（sortValues 优先、回退展示文本）比较，
+ *   同值保持原序（稳定排序）；
+ * - 分页从 1 起计，请求页越界时收敛到最后一页。
+ */
+export function sliceTableRows<R extends TableRowSpec>(
+  items: readonly SortableTableRow<R>[],
+  columns: readonly TableColumnSpec[],
+  sort: { key: string; direction: 'asc' | 'desc' },
+  filters: readonly TableFilterSpec[] | undefined,
+  page: number,
+  pageSize: number,
+): TableSlice<R> {
+  const active = (filters ?? []).filter((filter) =>
+    filter.kind === 'select' ? filter.value !== 'all' : filter.value !== '',
+  );
+  const matched = items.filter(({ row }) =>
+    active.every((filter) => {
+      const cell = row.cells[filter.cellKey] ?? '';
+      return filter.kind === 'select'
+        ? cell === filter.value
+        : cell.toLowerCase().includes(filter.value.toLowerCase());
+    }),
+  );
+  const column = columns.find((candidate) => candidate.key === sort.key);
+  const direction = sort.direction === 'desc' ? -1 : 1;
+  const sorted = matched
+    .map((item, index) => ({ item, index }))
+    .sort((left, right) => {
+      const compared = compareByColumn(left.item, right.item, sort.key, column?.sortType);
+      return compared !== 0 ? compared * direction : left.index - right.index;
+    })
+    .map(({ item }) => item);
+  const safePageSize = pageSize > 0 ? pageSize : 1;
+  const pageCount = Math.max(1, Math.ceil(sorted.length / safePageSize));
+  const safePage = Math.min(Math.max(1, Math.floor(page)), pageCount);
+  const start = (safePage - 1) * safePageSize;
+  return {
+    rows: sorted.slice(start, start + safePageSize).map(({ row }) => row),
+    total: sorted.length,
+    pageCount,
+    page: safePage,
+  };
+}
+
+function compareByColumn(
+  left: SortableTableRow,
+  right: SortableTableRow,
+  key: string,
+  sortType: TableColumnSpec['sortType'] | undefined,
+): number {
+  if (sortType === 'number') {
+    const leftValue = toNumber(left.sortValues?.[key] ?? left.row.cells[key]);
+    const rightValue = toNumber(right.sortValues?.[key] ?? right.row.cells[key]);
+    return leftValue - rightValue;
+  }
+  const leftValue = String(left.sortValues?.[key] ?? left.row.cells[key] ?? '');
+  const rightValue = String(right.sortValues?.[key] ?? right.row.cells[key] ?? '');
+  return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
+}
+
+/** 数值列的排序值兜底：非有限数值按 0 参与比较（保持顺序确定）。 */
+function toNumber(value: string | number | undefined): number {
+  const parsed = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 /** 宿主 → 视图的渲染状态。 */
 export interface PanelState {
   /** 当前会话代次：目标切换即更换，异步结果须校验后才允许写入。 */
@@ -199,6 +354,21 @@ export interface PanelState {
   hint?: string;
   /** P2 规则编辑区（规则列表 + 待加入输入）。 */
   ignoreEditor?: IgnoreEditorSpec;
+  /** 表格（与大文件/导入核对文件列表并列的展示组件；宿主已切片）。 */
+  table?: TableSpec;
+  /**
+   * 向导步骤条：labels 为各步名称、current 为当前步下标（0 起）。
+   * 当前步高亮由步骤条自身承载，不用 headerBadges（其只有 text/warn，
+   * 表达不了正常态高亮）。
+   */
+  steps?: { labels: string[]; current: number };
+  /**
+   * 占用态（busy/writeLocked）下的可交互动作集：宿主渲染前从面板
+   * 放行表求值谓词后推导（同源生成）。视图据此禁用通用控件；未携带
+   * 时占用态一律禁用（提交/忽略面板现状——守卫放行迟到输入不代表
+   * DOM 解禁输入控件）。
+   */
+  gate?: { busy: string[]; writeLocked: string[] };
 }
 
 /** reducer 的输入事件：视图意图（intent: 前缀）与宿主内部事件（host: 前缀）。 */

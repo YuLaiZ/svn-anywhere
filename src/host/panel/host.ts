@@ -25,6 +25,7 @@ import {
   type Intent,
   type ViewToHostMessage,
 } from './protocol';
+import { allowedActions, gatePermits, M2_PANEL_GATES, type PanelGates } from './gates';
 import type { PanelState } from './state';
 import { findRow } from './state';
 import { render } from './view';
@@ -54,6 +55,15 @@ export interface PanelEntryOptions {
   /** 仅 P1 开启 retainContextWhenHidden；其余面板隐藏即销毁、重显时由宿主重推状态。 */
   retainContextWhenHidden?: boolean;
   viewColumn?: vscode.ViewColumn;
+  /**
+   * 占用态（busy/writeLocked）放行表：面板注册时注入，宿主守卫与 DOM
+   * 禁用按同一张表推导。不携带时按基线表守卫（busy 只放行迟到输入同步、
+   * writeLocked 只放行核实与重读，含横幅按钮按 actionId）——提交/忽略
+   * 面板的放行集合与「占用即全禁」的 DOM 行为保持不变；携带自定义表
+   * 的面板（任务与面板解耦、运行中需可取消/看日志/查看已有分析）同时
+   * 获得按表推导的 DOM 可交互视图（随渲染注入 PanelState.gate）。
+   */
+  gates?: PanelGates;
 }
 
 interface PanelEntry {
@@ -212,7 +222,7 @@ function handleFor(entry: PanelEntry): PanelHandle {
         revision: entry.revision,
         formRevision: next.formRevision,
         viewEpoch: entry.viewEpoch,
-        html: render({ ...next, revision: entry.revision }),
+        html: render({ ...renderStateOf(entry, next), revision: entry.revision }),
       });
     },
     toast(level, message) {
@@ -315,7 +325,7 @@ async function handleViewMessage(entry: PanelEntry, raw: unknown): Promise<void>
         revision: entry.revision,
         formRevision: entry.state.formRevision,
         viewEpoch: entry.viewEpoch,
-        html: render({ ...entry.state, revision: entry.revision }),
+        html: render({ ...renderStateOf(entry, entry.state), revision: entry.revision }),
       });
     }
     // 快照属于旧会话（切换目标后新会话尚未重建）时不重推：旧目标内容不得
@@ -333,20 +343,11 @@ async function handleViewMessage(entry: PanelEntry, raw: unknown): Promise<void>
 
   const intent = message.intent;
   const busy = entry.state?.busy ?? false;
-  if (busy && intent.kind !== 'syncInput') {
-    // 写意图在忙碌期间拒绝：事件守卫与 DOM 禁用保持一致。
-    postToView(entry, {
-      type: 'toast',
-      protocolVersion: PROTOCOL_VERSION,
-      sessionId: entry.sessionId,
-      level: 'info',
-      message: strings.panel.toastBusyRejected,
-    });
-    return;
-  }
-  if (!busy && entry.state?.writeLocked && !writeLockExempt(intent)) {
-    // 结果未知/待核实等写锁定期间，连同输入同步在内的全部写意图都被拒绝；
-    // 只放行核实/恢复与重读动作（由控制器自行分发）。
+  // 占用态守卫按面板放行表判定（busy 与 writeLocked 可同真，先按 busy 行
+  // 判、busy=false 才看 writeLocked 行）：任务与面板同生命周期的面板维持
+  // 「忙碌只收迟到输入、写锁只放行核实与重读」；任务与面板解耦的面板在
+  // 运行中放行取消/日志/关闭/只读查看等动作。事件守卫与 DOM 禁用同表。
+  if (!gatePermits(entry.options.gates ?? M2_PANEL_GATES, busy, entry.state?.writeLocked ?? false, intent)) {
     postToView(entry, {
       type: 'toast',
       protocolVersion: PROTOCOL_VERSION,
@@ -384,19 +385,23 @@ function intentRequiresItem(intent: Intent): intent is Intent & { itemId: string
   return intent.kind === 'openDiff' || intent.kind === 'openFile' || intent.kind === 'rowMore';
 }
 
-/** 写锁定期间仍可执行的意图：核实/恢复与重读。 */
-const WRITE_LOCK_EXEMPT_KINDS = new Set<Intent['kind']>(['resolveUnknown', 'refresh']);
 /**
- * 横幅按钮统一以 bannerAction 发送，写锁豁免必须按 actionId 判定：
- * 只认 kind 会让重启恢复后的「核实提交结果」按钮被宿主当成写意图拒绝。
+ * 渲染前的状态组装：携带自定义放行表的面板注入 DOM 可交互视图——
+ * 同一张表求值谓词后的动作集（宿主守卫在意图送达时求值、DOM 禁用在
+ * 渲染时求值，两侧同源）；未携带放行表的面板保持原状态（占用即全禁）。
  */
-const WRITE_LOCK_EXEMPT_BANNER_ACTIONS = new Set(['resolveUnknown', 'refresh']);
-
-function writeLockExempt(intent: Intent): boolean {
-  if (WRITE_LOCK_EXEMPT_KINDS.has(intent.kind)) {
-    return true;
+function renderStateOf(entry: PanelEntry, next: PanelState): PanelState {
+  const gates = entry.options.gates;
+  if (!gates) {
+    return next;
   }
-  return intent.kind === 'bannerAction' && WRITE_LOCK_EXEMPT_BANNER_ACTIONS.has(intent.actionId);
+  return {
+    ...next,
+    gate: {
+      busy: allowedActions(gates.busy),
+      writeLocked: allowedActions(gates.writeLocked),
+    },
+  };
 }
 
 /** 测试辅助：重置面板注册表（真实宿主不需要）。 */

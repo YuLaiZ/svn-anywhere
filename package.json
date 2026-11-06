@@ -24,7 +24,8 @@
     "onCommand:svnAnywhere.revert",
     "onCommand:svnAnywhere.move",
     "onCommand:svnAnywhere.revealInFinder",
-    "onCommand:svnAnywhere.showRemoteInfo"
+    "onCommand:svnAnywhere.showRemoteInfo",
+    "onCommand:svnAnywhere.checkout"
   ],
   "contributes": {
     "submenus": [
@@ -103,6 +104,11 @@
         "command": "svnAnywhere.showRemoteInfo",
         "title": "远端信息",
         "category": "SVN Anywhere"
+      },
+      {
+        "command": "svnAnywhere.checkout",
+        "title": "检出",
+        "category": "SVN Anywhere"
       }
     ],
     "menus": {
@@ -169,6 +175,10 @@
         {
           "command": "svnAnywhere.showOutput",
           "group": "4_advanced@9"
+        },
+        {
+          "command": "svnAnywhere.checkout",
+          "group": "4_obtain@1"
         }
       ],
       "commandPalette": [
@@ -213,6 +223,9 @@
         },
         {
           "command": "svnAnywhere.showRemoteInfo"
+        },
+        {
+          "command": "svnAnywhere.checkout"
         }
       ]
     },
@@ -254,6 +267,17 @@
           "type": "boolean",
           "default": true,
           "description": "命令失败时自动切到输出面板"
+        },
+        "svnAnywhere.checkoutDefaultDepth": {
+          "type": "string",
+          "enum": [
+            "empty",
+            "files",
+            "immediates",
+            "infinity"
+          ],
+          "default": "infinity",
+          "description": "检出面板新表单的默认检出深度；只影响初始值，不覆盖已保存的草稿"
         }
       }
     }

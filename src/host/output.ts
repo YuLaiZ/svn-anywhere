@@ -11,8 +11,12 @@ import { LineBuffer, redactArgs, sanitizeText } from '../core/redact';
 import { readEncodingSettings } from './config';
 import { format, strings } from './i18n';
 
-/** 操作域频道分类；错误收口与探测等无明确域的输出归 other。 */
-export type OutputKind = 'status' | 'update' | 'commit' | 'other';
+/**
+ * 操作域频道分类；错误收口与探测等无明确域的输出归 other。
+ * checkout 频道承载检出/续检任务日志（F128）；import 频道为 P3 导入任务
+ * 预留（导入执行器接入时使用，先注册频道标题保持文案集中）。
+ */
+export type OutputKind = 'status' | 'update' | 'commit' | 'checkout' | 'import' | 'other';
 
 function kindTitle(kind: OutputKind): string {
   switch (kind) {
@@ -22,6 +26,10 @@ function kindTitle(kind: OutputKind): string {
       return strings.output.titleUpdate;
     case 'commit':
       return strings.output.titleCommit;
+    case 'checkout':
+      return strings.output.titleCheckout;
+    case 'import':
+      return strings.output.titleImport;
     default:
       return strings.output.title;
   }

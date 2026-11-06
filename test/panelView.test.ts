@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import { commitFixture } from '../src/host/panel/fixture';
 import { render } from '../src/host/panel/view';
-import type { PanelState, RowSpec } from '../src/host/panel/state';
+import type { FormFieldSpec, PanelState, RowSpec } from '../src/host/panel/state';
 import { strings } from '../src/host/i18n';
 
 function baseState(patch: Partial<PanelState> = {}): PanelState {
@@ -408,5 +408,151 @@ describe('render：P2 忽略规则编辑器片段', () => {
     }));
     expect((html.match(/disabled/g) ?? []).length).toBeGreaterThanOrEqual(3);
     expect(html).toContain('data-busy="1"');
+  });
+});
+
+describe('render：表格组件（TableSpec）', () => {
+  function tableState(patch: Partial<NonNullable<PanelState['table']>> = {}, statePatch: Partial<PanelState> = {}): PanelState {
+    return baseState({
+      table: {
+        id: 'big',
+        columns: [
+          { key: 'path', label: '路径', sortable: true },
+          { key: 'size', label: '大小', sortable: true, sortType: 'number', align: 'right' },
+          { key: 'note', label: '备注' },
+        ],
+        sort: { key: 'size', direction: 'desc' },
+        filters: [
+          { id: 'path', kind: 'text', cellKey: 'path', value: '' },
+          {
+            id: 'ext', kind: 'select', cellKey: 'ext', value: 'all',
+            options: [{ value: 'all', label: '全部' }, { value: 'ts', label: 'ts' }],
+          },
+        ],
+        pagination: { page: 1, pageSize: 50, total: 2, pageCount: 1 },
+        rows: [
+          { id: 'r1', cells: { path: 'src/a.ts', size: '9 GiB', ext: 'ts' }, actions: [{ id: 'revealFileInOS', label: '定位' }] },
+          { id: 'r2', cells: { path: 'b.bin', size: '100 B', ext: 'bin' } },
+        ],
+        empty: { title: '无大文件' },
+        filterEmpty: { title: '无匹配文件' },
+        note: '部分结果：1 个目录不可读',
+        ...patch,
+      },
+      ...statePatch,
+    });
+  }
+
+  it('渲染列头、行、行内动作按钮（意图只带行 ID）', () => {
+    const html = render(tableState());
+    expect(html).toContain('class="table-block"');
+    expect(html).toContain('data-sort-key="path"');
+    expect(html).toContain('data-sort-key="size"');
+    expect(html).toContain('<td class="col align-right">9 GiB</td>');
+    expect(html).toContain('data-intent="revealFileInOS" data-row-id="r1"');
+    expect(html).toContain('>定位</button>');
+  });
+
+  it('sortable 列渲染排序按钮且当前列带方向指示；非 sortable 列只有文本', () => {
+    const html = render(tableState());
+    // size 是当前排序列（desc）：按钮标记 active、指示 ↓、下一方向 asc。
+    expect(html).toContain('data-sort-key="size" data-sort-direction="asc"');
+    expect(html).toMatch(/th-sort active[^>]*>大小/);
+    // path 未激活：从升序开始。
+    expect(html).toContain('data-sort-key="path" data-sort-direction="asc"');
+    // note 列不可排序：无排序按钮。
+    expect(html).toContain('<th class="col" scope="col">备注</th>');
+  });
+
+  it('text 筛选渲染输入框、select 筛选渲染下拉（data-filter-id 绑定）', () => {
+    const html = render(tableState());
+    expect(html).toMatch(/<input type="text" data-intent="setFilter" data-filter-id="path"/);
+    expect(html).toMatch(/<select data-intent="setFilter" data-filter-id="ext"/);
+    expect(html).toContain('<option value="all" selected>全部</option>');
+  });
+
+  it('分页只在多页时渲染：翻页意图带目标页码', () => {
+    const single = render(tableState());
+    expect(single).not.toContain('data-intent="setPage"');
+    const paged = render(tableState({ pagination: { page: 2, pageSize: 1, total: 2, pageCount: 2 } }));
+    expect(paged).toContain('data-page="1"');
+    expect(paged).toContain('data-page="3"');
+    expect(paged).toContain('第 2 / 2 页');
+  });
+
+  it('无行时按筛选活跃与否渲染两种空态；note 始终渲染', () => {
+    const noRows = render(tableState({ rows: [] }));
+    expect(noRows).toContain('无大文件');
+    const filteredEmpty = render(tableState({
+      rows: [],
+      filters: [{ id: 'path', kind: 'text', cellKey: 'path', value: 'zzz' }],
+    }));
+    expect(filteredEmpty).toContain('无匹配文件');
+    expect(filteredEmpty).toContain('部分结果：1 个目录不可读');
+  });
+
+  it('占用态无放行视图：表格通用控件全禁（基线面板现状）', () => {
+    const html = render(tableState({}, { busy: true }));
+    expect(html).toMatch(/data-intent="setSort"[^>]*disabled/);
+    expect(html).toMatch(/data-intent="setFilter"[^>]*disabled/);
+    expect(html).toMatch(/data-intent="revealFileInOS"[^>]*disabled/);
+  });
+
+  it('占用态按放行视图禁用：busy 帧中放行的只读控件可交互、未放行的禁用', () => {
+    const html = render(tableState({}, {
+      busy: true,
+      gate: {
+        busy: ['setSort', 'setFilter', 'setPage', 'revealFileInOS', 'viewTaskLog'],
+        writeLocked: [],
+      },
+    }));
+    expect(html).not.toMatch(/data-intent="setSort"[^>]*disabled/);
+    expect(html).not.toMatch(/data-intent="setFilter"[^>]*disabled/);
+    expect(html).not.toMatch(/data-intent="revealFileInOS"[^>]*disabled/);
+    // 放行视图只覆盖 busy 行；writeLocked 行为空集不影响 busy 帧。
+  });
+});
+
+describe('render：向导步骤条（steps）', () => {
+  it('渲染三步向导，当前步高亮、已过步弱化、未到步默认', () => {
+    const html = render(baseState({
+      steps: { labels: ['填写信息', '核对范围', '执行与结果'], current: 1 },
+    }));
+    expect(html).toContain('class="steps"');
+    expect(html).toMatch(/class="step done"><span class="step-index" aria-hidden="true">1<\/span><span class="step-label">填写信息<\/span>/);
+    expect(html).toMatch(/class="step current"><span class="step-index" aria-hidden="true">2<\/span><span class="step-label">核对范围<\/span>/);
+    expect(html).toMatch(/class="step"><span class="step-index" aria-hidden="true">3<\/span><span class="step-label">执行与结果<\/span>/);
+  });
+
+  it('未声明 steps 时不渲染步骤条（M2 面板零变化）', () => {
+    expect(render(baseState())).not.toContain('class="steps"');
+  });
+});
+
+describe('render：checkbox 表单字段', () => {
+  function checkState(field: Partial<FormFieldSpec>, statePatch: Partial<PanelState> = {}): PanelState {
+    return baseState({
+      form: { id: 'f', busy: false, fields: [{ id: 'directMode', label: '直接检出到所选目录', value: 'false', type: 'checkbox', ...field }] },
+      ...statePatch,
+    });
+  }
+
+  it("checked 由 value 派生：'true' 勾选、其余不勾选", () => {
+    const checked = render(checkState({ value: 'true' }));
+    expect(checked).toMatch(/<input type="checkbox" data-field-id="directMode"[^>]*checked/);
+    const unchecked = render(checkState({ value: 'false' }));
+    expect(unchecked).not.toMatch(/<input type="checkbox" data-field-id="directMode"[^>]*checked/);
+  });
+
+  it('disabled/error/help 沿用既有字段语义', () => {
+    const html = render(checkState({ disabled: true, error: '解析失败，暂不可修改', help: '勾选后目标路径按所选目录计算' }));
+    expect(html).toMatch(/<input type="checkbox" data-field-id="directMode"[^>]*disabled/);
+    expect(html).toContain('class="field-error"');
+    expect(html).toContain('勾选后目标路径按所选目录计算');
+  });
+
+  it('占用态无放行视图时禁用（与文本字段同判定）', () => {
+    const html = render(checkState({}, { busy: true }));
+    expect(html).toMatch(/<input type="checkbox" data-field-id="directMode"[^>]*disabled/);
   });
 });

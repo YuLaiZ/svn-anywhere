@@ -558,3 +558,180 @@ button.dismiss-success {
   .add-row label { width: 100%; }
   .add-row input[type="text"] { flex-basis: 100%; width: 100%; }
 }
+
+/* ------------------------------ 向导步骤条 ------------------------------ */
+
+.steps {
+  flex: none;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  align-items: center;
+  list-style: none;
+  margin: 0;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+.steps .step {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--vscode-descriptionForeground);
+}
+
+.step-index {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 50%;
+  font-size: 11px;
+  line-height: 1;
+  box-sizing: border-box;
+}
+
+.step-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.steps .step.current { color: var(--vscode-foreground); font-weight: 600; }
+
+.steps .step.current .step-index {
+  background: var(--vscode-button-background);
+  border-color: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+}
+
+.steps .step.done .step-index { color: var(--vscode-gitDecoration-addedResourceForeground, var(--vscode-foreground)); }
+
+/* ------------------------------ 表格 ------------------------------ */
+
+.table-block {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.table-filter-bar {
+  flex: none;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  align-items: center;
+  padding: 8px 16px;
+  background: var(--vscode-sideBar-background);
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+.table-filter { display: flex; align-items: center; gap: 5px; font-size: 12px; }
+
+.table-filter select {
+  font-family: var(--vscode-font-family);
+  font-size: 12px;
+  color: var(--vscode-dropdown-foreground, var(--vscode-input-foreground));
+  background: var(--vscode-dropdown-background, var(--vscode-input-background));
+  border: 1px solid var(--vscode-dropdown-border, var(--vscode-input-border));
+  padding: 2px 4px;
+}
+
+.table-filter input[type="text"] {
+  font-family: var(--vscode-font-family);
+  font-size: 12px;
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border);
+  padding: 2px 6px;
+  min-width: 130px;
+}
+
+.table-filter input[type="text"]:focus, .table-filter select:focus {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+
+/* 窄面板：容器内横向滚动，页面本身不横向溢出。 */
+.table-scroll { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.data-table th, .data-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.data-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--vscode-sideBar-background);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.data-table .col.align-right { text-align: right; }
+
+.data-table tbody tr:hover { background: var(--vscode-list-hoverBackground); }
+
+button.th-sort {
+  font: inherit;
+  font-weight: inherit;
+  color: inherit;
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+button.th-sort:hover:not([disabled]) { color: var(--vscode-textLink-foreground, var(--vscode-focusBorder)); }
+button.th-sort:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+button.th-sort.active { color: var(--vscode-textLink-foreground, var(--vscode-focusBorder)); }
+
+.sort-indicator { font-size: 11px; }
+
+.data-table td.acts { text-align: right; white-space: nowrap; }
+
+.table-pager {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 16px;
+  border-top: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-sideBar-background);
+  font-size: 12px;
+}
+
+.table-pager .summary { color: var(--vscode-descriptionForeground); }
+
+.table-note {
+  flex: none;
+  margin: 0;
+  padding: 6px 16px;
+  border-top: 1px solid var(--vscode-panel-border);
+  font-size: 11px;
+}
+
+/* ------------------------------ 表单勾选字段 ------------------------------ */
+
+.check-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  min-height: 26px;
+}

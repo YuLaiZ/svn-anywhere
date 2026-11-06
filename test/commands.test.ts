@@ -332,13 +332,13 @@ describe('registerAllCommands 二次激活', () => {
     // 必须 await 后断言，同步断言会拿到未完成的注册计数。
     const firstContext = { subscriptions: [], globalState } as unknown as vscode.ExtensionContext;
     await registerAllCommands(firstContext);
-    expect(vscodeMock.registered).toHaveLength(14);
+    expect(vscodeMock.registered).toHaveLength(15);
     const firstHandles = vscodeMock.registered.map((r) => r.disposable);
 
     const secondContext = { subscriptions: [], globalState } as unknown as vscode.ExtensionContext;
     await expect(registerAllCommands(secondContext)).resolves.toBeUndefined();
     expect(firstHandles.every((d) => d.disposed)).toBe(true);
-    expect(vscodeMock.registered).toHaveLength(28);
-    expect(vscodeMock.activeCommandIds.size).toBe(14);
+    expect(vscodeMock.registered).toHaveLength(30);
+    expect(vscodeMock.activeCommandIds.size).toBe(15);
   });
 });

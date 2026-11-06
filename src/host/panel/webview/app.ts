@@ -78,11 +78,21 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
     if (!(target instanceof HTMLElement)) {
       return;
     }
+    if (target instanceof HTMLInputElement && target.type === 'checkbox') {
+      // 勾选控件的 value 属性是静态字符串（不随勾选变化），input 委托
+      // 会发出恒定值；勾选态单通道由 change 事件派生（见 onChange）。
+      return;
+    }
     const fieldId = target.dataset.fieldId;
     if (!fieldId || target.hasAttribute('disabled')) {
       return;
     }
     const value = 'value' in target ? String(target.value) : '';
+    syncFieldValue(fieldId, value);
+  };
+
+  /** 输入同步单通道：登记待确认输入并按序号发送（文本与勾选派生值共用）。 */
+  const syncFieldValue = (fieldId: string, value: string): void => {
     inputSequence += 1;
     pendingInputs.set(fieldId, { value, inputRevision: inputSequence });
     send({
@@ -114,12 +124,15 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
       case 'toggleTree':
       case 'setFilter':
       case 'syncInput':
-        // 复选框/下拉的选中态由 change 事件负责；click 只做禁用守卫。
+        // 复选框/下拉/表格筛选的值变化由 change 事件负责；click 只做禁用守卫。
         return;
       case 'openDiff':
       case 'openFile':
       case 'rowMore':
         sendIntent({ kind: intent, itemId: holder.dataset.itemId ?? '' });
+        return;
+      case 'revealFileInOS':
+        sendIntent({ kind: 'revealFileInOS', rowId: holder.dataset.rowId ?? '' });
         return;
       case 'dismissBanner':
         sendIntent({ kind: 'dismissBanner', bannerId: holder.dataset.bannerId ?? '' });
@@ -134,15 +147,35 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
       case 'applyPrefix':
       case 'applyHistory':
       case 'removeRule':
+      case 'selectHistoryUrl':
         sendIntent({ kind: intent, index: Number(holder.dataset.index ?? 0) });
         return;
+      case 'setSort': {
+        const key = holder.dataset.sortKey;
+        if (key !== undefined) {
+          sendIntent({
+            kind: 'setSort',
+            key,
+            direction: holder.dataset.sortDirection === 'desc' ? 'desc' : 'asc',
+          });
+        }
+        return;
+      }
+      case 'setPage': {
+        const page = Number(holder.dataset.page);
+        if (Number.isFinite(page)) {
+          sendIntent({ kind: 'setPage', page });
+        }
+        return;
+      }
       case 'setView':
         sendIntent({ kind: 'setView', view: holder.dataset.view === 'list' ? 'list' : 'tree' });
         return;
       default:
         // refresh/clearFilters/selectVisible/clearSelection/selectChangelist/
         // managePrefixes/showHistory/submit/closePanel/resolveUnknown/
-        // addRule/fillOriginName/saveIgnore/submitIgnore 等无参意图。
+        // addRule/fillOriginName/saveIgnore/submitIgnore 与 P3/P4 的
+        // 无参动作（目录选择、校验、取消、收口、日志等）统一转发。
         sendIntent({ kind: intent });
     }
   };
@@ -181,6 +214,13 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
     }
     const intent = target.dataset.intent;
     if (target instanceof HTMLInputElement) {
+      // 表单勾选字段（data-field-id、无 data-intent）：勾选态唯一同步通道——
+      // 由 checked 派生 'true'|'false' 走输入同步（input 委托对勾选不发送）。
+      const fieldId = target.dataset.fieldId;
+      if (target.type === 'checkbox' && fieldId) {
+        syncFieldValue(fieldId, target.checked ? 'true' : 'false');
+        return;
+      }
       if (intent === 'toggleRow') {
         sendIntent({ kind: 'toggleRow', rowId: target.dataset.rowId ?? '', selected: target.checked });
         return;
@@ -194,7 +234,12 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
         return;
       }
     }
-    if (intent === 'setFilter' && target instanceof HTMLSelectElement) {
+    // 表格文本筛选（无 data-field-id，不进输入同步通道）与下拉筛选同走
+    // setFilter：值变化即发送，宿主重算切片后整帧重推。
+    if (
+      intent === 'setFilter' &&
+      (target instanceof HTMLSelectElement || (target instanceof HTMLInputElement && target.type === 'text'))
+    ) {
       const filterId = target.dataset.filterId;
       if (filterId !== undefined) {
         sendIntent({ kind: 'setFilter', filterId, value: target.value });
@@ -287,7 +332,10 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
         continue;
       }
       const control = root.querySelector<HTMLElement>(`[data-field-id="${cssEscape(field)}"]`);
-      if (control instanceof HTMLInputElement || control instanceof HTMLTextAreaElement) {
+      if (control instanceof HTMLInputElement && control.type === 'checkbox') {
+        // 勾选字段的待确认值是 'true'|'false' 派生串：恢复到 checked 态。
+        control.checked = pending.value === 'true';
+      } else if (control instanceof HTMLInputElement || control instanceof HTMLTextAreaElement) {
         control.value = pending.value;
       }
     }

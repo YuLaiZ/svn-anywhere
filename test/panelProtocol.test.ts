@@ -95,3 +95,59 @@ describe('parseViewMessage', () => {
     expect(parseViewMessage(intentMessage({ intent: { kind: 'removeRule', index: '0' } })).ok).toBe(false);
   });
 });
+
+describe('parseViewMessage：P3/P4/表格动作全集校验', () => {
+  const parameterlessKinds = [
+    'pickParentDir', 'pickDirectDir', 'pickSourceDir', 'useUrlName', 'useDirName',
+    'clearUrlHistory', 'checkoutNext', 'importNext', 'checkoutBack',
+    'startCheckout', 'startImport', 'cancelTask', 'viewTaskLog',
+    'verifyCheckout', 'resumeCheckout', 'abandonResidue', 'refreshImportPreview',
+    'verifyImport', 'retryImport', 'switchP3Mode', 'acknowledgeMerged', 'abandonUnknownImport',
+    'openCurrentWindow', 'openNewWindow', 'addToWorkspace', 'revealResultDir', 'revealSourceDir',
+    'handoffToCheckout', 'newTask',
+    'startScan', 'cancelScan', 'rescan', 'confirmVacuum', 'showScopeHelp',
+  ];
+
+  it('无参动作全部放行', () => {
+    for (const kind of parameterlessKinds) {
+      const parsed = parseViewMessage(intentMessage({ intent: { kind } }));
+      expect(parsed.ok, kind).toBe(true);
+      if (parsed.ok) {
+        expect((parsed.message as IntentMessage).intent).toEqual({ kind });
+      }
+    }
+  });
+
+  it('无参动作不接受多余载荷字段（载荷字段被丢弃，不进意图）', () => {
+    const parsed = parseViewMessage(intentMessage({ intent: { kind: 'startScan', path: '/tmp/evil' } }));
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(Object.keys((parsed.message as IntentMessage).intent)).toEqual(['kind']);
+    }
+  });
+
+  it('selectHistoryUrl 校验非负整数 index', () => {
+    expect(parseViewMessage(intentMessage({ intent: { kind: 'selectHistoryUrl', index: 0 } })).ok).toBe(true);
+    expect(parseViewMessage(intentMessage({ intent: { kind: 'selectHistoryUrl', index: -1 } })).ok).toBe(false);
+    expect(parseViewMessage(intentMessage({ intent: { kind: 'selectHistoryUrl', index: '0' } })).ok).toBe(false);
+  });
+
+  it('revealFileInOS 校验 rowId 字符串', () => {
+    expect(parseViewMessage(intentMessage({ intent: { kind: 'revealFileInOS', rowId: 'row-1' } })).ok).toBe(true);
+    expect(parseViewMessage(intentMessage({ intent: { kind: 'revealFileInOS', rowId: 42 } })).ok).toBe(false);
+  });
+
+  it('setSort 校验 key 与方向枚举', () => {
+    expect(parseViewMessage(intentMessage({ intent: { kind: 'setSort', key: 'size', direction: 'desc' } })).ok).toBe(true);
+    expect(parseViewMessage(intentMessage({ intent: { kind: 'setSort', key: 'size', direction: 'DESC' } })).ok).toBe(false);
+    expect(parseViewMessage(intentMessage({ intent: { kind: 'setSort', key: 'size' } })).ok).toBe(false);
+  });
+
+  it('setPage 校验不小于 1 的整数页码（页码从 1 起）', () => {
+    expect(parseViewMessage(intentMessage({ intent: { kind: 'setPage', page: 1 } })).ok).toBe(true);
+    expect(parseViewMessage(intentMessage({ intent: { kind: 'setPage', page: 0 } })).ok).toBe(false);
+    expect(parseViewMessage(intentMessage({ intent: { kind: 'setPage', page: -2 } })).ok).toBe(false);
+    expect(parseViewMessage(intentMessage({ intent: { kind: 'setPage', page: 1.5 } })).ok).toBe(false);
+    expect(parseViewMessage(intentMessage({ intent: { kind: 'setPage', page: '2' } })).ok).toBe(false);
+  });
+});

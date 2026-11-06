@@ -14,6 +14,10 @@ const state = {
   information: [],
   warning: [],
   openDialogCalls: 0,
+  /** showOpenDialog 选项记录（断言 canSelectFolders 等参数形态）。 */
+  openDialogOptions: [],
+  /** showOpenDialog 选中结果（undefined 表示取消）。 */
+  openDialogResult: undefined,
   channels: [],
   registered: new Map(),
   activeCommandIds: new Set(),
@@ -112,9 +116,10 @@ const fakeVscode = {
       state.warning.push(`[error] ${message}`);
       return Promise.resolve(undefined);
     },
-    showOpenDialog() {
+    showOpenDialog(options) {
       state.openDialogCalls += 1;
-      return Promise.resolve(undefined);
+      state.openDialogOptions.push(options);
+      return Promise.resolve(state.openDialogResult);
     },
     withProgress(options, task) {
       state.progressTitles.push(options.title);
@@ -2632,6 +2637,420 @@ async function main() {
     backFrame57 ? '' : '切回 batch-a 帧未出现');
   state.confirmResult = undefined;
   rmSync(lab57.lab, { recursive: true, force: true });
+
+  /* ---------------- P3 检出/续检任务执行器（真实 file:// svn） ---------------- */
+
+  // 远端身份三元组读取（脚本侧轻解析 svn info --xml；面板正式链路走 core 的 checkRemote）。
+  const peggedUrl = (url) => (url.includes('@') ? `${url}@` : url);
+  const remoteIdentityOf = (url) => {
+    const xml = svn(['info', '--xml', peggedUrl(url)]);
+    const pick = (re) => re.exec(xml)?.[1] ?? '';
+    return {
+      repositoryUuid: pick(/<uuid>([^<]+)<\/uuid>/),
+      repositoryRootUrl: pick(/<root>([^<]+)<\/root>/),
+      relativeUrl: pick(/<relative-url>([^<]+)<\/relative-url>/),
+      revision: Number(pick(/<entry[^>]*revision="(\d+)"/)),
+    };
+  };
+  const draftFormOf = (url, rev, depth, parentDir, name) => ({
+    url, urlInput: url, nameMode: 'auto', parentDir, dirName: name,
+    directMode: false, directDir: '', revMode: 'number', rev: String(rev),
+    depth, sourceDir: '', message: '',
+  });
+  // 仓库结构：trunk 下 a.txt + sub/b.txt + sub/deep/c.txt（供四深度与续检断言）。
+  // lab.checkout 检出的是仓库根——trunk 作为首个提交的子目录建立。
+  const seedTrunk = (lab, fileTag) => {
+    const seed = lab.checkout('seed');
+    mkdirSync(join(seed, 'trunk', 'sub', 'deep'), { recursive: true });
+    writeFileSync(join(seed, 'trunk', 'a.txt'), `${fileTag}-a`);
+    writeFileSync(join(seed, 'trunk', 'sub', 'b.txt'), `${fileTag}-b`);
+    writeFileSync(join(seed, 'trunk', 'sub', 'deep', 'c.txt'), `${fileTag}-c`);
+    svn(['add', '-q', 'trunk'], seed);
+    svn(['commit', '-q', '-m', 'seed'], seed);
+    return seed;
+  };
+
+  console.log('场景 58：P3 检出执行器——四深度、指定版本与 URL 段含 @（真实 file://）');
+  {
+    const api = extension.__checkoutTaskApi;
+    if (!api) {
+      throw new Error('扩展未导出 __checkoutTaskApi（自动化驱动出口缺失）');
+    }
+    const lab58 = makeSvnLab();
+    const trunk58 = `${lab58.repoUrl}/trunk`;
+    const seed58 = seedTrunk(lab58, 'r1');
+    writeFileSync(join(seed58, 'trunk', 'a.txt'), 'r2-a');
+    svn(['commit', '-q', '-m', 'r2'], seed58);
+
+    const parent58 = join(lab58.lab, 'targets');
+    mkdirSync(parent58, { recursive: true });
+    const runCheckout58 = async ({ url, rev, depth, name }) => {
+      const identity = remoteIdentityOf(url);
+      const progress = [];
+      const started = api.startCheckoutTask({
+        svnPath: 'svn', url, pinnedRevision: rev ?? identity.revision, depth,
+        targetDir: join(parent58, name), parentDir: parent58, dirName: name,
+        directMode: false, directDir: '', identity,
+        entryKey: parent58, initiatorSessionId: 'mock-session-58',
+        formSnapshot: draftFormOf(url, rev ?? identity.revision, depth, parent58, name),
+        callbacks: { onProgress: (s) => progress.push({ count: s.count, currentFile: s.currentFile }) },
+      });
+      const done = await started.done;
+      return { done, progress };
+    };
+    const depthOf = (dir) => svn(['info', '--show-item', 'depth', '--', `${dir}@`]).trim();
+
+    // 四深度：empty / files / immediates / infinity。
+    const empty58 = await runCheckout58({ url: trunk58, depth: 'empty', name: 'd-empty' });
+    check('empty 深度检出 success', empty58.done.outcome === 'finished' && empty58.done.result.kind === 'success',
+      JSON.stringify(empty58.done).slice(0, 300));
+    check('empty：目标 depth=empty 且无业务条目', depthOf(join(parent58, 'd-empty')) === 'empty'
+      && !existsSync(join(parent58, 'd-empty', 'a.txt')));
+
+    const files58 = await runCheckout58({ url: trunk58, depth: 'files', name: 'd-files' });
+    check('files 深度检出 success 与流式计数', files58.done.outcome === 'finished'
+      && files58.progress.at(-1)?.count === 1, JSON.stringify(files58.progress).slice(0, 200));
+    check('files：顶层文件存在、子目录不展开', existsSync(join(parent58, 'd-files', 'a.txt'))
+      && !existsSync(join(parent58, 'd-files', 'sub')));
+
+    const imm58 = await runCheckout58({ url: trunk58, depth: 'immediates', name: 'd-imm' });
+    check('immediates 深度检出 success 与流式计数', imm58.done.outcome === 'finished'
+      && imm58.progress.at(-1)?.count === 2, JSON.stringify(imm58.progress).slice(0, 200));
+    check('immediates：顶层文件与子目录实体、深层不展开',
+      existsSync(join(parent58, 'd-imm', 'a.txt')) && existsSync(join(parent58, 'd-imm', 'sub'))
+      && !existsSync(join(parent58, 'd-imm', 'sub', 'b.txt')) && !existsSync(join(parent58, 'd-imm', 'sub', 'deep')));
+
+    const inf58 = await runCheckout58({ url: trunk58, depth: 'infinity', name: 'd-inf' });
+    check('infinity 深度检出 success 与流式计数', inf58.done.outcome === 'finished'
+      && inf58.progress.at(-1)?.count === 5, JSON.stringify(inf58.progress).slice(0, 200));
+    check('infinity：全量条目落盘', existsSync(join(parent58, 'd-inf', 'sub', 'deep', 'c.txt')));
+
+    // 指定版本：固定 r1（a.txt 为 r1 内容）。
+    const rev58 = await runCheckout58({ url: trunk58, rev: 1, depth: 'infinity', name: 'd-rev1' });
+    check('指定版本检出 success（尾行 revision）', rev58.done.outcome === 'finished'
+      && rev58.done.result.kind === 'success' && rev58.done.result.revision === 1,
+      JSON.stringify(rev58.done.result).slice(0, 200));
+    check('指定版本：内容与 working revision 都是 r1',
+      readFileSync(join(parent58, 'd-rev1', 'a.txt'), 'utf8') === 'r1-a'
+      && svn(['info', '--show-item', 'revision', '--', `${join(parent58, 'd-rev1')}@`]).trim() === '1');
+
+    // URL 段含 @：peg 处理（escapeUrlPeg 补尾 @）后正确检出目录 a@b。
+    // a@b 目录此刻才建（四深度计数断言基于纯 trunk 结构）。
+    svn(['mkdir', '-q', '-m', 'at-dir', `${trunk58}/a@b@`]);
+    const at58 = await runCheckout58({ url: `${trunk58}/a@b`, depth: 'infinity', name: 'a@b' });
+    check('@ 段 URL 检出 success', at58.done.outcome === 'finished' && at58.done.result.kind === 'success',
+      JSON.stringify(at58.done).slice(0, 300));
+    check('@ 段：目标目录名原样为 a@b（.svn 元数据就位）',
+      existsSync(join(parent58, 'a@b', '.svn', 'wc.db')), join(parent58, 'a@b'));
+
+    // 成功路径记录按终态收口移除、检出频道有命令与尾行。
+    check('成功路径全部记录已收口移除',
+      !(state.globalStateMap.get('svnAnywhere.operations') || []).some((r) => r.kind === 'checkout' && r.lockKey?.startsWith(parent58)),
+      JSON.stringify(state.globalStateMap.get('svnAnywhere.operations')));
+    check('检出频道有 checkout 命令回显与尾行', channelTextOf('SVN Anywhere · 检出').includes('checkout --non-interactive')
+      && channelTextOf('SVN Anywhere · 检出').includes('Checked out revision'),
+      channelTextOf('SVN Anywhere · 检出').slice(-400));
+    rmSync(lab58.lab, { recursive: true, force: true });
+  }
+
+  console.log('场景 59：中断续检——半成品构造、只读核验、resume 补全与身份不一致阻断');
+  {
+    const api = extension.__checkoutTaskApi;
+    const lab59 = makeSvnLab();
+    const trunk59 = `${lab59.repoUrl}/trunk`;
+    seedTrunk(lab59, 'v1');
+    const identity59 = remoteIdentityOf(trunk59);
+    const head59 = identity59.revision;
+
+    // 半成品构造：完整检出后删除深层（.svn 元数据仍在，宿主被 kill 的残留形态）。
+    const partial = join(lab59.lab, 'partial');
+    svn(['checkout', '-q', trunk59, partial]);
+    rmSync(join(partial, 'sub', 'deep'), { recursive: true, force: true });
+    rmSync(join(partial, 'sub', 'b.txt'));
+    // 预置 residue-pending 记录并重新 activate（loadPending 恢复记录）。
+    state.globalStateMap.set('svnAnywhere.operations', [{
+      operationId: 'op-resume-mock', wcRoot: partial, lockKey: partial, kind: 'checkout',
+      targetRelPath: '.', nodeKind: 'dir', phase: 'residue-pending', knownRevisions: [],
+      updatedAt: Date.now(), url: trunk59, targetPath: partial, pinnedRevision: head59,
+      depth: 'infinity', repositoryUuid: identity59.repositoryUuid,
+      repositoryRootUrl: identity59.repositoryRootUrl, relativeUrl: identity59.relativeUrl,
+    }]);
+    await extension.activate(secondContext);
+
+    // 1) 只读核验：resumable；核验不改记录。
+    const report59 = await api.verifyCheckoutOnly({
+      svnPath: 'svn', targetDir: partial,
+      expectation: {
+        repositoryUuid: identity59.repositoryUuid,
+        repositoryRootUrl: identity59.repositoryRootUrl,
+        relativeUrl: identity59.relativeUrl,
+        depth: 'infinity', pinnedRevision: head59,
+      },
+      resultScope: { entryKey: lab59.lab, mode: 'checkout' }, epoch: 1,
+    });
+    check('只读核验结论 resumable（半成品可续）', report59.kind === 'resumable',
+      JSON.stringify(report59).slice(0, 300));
+    check('核验不改记录（保持 residue-pending）',
+      (state.globalStateMap.get('svnAnywhere.operations') || [])
+        .find((r) => r.operationId === 'op-resume-mock')?.phase === 'residue-pending');
+
+    // recordUnavailable 分支：记录不存在时返回供面板提示。
+    const unavailable59 = await api.resumeCheckoutTask({
+      svnPath: 'svn', operationId: 'op-no-such', lockKey: partial, targetDir: partial,
+      url: trunk59, pinnedRevision: head59, depth: 'infinity', identity: identity59,
+      entryKey: lab59.lab, initiatorSessionId: 'mock-session-59',
+    });
+    check('记录不存在 → recordUnavailable（非占用）', unavailable59.ok === false && unavailable59.reason === 'recordUnavailable',
+      JSON.stringify(unavailable59).slice(0, 200));
+
+    // 2) resume：核验通过 → cleanup + update 补全深层。
+    const resumed59 = await api.resumeCheckoutTask({
+      svnPath: 'svn', operationId: 'op-resume-mock', lockKey: partial, targetDir: partial,
+      url: trunk59, pinnedRevision: head59, depth: 'infinity', identity: identity59,
+      entryKey: lab59.lab, formSnapshot: draftFormOf(trunk59, head59, 'infinity', lab59.lab, 'partial'),
+      initiatorSessionId: 'mock-session-59',
+    });
+    check('resume 启动成功（beginResume 独占通过）', resumed59.ok === true, JSON.stringify(resumed59).slice(0, 200));
+    if (resumed59.ok) {
+      const done59 = await resumed59.done;
+      check('续检完成 success（update 尾行 revision）',
+        done59.outcome === 'finished' && done59.result.kind === 'success' && done59.result.revision === head59,
+        JSON.stringify(done59).slice(0, 300));
+      check('中断深层已补全（missing 条目恢复）', existsSync(join(partial, 'sub', 'deep', 'c.txt'))
+        && existsSync(join(partial, 'sub', 'b.txt')));
+    }
+    check('续检完成记录按终态收口移除',
+      !(state.globalStateMap.get('svnAnywhere.operations') || []).some((r) => r.operationId === 'op-resume-mock'),
+      JSON.stringify(state.globalStateMap.get('svnAnywhere.operations')));
+    check('检出频道记录续检 update 命令', channelTextOf('SVN Anywhere · 检出').includes('update --non-interactive'),
+      channelTextOf('SVN Anywhere · 检出').slice(-300));
+
+    // 3) 身份不一致阻断：另一仓库的副本配本仓库的记录参数 → resumeBlocked。
+    const otherLab = makeSvnLab();
+    const otherSeed = otherLab.checkout('other-seed');
+    writeFileSync(join(otherSeed, 'x.txt'), 'other');
+    svn(['add', '-q', '--parents', 'x.txt'], otherSeed);
+    svn(['commit', '-q', '-m', 'other'], otherSeed);
+    const partial2 = join(lab59.lab, 'partial2');
+    svn(['checkout', '-q', otherLab.repoUrl, partial2]);
+    state.globalStateMap.set('svnAnywhere.operations', [{
+      operationId: 'op-resume-mock2', wcRoot: partial2, lockKey: partial2, kind: 'checkout',
+      targetRelPath: '.', nodeKind: 'dir', phase: 'residue-pending', knownRevisions: [],
+      updatedAt: Date.now(), url: trunk59, targetPath: partial2, pinnedRevision: head59,
+      depth: 'infinity', repositoryUuid: identity59.repositoryUuid,
+      repositoryRootUrl: identity59.repositoryRootUrl, relativeUrl: identity59.relativeUrl,
+    }]);
+    await extension.activate(secondContext);
+    const blocked59 = await api.resumeCheckoutTask({
+      svnPath: 'svn', operationId: 'op-resume-mock2', lockKey: partial2, targetDir: partial2,
+      url: trunk59, pinnedRevision: head59, depth: 'infinity', identity: identity59,
+      entryKey: lab59.lab, formSnapshot: draftFormOf(trunk59, head59, 'infinity', lab59.lab, 'partial2'),
+      initiatorSessionId: 'mock-session-59',
+    });
+    check('阻断分支 resume 启动成功（重核验在 connecting 窗口内）', blocked59.ok === true, JSON.stringify(blocked59).slice(0, 200));
+    if (blocked59.ok) {
+      const doneBlocked = await blocked59.done;
+      check('重核验失败 → resumeBlocked（VerifyReport 附带，无任务终态 result）',
+        doneBlocked.outcome === 'finished' && doneBlocked.result.kind === 'resumeBlocked'
+        && doneBlocked.result.verify?.blockReason === 'identityMismatch',
+        JSON.stringify(doneBlocked).slice(0, 400));
+    }
+    check('阻断分支记录回 residue-pending（未终态保留）',
+      (state.globalStateMap.get('svnAnywhere.operations') || [])
+        .find((r) => r.operationId === 'op-resume-mock2')?.phase === 'residue-pending');
+    check('resumeBlocked 结果页写入会话缓存', api.readCachedResult(lab59.lab)?.page?.kind === 'resumeBlocked');
+    rmSync(otherLab.lab, { recursive: true, force: true });
+    rmSync(lab59.lab, { recursive: true, force: true });
+  }
+
+  console.log('场景 60：关闭面板任务继续——后台完成终态写缓存（执行器与面板生命周期解耦）');
+  {
+    const api = extension.__checkoutTaskApi;
+    const lab60 = makeSvnLab();
+    const trunk60 = `${lab60.repoUrl}/trunk`;
+    seedTrunk(lab60, 'bg');
+    const identity60 = remoteIdentityOf(trunk60);
+    // wrapper 让 checkout 睡 1.5 秒：制造「面板已关、任务仍在途」的窗口。
+    const wrapDir60 = makeTempDir('svn-anywhere-slowwrap-');
+    const slowSvn = join(wrapDir60, 'svn-slow.sh');
+    writeFileSync(slowSvn, [
+      '#!/bin/sh',
+      'if [ "$1" = "checkout" ]; then sleep 1.5; fi',
+      'exec svn "$@"',
+      '',
+    ].join('\n'), { mode: 0o755 });
+    state.configOverrides = { svnPath: slowSvn };
+    try {
+      const target60 = join(lab60.lab, 'bg-target');
+      const startedAt60 = Date.now();
+      const started = api.startCheckoutTask({
+        // 不传 svnPath：走配置（指向延迟 wrapper），同真实面板发起链路。
+        url: trunk60, pinnedRevision: identity60.revision, depth: 'infinity',
+        targetDir: target60, parentDir: lab60.lab, dirName: 'bg-target',
+        directMode: false, directDir: '', identity: identity60,
+        entryKey: lab60.lab, initiatorSessionId: 'mock-session-60',
+        formSnapshot: draftFormOf(trunk60, identity60.revision, 'infinity', lab60.lab, 'bg-target'),
+        // 「面板已关」：不注入任何回调订阅（dispose 后执行器仍结算）。
+      });
+      const done60 = await started.done;
+      check('后台完成 success（与面板存活无关）',
+        done60.outcome === 'finished' && done60.result.kind === 'success',
+        JSON.stringify(done60).slice(0, 300));
+      check('任务真实运行了延迟窗口（发起时进程在途）', Date.now() - startedAt60 >= 1400,
+        `${Date.now() - startedAt60}ms`);
+      check('终态写入会话缓存（executor 后台写入）',
+        api.readCachedResult(lab60.lab)?.page?.kind === 'success',
+        JSON.stringify(api.readCachedResult(lab60.lab))?.slice(0, 200));
+      check('该目标的记录按终态收口移除',
+        !(state.globalStateMap.get('svnAnywhere.operations') || [])
+          .some((r) => r.lockKey === target60),
+        JSON.stringify(state.globalStateMap.get('svnAnywhere.operations')));
+    } finally {
+      state.configOverrides = undefined;
+      rmSync(wrapDir60, { recursive: true, force: true });
+      rmSync(lab60.lab, { recursive: true, force: true });
+    }
+  }
+
+  console.log('场景 61：检出命令入口与面板链路——命令打开面板、检出、取消、关闭重开恢复（真实 file://）');
+  {
+    const lab61 = makeSvnLab();
+    const trunk61 = `${lab61.repoUrl}/trunk`;
+    seedTrunk(lab61, 'cmd');
+    const parent61 = join(lab61.lab, 'targets');
+    mkdirSync(parent61, { recursive: true });
+
+    // 1) 右键目录驱动命令 → 面板创建，表单页带出该父目录。
+    await state.registered.get('svnAnywhere.checkout')({ fsPath: parent61, scheme: 'file' });
+    let panel61 = [...state.panels].reverse().find((p) => p.viewType === 'svn-anywhere-checkout' && !p.disposed);
+    check('命令打开检出面板（webview 创建）', Boolean(panel61),
+      `panels=${state.panels.map((p) => p.viewType).join(',')}`);
+    panel61.sendReady();
+    const formFrame61 = await waitRender(panel61, '仓库 URL');
+    check('表单页呈现且父目录带出', Boolean(formFrame61) && formFrame61.html.includes(parent61),
+      formFrame61 ? '' : '表单页帧未出现');
+
+    // 2) 填 file:// 仓库 URL → 下一步（真实 svn info 连接检查）→ 核对页。
+    let posted = panel61.webview.posted.length;
+    panel61.sendAuto({ kind: 'syncInput', fieldId: 'url', value: trunk61, inputRevision: state.intentSeq + 1000 });
+    await waitNewRender(panel61, 'trunk', posted);
+    posted = panel61.webview.posted.length;
+    panel61.sendAuto({ kind: 'checkoutNext' });
+    const reviewFrame61 = await waitNewRender(panel61, '开始检出', posted);
+    check('连接检查通过进入核对页（固定 revision）', Boolean(reviewFrame61),
+      reviewFrame61 ? '' : '核对页帧未出现');
+
+    // 3) 开始检出 → 成功页（真实 svn checkout，默认命名取 URL 末段 trunk）。
+    posted = panel61.webview.posted.length;
+    panel61.sendAuto({ kind: 'startCheckout' });
+    const successFrame61 = await waitNewRender(panel61, '检出完成', posted, 400);
+    check('面板内检出成功页', Boolean(successFrame61), successFrame61 ? '' : '成功页帧未出现');
+    check('目标目录真实落盘（join(父目录, URL 末段)）',
+      existsSync(join(parent61, 'trunk', 'a.txt')) && existsSync(join(parent61, 'trunk', 'sub', 'deep', 'c.txt')));
+
+    // 4) 新建任务 → 第二次检出（慢 svn 保证取消窗口）→ 运行中取消 → 取消结果页。
+    posted = panel61.webview.posted.length;
+    panel61.sendAuto({ kind: 'newTask' });
+    await waitNewRender(panel61, '仓库 URL', posted);
+    const wrapDir61 = makeTempDir('svn-anywhere-slowwrap61-');
+    const slowSvn61 = join(wrapDir61, 'svn-slow.sh');
+    // 检出命令的真实写盘照常（svn 先落全部文件），流式输出逐行放慢——
+    // 制造「文件已落地、任务仍在途」的取消窗口：此刻取消即得「已取消，
+    // 文件保留」的真实形态（连接期取消则目录尚不存在，同样是合法现场，
+    // 但无法断言磁盘保留）。
+    writeFileSync(slowSvn61, [
+      '#!/bin/sh',
+      'if [ "$1" = "checkout" ]; then',
+      '  svn "$@" | while IFS= read -r line; do',
+      '    printf \'%s\\n\' "$line"',
+      '    sleep 0.25',
+      '  done',
+      '  exit 0',
+      'fi',
+      'exec svn "$@"',
+      '',
+    ].join('\n'), { mode: 0o755 });
+    const confirmBefore61 = state.confirmResult;
+    state.configOverrides = { svnPath: slowSvn61 };
+    state.confirmResult = '取消检出';
+    try {
+      panel61.sendAuto({ kind: 'syncInput', fieldId: 'url', value: `${trunk61}/sub`, inputRevision: state.intentSeq + 1000 });
+      posted = panel61.webview.posted.length;
+      panel61.sendAuto({ kind: 'checkoutNext' });
+      await waitNewRender(panel61, '开始检出', posted);
+      posted = panel61.webview.posted.length;
+      panel61.sendAuto({ kind: 'startCheckout' });
+      // 等取消真正可用：运行页首帧在 connecting 段就渲染「已取得 0 项」，但取消
+      // 按钮此刻 disabled（宿主放行表同源拒绝，title 恒带「正在准备」说明不能
+      // 作区分标记）；running 段 disabled 属性消失，此刻发送取消才进链路。
+      const cancelEnabled61 = (html) => {
+        const tag = /<button[^>]*data-intent="cancelTask"[^>]*>/.exec(html)?.[0];
+        return tag !== undefined && !tag.includes(' disabled');
+      };
+      let runningFrame61;
+      for (let i = 0; i < 400 && !runningFrame61; i += 1) {
+        runningFrame61 = [...panel61.webview.posted.slice(posted)].reverse().find(
+          (m) => m.type === 'render' && m.html.includes('已取得 1') && cancelEnabled61(m.html),
+        );
+        if (!runningFrame61) await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      check('运行页进入 running 段（首条文件已取得，取消按钮可用）', Boolean(runningFrame61),
+        runningFrame61 ? '' : 'running 帧未出现');
+      posted = panel61.webview.posted.length;
+      panel61.sendAuto({ kind: 'cancelTask' });
+      const canceledFrame61 = await waitNewRender(panel61, '已取消，文件保留', posted, 400);
+      check('运行中取消 → 取消结果页（文件保留）', Boolean(canceledFrame61),
+        canceledFrame61 ? '' : '取消结果页帧未出现');
+      check('取消后文件保留（svn 已写盘的业务文件仍在）',
+        existsSync(join(parent61, 'sub')) && existsSync(join(parent61, 'sub', 'b.txt')));
+    } finally {
+      state.configOverrides = undefined;
+      state.confirmResult = confirmBefore61;
+      rmSync(wrapDir61, { recursive: true, force: true });
+    }
+
+    // 5) 关闭面板 → 同入口重开 → 会话缓存恢复取消结果页（而非新表单）。
+    panel61.sendAuto({ kind: 'closePanel' });
+    check('面板已关闭', panel61.disposed === true);
+    await state.registered.get('svnAnywhere.checkout')({ fsPath: parent61, scheme: 'file' });
+    const reopened61 = [...state.panels].reverse().find((p) => p.viewType === 'svn-anywhere-checkout' && !p.disposed);
+    check('重开创建新面板实例', Boolean(reopened61) && reopened61 !== panel61);
+    reopened61.sendReady();
+    const recovered61 = await waitRender(reopened61, '已取消，文件保留');
+    check('关闭重开恢复取消结果页（会话缓存命中）', Boolean(recovered61),
+      recovered61 ? '' : '恢复帧未出现');
+
+    // 6) 命令面板回退：无参且无活动编辑器 → 弹目录选择框（只可选目录）；取消静默。
+    const dialogBefore61 = state.openDialogCalls;
+    const panelsBefore61 = state.panels.filter((p) => !p.disposed).length;
+    const infoBefore61 = state.information.length;
+    state.openDialogResult = undefined;
+    await state.registered.get('svnAnywhere.checkout')(undefined);
+    const dialogOptions61 = state.openDialogOptions[state.openDialogOptions.length - 1];
+    check('无参调用弹目录选择框（canSelectFolders、不可选文件）',
+      state.openDialogCalls === dialogBefore61 + 1
+        && dialogOptions61?.canSelectFolders === true && dialogOptions61?.canSelectFiles === false,
+      JSON.stringify(dialogOptions61));
+    check('选择框取消静默：无新面板、无提示',
+      state.panels.filter((p) => !p.disposed).length === panelsBefore61
+        && state.information.length === infoBefore61);
+
+    // 7) 选择框选中另一目录 → 面板目标切换（结果页未处理 → 确认放弃并切换 → 新表单）。
+    const parent61b = join(lab61.lab, 'targets-b');
+    mkdirSync(parent61b, { recursive: true });
+    state.openDialogResult = [{ fsPath: parent61b }];
+    state.confirmResult = '放弃并切换';
+    try {
+      await state.registered.get('svnAnywhere.checkout')(undefined);
+      const switched61 = await waitRender(reopened61, parent61b);
+      check('选择框选中回退 → 目标切换确认后新表单带出新父目录', Boolean(switched61),
+        switched61 ? '' : '切换后表单帧未出现');
+    } finally {
+      state.openDialogResult = undefined;
+      state.confirmResult = confirmBefore61;
+    }
+    rmSync(lab61.lab, { recursive: true, force: true });
+  }
 
   rmSync(igLab.lab, { recursive: true, force: true });
 

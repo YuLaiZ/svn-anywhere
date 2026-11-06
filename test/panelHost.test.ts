@@ -104,7 +104,8 @@ vi.mock('vscode', () => ({
 }));
 
 import { createPanel, panelHtmlTemplate, resetPanelRegistry } from '../src/host/panel/host';
-import type { PanelState } from '../src/host/panel/state';
+import { createP3Gates, createP4Gates } from '../src/host/panel/gates';
+import type { PanelState, TableSpec } from '../src/host/panel/state';
 
 const context = {
   extensionUri: { toString: () => 'file:///ext' } as never,
@@ -408,8 +409,211 @@ describe('意图校验', () => {
   });
 });
 
-describe('复用与销毁', () => {
-  it('同 panelId 再次 createPanel 复用并 reveal，不新建', () => {
+describe('占用态放行按面板查表（基线集合改造前后不变）', () => {
+  interface Harness {
+    handle: ReturnType<typeof createPanel>;
+    panel: FakePanel;
+    intents: unknown[];
+    receive(intent: Record<string, unknown>): Promise<void>;
+    patch(patch: Partial<PanelState>): void;
+  }
+
+  function makePanel(options?: Parameters<typeof createPanel>[1]): Harness {
+    const intents: unknown[] = [];
+    const handle = createPanel(
+      't1',
+      options ?? { title: 'T' },
+      { onIntent: (intent) => { intents.push(intent); } },
+      context,
+    );
+    const panel = panelsCreated[0];
+    const harness: Harness = {
+      handle,
+      panel,
+      intents,
+      receive: (intent) =>
+        Promise.resolve(panel.receive({
+          type: 'intent', protocolVersion: 1, sessionId: handle.sessionId,
+          requestId: `r-${Math.random().toString(36).slice(2)}`,
+          intent,
+        })),
+      patch: (patch) => {
+        panel.posted.length = 0;
+        handle.update(state({ sessionId: handle.sessionId, ...patch }));
+      },
+    };
+    handle.update(state({ sessionId: handle.sessionId }));
+    panel.posted.length = 0;
+    return harness;
+  }
+
+  it('基线 busy 集合不变：只放行 syncInput，其余（含关闭/重读）拒绝并 toast', async () => {
+    const h = makePanel();
+    h.patch({ busy: true });
+    await h.receive({ kind: 'syncInput', fieldId: 'message', value: 'x', inputRevision: 1 });
+    expect(h.intents).toHaveLength(1);
+    for (const kind of ['refresh', 'closePanel', 'submit']) {
+      await h.receive({ kind });
+      expect(h.intents, kind).toHaveLength(1);
+    }
+    expect(toastMessages(h.panel.posted).length).toBeGreaterThan(0);
+    h.handle.dispose();
+  });
+
+  it('基线 writeLocked 集合不变：放行 resolveUnknown/refresh（含 bannerAction 按 actionId），拒绝输入同步与其余', async () => {
+    const h = makePanel();
+    h.patch({
+      busy: false,
+      writeLocked: true,
+      banners: [{ id: 'unknown', level: 'warn', title: '未知', actions: [{ id: 'resolveUnknown', label: '核实' }] }],
+    });
+    await h.receive({ kind: 'resolveUnknown' });
+    await h.receive({ kind: 'refresh' });
+    await h.receive({ kind: 'bannerAction', bannerId: 'unknown', actionId: 'resolveUnknown' });
+    expect(h.intents).toHaveLength(3);
+    await h.receive({ kind: 'syncInput', fieldId: 'message', value: 'x', inputRevision: 1 });
+    await h.receive({ kind: 'bannerAction', bannerId: 'unknown', actionId: 'otherAction' });
+    await h.receive({ kind: 'submit' });
+    expect(h.intents).toHaveLength(3);
+    h.handle.dispose();
+  });
+
+  it('P3 表 busy：cancelTask 仅运行段放行（connecting 拒绝），syncInput 拒绝', async () => {
+    let phase: 'connecting' | 'running' | 'canceling' = 'running';
+    const h = makePanel({
+      title: 'P3',
+      gates: createP3Gates({
+        taskPhase: () => phase,
+        canResume: () => true,
+        isMergedOutcome: () => false,
+        isSnapshotIncomplete: () => false,
+        isResidueResultPage: () => false,
+      }),
+    });
+    h.patch({ busy: true });
+    await h.receive({ kind: 'cancelTask' });
+    await h.receive({ kind: 'viewTaskLog' });
+    await h.receive({ kind: 'closePanel' });
+    expect(h.intents).toHaveLength(3);
+    await h.receive({ kind: 'syncInput', fieldId: 'url', value: 'x', inputRevision: 1 });
+    expect(h.intents).toHaveLength(3);
+    phase = 'connecting';
+    await h.receive({ kind: 'cancelTask' });
+    expect(h.intents).toHaveLength(3);
+    phase = 'canceling';
+    await h.receive({ kind: 'cancelTask' });
+    expect(h.intents).toHaveLength(3);
+    h.handle.dispose();
+  });
+
+  it('P3 表 busy 优先于 writeLocked（同真时按 busy 行拒绝 writeLocked 行放行的动作）', async () => {
+    const h = makePanel({
+      title: 'P3',
+      gates: createP3Gates({
+        taskPhase: () => 'running',
+        canResume: () => true,
+        isMergedOutcome: () => false,
+        isSnapshotIncomplete: () => false,
+        isResidueResultPage: () => false,
+      }),
+    });
+    h.patch({ busy: true, writeLocked: true });
+    // resumeCheckout 在 writeLocked 行放行，但 busy 在途必须等待。
+    await h.receive({ kind: 'resumeCheckout' });
+    expect(h.intents).toHaveLength(0);
+    h.patch({ busy: false, writeLocked: true });
+    await h.receive({ kind: 'resumeCheckout' });
+    expect(h.intents).toHaveLength(1);
+    h.handle.dispose();
+  });
+
+  it('P3 表 writeLocked：条件收口动作按谓词放行（merged 收口不被写锁拒绝）', async () => {
+    let merged = false;
+    const h = makePanel({
+      title: 'P3',
+      gates: createP3Gates({
+        taskPhase: () => undefined,
+        canResume: () => true,
+        isMergedOutcome: () => merged,
+        isSnapshotIncomplete: () => false,
+        isResidueResultPage: () => true,
+      }),
+    });
+    h.patch({ writeLocked: true });
+    await h.receive({ kind: 'acknowledgeMerged' });
+    expect(h.intents).toHaveLength(0);
+    merged = true;
+    await h.receive({ kind: 'acknowledgeMerged' });
+    await h.receive({ kind: 'abandonResidue' });
+    await h.receive({ kind: 'newTask' });
+    expect(h.intents).toHaveLength(3);
+    h.handle.dispose();
+  });
+
+  it('P4 表 busy：表格只读意图放行、rescan/confirmVacuum 拒绝；DOM 与守卫同源（渲染注入可交互集）', async () => {
+    const h = makePanel({
+      title: 'P4',
+      gates: createP4Gates({ isUserScanning: () => false }),
+    });
+    const table: TableSpec = {
+      id: 'big',
+      columns: [{ key: 'path', label: '路径' }, { key: 'size', label: '大小', sortable: true }],
+      sort: { key: 'size', direction: 'desc' },
+      filters: [{ id: 'path', kind: 'text', cellKey: 'path', value: '' }],
+      pagination: { page: 1, pageSize: 50, total: 2, pageCount: 1 },
+      rows: [
+        { id: 'r1', cells: { path: 'a.bin', size: '100 B' }, actions: [{ id: 'revealFileInOS', label: '定位' }] },
+        { id: 'r2', cells: { path: 'b.bin', size: '9 GiB' } },
+      ],
+      empty: { title: '空' },
+    };
+    h.patch({ busy: true, table });
+    // 守卫：只读意图放行，重新分析/清理确认拒绝。
+    await h.receive({ kind: 'setSort', key: 'size', direction: 'asc' });
+    await h.receive({ kind: 'setFilter', filterId: 'path', value: 'a' });
+    await h.receive({ kind: 'revealFileInOS', rowId: 'r1' });
+    expect(h.intents).toHaveLength(3);
+    await h.receive({ kind: 'rescan' });
+    await h.receive({ kind: 'confirmVacuum' });
+    await h.receive({ kind: 'cancelScan' });
+    expect(h.intents).toHaveLength(3);
+    // DOM 同源：busy 帧中表格只读控件未禁用、行内定位按钮未禁用。
+    const html = String((renderMessage(h.panel.posted) as { html?: string })?.html ?? '');
+    expect(html).toContain('data-intent="setSort"');
+    expect(html).not.toMatch(/data-intent="setSort"[^>]*disabled/);
+    expect(html).not.toMatch(/data-intent="setFilter"[^>]*disabled/);
+    expect(html).not.toMatch(/data-intent="revealFileInOS"[^>]*disabled/);
+    h.handle.dispose();
+  });
+
+  it('P4 表 writeLocked：拒绝 confirmVacuum、放行 rescan（记录存在时重新检测不被拦死）', async () => {
+    const h = makePanel({
+      title: 'P4',
+      gates: createP4Gates({ isUserScanning: () => false }),
+    });
+    h.patch({ writeLocked: true });
+    await h.receive({ kind: 'rescan' });
+    await h.receive({ kind: 'startScan' });
+    await h.receive({ kind: 'viewTaskLog' });
+    expect(h.intents).toHaveLength(3);
+    await h.receive({ kind: 'confirmVacuum' });
+    expect(h.intents).toHaveLength(3);
+    h.handle.dispose();
+  });
+
+  it('未携带放行表的面板不注入 DOM 可交互视图（占用即全禁，M2 现状）', async () => {
+    const h = makePanel();
+    h.patch({
+      busy: true,
+      form: { id: 'm', busy: true, fields: [{ id: 'message', label: '说明', value: '', type: 'textarea' }] },
+    });
+    const html = String((renderMessage(h.panel.posted) as { html?: string })?.html ?? '');
+    expect(html).toMatch(/data-field-id="message"[^>]*disabled/);
+    h.handle.dispose();
+  });
+});
+
+describe('复用与销毁', () => {  it('同 panelId 再次 createPanel 复用并 reveal，不新建', () => {
     const h1 = createPanel('t1', { title: 'T' }, { onIntent: () => {} }, context);
     const h2 = createPanel('t1', { title: 'T' }, { onIntent: () => {} }, context);
     expect(panelsCreated).toHaveLength(1);

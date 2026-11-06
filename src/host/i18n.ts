@@ -8,6 +8,8 @@ export const strings = {
     titleStatus: 'SVN Anywhere · 状态',
     titleUpdate: 'SVN Anywhere · 更新',
     titleCommit: 'SVN Anywhere · 提交',
+    titleCheckout: 'SVN Anywhere · 检出',
+    titleImport: 'SVN Anywhere · 导入',
     titleOperationLog: 'SVN Anywhere · 操作日志',
     exitCode: '退出码: {code}',
     /** 操作日志行：时间 | 命令（脱敏） | 退出码 | 耗时。 */
@@ -32,6 +34,7 @@ export const strings = {
     move: '移动',
     revealInFinder: '在 Finder 中显示',
     showRemoteInfo: '远端信息',
+    checkout: '检出',
   },
   target: {
     resolved: '[定位] {command}：目标 {target}，副本根 {wcRoot}',
@@ -157,6 +160,10 @@ export const strings = {
   },
   placeholder: {
     notice: '「{command}」将在后续版本提供。已定位到工作副本：{wcRoot}',
+  },
+  checkoutCommand: {
+    /** 命令面板无路径回退时的目录选择框按钮文案（只可选目录）。 */
+    pickParentDirTitle: '选择检出父目录',
   },
   remoteInfo: {
     pickPlaceholder: '选择信息项；选中含 URL 或路径的条目即复制原始值',
@@ -328,6 +335,13 @@ export const strings = {
     historyReplaceDetail: '历史说明会覆盖当前输入；返回可保留原内容。',
     historyEmpty: '暂无历史记录（仅记录成功提交的说明）',
     dismiss: '收起',
+    /** 表格列头排序（aria 与悬浮说明；点击后切换到该方向）。 */
+    sortAscLabel: '按{label}升序排序',
+    sortDescLabel: '按{label}降序排序',
+    /** 表格分页（宿主已切片，翻页意图由宿主重算后整帧重推）。 */
+    pagerPrev: '上一页',
+    pagerNext: '下一页',
+    pagerSummary: '第 {page} / {pageCount} 页 · 共 {total} 项',
     toastInvalidMessage: '面板消息被拒绝：{reason}',
     validation: {
       messageObject: '消息必须是对象',
@@ -339,6 +353,8 @@ export const strings = {
       numberField: '{label} 必须是有限数字',
       booleanField: '{label}.selected 必须是布尔值',
       viewMode: '视图模式必须是 tree 或 list，收到 {view}',
+      sortDirection: '排序方向必须是 asc 或 desc，收到 {direction}',
+      pageNumber: '{label} 必须是不小于 1 的整数页码',
     },
     toastStaleSession: '目标已切换，忽略上一个目标的迟到结果',
     toastBusyRejected: '正在执行操作，已忽略重复请求',
@@ -477,6 +493,158 @@ export const strings = {
     switchDiscardButton: '放弃并切换',
     commitMessage: '更新忽略规则',
     commitStartedNotice: '开始仅提交当前目录的 svn:ignore（经隔离的限深临时工作副本）。',
+  },
+  checkoutPanel: {
+    panelTitleCheckout: '检出',
+    panelTitleImport: '导入',
+    /** 页头当前目标：未绑定时显示打开入口（检出的父目录/导入的源目录），绑定运行中任务或结果页后按目标路径呈现。 */
+    targetParentDir: '检出父目录：{path}',
+    targetSourceDir: '导入源目录：{path}',
+    targetBound: '目标：{path}',
+    /** 三步向导步骤条（§7.1 PanelState.steps 承载）。 */
+    stepForm: '填写',
+    stepReview: '核对',
+    stepResult: '执行/结果',
+    /* ---------------- 表单字段 ---------------- */
+    urlLabel: '仓库 URL',
+    urlHelp: '支持 http、https、svn、svn+ssh 与 file；不填写用户名、密码、查询参数或片段',
+    urlHistoryLabel: '最近使用',
+    urlHistoryNone: '最近使用…',
+    parentDirLabel: '父目录',
+    pickParentDir: '选择…',
+    pickDirectDir: '选择…',
+    dirNameLabel: '子目录名',
+    dirNameHelp: '默认取 URL 末段；手动修改后保留自定义值',
+    directModeLabel: '直接检出到所选目录（不再新建子目录）',
+    directDirLabel: '目标目录',
+    revModeLabel: '版本',
+    revModeHead: 'HEAD（最新）',
+    revModeNumber: '指定版本',
+    revLabel: 'revision',
+    depthLabel: '检出深度',
+    depthLabels: {
+      empty: '仅目录自身（empty）',
+      files: '目录自身与直属文件（files）',
+      immediates: '目录自身、直属文件与直属子目录（immediates）',
+      infinity: '全部后代（infinity）',
+    },
+    sourceDirLabel: '本地源目录（未版本控制）',
+    messageLabel: '提交说明',
+    useUrlName: '恢复 URL 目录名',
+    useDirName: '使用本地目录名',
+    /* ---------------- 连接检查与表单页脚 ---------------- */
+    nextLabel: '下一步',
+    nextTesting: '正在检查连接…',
+    badgeConnTesting: '正在检查连接…',
+    badgeConnAuth: '等待认证输入…',
+    badgeConnSuccess: '连接成功 · 已解析 r{revision}',
+    badgeConnFailed: '连接失败',
+    connErrorTitle: '连接检查失败',
+    /* ---------------- 字段校验 ---------------- */
+    nameInvalid: '子目录名不能为 . 或 ..，不能包含路径分隔符、控制字符或首尾空白',
+    revInvalid: '版本号必须是零或正整数',
+    /* ---------------- 核对页 ---------------- */
+    reviewUrl: '仓库 URL',
+    reviewPath: '最终路径',
+    reviewRequested: '请求版本',
+    reviewPinned: '固定 revision',
+    reviewDepth: '检出深度',
+    reviewTargetState: '目标状态',
+    reviewSourceDir: '源目录',
+    reviewMessage: '提交说明',
+    reviewCheckedLabel: '我已核对导入范围',
+    startCheckoutLabel: '开始检出',
+    startImportLabel: '开始导入',
+    startImportReason: '先勾选确认导入范围',
+    backLabel: '返回',
+    reviewErrorTitle: '无法开始',
+    /* ---------------- 运行页 ---------------- */
+    progressCount: '已取得 {count} 项',
+    progressCurrent: '当前文件',
+    progressTotalUnknown: '总量未知',
+    cancelLabel: '取消检出',
+    cancelDisabledConnecting: '正在准备，进入运行后可取消',
+    cancelDisabledCanceling: '正在等待退出…',
+    /* ---------------- 结果页 ---------------- */
+    resultTitles: {
+      success: '检出完成',
+      canceled: '已取消，文件保留',
+      failed: '检出失败，文件保留',
+      interrupted: '宿主中断，检出未完成',
+      resumable: '核验匹配，可继续原检出',
+      resumeBlocked: '核验不匹配，不能继续原检出',
+      unknown: '导入结果未知',
+      merged: '内容可能已合并，请人工核对仓库',
+    },
+    resultRevision: 'revision',
+    resultPath: '本地路径',
+    resultDetail: '原因',
+    resultVerify: '核验结论',
+    resultUrl: '仓库 URL',
+    actVerifyResume: '核验后续检',
+    actReverify: '重新核验',
+    actResume: '继续原检出',
+    actAbandon: '改用新目录',
+    actRevealDir: '在 Finder 中查看',
+    actOpenCurrent: '在当前窗口打开',
+    actOpenNew: '在新窗口打开',
+    actAddWorkspace: '加入当前工作区',
+    actNewTask: '新建任务',
+    actLog: '查看日志',
+    actVerifyImport: '核实仓库结果',
+    actAckMerged: '已人工核对，完成',
+    actAbandonVerify: '放弃核实并解除限制',
+    actRetryImport: '返回填写并重试',
+    actHandoff: '另选新目录检出',
+    actRevealSource: '查看原目录',
+    resumeOccupiedReason: '目标正被其他任务占用，暂不能续检',
+    /** 结果页上的「核验/核实进行中」过程提示：不渲染关闭 ×（dismissable:false）。 */
+    verifyPendingTitle: '核验/核实进行中，完成后自动更新…',
+    /* ---------------- 面板控制器：确认框与提示 ---------------- */
+    /** 切换确认（同模式换目标 / 模式切换共用，按钮复用 M2「放弃并切换」）。 */
+    switchDiscardDetail: '当前表单输入或结果页尚未处理，切换将放弃对应草稿与结果缓存。',
+    cancelConfirmTitle: '取消检出？',
+    cancelConfirmButton: '取消检出',
+    cancelConfirmDetail: '已取得的文件将保留在目标目录，之后可核验续检或改用新目录。',
+    abandonConfirmTitle: '改用新目录并放弃本次残留？',
+    abandonConfirmDetail: '将解除本次检出记录的限制；目标目录中已写入的文件保留，由你自行处理。',
+    /** 开始检出被同 lockKey 在途/受限记录拒绝（begin busy 预命令出口）。 */
+    beginBusyNotice: '目标被其他任务占用；请换目标或等待完成',
+    /** begin 返回 idConflict（预生成操作编号与既有记录撞车，随机段冲突极罕见）。 */
+    beginIdConflictNotice: '任务编号冲突，请重试',
+    /** 导入侧预命令出口的通用提示（阶段 2 细分文案）。 */
+    preCommandAbortedNotice: '命令未发出，请调整参数后重试',
+    /** 目录选择器返回值不是绝对路径（防御分支）。 */
+    pickInvalidPath: '目录路径无效：{path}',
+    /** 续检/核验时记录已被收口或删除。 */
+    recordUnavailable: '检出记录已不可用，请重新核验',
+    /** 核验发起时找不到关联的未终态检出记录。 */
+    verifyRecordMissing: '未找到对应的未完成检出记录，无法核验',
+    /** 取消请求到达时任务已终态（确认竞态，不回改）。 */
+    cancelRaceFinished: '任务已结束，无需取消',
+    /** 取消请求到达时任务不在运行段（准备段不提供取消、取消中禁重复）。 */
+    cancelNotRunning: '当前阶段不能取消：准备段无取消入口，已请求取消的等待退出',
+    /** 加入工作区失败（updateWorkspaceFolders 返回 false）。 */
+    addWorkspaceFailed: '加入工作区失败',
+    /* ---------------- 续检占用按 kind 分列的提示文案表 ---------------- */
+    resumeBusyCommitRunning: '同一目标有提交正在进行，等待提交完成后再续检',
+    resumeBusyCommitFrozen: '同一目标有结果未知的提交记录，请到提交面板核实',
+    resumeBusyIgnoreRunning: '同一目标有忽略规则写入正在进行，等待完成后再续检',
+    resumeBusyIgnoreFrozen: '同一目标有未完成的忽略操作，请到忽略面板核实',
+    resumeBusyVacuumRunning: '同一目标有磁盘清理正在进行，等待清理完成后再续检',
+    resumeBusyVacuumFrozen: '同一目标有结果未知的清理记录，请先重新检测',
+    resumeBusyCheckoutRunning: '同一目标有检出/续检正在进行，等待完成后再续检',
+    resumeBusyImportRunning: '同一目标有导入正在进行，等待完成后再续检',
+    resumeBusyImportFrozen: '同一目标有结果未知的导入记录，请到导入面板核实',
+    resumeBusyDefault: '同一目标被其他操作占用，暂不能续检',
+    /* ---------------- 核对页目标状态（开始前目标重查的展示映射） ---------------- */
+    targetStateOk: '目录不存在或为空，可检出',
+    targetStateHasMetadata: '目标已包含 .svn，不能在其上检出',
+    targetStateNotEmpty: '目标目录不为空，请换一个空目录或新目录名',
+    targetStateNested: '目标位于工作副本内，不能创建嵌套副本，请另选副本外目录',
+    /* ---------------- 目录选择器 ---------------- */
+    pickParentDirTitle: '选择检出父目录',
+    pickDirectDirTitle: '选择检出目标目录',
   },
   activation: {
     svnVersionPrefix: 'svn 版本：',

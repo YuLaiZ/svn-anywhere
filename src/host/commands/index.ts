@@ -1,9 +1,10 @@
 /**
  * 命令注册总表。命令 ID 与 package.json 贡献点一一对应，
- * 顺序按子菜单分组（信息、提交、日常操作、更新、高级）排列。
+ * 顺序按子菜单分组（信息、提交、日常操作、更新、高级、获取）排列。
  */
 import type * as vscode from 'vscode';
 import { commandAdd } from './add';
+import { commandCheckout } from './checkout';
 import { commandCleanup } from './cleanup';
 import { commandCommit } from './commit';
 import { commandDelete } from './delete';
@@ -20,6 +21,8 @@ import { commandShowStatus } from './showStatus';
 import { commandUpdate } from './update';
 import { setCommitPanelContext } from '../panel/panels/commit';
 import { setIgnorePanelContext } from '../panel/panels/ignore';
+import { setCheckoutPanelContext } from '../panel/panels/checkout';
+import { setDraftStorage } from '../panel/drafts';
 import { initializeOperationStore } from '../../core/operations';
 import { cleanupOrphanSnapshots } from '../orphanSnapshots';
 import { logLine } from '../output';
@@ -41,6 +44,7 @@ const COMMANDS: ReadonlyArray<{ id: string; handler: CommandHandler; kind: Outpu
   { id: 'svnAnywhere.revert', handler: commandRevert, kind: 'other' },
   { id: 'svnAnywhere.move', handler: commandMove, kind: 'other' },
   { id: 'svnAnywhere.revealInFinder', handler: commandReveal, kind: 'other' },
+  { id: 'svnAnywhere.checkout', handler: commandCheckout, kind: 'checkout' },
 ];
 
 /**
@@ -65,6 +69,10 @@ export async function registerAllCommands(context: vscode.ExtensionContext): Pro
   // 面板创建需要 extensionUri / subscriptions / globalState；activate 注入一次。
   setCommitPanelContext(context);
   setIgnorePanelContext(context);
+  // P3 检出/导入面板（URL 历史 globalState 与面板创建上下文；命令入口在 M3 阶段 1 任务 9 接入）。
+  setCheckoutPanelContext(context);
+  // P3 草稿存储（检出/导入面板共用，执行器预命令出口与面板恢复同源）。
+  setDraftStorage(context.globalState);
   // 未完成操作记录跨会话恢复限制（写锁在面板打开时生效）。
   // 每次 activate 都重载：记录可能被另一窗口写入同一 globalState，
   // 重跑 loadPending 是幂等的（active 收窄幂等、对运行登记中的键跳过陈旧化）。

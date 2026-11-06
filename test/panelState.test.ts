@@ -8,9 +8,12 @@ import {
   countSelection,
   findRow,
   reduce,
+  sliceTableRows,
   visibleRows,
   type PanelState,
   type RowSpec,
+  type SortableTableRow,
+  type TableColumnSpec,
 } from '../src/host/panel/state';
 
 function row(id: string, patch: Partial<RowSpec> = {}): RowSpec {
@@ -282,5 +285,83 @@ describe('0a typed fixture 复用', () => {
       empty: { title: 'e' },
     };
     expect(countSelection(list)).toEqual({ total: 1, visible: 1, hidden: 0 });
+  });
+});
+
+describe('sliceTableRows：宿主侧排序/筛选/分页切片', () => {
+  const columns: TableColumnSpec[] = [
+    { key: 'path', label: '路径', sortable: true },
+    { key: 'size', label: '大小', sortable: true, sortType: 'number', align: 'right' },
+    { key: 'ext', label: '类型' },
+  ];
+
+  /** 大文件场景：size 列展示文本是格式化容量，排序值是业务字节值。 */
+  function items(): SortableTableRow[] {
+    return [
+      { row: { id: 'a', cells: { path: 'docs/Big.PNG', size: '100 B', ext: 'png' } }, sortValues: { size: 100 } },
+      { row: { id: 'b', cells: { path: 'src/core.ts', size: '9 GiB', ext: 'ts' } }, sortValues: { size: 96636764160 } },
+      { row: { id: 'c', cells: { path: 'bin/app.dmg', size: '512 KiB', ext: 'dmg' } }, sortValues: { size: 524288 } },
+      { row: { id: 'd', cells: { path: 'src/util.ts', size: '2 KiB', ext: 'ts' } }, sortValues: { size: 2048 } },
+    ];
+  }
+
+  it("sortType='number' 按业务数值排序：9 GiB 排在 100 B 前（不按展示字符串）", () => {
+    const slice = sliceTableRows(items(), columns, { key: 'size', direction: 'desc' }, undefined, 1, 50);
+    expect(slice.rows.map((row) => row.id)).toEqual(['b', 'c', 'd', 'a']);
+    const asc = sliceTableRows(items(), columns, { key: 'size', direction: 'asc' }, undefined, 1, 50);
+    expect(asc.rows.map((row) => row.id)).toEqual(['a', 'd', 'c', 'b']);
+  });
+
+  it('字符串列按单元格文本排序，同值保持原序（稳定）', () => {
+    const stable: SortableTableRow[] = [
+      { row: { id: 'x1', cells: { path: 'b.txt', size: '', ext: 'ts' } } },
+      { row: { id: 'x2', cells: { path: 'a.txt', size: '', ext: 'ts' } } },
+      { row: { id: 'x3', cells: { path: 'b.txt', size: '', ext: 'dmg' } } },
+    ];
+    const slice = sliceTableRows(stable, columns, { key: 'path', direction: 'asc' }, undefined, 1, 50);
+    expect(slice.rows.map((row) => row.id)).toEqual(['x2', 'x1', 'x3']);
+  });
+
+  it("text 筛选：作用列单元格值的大小写不敏感子串匹配（cellKey 绑定列）", () => {
+    const slice = sliceTableRows(
+      items(), columns, { key: 'size', direction: 'desc' },
+      [{ id: 'path', kind: 'text', cellKey: 'path', value: 'BIG' }], 1, 50,
+    );
+    expect(slice.rows.map((row) => row.id)).toEqual(['a']);
+  });
+
+  it("select 筛选：作用列精确匹配；'all' 哨兵不过滤；多筛选叠加", () => {
+    const extFilter = { id: 'ext', kind: 'select' as const, cellKey: 'ext', value: 'ts' };
+    expect(
+      sliceTableRows(items(), columns, { key: 'size', direction: 'desc' }, [extFilter], 1, 50).rows.map((r) => r.id),
+    ).toEqual(['b', 'd']);
+    expect(
+      sliceTableRows(items(), columns, { key: 'size', direction: 'desc' }, [{ ...extFilter, value: 'all' }], 1, 50).total,
+    ).toBe(4);
+    // 路径子串 + 类型精确叠加：src 目录下的 ts 文件。
+    expect(
+      sliceTableRows(items(), columns, { key: 'size', direction: 'asc' },
+        [{ id: 'path', kind: 'text', cellKey: 'path', value: 'src/' }, extFilter], 1, 50).rows.map((r) => r.id),
+    ).toEqual(['d', 'b']);
+  });
+
+  it('分页切片：页码从 1 起、total/pageCount 为筛选后计数、越界页收敛到最后一页', () => {
+    // path 升序：bin/app.dmg(c) < docs/Big.PNG(a) < src/core.ts(b) < src/util.ts(d)。
+    const slice = sliceTableRows(items(), columns, { key: 'path', direction: 'asc' }, undefined, 2, 2);
+    expect(slice).toMatchObject({ total: 4, pageCount: 2, page: 2 });
+    expect(slice.rows.map((row) => row.id)).toEqual(['b', 'd']);
+    const overflow = sliceTableRows(items(), columns, { key: 'path', direction: 'asc' }, undefined, 9, 2);
+    expect(overflow.page).toBe(2);
+    const empty = sliceTableRows([], columns, { key: 'path', direction: 'asc' }, undefined, 1, 50);
+    expect(empty).toMatchObject({ total: 0, pageCount: 1, page: 1, rows: [] });
+  });
+
+  it('数值列缺排序值时回退展示文本数值化（排序值不进消息的宿主兜底）', () => {
+    const fallback: SortableTableRow[] = [
+      { row: { id: 'f1', cells: { path: 'x', size: '10', ext: '' } } },
+      { row: { id: 'f2', cells: { path: 'y', size: '9', ext: '' } } },
+    ];
+    const slice = sliceTableRows(fallback, columns, { key: 'size', direction: 'desc' }, undefined, 1, 50);
+    expect(slice.rows.map((row) => row.id)).toEqual(['f1', 'f2']);
   });
 });

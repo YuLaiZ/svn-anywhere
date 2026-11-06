@@ -462,3 +462,136 @@ describe('瞬时提示与销毁', () => {
     app.dispose();
   });
 });
+
+describe('checkbox 表单字段：单通道输入同步', () => {
+  function checkSetup(patch: Partial<PanelState> = {}) {
+    return setup({
+      form: {
+        id: 'f',
+        busy: false,
+        fields: [{ id: 'directMode', label: '直接检出', value: 'false', type: 'checkbox' }],
+      },
+      ...patch,
+    });
+  }
+
+  function intentsOf(sent: unknown[]): Array<Record<string, unknown>> {
+    return sent
+      .filter((m) => (m as { type?: string }).type === 'intent')
+      .map((m) => (m as { intent: Record<string, unknown> }).intent);
+  }
+
+  it('勾选/取消各发送一次 syncInput，值由 checked 派生（change 单通道）', () => {
+    const { app, sent } = checkSetup();
+    const box = document.querySelector<HTMLInputElement>('[data-field-id="directMode"]')!;
+    expect(box.checked).toBe(false);
+    box.checked = true;
+    box.dispatchEvent(new Event('change', { bubbles: true }));
+    box.checked = false;
+    box.dispatchEvent(new Event('change', { bubbles: true }));
+    const intents = intentsOf(sent);
+    expect(intents).toHaveLength(2);
+    expect(intents[0]).toMatchObject({ kind: 'syncInput', fieldId: 'directMode', value: 'true' });
+    expect(intents[1]).toMatchObject({ kind: 'syncInput', fieldId: 'directMode', value: 'false' });
+    expect((intents[1].inputRevision as number)).toBeGreaterThan(intents[0].inputRevision as number);
+    app.dispose();
+  });
+
+  it('input 事件对 checkbox 目标不发送（勾选不走文本输入委托）', () => {
+    const { app, sent } = checkSetup();
+    const box = document.querySelector<HTMLInputElement>('[data-field-id="directMode"]')!;
+    box.checked = true;
+    box.dispatchEvent(new Event('input', { bubbles: true }));
+    // checkbox 的 value 属性是静态串，input 委托不发送（否则「取消勾选仍发送 true」）。
+    expect(intentsOf(sent)).toHaveLength(0);
+    app.dispose();
+  });
+
+  it('disabled 勾选不产生意图', () => {
+    const { app, sent } = checkSetup({
+      form: {
+        id: 'f',
+        busy: false,
+        fields: [{ id: 'directMode', label: '直接检出', value: 'false', type: 'checkbox', disabled: true }],
+      },
+    });
+    const box = document.querySelector<HTMLInputElement>('[data-field-id="directMode"]')!;
+    expect(box.disabled).toBe(true);
+    box.checked = true;
+    box.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(intentsOf(sent)).toHaveLength(0);
+    app.dispose();
+  });
+
+  it('待确认的勾选值不被旧 formRevision 帧回退（checked 恢复）', () => {
+    const { app, sent } = checkSetup();
+    const box = document.querySelector<HTMLInputElement>('[data-field-id="directMode"]')!;
+    box.checked = true;
+    box.dispatchEvent(new Event('change', { bubbles: true }));
+    const inputRevision = (intentsOf(sent)[0].inputRevision as number) ?? 0;
+    const older = stateOf();
+    older.form = { id: 'f', busy: false, fields: [{ id: 'directMode', label: '直接检出', value: 'false', type: 'checkbox' }] };
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's1', revision: 2,
+      formRevision: inputRevision - 1, html: render(older),
+    });
+    expect(document.querySelector<HTMLInputElement>('[data-field-id="directMode"]')!.checked).toBe(true);
+    app.dispose();
+  });
+});
+
+describe('表格交互：排序/翻页/行内定位/文本筛选转发', () => {
+  function tableSetup(patch: Partial<PanelState> = {}) {
+    return setup({
+      list: undefined,
+      form: undefined,
+      table: {
+        id: 'big',
+        columns: [
+          { key: 'path', label: '路径', sortable: true },
+          { key: 'size', label: '大小', sortable: true, sortType: 'number', align: 'right' },
+        ],
+        sort: { key: 'size', direction: 'desc' },
+        filters: [{ id: 'path', kind: 'text', cellKey: 'path', value: '' }],
+        pagination: { page: 2, pageSize: 1, total: 3, pageCount: 3 },
+        rows: [
+          { id: 'r1', cells: { path: 'a.bin', size: '9 GiB' }, actions: [{ id: 'revealFileInOS', label: '定位' }] },
+        ],
+        empty: { title: '空' },
+      },
+      ...patch,
+    });
+  }
+
+  it('点击列头排序按钮发送 setSort（key + 点击后方向）', () => {
+    const { app, sent } = tableSetup();
+    document.querySelector<HTMLButtonElement>('[data-intent="setSort"][data-sort-key="size"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'setSort', key: 'size', direction: 'asc' });
+    app.dispose();
+  });
+
+  it('点击翻页按钮发送 setPage（目标页码）', () => {
+    const { app, sent } = tableSetup();
+    document.querySelector<HTMLButtonElement>('[data-intent="setPage"][data-page="1"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'setPage', page: 1 });
+    document.querySelector<HTMLButtonElement>('[data-intent="setPage"][data-page="3"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'setPage', page: 3 });
+    app.dispose();
+  });
+
+  it('点击行内定位按钮发送 revealFileInOS（只带行 ID，不带路径）', () => {
+    const { app, sent } = tableSetup();
+    document.querySelector<HTMLButtonElement>('[data-intent="revealFileInOS"][data-row-id="r1"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'revealFileInOS', rowId: 'r1' });
+    app.dispose();
+  });
+
+  it('表格文本筛选输入走 setFilter（change 通道，不进表单输入同步）', () => {
+    const { app, sent } = tableSetup();
+    const input = document.querySelector<HTMLInputElement>('[data-intent="setFilter"][data-filter-id="path"]')!;
+    input.value = 'SRC';
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'setFilter', filterId: 'path', value: 'SRC' });
+    app.dispose();
+  });
+});

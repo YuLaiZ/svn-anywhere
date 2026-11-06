@@ -3,6 +3,7 @@
  * 用户可能填入非法类型，读取处做防御，不让激活路径抛未处理异常。
  */
 import * as vscode from 'vscode';
+import type { CheckoutDepth } from '../core/checkout';
 import { DEFAULT_ENCODING_FALLBACK, DEFAULT_OUTPUT_ENCODING } from '../core/encoding';
 import { DEFAULT_TIMEOUT_MS } from '../core/svnCli';
 
@@ -42,6 +43,20 @@ export function readRemoteCheckBeforeCommit(): boolean {
 export function readAllowEmptyCommitMessage(): boolean {
   const raw: unknown = getConfiguration().get('allowEmptyCommitMessage', true);
   return typeof raw === 'boolean' ? raw : true;
+}
+
+/** 检出面板默认深度四档的合法取值（与 core/checkout 的 CheckoutDepth 同构）。 */
+const CHECKOUT_DEPTHS: readonly CheckoutDepth[] = ['empty', 'files', 'immediates', 'infinity'];
+
+/**
+ * 检出面板新表单的默认深度（F136）：只影响新任务草稿的初始值，
+ * 已保存的草稿按草稿值恢复、不被配置覆盖。类型非法时按全部后代处理。
+ */
+export function readCheckoutDefaultDepth(): CheckoutDepth {
+  const raw: unknown = getConfiguration().get('checkoutDefaultDepth', 'infinity');
+  return typeof raw === 'string' && CHECKOUT_DEPTHS.includes(raw as CheckoutDepth)
+    ? (raw as CheckoutDepth)
+    : 'infinity';
 }
 
 /** svn 输出解码设置：主编码与回退链（编码 label 不区分大小写）。 */

@@ -13,7 +13,12 @@ import { format, strings } from '../i18n';
 
 export const PROTOCOL_VERSION = 1;
 
-/** 视图可发起的意图（已知动作的联合类型）。阶段 1 起覆盖 P1 提交面板，阶段 2 起覆盖 P2 忽略规则编辑器。 */
+/**
+ * 视图可发起的意图（已知动作的联合类型）。阶段 1 起覆盖 P1 提交面板，
+ * 阶段 2 起覆盖 P2 忽略规则编辑器；后续阶段扩展 P3 检出/导入与 P4 磁盘
+ * 治理的动作全集——类型与白名单先行登记（处理器由各面板落地时实现），
+ * 意图里仍只允许条目 ID / 序号等稳定标识，路径一律由宿主映射。
+ */
 export type Intent =
   | { kind: 'refresh' }
   | { kind: 'openDiff'; itemId: string }
@@ -42,7 +47,49 @@ export type Intent =
   | { kind: 'removeRule'; index: number }
   | { kind: 'fillOriginName' }
   | { kind: 'saveIgnore' }
-  | { kind: 'submitIgnore' };
+  | { kind: 'submitIgnore' }
+  /* ---------------- P3 检出/导入：表单 ---------------- */
+  | { kind: 'pickParentDir' }
+  | { kind: 'pickDirectDir' }
+  | { kind: 'pickSourceDir' }
+  | { kind: 'useUrlName' }
+  | { kind: 'useDirName' }
+  | { kind: 'selectHistoryUrl'; index: number }
+  | { kind: 'clearUrlHistory' }
+  | { kind: 'checkoutNext' }
+  | { kind: 'importNext' }
+  | { kind: 'checkoutBack' }
+  /* ---------------- P3 检出/导入：执行与结果 ---------------- */
+  | { kind: 'startCheckout' }
+  | { kind: 'startImport' }
+  | { kind: 'cancelTask' }
+  | { kind: 'viewTaskLog' }
+  | { kind: 'verifyCheckout' }
+  | { kind: 'resumeCheckout' }
+  | { kind: 'abandonResidue' }
+  | { kind: 'refreshImportPreview' }
+  | { kind: 'verifyImport' }
+  | { kind: 'retryImport' }
+  | { kind: 'switchP3Mode' }
+  | { kind: 'acknowledgeMerged' }
+  | { kind: 'abandonUnknownImport' }
+  | { kind: 'openCurrentWindow' }
+  | { kind: 'openNewWindow' }
+  | { kind: 'addToWorkspace' }
+  | { kind: 'revealResultDir' }
+  | { kind: 'revealSourceDir' }
+  | { kind: 'handoffToCheckout' }
+  | { kind: 'newTask' }
+  /* ---------------- P4 磁盘治理 ---------------- */
+  | { kind: 'startScan' }
+  | { kind: 'cancelScan' }
+  | { kind: 'rescan' }
+  | { kind: 'confirmVacuum' }
+  | { kind: 'revealFileInOS'; rowId: string }
+  | { kind: 'showScopeHelp' }
+  /* ---------------- 表格配套（通用） ---------------- */
+  | { kind: 'setSort'; key: string; direction: 'asc' | 'desc' }
+  | { kind: 'setPage'; page: number };
 
 /** 宿主 → 视图：整段渲染（宿主已本地化并转义的 HTML）。 */
 export interface RenderMessage {
@@ -92,10 +139,22 @@ const INTENT_KINDS = new Set([
   'selectChangelist', 'applyPrefix', 'managePrefixes', 'applyHistory', 'showHistory',
   'rowMore', 'submit', 'closePanel', 'resolveUnknown',
   'addRule', 'removeRule', 'fillOriginName', 'saveIgnore', 'submitIgnore',
+  'pickParentDir', 'pickDirectDir', 'pickSourceDir', 'useUrlName', 'useDirName',
+  'selectHistoryUrl', 'clearUrlHistory', 'checkoutNext', 'importNext', 'checkoutBack',
+  'startCheckout', 'startImport', 'cancelTask', 'viewTaskLog',
+  'verifyCheckout', 'resumeCheckout', 'abandonResidue', 'refreshImportPreview',
+  'verifyImport', 'retryImport', 'switchP3Mode', 'acknowledgeMerged', 'abandonUnknownImport',
+  'openCurrentWindow', 'openNewWindow', 'addToWorkspace', 'revealResultDir', 'revealSourceDir',
+  'handoffToCheckout', 'newTask',
+  'startScan', 'cancelScan', 'rescan', 'confirmVacuum', 'revealFileInOS', 'showScopeHelp',
+  'setSort', 'setPage',
 ]);
 
 /** 提交面板视图切换的合法取值。 */
 const VIEW_MODES = new Set(['tree', 'list']);
+
+/** 表格排序方向的合法取值。 */
+const SORT_DIRECTIONS = new Set(['asc', 'desc']);
 
 export interface ParsedViewMessage {
   ok: true;
@@ -153,7 +212,45 @@ function parseIntent(raw: unknown): { ok: true; intent: Intent } | { ok: false; 
     case 'fillOriginName':
     case 'saveIgnore':
     case 'submitIgnore':
-      return { ok: true, intent: { kind } };
+    case 'pickParentDir':
+    case 'pickDirectDir':
+    case 'pickSourceDir':
+    case 'useUrlName':
+    case 'useDirName':
+    case 'clearUrlHistory':
+    case 'checkoutNext':
+    case 'importNext':
+    case 'checkoutBack':
+    case 'startCheckout':
+    case 'startImport':
+    case 'cancelTask':
+    case 'viewTaskLog':
+    case 'verifyCheckout':
+    case 'resumeCheckout':
+    case 'abandonResidue':
+    case 'refreshImportPreview':
+    case 'verifyImport':
+    case 'retryImport':
+    case 'switchP3Mode':
+    case 'acknowledgeMerged':
+    case 'abandonUnknownImport':
+    case 'openCurrentWindow':
+    case 'openNewWindow':
+    case 'addToWorkspace':
+    case 'revealResultDir':
+    case 'revealSourceDir':
+    case 'handoffToCheckout':
+    case 'newTask':
+    case 'startScan':
+    case 'cancelScan':
+    case 'rescan':
+    case 'confirmVacuum':
+    case 'showScopeHelp': {
+      // 无参意图：case 标签联合到判别联合的直接构造在类型层不可表达
+      // （宽 kind 无法匹配单一成员），此处集中一次断言；带载荷意图各有
+      // 独立校验分支，白名单与单测双重覆盖此列表。
+      return { ok: true, intent: { kind } as Intent };
+    }
     case 'openDiff':
     case 'openFile':
     case 'rowMore': {
@@ -161,6 +258,12 @@ function parseIntent(raw: unknown): { ok: true; intent: Intent } | { ok: false; 
       return itemId.ok
         ? { ok: true, intent: { kind: kind as 'openDiff' | 'openFile' | 'rowMore', itemId: itemId.value } }
         : { ok: false, reason: itemId.message };
+    }
+    case 'revealFileInOS': {
+      const rowId = readString(raw, 'rowId', label);
+      return rowId.ok
+        ? { ok: true, intent: { kind, rowId: rowId.value } }
+        : { ok: false, reason: rowId.message };
     }
     case 'dismissBanner': {
       const bannerId = readString(raw, 'bannerId', label);
@@ -227,7 +330,8 @@ function parseIntent(raw: unknown): { ok: true; intent: Intent } | { ok: false; 
     }
     case 'applyPrefix':
     case 'applyHistory':
-    case 'removeRule': {
+    case 'removeRule':
+    case 'selectHistoryUrl': {
       const index = readFiniteNumber(raw, 'index', label);
       if (!index.ok) {
         return { ok: false, reason: index.message };
@@ -236,6 +340,27 @@ function parseIntent(raw: unknown): { ok: true; intent: Intent } | { ok: false; 
         return { ok: false, reason: format(strings.panel.validation.numberField, { label: `${label}.index` }) };
       }
       return { ok: true, intent: { kind, index: index.value } };
+    }
+    case 'setSort': {
+      const key = readString(raw, 'key', label);
+      if (!key.ok) {
+        return { ok: false, reason: key.message };
+      }
+      const direction = raw.direction;
+      if (typeof direction !== 'string' || !SORT_DIRECTIONS.has(direction)) {
+        return { ok: false, reason: format(strings.panel.validation.sortDirection, { direction: String(direction) }) };
+      }
+      return { ok: true, intent: { kind, key: key.value, direction: direction as 'asc' | 'desc' } };
+    }
+    case 'setPage': {
+      const page = readFiniteNumber(raw, 'page', label);
+      if (!page.ok) {
+        return { ok: false, reason: page.message };
+      }
+      if (!Number.isInteger(page.value) || page.value < 1) {
+        return { ok: false, reason: format(strings.panel.validation.pageNumber, { label: `${label}.page` }) };
+      }
+      return { ok: true, intent: { kind, page: page.value } };
     }
     case 'syncInput': {
       const fieldId = readString(raw, 'fieldId', label);
