@@ -425,6 +425,12 @@ function filterLabel(filterId: string): string {
   if (filterId === 'changelist') {
     return strings.panel.filterChangelist;
   }
+  if (filterId === 'previewPath') {
+    return strings.panel.filterPreviewPath;
+  }
+  if (filterId === 'previewState') {
+    return strings.panel.filterPreviewState;
+  }
   return filterId;
 }
 

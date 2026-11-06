@@ -784,15 +784,14 @@ describe('newTask、switchMode 与错误承载', () => {
     );
   });
 
-  it('导入核对勾选通道一次到位：checked 切换驱动开始按钮禁用（清单 §三 未勾选不能开始）', () => {
-    let s = switchMode(state());
-    s = syncInput(s, 'checked', 'true');
-    expect(s.review.checked).toBe(true);
-    const footer = buildCheckoutPanelState({ ...s, step: 'review', conn: { ...s.conn, phase: 'success' } }).footer;
-    expect(footer?.primary?.id).toBe('startImport');
-    expect(footer?.primary?.disabled).toBe(false);
-    const unchecked = buildCheckoutPanelState({ ...syncInput(s, 'checked', 'false'), step: 'review', conn: { ...s.conn, phase: 'success' } }).footer;
+  it('导入核对勾选：未勾选开始禁用；未进核对页/预览未回填时勾选被拒（清单 §三 未勾选不能开始）', () => {
+    const s = switchMode(state());
+    // form 步与预览未回填时勾选守卫拒绝（阶段 2 起与 setChecked 同源）。
+    expect(syncInput(s, 'checked', 'true').review.checked).toBe(false);
+    const unchecked = buildCheckoutPanelState({ ...s, step: 'review', conn: { ...s.conn, phase: 'success' } }).footer;
+    expect(unchecked?.primary?.id).toBe('startImport');
     expect(unchecked?.primary?.disabled).toBe(true);
+    // 勾选成功驱动开始解禁的完整路径见 importModel.test.ts（需 review 步 + 预览回填）。
   });
 
   it('导入结果页动作集一并建好：unknown=核实（快照不完整分支另挂放弃核实）/merged/failed/success', () => {

@@ -35,6 +35,7 @@ export const strings = {
     revealInFinder: '在 Finder 中显示',
     showRemoteInfo: '远端信息',
     checkout: '检出',
+    importLocal: '导入本地目录',
   },
   target: {
     resolved: '[定位] {command}：目标 {target}，副本根 {wcRoot}',
@@ -165,6 +166,12 @@ export const strings = {
     /** 命令面板无路径回退时的目录选择框按钮文案（只可选目录）。 */
     pickParentDirTitle: '选择检出父目录',
   },
+  importCommand: {
+    /** 命令面板/文件入口回退时的目录选择框按钮文案（只可选目录）。 */
+    pickSourceDirTitle: '选择导入源目录',
+    /** 右键文件 URI 的提示：文件不能作导入源，改选目录。 */
+    sourceMustBeDir: '导入源必须是目录，请在弹出的选择框中选择目录',
+  },
   remoteInfo: {
     pickPlaceholder: '选择信息项；选中含 URL 或路径的条目即复制原始值',
     labelLocalPath: '本地路径',
@@ -196,6 +203,9 @@ export const strings = {
     filterExt: '后缀',
     filterChangelist: 'changelist',
     filterAll: '全部',
+    /** 导入预览表筛选器（TableSpec.filters 的 filterId → 标签）。 */
+    filterPreviewPath: '路径',
+    filterPreviewState: '状态',
     filterStatusAll: '全部状态',
     filterExtAll: '全部后缀',
     filterChangelistAll: '全部 changelist',
@@ -530,6 +540,7 @@ export const strings = {
     },
     sourceDirLabel: '本地源目录（未版本控制）',
     messageLabel: '提交说明',
+    pickSourceDir: '选择…',
     useUrlName: '恢复 URL 目录名',
     useDirName: '使用本地目录名',
     /* ---------------- 连接检查与表单页脚 ---------------- */
@@ -543,6 +554,33 @@ export const strings = {
     /* ---------------- 字段校验 ---------------- */
     nameInvalid: '子目录名不能为 . 或 ..，不能包含路径分隔符、控制字符或首尾空白',
     revInvalid: '版本号必须是零或正整数',
+    /* ---------------- 导入：源预检与连接检查（§5） ---------------- */
+    /** 源目录已被纳管/是工作副本根（svn info 成功）——拒绝并提示改用提交功能。 */
+    sourceVersionedNotice: '源目录已受版本控制（或是工作副本根），请改用提交功能提交变更',
+    /** svn info 其他失败（超时/wc.db 被锁等）——「未纳管」未被证明，不得当未版本控制放行。 */
+    sourceSvnStatusFailedNotice: 'SVN 状态读取失败，无法确认源目录版本控制状态：{message}',
+    /** 连接检查：父 entry kind≠dir（svn info 成功但父是文件节点，ls 会与「不存在」同码）。 */
+    importParentNotDirNotice: '父路径不是目录，请检查目标 URL（应指向要创建的新目录）',
+    /** 连接检查/重检：目标 ls exit 0——远端已存在同名节点。 */
+    importTargetExistsNotice: '远端目标已存在，请修改 URL 后重新测试',
+    /** 源快照比对失败（sourceChanged）：旧确认失效，必须重新预览。 */
+    importScopeChangedNotice: '源目录内容已变化，旧确认已失效；请重新预览并再次确认',
+    /* ---------------- 导入：范围预览（§5） ---------------- */
+    /** global-ignores 配置解析失败——范围不被声称完整，阻止勾选确认与开始。 */
+    importPreviewIgnoreFailedNotice: '忽略规则读取失败，无法确认忽略范围',
+    /** 仅空目录/无可导入文件——本轮不提供只创建空目录。 */
+    importEmptyNotice: '没有可导入的文件（本轮不提供只创建空目录）',
+    /** 存在 unreadable/nested/unsupported 条目时的核对页错误横幅标题。 */
+    importBlockersTitle: '无法确认完整导入范围',
+    importBlockerUnreadable: '存在不可读取的条目',
+    importBlockerNested: '源目录内存在嵌套工作副本（.svn）',
+    importBlockerUnsupported: '存在不支持导入的条目（特殊节点或名称含控制字符）',
+    /** 勾选控件的禁用原因（与 setChecked 守卫同源）。 */
+    checkedDisabledPreviewPending: '正在生成范围预览…',
+    checkedDisabledPreviewFailed: '忽略规则读取失败，修复配置后重新预览',
+    checkedDisabledBlockers: '范围包含不可导入条目，处理后重新预览',
+    checkedDisabledEmpty: '没有可导入的文件',
+    checkedDisabledScopeChanged: '导入范围已变化，请重新预览',
     /* ---------------- 核对页 ---------------- */
     reviewUrl: '仓库 URL',
     reviewPath: '最终路径',
@@ -553,6 +591,36 @@ export const strings = {
     reviewSourceDir: '源目录',
     reviewMessage: '提交说明',
     reviewCheckedLabel: '我已核对导入范围',
+    /** 导入核对页计数行（fileCount/totalBytes 不含忽略项；四类特殊项分列计数）。 */
+    reviewFileCountLabel: '将导入',
+    reviewFileCountUnit: '{count} 项',
+    reviewTotalBytesLabel: '共计',
+    reviewIgnoredCountLabel: '忽略项',
+    reviewSymlinkCountLabel: '符号链接',
+    reviewUnreadableCountLabel: '不可读条目',
+    reviewNestedCountLabel: '嵌套工作副本',
+    reviewUnsupportedCountLabel: '不支持节点',
+    reviewSourceUnversioned: '原目录仍未版本控制（导入不改变本地目录状态）',
+    /** 导入核对页文件表列与状态标注（TableSpec 数据投影）。 */
+    previewColumnPath: '路径',
+    previewColumnKind: '类型',
+    previewColumnSize: '大小',
+    previewColumnState: '状态',
+    previewKindFile: '文件',
+    previewKindDir: '目录',
+    previewKindSymlink: '符号链接',
+    previewKindSpecial: '特殊节点',
+    previewStateWillImport: '将导入',
+    previewStateIgnored: '将忽略',
+    previewStateUnreadable: '不可读',
+    previewStateNested: '嵌套副本',
+    previewStateUnsupported: '不支持',
+    previewEmptyTitle: '源目录为空',
+    previewEmptyDetail: '没有可导入的条目',
+    /** 空说明二次确认进行中（allowEmptyCommitMessage 开启时点开始触发，宿主弹确认框）。 */
+    emptyMessageConfirmTitle: '提交说明为空，等待二次确认…',
+    /** scopeChanged='source' 时核对页的重新预览入口。 */
+    actRefreshPreview: '重新预览',
     startCheckoutLabel: '开始检出',
     startImportLabel: '开始导入',
     startImportReason: '先勾选确认导入范围',
@@ -566,6 +634,7 @@ export const strings = {
     cancelDisabledConnecting: '正在准备，进入运行后可取消',
     cancelDisabledCanceling: '正在等待退出…',
     /* ---------------- 结果页 ---------------- */
+    /** 检出结果页标题（清单 §二；canceled/failed 的「文件保留」是检出残留语义）。 */
     resultTitles: {
       success: '检出完成',
       canceled: '已取消，文件保留',
@@ -573,6 +642,11 @@ export const strings = {
       interrupted: '宿主中断，检出未完成',
       resumable: '核验匹配，可继续原检出',
       resumeBlocked: '核验不匹配，不能继续原检出',
+    },
+    /** 导入结果页标题（清单 §三：failed=已确认未提交及原因，不带检出「文件保留」语义）。 */
+    importResultTitles: {
+      success: '导入完成',
+      failed: '导入失败，已确认未提交',
       unknown: '导入结果未知',
       merged: '内容可能已合并，请人工核对仓库',
     },
@@ -600,6 +674,8 @@ export const strings = {
     resumeOccupiedReason: '目标正被其他任务占用，暂不能续检',
     /** 结果页上的「核验/核实进行中」过程提示：不渲染关闭 ×（dismissable:false）。 */
     verifyPendingTitle: '核验/核实进行中，完成后自动更新…',
+    /** merged 页核实第 0 步失败（快照不完整）的页面横幅：不转 unknown、不写 snapshotIncomplete。 */
+    importVerifySnapshotFailedTitle: '导入快照不完整，无法核实',
     /* ---------------- 面板控制器：确认框与提示 ---------------- */
     /** 切换确认（同模式换目标 / 模式切换共用，按钮复用 M2「放弃并切换」）。 */
     switchDiscardDetail: '当前表单输入或结果页尚未处理，切换将放弃对应草稿与结果缓存。',
@@ -614,6 +690,26 @@ export const strings = {
     beginIdConflictNotice: '任务编号冲突，请重试',
     /** 导入侧预命令出口的通用提示（阶段 2 细分文案）。 */
     preCommandAbortedNotice: '命令未发出，请调整参数后重试',
+    /* ---------------- 导入：开始确认与收口确认（§5） ---------------- */
+    /** 仓库提交确认框（范围 + 目标 URL + 说明；Esc 返回不发起）。 */
+    importCommitConfirmTitle: '确认导入到仓库？',
+    importCommitConfirmDetail: '目标：{url}（共 {count} 项）\n说明：{message}',
+    importCommitConfirmButton: '确认导入',
+    /** 空说明二次确认（allowEmptyCommitMessage 开启时空说明发起，M1 同款语义）。 */
+    importEmptyMessageTitle: '提交说明为空，继续导入？',
+    importEmptyMessageButton: '继续导入',
+    /** merged 页「已人工核对，完成」确认框（防误触收口）。 */
+    ackMergedConfirmTitle: '确认已人工核对合并结果？',
+    ackMergedConfirmDetail: '确认后写限制解除、记录收口完成，合并提示不再出现。',
+    ackMergedConfirmButton: '确认完成',
+    /** 快照不完整 unknown 页「放弃核实并解除限制」确认框（出口⑪）。 */
+    abandonVerifyConfirmTitle: '放弃核实并解除限制？',
+    abandonVerifyConfirmDetail: '结果是未知的：放弃不等于判定未提交；源目录可重新发起导入（完整重走检查）。',
+    abandonVerifyConfirmButton: '放弃并解除',
+    /** 核实结论 notCommitted 的失败页原因行。 */
+    importVerifyNotCommittedDetail: '核实确认未提交：目标不存在，且父目录自最后一次远端确认以来无变化（锚点 r{revision}）',
+    /** 核实成功页（unknown 核实转 committed）的说明行。 */
+    importVerifyCommittedDetail: '核实确认已提交（revision r{revision}）',
     /** 目录选择器返回值不是绝对路径（防御分支）。 */
     pickInvalidPath: '目录路径无效：{path}',
     /** 续检/核验时记录已被收口或删除。 */
@@ -645,6 +741,7 @@ export const strings = {
     /* ---------------- 目录选择器 ---------------- */
     pickParentDirTitle: '选择检出父目录',
     pickDirectDirTitle: '选择检出目标目录',
+    pickSourceDirTitle: '选择导入源目录',
   },
   activation: {
     svnVersionPrefix: 'svn 版本：',
@@ -669,6 +766,17 @@ export const strings = {
   auth: {
     usernamePrompt: 'SVN 认证失败，请输入用户名',
     passwordPrompt: '请输入密码（仅本次内存使用，不会保存）',
+  },
+  importTask: {
+    snapshotDirMissing: '快照存储目录未配置，无法保存导入快照',
+    mergedDetail: '远端目标已存在，导入内容可能与既有内容合并，请人工核对仓库',
+    evidenceUnavailable: '无法读取仓库证据，请核实',
+    noRevisionTail: '命令正常结束但未识别到提交结果，请核实',
+    canceledUnknown: '导入已取消，提交结果未知，请核实',
+    lsTargetExists: '远端目标已存在，未重新导入；请返回修改 URL 重新测试核对',
+    lsAuthFailed: '补录的凭据无法访问仓库，请更换凭据后重新发起导入',
+    lsOtherFailed: '无法确认远端目标状态，请检查网络后重试',
+    recordUnavailable: '导入记录已不可用，无法核实',
   },
 } as const;
 

@@ -26,47 +26,82 @@ import { realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, sep } from 'node:path';
 import {
   checkRemote,
+  editableURL,
   escapeUrlPeg,
   schemeAcceptsCredentials,
   type CheckoutDepth,
   type RemoteIdentity,
 } from '../../../core/checkout';
+import { SvnError, extractSvnErrorCodes, isAuthFailure } from '../../../core/errors';
+import {
+  enumerateImportSource,
+  enumerationToSnapshot,
+  parseParentInfoXml,
+  precheckImportSource,
+  recheckImportTarget,
+  snapshotDigest,
+  type ImportEnumeration,
+} from '../../../core/importDir';
+import { readSvnConfigGlobalIgnores } from '../../../core/svnConfig';
 import {
   getOperationRegistry,
   kindOf,
   lockKeyOf,
+  randomOperationId,
   type OperationRecord,
 } from '../../../core/operations';
-import { readCheckoutDefaultDepth, readSvnPath, readTimeoutMs } from '../../config';
+import { runOrThrow, type AuthCredentials, type RunOptions } from '../../../core/svnCli';
+import { readAllowEmptyCommitMessage, readCheckoutDefaultDepth, readSvnPath, readTimeoutMs } from '../../config';
 import { format, strings } from '../../i18n';
 import { decodingRunOptions, logCommand, logLine, showOutput } from '../../output';
 import { promptForCredentials } from '../../auth';
 import { createPanel, type PanelHandle } from '../host';
 import type { Intent } from '../protocol';
 import type { PanelState } from '../state';
+import type { TableFilterSpec, TableSpec } from '../state';
 import {
+  IMPORT_PREVIEW_SORT_DEFAULT,
+  abandonUnknownImportReducer,
+  acknowledgeMergedReducer,
   addHistoryUrl,
   backToForm,
+  beginImportTask,
+  beginImportVerify,
   beginTask,
   buildCheckoutPanelState,
   buildInterruptedPage,
+  checkImportScope,
   connAuth,
   connAuthCancel,
   connAuthResume,
   connNext,
   connSettled,
   consumeIdentity,
+  consumeParentIdentity,
+  createImportPreviewFilters,
   createCheckoutPanelState,
   enterReview,
   fromDraft,
+  handoffReducer,
+  importConnSettled,
+  importConfirmBlockReason,
+  importNextReducer,
   markRecovered,
   newTask,
   pickDirectDir,
   pickParentDir,
+  pickSourceDirReducer,
+  retryImportReducer,
   selectHistoryUrl,
+  setConfirmState,
+  setEmptyMessageConfirm,
+  setPreview,
+  setPreviewError,
+  setRecheckOutcome,
   setReviewInfo,
   setReviewError,
   setResult,
+  setSourcePrecheck,
   setVerifyOutcome,
   switchMode,
   syncInput,
@@ -80,6 +115,7 @@ import {
   type CheckoutPanelEntry,
   type CheckoutPanelState,
   type CheckoutTaskPhase,
+  type ImportConnOutcome,
   type P3Mode,
   type P3ResultPage,
 } from '../checkoutModel';
@@ -93,6 +129,15 @@ import {
   type CheckoutTaskOutcome,
   type TargetRecheckFailure,
 } from '../checkoutTask';
+import {
+  abandonUnknownImportTask,
+  acknowledgeImportTask,
+  startImportTask,
+  verifyImportTask,
+  type ImportTaskCallbacks,
+  type ImportTaskOutcome,
+  type ImportVerifyTaskResult,
+} from '../importTask';
 import {
   clearDraft,
   createEmptyFormDraft,
@@ -116,11 +161,14 @@ import {
   type SessionResultUpdatedSubscription,
 } from '../../sessionResults';
 import {
+  addTask,
   getActiveTask,
   getTaskById,
   hasActiveTask,
   onTaskRemoved,
+  removeTask,
   type CheckoutResultScope,
+  type TaskObject,
   type TaskRemovedSubscription,
 } from '../../taskRegistry';
 
@@ -154,6 +202,13 @@ let panelContext: PanelContext | undefined;
 let handle: PanelHandle | undefined;
 let session: CheckoutPanelState | undefined;
 let formRevision = 0;
+/** 导入核对页文件表的当前页码（表格视图状态由宿主唯一持有，模型按页码切片）。 */
+let importPreviewPage = 1;
+/** 导入核对页文件表的当前排序/筛选（同上由宿主唯一持有，渲染时回喂模型切片）。 */
+let importPreviewSort: TableSpec['sort'] = IMPORT_PREVIEW_SORT_DEFAULT;
+let importPreviewFilters: TableFilterSpec[] = createImportPreviewFilters();
+/** merged 页核实第 0 步失败（快照不完整）的横幅标记——不转 unknown、不写 snapshotIncomplete（§5 第 0 步）。 */
+let importVerifySnapshotFailed = false;
 /** 任务移除通知订阅（绑定即订阅；面板 dispose 时取消，订阅存活即代表会话存活）。 */
 let taskRemovalSub: TaskRemovedSubscription | undefined;
 /** 只读结论写入后的重跑订阅（重开会话停在带提示的旧结果页时由推送自动转结论页）。 */
@@ -205,11 +260,13 @@ function sessionScopeBaseline(): CheckoutResultScope {
 
 /**
  * 结果页关联的互斥键（writeLocked 判定与续检/放弃动作对象）：运行中任务取
- * 任务 lockKey；checkout 结果页按目标路径（checkout 记录的 lockKey=目标路径）。
+ * 任务 lockKey；checkout 结果页按目标路径（checkout 记录的 lockKey=目标
+ * 路径）；import 结果页按源目录 realpath（import 记录的 lockKey=源目录，
+ * 结果页 path 与之同值）。
  */
 function activeLockKeyOf(state: CheckoutPanelState): string | undefined {
   const result = state.result;
-  if (result?.mode === 'checkout') {
+  if (result?.mode === 'checkout' || result?.mode === 'import') {
     return result.path;
   }
   return undefined;
@@ -278,8 +335,14 @@ const gates = createP3Gates({
       ? canResumeCheckoutTarget(result.path)
       : false;
   },
-  isMergedOutcome: () => false, // 导入侧阶段 2 接入（检出侧恒 false）
-  isSnapshotIncomplete: () => false, // 导入侧阶段 2 接入（检出侧恒 false）
+  isMergedOutcome: () => {
+    const result = session?.result;
+    return result?.mode === 'import' && result.kind === 'merged' && result.settled !== true;
+  },
+  isSnapshotIncomplete: () => {
+    const result = session?.result;
+    return result?.mode === 'import' && result.kind === 'unknown' && result.snapshotIncomplete === true;
+  },
   isResidueResultPage: () => {
     const result = session?.result;
     return result?.mode === 'checkout' && RESIDUE_RESULT_KINDS.includes(result.kind);
@@ -287,6 +350,17 @@ const gates = createP3Gates({
 });
 
 /* ------------------------------ 渲染推送 ------------------------------ */
+
+/**
+ * 重置导入预览表的视图状态（页码/排序/筛选）：换源目录、装载新快照与
+ * 离页回表单动作时调用——新数据集上旧筛选语义不保留（P4「tableView 不
+ * 随缓存恢复」同口径）。
+ */
+function resetImportPreviewView(): void {
+  importPreviewPage = 1;
+  importPreviewSort = IMPORT_PREVIEW_SORT_DEFAULT;
+  importPreviewFilters = createImportPreviewFilters();
+}
 
 function pushRender(): void {
   if (!session || !handle) {
@@ -301,7 +375,14 @@ function pushRender(): void {
     session.result?.mode === 'checkout' && session.result.kind === 'resumable'
       ? canResumeCheckoutTarget(session.result.path)
       : undefined;
-  const state: PanelState = buildCheckoutPanelState(session, { verifyPending, resumeAvailable });
+  const state: PanelState = buildCheckoutPanelState(session, {
+    verifyPending,
+    resumeAvailable,
+    importPreviewPage,
+    importPreviewSort,
+    importPreviewFilters,
+    importVerifySnapshotFailed,
+  });
   handle.update({ ...state, formRevision }, handle.sessionId);
 }
 
@@ -455,6 +536,63 @@ export async function findCheckoutRecoveryRecords(entryKey: string): Promise<Ope
 }
 
 /**
+ * 两阶段查询阶段一的 import 变体（§9）：未终态 import 记录按 lockKey
+ * （= 源目录 realpath，targetPath 同值）与入口键精确命中——源目录在打开
+ * 时即确定，命令入口（右键源目录）与面板恢复共用本匹配。
+ */
+export function matchImportRecordToEntry(record: OperationRecord, entryKey: string): boolean {
+  return lockKeyOf(record) === entryKey || record.targetPath === entryKey;
+}
+
+/**
+ * 阶段一候选（import）：入口键命中的 unknown 记录（updatedAt 新者优先）。
+ * 重启折算后 import 未终态的唯一形态是 unknown（含 outcome='merged'——
+ * 按 merged 页恢复并带回 resolvedRevision）；prepared/running 的在途记录
+ * 由 loadPending 折算成 unknown，快照不完整由核实第 0 步发现、不在此判定。
+ */
+export async function findImportRecoveryRecords(entryKey: string): Promise<OperationRecord[]> {
+  const records = await getOperationRegistry().loadAllRecords().catch(() => []);
+  return records
+    .filter(
+      (record) =>
+        kindOf(record) === 'import' &&
+        record.phase === 'unknown' &&
+        matchImportRecordToEntry(record, entryKey),
+    )
+    .sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+/**
+ * import unknown/merged 记录 → 恢复结果页（§4.1 五段第③段的 import 分诊
+ * 形态）：merged 记录按 merged 页恢复（revision 随记录读出不丢）；表单
+ * 快照从 importIntent 派生（retryImport/abandonUnknownImport 的回填数据源，
+ * 快照不完整分支的 abandon 出口由此可达）。记录字段缺失按不可恢复处理。
+ */
+export function buildImportRecoveryPage(record: OperationRecord): P3ResultPage | undefined {
+  if (!record.targetPath || !record.importIntent) {
+    return undefined;
+  }
+  const merged = record.outcome === 'merged';
+  const page: P3ResultPage = {
+    mode: 'import',
+    kind: merged ? 'merged' : 'unknown',
+    path: record.targetPath,
+    resolution: 'unresolved',
+    detail: merged ? strings.importTask.mergedDetail : undefined,
+    formSnapshot: {
+      url: record.importIntent.targetUrl,
+      sourceDir: record.targetPath,
+      message: record.importIntent.message,
+      nameMode: record.importIntent.nameMode,
+    },
+  };
+  if (merged && record.resolvedRevision !== undefined) {
+    page.revision = record.resolvedRevision;
+  }
+  return page;
+}
+
+/**
  * 建立/重建会话并按五段顺序恢复（§4.1）：①运行任务（含跨入口绑定：会话
  * 绑定任务 resultScope、session.mode 随任务、绑定即订阅移除通知）→ ②结果
  * 缓存（作用域基准一致才命中）→ ③未终态记录分诊（interrupted 核验页，
@@ -508,22 +646,46 @@ async function recoverSession(sessionId: string, entry: CheckoutOpenEntry, entry
   if (cached) {
     state = setResult(state, cached.page as P3ResultPage);
     state = markRecovered(state, 'cache');
-    // 恢复态绑定：页头与动作对象按结果页的目标（缓存 scope 与基准一致才走到这里）。
+    // 恢复态绑定：页头与动作对象按结果页的目标（缓存 scope 与基准一致才走到这里；
+    // merged 页横幅标记随缓存页恢复——settled 形态不依赖，标记仅第 0 步失败时置位）。
     const page = cached.page as P3ResultPage;
-    if (page.mode === 'checkout') {
+    if (page.mode === 'checkout' || page.mode === 'import') {
       state = { ...state, binding: { resultScope: baseline, targetPath: page.path } };
     }
+    importVerifySnapshotFailed = false;
     session = state;
     pushRender();
     return;
   }
 
-  // ③ 未终态记录分诊（缓存无对应终态——典型为宿主重启后）：按入口键列候选，
-  // 命中最新者派生 interrupted 核验页；恢复态会话绑定记录自身的目标作用域
-  // （缓存按本次打开入口写、记录的 lockKey 只用于动作对象）。
-  const candidates = await findCheckoutRecoveryRecords(entryKey);
+  // ③ 未终态记录分诊（缓存无对应终态——典型为宿主重启后）：checkout 与
+  // import 记录合并按入口键列候选，命中 updatedAt 最新者分诊——checkout
+  // 派生 interrupted 核验页、import 派生 unknown/merged 核实页（恢复态
+  // session.mode 随记录 kind 设定；会话绑定记录自身的目标作用域，缓存按
+  // 本次打开入口写、记录的 lockKey 只用于动作对象）。
+  const candidates = (
+    await Promise.all([findCheckoutRecoveryRecords(entryKey), findImportRecoveryRecords(entryKey)])
+  )
+    .flat()
+    .sort((a, b) => b.updatedAt - a.updatedAt);
   const record = candidates[0];
-  if (record?.targetPath) {
+  if (record && kindOf(record) === 'import') {
+    const page = buildImportRecoveryPage(record);
+    if (page) {
+      state = setResult(state, page);
+      state = markRecovered(state, 'record');
+      state = {
+        ...state,
+        mode: 'import',
+        entry: { ...state.entry, mode: 'import' },
+        binding: { resultScope: { entryKey, mode: 'import' }, targetPath: page.path },
+      };
+      importVerifySnapshotFailed = false;
+      session = state;
+      pushRender();
+      return;
+    }
+  } else if (record?.targetPath) {
     const page = buildInterruptedPage({ path: record.targetPath });
     state = setResult(state, page);
     state = markRecovered(state, 'record');
@@ -702,7 +864,8 @@ async function onIntent(intent: Intent, context: { sessionId: string; busy: bool
       revealResultDir();
       return;
     case 'viewTaskLog':
-      showOutput(false, 'checkout');
+      // 导入任务日志走 import 频道（与执行器 onLogLine 同一频道）。
+      showOutput(false, session?.mode === 'import' ? 'import' : 'checkout');
       return;
     case 'switchP3Mode':
       await handleSwitchMode(context.sessionId);
@@ -710,19 +873,57 @@ async function onIntent(intent: Intent, context: { sessionId: string; busy: bool
     case 'closePanel':
       handle.dispose();
       return;
-    /* 导入侧流程与 URL 历史清空（阶段 2 在同一面板扩展）：类型与白名单已
-     * 先行登记，处理器留注册位——到达时不改变面板状态。 */
+    /* ---------------- 导入侧流程（§5：同一面板 mode='import'） ---------------- */
     case 'pickSourceDir':
+      await handlePickSourceDir(context.sessionId);
+      return;
     case 'importNext':
+      await handleImportNext(context.sessionId);
+      return;
     case 'startImport':
+      await handleStartImport(context.sessionId);
+      return;
     case 'refreshImportPreview':
+      // 用户主动刷新：直接装载新快照（scopeChanged 提示下的出口）。
+      await runImportPreview(context.sessionId, false);
+      return;
     case 'verifyImport':
+      await handleVerifyImport(context.sessionId);
+      return;
     case 'retryImport':
+      handleRetryImport(context.sessionId);
+      return;
     case 'acknowledgeMerged':
+      await handleAcknowledgeMerged(context.sessionId);
+      return;
     case 'abandonUnknownImport':
+      await handleAbandonUnknownImport(context.sessionId);
+      return;
     case 'handoffToCheckout':
+      handleHandoffToCheckout(context.sessionId);
+      return;
     case 'revealSourceDir':
+      revealSourceDir();
+      return;
     case 'clearUrlHistory':
+      handleClearUrlHistory();
+      return;
+    /* ---------------- 导入核对页表格视图（§7.1：排序/筛选/翻页由宿主持有回喂） ---------------- */
+    case 'setPage':
+      importPreviewPage = Math.max(1, Math.floor(intent.page));
+      pushRender();
+      return;
+    case 'setSort':
+      importPreviewSort = { key: intent.key, direction: intent.direction };
+      importPreviewPage = 1;
+      pushRender();
+      return;
+    case 'setFilter':
+      importPreviewFilters = importPreviewFilters.map((filter) =>
+        filter.id === intent.filterId ? { ...filter, value: intent.value } : filter,
+      );
+      importPreviewPage = 1;
+      pushRender();
       return;
     default:
       return;
@@ -1323,11 +1524,808 @@ async function handleSwitchMode(sessionId: string): Promise<void> {
   pushRender();
 }
 
+/* ------------------------------ 导入流程（§5） ------------------------------ */
+
+/** 会话存活的守卫变更（await 返回后套用模型转移；面板销毁/会话切换时空转）。 */
+function applyIfLive(sessionId: string, mutate: (s: CheckoutPanelState) => CheckoutPanelState): void {
+  if (!handle || !session || handle.sessionId !== sessionId || session.sessionId !== sessionId) {
+    return;
+  }
+  session = mutate(session);
+  pushRender();
+}
+
+/**
+ * 枚举入口（global-ignores 读取 + 源枚举）：预览装载与三次快照比对共用。
+ * 配置解析失败与源不可枚举都按「无法完整确认范围」返回可读原因（阻止
+ * 勾选确认与开始的基线）。
+ */
+function enumerateImport(sourceDir: string): { enumeration?: ImportEnumeration; error?: string } {
+  let patterns: string[];
+  try {
+    patterns = readSvnConfigGlobalIgnores();
+  } catch {
+    return { error: strings.checkoutPanel.importPreviewIgnoreFailedNotice };
+  }
+  try {
+    return { enumeration: enumerateImportSource(sourceDir, { ignorePatterns: patterns }) };
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** 源目录选择（pickSourceDir）：选择器 + realpath 归一 + 异步源预检回填。 */
+async function handlePickSourceDir(sessionId: string): Promise<void> {
+  if (!handle || !session || handle.sessionId !== sessionId) {
+    return;
+  }
+  const t = strings.checkoutPanel;
+  const picked = await vscode.window.showOpenDialog({
+    canSelectFiles: false,
+    canSelectFolders: true,
+    canSelectMany: false,
+    openLabel: t.pickSourceDirTitle,
+  });
+  if (!session || !handle) {
+    return;
+  }
+  const dir = picked?.[0]?.fsPath;
+  if (!dir) {
+    // 取消（Esc/关闭选择框）：保留原值。
+    return;
+  }
+  if (!isAbsolute(dir)) {
+    handle.toast('error', format(t.pickInvalidPath, { path: dir }));
+    return;
+  }
+  const normalized = normalizePath(dir);
+  const next = pickSourceDirReducer(session, normalized);
+  session = next.state;
+  resetImportPreviewView();
+  pushRender();
+  // 源预检（只查源目录自身的版本控制形态）：回包带发起代次，迟到/参数已
+  // 编辑的回包由 setSourcePrecheck 按代次与相位丢弃。
+  const seq = next.seq;
+  const result = await precheckImportSource(readSvnPath(), normalized, {
+    timeoutMs: readTimeoutMs(),
+    ...decodingRunOptions('import'),
+  });
+  applyIfLive(sessionId, (s) => setSourcePrecheck(s, seq, result));
+}
+
+/** 父 URL 构造（§5）：剥掉目标 URL 最后一个非空路径段；无路径段（仓库根）→ 父即根。 */
+function parentUrlOfImport(targetUrl: string): string {
+  const schemeEnd = targetUrl.indexOf('://');
+  if (schemeEnd < 0) {
+    return targetUrl;
+  }
+  const authorityEnd = targetUrl.indexOf('/', schemeEnd + 3);
+  if (authorityEnd < 0) {
+    return targetUrl;
+  }
+  const path = targetUrl.slice(authorityEnd + 1).replace(/\/+$/, '');
+  if (path === '') {
+    return targetUrl;
+  }
+  return targetUrl.slice(0, authorityEnd + 1 + path.lastIndexOf('/'));
+}
+
+/** E200009/W160009：URL 目标不存在（与 core 判定同口径）。 */
+function isImportUrlNotFound(err: SvnError): boolean {
+  return extractSvnErrorCodes(err.stderr).includes('E200009') || err.stderr.includes('W160009');
+}
+
+/** 命令失败分类：认证失败按 auth 上报（是否弹补录由调用方按协议分支决定）。 */
+function classifyImportConnError(err: unknown, fallback: 'parentUnreachable' | 'connectError'): ImportConnOutcome {
+  if (err instanceof SvnError && isAuthFailure(err.stderr)) {
+    return { ok: false, failure: 'auth', message: err.message };
+  }
+  return { ok: false, failure: fallback, message: err instanceof Error ? err.message : String(err) };
+}
+
+/**
+ * 导入连接检查的命令编排（§5：命令顺序固定——先父 info、后目标 ls）：
+ * 父 info 校验 kind=dir 并读取身份快照（uuid/root/last-changed）；目标
+ * ls exit 0 = 已存在（existing），E200009 = 不存在（通过）。
+ */
+async function runImportConnCheck(
+  svnPath: string,
+  parentUrl: string,
+  targetUrl: string,
+  options: RunOptions,
+): Promise<ImportConnOutcome> {
+  let infoXml: string;
+  try {
+    const result = await runOrThrow(svnPath, ['info', '--xml', '--non-interactive', '--', escapeUrlPeg(parentUrl)], options);
+    infoXml = result.stdout;
+  } catch (err) {
+    return classifyImportConnError(err, 'parentUnreachable');
+  }
+  const parent = parseParentInfoXml(infoXml);
+  if (!parent) {
+    return { ok: false, failure: 'parentUnreachable', message: '父目录信息无法解析（svn info --xml 输出异常）' };
+  }
+  if (parent.kind !== 'dir') {
+    return { ok: false, failure: 'parentNotDir' };
+  }
+  try {
+    await runOrThrow(svnPath, ['ls', '--non-interactive', '--', escapeUrlPeg(targetUrl)], options);
+    return { ok: false, failure: 'targetExists' };
+  } catch (err) {
+    if (err instanceof SvnError && isImportUrlNotFound(err)) {
+      return {
+        ok: true,
+        parentIdentity: {
+          repositoryUuid: parent.repositoryUuid,
+          repositoryRootUrl: parent.repositoryRootUrl,
+          lastChangedRevision: parent.lastChangedRevision,
+        },
+      };
+    }
+    return classifyImportConnError(err, 'connectError');
+  }
+}
+
+/**
+ * 导入「下一步」（连接检查）：先父 info 后目标 ls；认证失败按协议分支显式
+ * 编排（模型 auth 相位：失败转 auth → 弹补录 → resume 后带凭据重试 /
+ * cancel 终止回 untested——svn+ssh/file 不弹、按普通失败呈现）；通过写
+ * review.parentIdentity 初读并自动进入核对页（范围预览随进入发起）。
+ */
+async function handleImportNext(sessionId: string): Promise<void> {
+  if (!handle || !session || handle.sessionId !== sessionId) {
+    return;
+  }
+  const next = importNextReducer(session);
+  session = next.state;
+  pushRender();
+  if (!next.issued) {
+    return;
+  }
+  const seq = next.seq;
+  const url = session.form.url;
+  const svnPath = readSvnPath();
+  const options: RunOptions = {
+    timeoutMs: readTimeoutMs(),
+    ...decodingRunOptions('import'),
+  };
+  let credentials: AuthCredentials | undefined;
+  for (;;) {
+    const runOptions: RunOptions = credentials
+      ? { ...options, getCredentials: async () => credentials }
+      : options;
+    const outcome = await runImportConnCheck(svnPath, parentUrlOfImport(url), url, runOptions);
+    if (outcome.ok || outcome.failure !== 'auth' || !schemeAcceptsCredentials(url)) {
+      // 非认证失败（或 svn+ssh/file 的认证形态）：直接结论。
+      applyIfLive(sessionId, (s) => importConnSettled(s, seq, outcome));
+      break;
+    }
+    // 认证失败：转 auth 相位 → 弹补录 → resume 带凭据重试 / cancel 终止。
+    applyIfLive(sessionId, (s) => importConnSettled(s, seq, outcome));
+    if (!handle || !session || handle.sessionId !== sessionId || session.sessionId !== sessionId) {
+      break;
+    }
+    if (session.conn.phase !== 'auth') {
+      // 期间参数已编辑（代次失效）或检查已被终止：不再弹补录。
+      break;
+    }
+    const creds = await promptForCredentials();
+    if (!handle || !session || handle.sessionId !== sessionId) {
+      break;
+    }
+    if (!creds) {
+      applyIfLive(sessionId, (s) => connAuthCancel(s));
+      break;
+    }
+    credentials = creds;
+    applyIfLive(sessionId, (s) => connAuthResume(s));
+  }
+  // 通过自动进入核对页：随进入发起范围预览（进入 review 那次做快照比对）。
+  if (
+    session &&
+    session.sessionId === sessionId &&
+    handle?.sessionId === sessionId &&
+    session.step === 'review' &&
+    session.mode === 'import' &&
+    session.conn.phase === 'success'
+  ) {
+    await runImportPreview(sessionId, true);
+  }
+}
+
+/**
+ * 范围预览（§5）：枚举注入 global-ignores 模式；compare=true（随 review
+ * 进入/流程比对）时先做快照比对——digest 不一致置 scopeChanged 并保留旧
+ * 快照提示重新预览，一致（或首次无快照）时装载新快照并复位勾选。
+ */
+async function runImportPreview(sessionId: string, compare: boolean): Promise<void> {
+  if (!handle || !session || handle.sessionId !== sessionId) {
+    return;
+  }
+  const s = session;
+  if (s.mode !== 'import') {
+    return;
+  }
+  const enumerated = enumerateImport(s.form.sourceDir);
+  if (enumerated.error) {
+    session = setPreviewError(s, enumerated.error);
+    pushRender();
+    return;
+  }
+  const enumeration = enumerated.enumeration!;
+  if (compare) {
+    const checked = checkImportScope(session, enumeration);
+    if (checked.review.scopeChanged === 'source') {
+      session = checked;
+      pushRender();
+      return;
+    }
+    session = checked;
+  }
+  session = setPreview(session, enumeration);
+  resetImportPreviewView();
+  pushRender();
+}
+
+/**
+ * 导入预命令出口的统一收口（哑任务窗口——仓库确认框停留与重检秒级窗口，
+ * §2.1/§5）：先把任务创建时捕获的表单快照写回草稿（不读面板实例 state——
+ * 面板可能已 dispose 或被重开会话取代）、再移除任务对象（顺序与任务终态
+ * 「先写缓存、再移除任务」同款）；UI 转移由调用方按各分支口径执行。
+ */
+function importPreCommandExit(task: TaskObject): void {
+  const scope = task.resultScope as CheckoutResultScope;
+  const form = task.formSnapshot as CheckoutFormDraft | undefined;
+  if (form) {
+    saveDraft(scope.entryKey, scope.mode, form);
+  }
+  removeTask(task.taskId);
+}
+
+/** import unknown/merged 记录查询（核实/收口/放弃的动作对象；lockKey=源目录）。 */
+function importUnknownRecordFor(sourceDir: string): OperationRecord | undefined {
+  return getOperationRegistry()
+    .pendingForWcRoot(sourceDir)
+    .filter((record) => kindOf(record) === 'import' && record.phase === 'unknown')
+    .sort((a, b) => b.updatedAt - a.updatedAt)[0];
+}
+
+/** 开始导入（§5 时序）：三次快照比对 + 双确认 + 哑任务承载确认/重检窗口 + 全链重检后发起。 */
+async function handleStartImport(sessionId: string): Promise<void> {
+  if (!handle || !session || handle.sessionId !== sessionId) {
+    return;
+  }
+  const t = strings.checkoutPanel;
+  let s = session;
+  if (s.mode !== 'import' || s.step !== 'review') {
+    pushRender();
+    return;
+  }
+  if (!s.review.checked || importConfirmBlockReason(s.review) !== null) {
+    pushRender();
+    return;
+  }
+  if (s.form.url === '' || s.form.urlError !== null || s.form.sourceDir === '' || s.review.parentIdentity === null) {
+    pushRender();
+    return;
+  }
+  const sourceDir = normalizePath(s.form.sourceDir);
+  const url = s.form.url;
+  const message = s.form.message;
+  const nameMode = s.form.nameMode;
+  const parentUrl = parentUrlOfImport(url);
+  const parentIdentity = s.review.parentIdentity;
+  const scope: CheckoutResultScope = { entryKey: s.entry.entryKey, mode: 'import' };
+  const basisSnapshot = s.review.snapshot;
+  const basisDigest = basisSnapshot ? snapshotDigest(basisSnapshot) : null;
+
+  // 第二次快照比对（点开始时；review 进入是第一次）。
+  const second = enumerateImport(sourceDir);
+  if (!handle || !session || handle.sessionId !== sessionId) {
+    return;
+  }
+  if (second.error) {
+    session = setPreviewError(session, second.error);
+    pushRender();
+    return;
+  }
+  s = checkImportScope(session, second.enumeration!);
+  session = s;
+  if (s.review.scopeChanged === 'source') {
+    pushRender();
+    return;
+  }
+
+  // 空说明口径（M1 同款语义）：开关关闭直接拒绝；开启时二次确认。
+  if (s.form.message.trim() === '') {
+    if (!readAllowEmptyCommitMessage()) {
+      handle.toast('info', strings.commit.emptyMessageRejected);
+      return;
+    }
+    session = setEmptyMessageConfirm(session, true);
+    pushRender();
+    const proceed = await vscode.window.showWarningMessage(
+      strings.commit.emptyMessageConfirm,
+      { modal: true },
+      strings.commit.continueButton,
+    );
+    if (!handle || !session || handle.sessionId !== sessionId || session.sessionId !== sessionId) {
+      return;
+    }
+    session = setEmptyMessageConfirm(session, false);
+    if (proceed !== strings.commit.continueButton) {
+      pushRender();
+      return;
+    }
+  }
+
+  // 任务启动递增（任务创建时点、busy 开始之前）+ 任务开始清草稿 + 哑任务
+  // 创建（§5：确认框打开前进 taskRegistry——busy 承载确认框停留与重检
+  // 窗口，一切未发起出口经任务移除收口）。
+  bumpResultEpoch('checkout');
+  clearDraft(scope.entryKey, scope.mode);
+  const formSnapshot = toDraft(session);
+  const placeholder: TaskObject = {
+    taskId: randomOperationId(),
+    panelKind: 'checkout',
+    phase: 'connecting',
+    resultScope: scope,
+    lockKey: sourceDir,
+    formSnapshot,
+    initiatorSessionId: sessionId,
+    abortController: new AbortController(),
+  };
+  addTask(placeholder);
+
+  // 仓库提交确认框（模态：Esc 不发起 = confirmAborted 预命令出口）。
+  session = setConfirmState(session, true);
+  pushRender();
+  const confirmed = await vscode.window.showWarningMessage(
+    t.importCommitConfirmTitle,
+    {
+      modal: true,
+      detail: format(t.importCommitConfirmDetail, {
+        url: editableURL(url),
+        count: String(session.review.previewSummary?.fileCount ?? 0),
+        message: session.form.message.trim() === '' ? '（空）' : session.form.message,
+      }),
+    },
+    t.importCommitConfirmButton,
+  );
+  const live = () =>
+    Boolean(handle && session && handle.sessionId === sessionId && session.sessionId === sessionId);
+  if (live()) {
+    session = setConfirmState(session, false);
+    pushRender();
+  }
+  if (confirmed !== t.importCommitConfirmButton) {
+    // Esc/取消：出口收口（草稿写回 + 任务移除）；勾选保留可再次点开始。
+    importPreCommandExit(placeholder);
+    return;
+  }
+
+  // 第三次快照比对（确认通过后、与远端重检同时点；先于远端重检执行）。
+  const third = enumerateImport(sourceDir);
+  const thirdDigest = third.enumeration ? snapshotDigest(enumerationToSnapshot(third.enumeration)) : null;
+  if (third.error) {
+    // 源无法枚举：无法完整确认范围——按 sourceChanged 出口（清勾选经 setPreviewError）。
+    if (live()) {
+      session = setPreviewError(session, third.error);
+    }
+    importPreCommandExit(placeholder);
+    if (live()) {
+      pushRender();
+    }
+    return;
+  }
+  if (thirdDigest !== basisDigest) {
+    if (live()) {
+      session = checkImportScope(session, third.enumeration!);
+    }
+    importPreCommandExit(placeholder);
+    if (live()) {
+      pushRender();
+    }
+    return;
+  }
+
+  // 远端重检（先父 info 后目标 ls——recheckImportTarget 固定顺序；父身份
+  // 比对与 lastChangedRevision 刷新）。targetChanged 与网络/认证失败分列。
+  const recheck = await recheckImportTarget(readSvnPath(), parentUrl, url, parentIdentity, {
+    timeoutMs: readTimeoutMs(),
+    ...decodingRunOptions('import'),
+  });
+  if (live()) {
+    session = setRecheckOutcome(session, recheck);
+  }
+  if (!recheck.ok) {
+    // 两类分支的 UI 都由 setRecheckOutcome 承载（targetChanged 清勾选提示
+    // 重新测试核对；网络/认证失败 review.error 横幅清确认保留参数）。
+    importPreCommandExit(placeholder);
+    if (live()) {
+      pushRender();
+    }
+    return;
+  }
+
+  // 全通过 → 发起真实导入任务（执行器内部快照落盘 → begin → import →
+  // 证据检查；addTask 自动替换哑任务——busy 连续、无窗口间隙）。
+  const started = startImportTask({
+    sourceDir,
+    targetUrl: url,
+    parentIdentity: recheck.parentIdentity,
+    message,
+    nameMode,
+    snapshot: basisSnapshot!,
+    entryKey: scope.entryKey,
+    initiatorSessionId: sessionId,
+    formSnapshot,
+    callbacks: makeImportTaskCallbacks(sessionId),
+  });
+  if (live()) {
+    session = beginImportTask(session, { opId: started.taskId, targetPath: sourceDir, resultScope: scope });
+    pushRender();
+  }
+  watchTaskPhase(started.taskId, sessionId);
+  void settleImportOnDone(started.done, sessionId);
+}
+
+/** 导入任务回调集合（认证弹窗、父身份清除、进度节流、日志、预命令出口、成功 URL 历史）。 */
+function makeImportTaskCallbacks(sessionId: string): ImportTaskCallbacks {
+  let lastPushAt = 0;
+  return {
+    getCredentials: () => promptForCredentials(),
+    onParentIdentityConsumed: () => {
+      applyIfLive(sessionId, (s) => consumeParentIdentity(s));
+    },
+    onProgress: (state) => {
+      if (!handle || !session || handle.sessionId !== sessionId || session.sessionId !== sessionId) {
+        return;
+      }
+      if (!session.task) {
+        return;
+      }
+      session = taskProgress(session, { count: state.count, currentFile: state.currentFile });
+      const now = Date.now();
+      if (now - lastPushAt >= PROGRESS_RENDER_THROTTLE_MS) {
+        lastPushAt = now;
+        pushRender();
+      }
+    },
+    onLogLine: (text) => {
+      logLine(text, 'import');
+    },
+    onPreCommandExit: (exit) => {
+      if (!handle || !session || handle.sessionId !== sessionId || session.sessionId !== sessionId) {
+        return;
+      }
+      if (exit.kind === 'beginBusy') {
+        // busy 分支：回核对页（连接结论仍有效）+ toast，不写错误横幅。
+        session = enterReview(session);
+        handle.toast('info', strings.checkoutPanel.beginBusyNotice);
+      } else if (exit.kind === 'beginIdConflict') {
+        session = setReviewError(session, strings.checkoutPanel.beginIdConflictNotice);
+      } else if (exit.kind === 'targetChanged' || exit.kind === 'sourceChanged' || exit.kind === 'confirmAborted') {
+        // 流程出口（面板侧已由 setRecheckOutcome/checkImportScope 承载）：
+        // 到达执行器窗口的重复出口只回核对页通用提示。
+        session = setReviewError(session, strings.checkoutPanel.preCommandAbortedNotice);
+      } else {
+        session = setReviewError(session, exit.message ?? strings.checkoutPanel.preCommandAbortedNotice);
+      }
+      pushRender();
+    },
+    onSucceeded: ({ targetUrl }) => {
+      // 成功（证据①与核实 committed 两时点触发）：共用 URL 历史写入。
+      recordUrlHistory(targetUrl);
+      if (session && session.history[0] !== targetUrl) {
+        session = { ...session, history: addHistoryUrl(session.history, targetUrl) };
+      }
+    },
+  };
+}
+
+/** 导入任务 done 结算：终态写结果页（发起会话仍存活时）。 */
+async function settleImportOnDone(done: Promise<ImportTaskOutcome>, sessionId: string): Promise<void> {
+  const outcome = await done;
+  if (outcome.outcome === 'preCommandExit') {
+    // 出口的 UI 转移由 onPreCommandExit 回调承担（出口即达）。
+    return;
+  }
+  if (!handle || !session || handle.sessionId !== sessionId || session.sessionId !== sessionId) {
+    return;
+  }
+  const result: P3ResultPage = { ...outcome.result };
+  session = setResult(session, result);
+  importVerifySnapshotFailed = false;
+  pushRender();
+}
+
+/** 核实结论 → 结果页（§5 三分类：committed → 成功页 / notCommitted → 失败页 / unknown 保持；merged 页保持 merged）。 */
+function importVerifyPage(report: ImportVerifyTaskResult, prevPath: string, prevKind: string): P3ResultPage {
+  if (report.conclusion === 'committed') {
+    return {
+      mode: 'import',
+      kind: 'success',
+      revision: report.revision,
+      path: prevPath,
+      evidence: 'verified',
+      detail: format(strings.checkoutPanel.importVerifyCommittedDetail, {
+        revision: String(report.revision ?? ''),
+      }),
+    };
+  }
+  if (report.conclusion === 'notCommitted') {
+    return {
+      mode: 'import',
+      kind: 'failed',
+      path: prevPath,
+      evidence: 'verified',
+      detail: format(strings.checkoutPanel.importVerifyNotCommittedDetail, {
+        revision: String(report.evidence?.parentLastChangedRevision ?? ''),
+      }),
+      formSnapshot: report.formSnapshot,
+    };
+  }
+  if (prevKind === 'merged') {
+    // merged 页核实证据不唯一：保持 merged（不判成功也不降级为普通 unknown）。
+    return { mode: 'import', kind: 'merged', path: prevPath };
+  }
+  const page: P3ResultPage = {
+    mode: 'import',
+    kind: 'unknown',
+    path: prevPath,
+    resolution: 'unresolved',
+    detail: report.message,
+    formSnapshot: report.formSnapshot,
+  };
+  if (report.snapshotIncomplete === true) {
+    page.snapshotIncomplete = true;
+  }
+  return page;
+}
+
+/**
+ * 核实仓库结果（§5 unknown 核实）：发起时重置快照不完整标记并同步缓存
+ * 镜像（§5 第 0 步）；结论按结果代次守卫——一致（或面板已 dispose）写
+ * 结论页 + 控制器写缓存 + settleReadonlyVerify 推送，不一致丢弃不推送。
+ * 记录收口已由执行器做过记录校验（recordSettled=false 即跳过）。
+ */
+async function handleVerifyImport(sessionId: string): Promise<void> {
+  if (!handle || !session || handle.sessionId !== sessionId) {
+    return;
+  }
+  const result = session.result;
+  if (!result || result.mode !== 'import' || (result.kind !== 'unknown' && result.kind !== 'merged')) {
+    pushRender();
+    return;
+  }
+  const record = importUnknownRecordFor(result.path);
+  if (!record) {
+    handle.toast('info', strings.importTask.recordUnavailable);
+    return;
+  }
+  const prevPath = result.path;
+  const prevKind = result.kind;
+  const scope = sessionScopeBaseline();
+  const epoch = getResultEpoch('checkout');
+  // 发起：unknown 页重置 snapshotIncomplete（模型）+ merged 页横幅标记清除
+  // + 缓存镜像同步（快照修复后的再核实、旧 true 残留会让页面错误保留放弃出口）。
+  session = beginImportVerify(session);
+  importVerifySnapshotFailed = false;
+  if (session.result?.mode === 'import') {
+    writeSessionResult('checkout', scope, session.result, 'controller');
+  }
+  pushRender();
+  try {
+    const report = await verifyImportTask({
+      operationId: record.operationId,
+      resultScope: scope,
+      epoch,
+      callbacks: {
+        getCredentials: () => promptForCredentials(),
+        onSucceeded: ({ targetUrl }) => {
+          // 核实转 committed：URL 历史共用写入（成功第二时点）。
+          recordUrlHistory(targetUrl);
+          if (session && session.history[0] !== targetUrl) {
+            session = { ...session, history: addHistoryUrl(session.history, targetUrl) };
+          }
+        },
+      },
+    });
+    let written = false;
+    if (getResultEpoch('checkout') === epoch) {
+      const page = importVerifyPage(report, prevPath, prevKind);
+      written = writeSessionResult('checkout', scope, page, 'controller');
+      if (written && handle && session && handle.sessionId === sessionId && session.sessionId === sessionId) {
+        session = setResult(session, page);
+        // merged 页核实第 0 步失败：保持 merged、以页面横幅提示（不写
+        // snapshotIncomplete——该字段仅 unknown 页合法）。
+        importVerifySnapshotFailed =
+          report.conclusion === 'unknown' && report.snapshotIncomplete === true && prevKind === 'merged';
+      }
+    }
+    // 结论写入或被守卫丢弃后结算登记：写入才向存活会话推送重跑。
+    settleReadonlyVerify('checkout', written);
+    if (handle && session && handle.sessionId === sessionId) {
+      pushRender();
+    }
+  } catch (err) {
+    // 命令异常终止：verifyImportTask 已清除登记（不推送），提示原因。
+    handle?.toast('error', err instanceof Error ? err.message : String(err));
+  }
+}
+
+/** 「已人工核对，完成」（merged 页收口，出口⑧）：确认后递增代次（第一条同步语句）→ 记录收口 → settled 页。 */
+async function handleAcknowledgeMerged(sessionId: string): Promise<void> {
+  if (!handle || !session || handle.sessionId !== sessionId) {
+    return;
+  }
+  const result = session.result;
+  if (!result || result.mode !== 'import' || result.kind !== 'merged' || result.settled === true) {
+    pushRender();
+    return;
+  }
+  const t = strings.checkoutPanel;
+  const ok = await vscode.window.showWarningMessage(
+    t.ackMergedConfirmTitle,
+    { modal: true, detail: t.ackMergedConfirmDetail },
+    t.ackMergedConfirmButton,
+  );
+  if (ok !== t.ackMergedConfirmButton) {
+    return;
+  }
+  // 递增时点 = 确认处理的第一条同步语句、任何 await 之前（§2.1）：核实
+  // 进行中点收口的迟到结论按代次守卫丢弃、记录收口经执行器校验跳过。
+  bumpResultEpoch('checkout');
+  const scope = sessionScopeBaseline();
+  const record = importUnknownRecordFor(result.path);
+  if (record) {
+    await acknowledgeImportTask(record.operationId);
+  }
+  // settled 页写缓存（不依赖面板存活）+ 活会话 UI 更新。
+  const settledPage: P3ResultPage = { ...result, settled: true };
+  writeSessionResult('checkout', scope, settledPage, 'controller');
+  importVerifySnapshotFailed = false;
+  if (handle && session && handle.sessionId === sessionId && session.sessionId === sessionId) {
+    session = acknowledgeMergedReducer(session);
+    pushRender();
+  }
+}
+
+/** 快照快照（formSnapshot）→ 草稿形态（导入四字段 + 空表单默认；两层回填的快照侧数据源）。 */
+function importDraftFromSnapshot(snapshot: { url: string; sourceDir: string; message: string; nameMode: 'auto' | 'manual' } | undefined): CheckoutFormDraft {
+  const draft = createEmptyFormDraft();
+  if (!snapshot) {
+    return draft;
+  }
+  return {
+    ...draft,
+    url: snapshot.url,
+    urlInput: editableURL(snapshot.url),
+    sourceDir: snapshot.sourceDir,
+    message: snapshot.message,
+    nameMode: snapshot.nameMode,
+  };
+}
+
+/** 「放弃核实并解除限制」（快照不完整 unknown 页，出口⑪）：确认 → 记录收口 → 回表单 + 清缓存 + 递增 + 草稿写回。 */
+async function handleAbandonUnknownImport(sessionId: string): Promise<void> {
+  if (!handle || !session || handle.sessionId !== sessionId) {
+    return;
+  }
+  const result = session.result;
+  if (!result || result.mode !== 'import' || result.kind !== 'unknown' || result.snapshotIncomplete !== true) {
+    pushRender();
+    return;
+  }
+  const t = strings.checkoutPanel;
+  const ok = await vscode.window.showWarningMessage(
+    t.abandonVerifyConfirmTitle,
+    { modal: true, detail: t.abandonVerifyConfirmDetail },
+    t.abandonVerifyConfirmButton,
+  );
+  if (ok !== t.abandonVerifyConfirmButton) {
+    return;
+  }
+  const scope = sessionScopeBaseline();
+  // 两层回填数据（await 前捕获——收口后面板可能已销毁，回填与写回不依赖面板存活）。
+  const fromSessionForm = session.form.url !== '' || session.form.urlInput !== '';
+  const fallbackDraft = fromSessionForm ? toDraft(session) : importDraftFromSnapshot(result.formSnapshot);
+  const record = importUnknownRecordFor(result.path);
+  if (record) {
+    await abandonUnknownImportTask(record.operationId);
+  }
+  clearSessionResult('checkout', scope);
+  bumpResultEpoch('checkout');
+  importVerifySnapshotFailed = false;
+  if (handle && session && handle.sessionId === sessionId && session.sessionId === sessionId) {
+    // 回表单保留表单值（reducer 内两层回填）→ 回填后的当前 form 写回草稿（同一批）。
+    session = abandonUnknownImportReducer(session);
+    saveDraft(scope.entryKey, scope.mode, toDraft(session));
+    resetImportPreviewView();
+    pushRender();
+  } else {
+    saveDraft(scope.entryKey, scope.mode, fallbackDraft);
+  }
+}
+
+/** 「返回填写并重试」（failed 页）：保留表单值回 form + 清缓存 + 递增 + 草稿写回（当前入口键）。 */
+function handleRetryImport(sessionId: string): void {
+  if (!handle || !session || handle.sessionId !== sessionId) {
+    return;
+  }
+  const result = session.result;
+  if (!result || result.mode !== 'import' || result.kind !== 'failed') {
+    pushRender();
+    return;
+  }
+  const scope = sessionScopeBaseline();
+  clearSessionResult('checkout', scope);
+  bumpResultEpoch('checkout');
+  session = retryImportReducer(session);
+  saveDraft(scope.entryKey, scope.mode, toDraft(session));
+  resetImportPreviewView();
+  pushRender();
+}
+
+/**
+ * 「另选新目录检出」（success 页 handoff）：切 checkout 模式保留 URL/
+ * revMode='number'/revision → 清缓存 + 递增 + 草稿写回（键 = 源目录
+ * realpath + checkout——§9 程序化回表单出口的草稿写回，验收 10 的重开
+ * 回填断言由此成立）。URL 优先取结果页携带的目标 URL（缓存恢复形态
+ * 会话 form 为空——执行器结果页的 targetUrl 字段是模型外数据源）。
+ */
+function handleHandoffToCheckout(sessionId: string): void {
+  if (!handle || !session || handle.sessionId !== sessionId) {
+    return;
+  }
+  const result = session.result;
+  if (!result || result.mode !== 'import' || result.kind !== 'success') {
+    pushRender();
+    return;
+  }
+  const scope = sessionScopeBaseline();
+  // 关闭重开/缓存恢复形态：会话 form 为空，先把目标 URL 回填表单（经
+  // syncInput 规范化），handoff 的「保留 URL」才有数据源。
+  const targetUrl = (result as { targetUrl?: string }).targetUrl ?? session.form.url;
+  if (targetUrl !== '' && session.form.url === '') {
+    session = syncInput(session, 'url', editableURL(targetUrl));
+  }
+  clearSessionResult('checkout', scope);
+  bumpResultEpoch('checkout');
+  session = handoffReducer(session);
+  // handoff 后入口不变（源目录 realpath）、mode=checkout：写「源目录 + checkout」键。
+  saveDraft(scope.entryKey, 'checkout', toDraft(session));
+  resetImportPreviewView();
+  importVerifySnapshotFailed = false;
+  pushRender();
+}
+
+/** 在 Finder 中显示导入源目录（success 页「查看原目录」）。 */
+function revealSourceDir(): void {
+  const result = session?.result;
+  if (!result || result.mode !== 'import') {
+    return;
+  }
+  void vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(result.path));
+}
+
+/** 清空共用 URL 历史（检出/导入同一份；表单下拉与后续打开即时生效）。 */
+function handleClearUrlHistory(): void {
+  saveUrlHistory([]);
+  if (session) {
+    session = { ...session, history: [] };
+    pushRender();
+  }
+}
+
 /** 测试辅助：重置面板控制器模块级状态（真实宿主不需要）。 */
 export function resetCheckoutPanelController(): void {
   handle = undefined;
   session = undefined;
   formRevision = 0;
+  resetImportPreviewView();
+  importVerifySnapshotFailed = false;
   taskRemovalSub?.dispose();
   taskRemovalSub = undefined;
   resultUpdatedSub?.dispose();

@@ -9,6 +9,7 @@ import { commandCleanup } from './cleanup';
 import { commandCommit } from './commit';
 import { commandDelete } from './delete';
 import { commandEditIgnore } from './ignore';
+import { commandImportLocal } from './importDir';
 import { commandMove } from './move';
 import { type CommandHandler, registerCommand } from './registry';
 import { commandRelocate } from './relocate';
@@ -23,6 +24,7 @@ import { setCommitPanelContext } from '../panel/panels/commit';
 import { setIgnorePanelContext } from '../panel/panels/ignore';
 import { setCheckoutPanelContext } from '../panel/panels/checkout';
 import { setDraftStorage } from '../panel/drafts';
+import { setImportSnapshotDir } from '../panel/importTask';
 import { initializeOperationStore } from '../../core/operations';
 import { cleanupOrphanSnapshots } from '../orphanSnapshots';
 import { logLine } from '../output';
@@ -45,6 +47,7 @@ const COMMANDS: ReadonlyArray<{ id: string; handler: CommandHandler; kind: Outpu
   { id: 'svnAnywhere.move', handler: commandMove, kind: 'other' },
   { id: 'svnAnywhere.revealInFinder', handler: commandReveal, kind: 'other' },
   { id: 'svnAnywhere.checkout', handler: commandCheckout, kind: 'checkout' },
+  { id: 'svnAnywhere.importLocal', handler: commandImportLocal, kind: 'import' },
 ];
 
 /**
@@ -73,6 +76,8 @@ export async function registerAllCommands(context: vscode.ExtensionContext): Pro
   setCheckoutPanelContext(context);
   // P3 草稿存储（检出/导入面板共用，执行器预命令出口与面板恢复同源）。
   setDraftStorage(context.globalState);
+  // 导入快照落盘目录（导入执行器与孤儿快照清理同一 globalStorageUri 根）。
+  setImportSnapshotDir(context.globalStorageUri?.fsPath);
   // 未完成操作记录跨会话恢复限制（写锁在面板打开时生效）。
   // 每次 activate 都重载：记录可能被另一窗口写入同一 globalState，
   // 重跑 loadPending 是幂等的（active 收窄幂等、对运行登记中的键跳过陈旧化）。

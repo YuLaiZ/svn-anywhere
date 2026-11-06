@@ -2,20 +2,21 @@
  * P3 检出/导入面板的会话状态机与渲染态构建（纯函数，不依赖 vscode）。
  *
  * 状态形状覆盖两种 mode（技术方案 §4.1，对齐交互状态清单 §二/§三逐行）：
- * mode 专属字段分组齐全——本批实现 checkout 侧 reducer 与渲染，import
- * 分组（sourceDir/message、review.checked/snapshot/parentIdentity、
- * result 的 unknown/merged 分支）的类型与渲染分列一次到位，导入流程的
- * reducer 由阶段 2 接入时补齐，避免破坏性扩展。
+ * checkout 侧与 import 侧的 reducer、联动与渲染分列齐全——导入流程
+ * （§5）覆盖源预检、连接检查（父 info kind=dir + 目标 ls）、范围预览
+ * （快照/计数/阻止条目）、快照比对、确认与重检、执行与结果页动作集。
  *
- * 关键规则（§4.1/§4.2/§7.1/§7.2，交互状态清单 §二）：
+ * 关键规则（§4.1/§4.2/§5/§7.1/§7.2，交互状态清单 §二/§三）：
  * - URL 双字段：urlInput 是输入框显示草稿（每次同步原样写入、含非法
  *   输入，视图只渲染它——非法输入不被旧值顶掉）；form.url 是规范编码
  *   URI（业务唯一真相源），校验通过才写；
  * - 连接检查按发起代次（checkSeq）丢弃迟到回包；参数编辑使签名失效、
- *   清除身份快照与自动前进意图；
- * - 默认命名联动只在 nameMode='auto' 时发生，手动改名后保留；
+ *   清除身份快照（检出 conn.identity / 导入 review.parentIdentity）与
+ *   自动前进意图；
+ * - 默认命名联动只在 nameMode='auto' 时发生，手动改名后保留（检出作用
+ *   于子目录名、导入作用于目标 URL 末段）；
  * - 最终路径 path.join 归一拼接（directMode 为 directDir）；
- * - 结果页动作集按 kind 分列（清单 §二各行），closed 是宿主视图态、
+ * - 结果页动作集按 kind 分列（清单 §二/§三各行），closed 是宿主视图态、
  *   不进 reducer 业务状态。
  */
 import { join } from 'node:path';
@@ -29,10 +30,33 @@ import {
   type RemoteIdentity,
   type VerifyReport,
 } from '../../core/checkout';
-import type { ImportSnapshot, ParentIdentitySnapshot } from '../../core/importDir';
+import type { ImportSnapshot } from '../../core/importDir';
+import {
+  buildImportTargetUrl,
+  enumerationToSnapshot,
+  normalizeImportTarget,
+  snapshotDigest,
+  type ImportBlockReason,
+  type ImportEntryKind,
+  type ImportEnumeration,
+  type ImportRecheckResult,
+  type ImportSourcePrecheck,
+  type ImportSourceSummary,
+  type ParentIdentitySnapshot,
+} from '../../core/importDir';
 import { format, strings } from '../i18n';
 import type { CheckoutFormDraft } from './drafts';
-import type { ActionSpec, BannerSpec, FooterSpec, FormFieldSpec, FormSpec, PanelState } from './state';
+import { sliceTableRows } from './state';
+import type {
+  ActionSpec,
+  BannerSpec,
+  FooterSpec,
+  FormFieldSpec,
+  FormSpec,
+  PanelState,
+  TableFilterSpec,
+  TableSpec,
+} from './state';
 
 /** URL 历史本机共用上限（检出/导入同一份，§4.2）。 */
 export const URL_HISTORY_LIMIT = 10;
@@ -98,7 +122,10 @@ export interface CheckoutConnState {
   identity: RemoteIdentity | null;
 }
 
-/** 核对页子态：检出用 targetState/error，导入分组字段阶段 2 接入。 */
+/**
+ * 核对页子态：检出用 targetState/error；导入分组 = 确认勾选、源快照与
+ * 枚举计数、范围变化标记、父目录身份快照、确认框标记。
+ */
 export interface CheckoutReviewState {
   /** 检出：目标目录状态说明（进入核对页时的本地检查结论）。 */
   targetState: string | null;
@@ -113,6 +140,16 @@ export interface CheckoutReviewState {
   error: string | null;
   /** 导入父目录身份快照（连接检查初读、重检刷新；§4.1）。 */
   parentIdentity: ParentIdentitySnapshot | null;
+  /** 导入：枚举摘要（忽略项/特殊项四类分列计数；渲染投影与「无可导入文件」判定的数据源）。 */
+  previewSummary: ImportSourceSummary | null;
+  /** 导入：枚举阻止原因（unreadable/nested/unsupported 任一存在即阻止勾选与开始）。 */
+  previewBlockers: ImportBlockReason[];
+  /** 导入：global-ignores 解析失败标志——范围不被声称完整，阻止勾选确认与开始。 */
+  previewError: boolean;
+  /** 导入：仓库提交确认框打开中（Esc 不发起；模型只持标记，确认框由宿主弹出）。 */
+  confirmPending: boolean;
+  /** 导入：空说明二次确认标记（allowEmptyCommitMessage 开启时空说明发起需宿主确认）。 */
+  emptyMessageConfirm: boolean;
 }
 
 /** 运行中任务的进度镜像（taskRegistry 任务对象是真相源，此处供渲染）。 */
@@ -298,6 +335,11 @@ function freshReview(): CheckoutReviewState {
     scopeChanged: null,
     error: null,
     parentIdentity: null,
+    previewSummary: null,
+    previewBlockers: [],
+    previewError: false,
+    confirmPending: false,
+    emptyMessageConfirm: false,
   };
 }
 
@@ -346,12 +388,25 @@ export function normalizeUrlInput(raw: string): { ok: true; url: string } | { ok
   return result.ok ? { ok: true, url: result.url } : { ok: false, message: result.message };
 }
 
+/**
+ * 按模式分派的 URL 校验链（§7.2：checkout 走 §8 逆变换+校验；import 走
+ * §5 normalizeImportTarget 三步一体——逆变换 + 尾 @ 编码 %40 + 校验，
+ * 与 importNext 共用同一共享函数，不得拆开走通用路径）。
+ */
+function normalizeUrlForMode(raw: string, mode: P3Mode): { ok: true; url: string } | { ok: false; message: string } {
+  if (mode === 'import') {
+    const result = normalizeImportTarget(raw);
+    return result.ok ? { ok: true, url: result.url } : { ok: false, message: result.message };
+  }
+  return normalizeUrlInput(raw);
+}
+
 /** 以 urlInput 为准重算 urlError（草稿恢复后重算用；非法时 form.url 置空、保留显示值）。 */
-function revalidateUrl(form: CheckoutFormState): Pick<CheckoutFormState, 'url' | 'urlError'> {
+function revalidateUrl(form: CheckoutFormState, mode: P3Mode): Pick<CheckoutFormState, 'url' | 'urlError'> {
   if (form.urlInput === '') {
     return { url: '', urlError: null };
   }
-  const check = normalizeUrlInput(form.urlInput);
+  const check = normalizeUrlForMode(form.urlInput, mode);
   return check.ok ? { url: check.url, urlError: null } : { url: '', urlError: check.message };
 }
 
@@ -433,26 +488,33 @@ export function syncInput(
     case 'parentDir':
       return withForm(state, refreshDerived({ ...state.form, parentDir: value }));
     case 'sourceDir':
-      return invalidateOnSignatureChange(withForm(state, { ...state.form, sourceDir: value }));
+      // 手动输入/粘贴源目录同样触发 auto 模式的目标 URL 末段联动（§5）。
+      return invalidateOnSignatureChange(
+        withForm(state, applyImportUrlLinkage({ ...state.form, sourceDir: value })),
+      );
     case 'message':
       return withForm(state, { ...state.form, message: value });
     case 'checked':
-      // 导入核对的范围确认勾选（清单 §三 review/unchecked↔checked；阶段 2
-      // 接入流程，类型与通道一次到位）。范围变化清确认由导入 reducer 承担。
-      return { ...state, review: { ...state.review, checked: value === 'true' } };
+      // 导入核对的范围确认勾选（清单 §三 review/unchecked↔checked）：
+      // 与 setChecked 同一守卫（阻止勾选场景不接受绕过通道的置位）。
+      return setChecked(state, value === 'true');
     default:
       return state;
   }
 }
 
-/** URL 输入同步：显示草稿原样保留，规范值与校验态重算，签名变化失效检查。 */
+/** URL 输入同步：显示草稿原样保留，规范值与校验态重算（按模式分派校验链），签名变化失效检查。 */
 function syncUrl(state: CheckoutPanelState, raw: string): CheckoutPanelState {
-  const check = raw === '' ? { ok: false as const, message: '' } : normalizeUrlInput(raw);
+  const check = raw === '' ? { ok: false as const, message: '' } : normalizeUrlForMode(raw, state.mode);
   const form: CheckoutFormState = {
     ...state.form,
     urlInput: raw,
     url: raw === '' ? '' : check.ok ? check.url : state.form.url,
     urlError: raw === '' ? null : check.ok ? null : check.message,
+    // 导入模式 nameMode 作用于目标 URL 末段：手动编辑/选择 URL 后保留
+    // 手动值（源目录联动不再覆盖）；检出侧 nameMode 作用于子目录名、
+    // 编辑 URL 不置 manual（auto 联动目录名）。
+    nameMode: state.mode === 'import' ? 'manual' : state.form.nameMode,
   };
   const linked = applyAutoNaming(form);
   return invalidateOnSignatureChange(withForm(state, linked));
@@ -470,13 +532,66 @@ function applyAutoNaming(form: CheckoutFormState): CheckoutFormState {
   return { ...form, dirName, nameError: validateDirName(dirName) };
 }
 
-/** 选择历史 URL（或联动/「使用本地目录名」写入规范 URL 的共用路径）：双字段同写、auto 联动。 */
+/** 源目录名：剥尾分隔符后取最后一段（兼容 / 与 \ 分隔符，源目录是单个目录名、不含分隔符语义）。 */
+function sourceDirName(dir: string): string {
+  const trimmed = dir.replace(/[\\/]+$/, '');
+  const cut = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'));
+  return cut < 0 ? trimmed : trimmed.slice(cut + 1);
+}
+
+/**
+ * 目标 URL 末段替换：定位路径部分最后一个非空段，替换为 buildImportTargetUrl
+ * 编码一次的源目录名。替换的是目标 URL 的最后一段（不是父 URL 末段——按
+ * 「父 URL 末段」实现会误删父路径一段）；URL 无路径段（仅 scheme://authority）
+ * 时无末段可替换，返回 null。
+ */
+function replaceImportUrlLastSegment(url: string, sourceName: string): string | null {
+  const schemeEnd = url.indexOf('://');
+  if (schemeEnd < 0) {
+    return null;
+  }
+  const authorityEnd = url.indexOf('/', schemeEnd + 3);
+  if (authorityEnd < 0) {
+    return null;
+  }
+  const path = url.slice(authorityEnd + 1);
+  const trimmed = path.replace(/\/+$/, '');
+  if (trimmed === '') {
+    return null;
+  }
+  const parent = url.slice(0, authorityEnd + 1 + trimmed.lastIndexOf('/'));
+  return buildImportTargetUrl(parent, sourceName);
+}
+
+/**
+ * 导入侧默认命名联动（§5）：nameMode='auto' 时源目录变化把目标 URL 末段
+ * 替换为编码一次的源目录名（中文/空格/@/# 等由 encodeURIComponent 统一
+ * 编码）；manual 保留手动值；源目录名为空或 URL 无末段时不联动。
+ */
+function applyImportUrlLinkage(form: CheckoutFormState): CheckoutFormState {
+  if (form.nameMode !== 'auto') {
+    return form;
+  }
+  const name = sourceDirName(form.sourceDir);
+  if (name === '' || form.url === '') {
+    return form;
+  }
+  const linked = replaceImportUrlLastSegment(form.url, name);
+  if (linked === null) {
+    return form;
+  }
+  return { ...form, url: linked, urlInput: editableURL(linked), urlError: null };
+}
+
+/** 选择历史 URL（或联动写入规范 URL 的共用路径）：双字段同写、auto 联动；导入侧视同手动设定。 */
 export function selectHistoryUrl(state: CheckoutPanelState, url: string): CheckoutPanelState {
-  // 历史写入前已过校验；此处仍走校验链保证状态不变量（非法值不写 form.url）。
-  const check = normalizeUrlInput(editableURL(url));
-  const form: CheckoutFormState = check.ok
+  // 历史写入前已过校验；此处仍走（按模式分派的）校验链保证状态不变量（非法值不写 form.url）。
+  const check = normalizeUrlForMode(editableURL(url), state.mode);
+  const base: CheckoutFormState = check.ok
     ? { ...state.form, url: check.url, urlInput: editableURL(check.url), urlError: null }
     : { ...state.form, urlInput: url, urlError: check.message };
+  // 导入模式：显式选择完整目标 URL 后保留（末段不再随源目录联动）。
+  const form = { ...base, nameMode: state.mode === 'import' ? ('manual' as const) : base.nameMode };
   return invalidateOnSignatureChange(withForm(state, applyAutoNaming(form)));
 }
 
@@ -485,9 +600,9 @@ export function useUrlName(state: CheckoutPanelState): CheckoutPanelState {
   return withForm(state, applyAutoNaming({ ...state.form, nameMode: 'auto' }));
 }
 
-/** 「使用本地目录名」（导入侧）：回 auto；末段联动由阶段 2 的导入 reducer 承担。 */
+/** 「使用本地目录名」（导入侧）：回 auto 并立即按当前源目录联动目标 URL 末段。 */
 export function useDirName(state: CheckoutPanelState): CheckoutPanelState {
-  return withForm(state, { ...state.form, nameMode: 'auto' });
+  return withForm(state, applyImportUrlLinkage({ ...state.form, nameMode: 'auto' }));
 }
 
 /** 目录选择器：写父目录（表单内草稿值，不改入口键）。 */
@@ -506,9 +621,10 @@ function withForm(state: CheckoutPanelState, form: CheckoutFormState): CheckoutP
 
 /**
  * 参数签名变化时使连接检查失效（§4.1：untested + 身份/结论/自动前进
- * 全清——旧 URL 的成功结果不得批准新参数）并清除两侧错误横幅（修改
- * 目标触发，§4.1 清除口径）。签名未变（如仅改目录名/深度、或非法输入
- * 未改变规范值）时不动 conn。
+ * 全清——旧 URL 的成功结果不得批准新参数）并清除两侧错误横幅与导入
+ * 父目录身份快照（修改目标触发，§4.1 清除口径——旧父身份不得用于新
+ * 目标）。签名未变（如仅改目录名/深度、或非法输入未改变规范值）时
+ * 不动 conn。
  */
 function invalidateOnSignatureChange(state: CheckoutPanelState): CheckoutPanelState {
   const before = state.conn.signature;
@@ -519,7 +635,7 @@ function invalidateOnSignatureChange(state: CheckoutPanelState): CheckoutPanelSt
   return {
     ...state,
     conn: { ...freshConn(), checkSeq: state.conn.checkSeq },
-    review: { ...state.review, error: null },
+    review: { ...state.review, error: null, parentIdentity: null },
   };
 }
 
@@ -660,6 +776,499 @@ export function setConnError(state: CheckoutPanelState, message: string): Checko
 /** 重查通过、紧邻写命令发出前清除身份快照（§4.3 时序；begin 失败与重查失败均保留）。 */
 export function consumeIdentity(state: CheckoutPanelState): CheckoutPanelState {
   return { ...state, conn: { ...state.conn, identity: null } };
+}
+
+/* ---------------------------------------------------------------------------
+ * 导入流程 reducer（§5：源预检 → 连接检查 → 范围预览 → 确认与重检 → 执行/结果）
+ * ------------------------------------------------------------------------- */
+
+/** pickSourceDirReducer 的返回：占位发起（预检 IO 由控制器执行后回填 setSourcePrecheck）。 */
+export interface SourcePrecheckNext {
+  state: CheckoutPanelState;
+  /** 本次预检的代次（回包经 setSourcePrecheck 带回比对，迟到回包丢弃）。 */
+  seq: number;
+}
+
+/**
+ * 源目录选择（pickSourceDir）：写入源目录值并联动目标 URL 末段（auto
+ * 模式），随后进入源预检占位态（conn.testing + 代次递增——实际预检
+ * （svn info 本地形态判定）由控制器执行后经 setSourcePrecheck 回填，
+ * 占位期间「下一步」按检查中拒绝）。占位时定格参数签名（预检失败后
+ * 的参数编辑据此失效并清除横幅）。
+ */
+export function pickSourceDirReducer(state: CheckoutPanelState, dir: string): SourcePrecheckNext {
+  const linked = applyImportUrlLinkage({ ...state.form, sourceDir: dir });
+  const next = withForm(state, linked);
+  const seq = next.conn.checkSeq + 1;
+  return {
+    state: {
+      ...next,
+      conn: {
+        phase: 'testing',
+        signature: signatureOf(next.form, next.mode),
+        checkSeq: seq,
+        pinnedRevision: null,
+        pendingNext: false,
+        error: null,
+        identity: null,
+      },
+      review: { ...next.review, error: null, parentIdentity: null },
+    },
+    seq,
+  };
+}
+
+/** 预检失败的可读原因（按 precheckImportSource 的状态分列；unversioned 放行无文案）。 */
+function sourcePrecheckMessage(result: ImportSourcePrecheck): string {
+  const t = strings.checkoutPanel;
+  switch (result.status) {
+    case 'unversioned':
+      // 调用方在 unversioned 时已提前放行返回，本分支不可达（穷尽守卫）。
+      return '';
+    case 'versioned':
+      return t.sourceVersionedNotice;
+    case 'svnMissing':
+    case 'missing':
+    case 'notDir':
+      return result.message;
+    case 'unknown':
+      return format(t.sourceSvnStatusFailedNotice, { message: result.message });
+  }
+}
+
+/**
+ * 源预检结论回填（代次一致且仍处占位 testing 才生效）：
+ * - unversioned（副本内未纳管或不在任何副本内）→ 放行回 untested——预检
+ *   不等于连接检查，表单页仍需「下一步」走远端检查；
+ * - versioned → 拒绝并提示改用提交功能；missing/notDir/svnMissing/unknown
+ *   → 均阻止导入（「未纳管」未被证明，读不出不等于未纳管），原因进
+ *   conn.error、渲染为表单页 error 横幅；签名保留（参数编辑失效判定的基准）。
+ */
+export function setSourcePrecheck(
+  state: CheckoutPanelState,
+  seq: number,
+  result: ImportSourcePrecheck,
+): CheckoutPanelState {
+  if (state.conn.checkSeq !== seq || state.conn.phase !== 'testing') {
+    return state;
+  }
+  if (result.status === 'unversioned') {
+    return { ...state, conn: { ...freshConn(), checkSeq: state.conn.checkSeq } };
+  }
+  return {
+    ...state,
+    conn: {
+      ...freshConn(),
+      checkSeq: state.conn.checkSeq,
+      phase: 'failed',
+      signature: state.conn.signature,
+      error: sourcePrecheckMessage(result),
+    },
+  };
+}
+
+/**
+ * 导入「下一步」（importNext）：对当前 urlInput 重走 normalizeImportTarget
+ * 三步一体（编辑回写逆变换 → 尾 @ 编码 %40 → 校验——与 syncInput 的
+ * 表单规范化同一共享函数，不得走「仅逆变换+校验」的通用路径），失败
+ * 拒绝发起、置 urlError 留表单（不用旧 form.url）；发起态 conn.testing +
+ * 代次递增 + 自动前进意图（通过后进核对页），旧父身份清除（重新检查
+ * 触发——旧父身份不得用于新参数）。
+ */
+export function importNextReducer(state: CheckoutPanelState): ConnNextResult {
+  const check = normalizeImportTarget(state.form.urlInput);
+  if (!check.ok) {
+    const rejected = withForm(state, {
+      ...state.form,
+      url: state.form.urlInput === '' ? '' : state.form.url,
+      urlError: check.message,
+    });
+    return { state: rejected, seq: state.conn.checkSeq, issued: false };
+  }
+  if (state.conn.phase === 'testing' || state.conn.phase === 'auth') {
+    return { state, seq: state.conn.checkSeq, issued: false };
+  }
+  const next = withForm(state, { ...state.form, url: check.url, urlError: null });
+  const seq = state.conn.checkSeq + 1;
+  return {
+    state: {
+      ...next,
+      review: { ...next.review, parentIdentity: null },
+      conn: {
+        phase: 'testing',
+        signature: signatureOf(next.form, next.mode),
+        checkSeq: seq,
+        pinnedRevision: null,
+        pendingNext: true,
+        error: null,
+        identity: null,
+      },
+    },
+    seq,
+    issued: true,
+  };
+}
+
+/**
+ * 导入连接检查的结论（父 info + 目标 ls 的编排结果，由控制器组装）：
+ * ok = 父 kind=dir 且目标 ls 判不存在；失败按原因分列——parentNotDir/
+ * targetExists 用模型默认文案（「父路径不是目录」「目标已存在」是判定
+ * 语义的一部分），网络/认证原因透传控制器组装的原文。
+ */
+export type ImportConnOutcome =
+  | { ok: true; parentIdentity: ParentIdentitySnapshot }
+  | {
+      ok: false;
+      failure: 'parentUnreachable' | 'parentNotDir' | 'targetExists' | 'auth' | 'connectError';
+      message?: string;
+    };
+
+/** 导入连接检查失败文案：结构化原因给默认提示，其余透传原文（缺省回退认证等待文案）。 */
+function importConnFailureMessage(outcome: Extract<ImportConnOutcome, { ok: false }>): string {
+  const t = strings.checkoutPanel;
+  switch (outcome.failure) {
+    case 'parentNotDir':
+      return t.importParentNotDirNotice;
+    case 'targetExists':
+      return t.importTargetExistsNotice;
+    case 'auth':
+      return outcome.message ?? t.badgeConnAuth;
+    default:
+      return outcome.message ?? '';
+  }
+}
+
+/**
+ * 导入连接检查结论写入（代次一致且仍处 testing 才生效——迟到回包丢弃）：
+ * - 通过：conn.success + 父身份快照初读写入 review.parentIdentity，
+ *   pendingNext 自动进入核对页（范围预览由控制器枚举后经 setPreview 回填）；
+ * - auth：转入认证补录相位（connAuthResume/connAuthCancel 复用检出侧）；
+ * - 其余失败（父不可达/父非目录/目标已存在/网络失败）：留在表单、原因
+ *   进 conn.error（清单 §三 form/testFailed 行——测试成功不表示有写权限）。
+ */
+export function importConnSettled(
+  state: CheckoutPanelState,
+  seq: number,
+  outcome: ImportConnOutcome,
+): CheckoutPanelState {
+  if (state.conn.checkSeq !== seq || state.conn.phase !== 'testing') {
+    return state;
+  }
+  if (outcome.ok) {
+    return {
+      ...state,
+      step: state.conn.pendingNext ? 'review' : state.step,
+      conn: { ...state.conn, phase: 'success', pendingNext: false, error: null },
+      review: { ...state.review, parentIdentity: outcome.parentIdentity },
+    };
+  }
+  if (outcome.failure === 'auth') {
+    return { ...state, conn: { ...state.conn, phase: 'auth' } };
+  }
+  return {
+    ...state,
+    step: 'form',
+    conn: {
+      ...state.conn,
+      phase: 'failed',
+      pendingNext: false,
+      error: importConnFailureMessage(outcome),
+    },
+  };
+}
+
+/**
+ * 范围预览回填（enumerateImportSource 的结果）：写快照与计数、复位勾选
+ * 与范围变化标记（重新预览后需重新勾选确认）；无可导入文件（fileCount=0，
+ * 仅空目录）→ 以 review.error 提示并阻止勾选（本轮不提供只创建空目录）。
+ */
+export function setPreview(state: CheckoutPanelState, enumeration: ImportEnumeration): CheckoutPanelState {
+  if (state.mode !== 'import') {
+    return state;
+  }
+  const empty = enumeration.summary.fileCount === 0;
+  return {
+    ...state,
+    step: 'review',
+    review: {
+      ...state.review,
+      snapshot: enumerationToSnapshot(enumeration),
+      previewSummary: enumeration.summary,
+      previewBlockers: enumeration.blockers,
+      checked: false,
+      scopeChanged: null,
+      previewError: false,
+      confirmPending: false,
+      error: empty ? strings.checkoutPanel.importEmptyNotice : null,
+    },
+  };
+}
+
+/**
+ * 范围预览失败（global-ignores 解析失败等）：范围不被声称完整——错误
+ * 横幅提示「忽略规则读取失败，无法确认忽略范围」+ 强制未勾选（阻止
+ * 勾选确认与开始；修复配置后重新预览重读配置即可继续）。
+ */
+export function setPreviewError(state: CheckoutPanelState, message: string): CheckoutPanelState {
+  if (state.mode !== 'import') {
+    return state;
+  }
+  return {
+    ...state,
+    step: 'review',
+    review: { ...state.review, previewError: true, checked: false, confirmPending: false, error: message },
+  };
+}
+
+/**
+ * 导入确认勾选的禁用原因（null = 可勾选）：预览未回填/解析失败/存在
+ * 阻止条目（unreadable/nested/unsupported）/无可导入文件/范围已变化。
+ * setChecked 守卫与渲染 checkbox 的 disabled 同源，绕过通道同样被拒。
+ */
+export function importConfirmBlockReason(review: CheckoutReviewState): string | null {
+  const t = strings.checkoutPanel;
+  if (review.snapshot === null) {
+    return t.checkedDisabledPreviewPending;
+  }
+  if (review.previewError) {
+    return t.checkedDisabledPreviewFailed;
+  }
+  if (review.previewBlockers.length > 0) {
+    return t.checkedDisabledBlockers;
+  }
+  if (review.previewSummary !== null && review.previewSummary.fileCount === 0) {
+    return t.checkedDisabledEmpty;
+  }
+  if (review.scopeChanged !== null) {
+    return t.checkedDisabledScopeChanged;
+  }
+  return null;
+}
+
+/**
+ * 源快照比对（review 进入、点开始、确认通过后共三次，均由控制器枚举后
+ * 调用）：新枚举与预览时快照的 digest 不一致 → scopeChanged='source'、
+ * 清勾选与确认、提示重新预览（旧范围不能直接提交；不写记录不发起——
+ * 任务对象收口由控制器执行，模型只出状态）。一致时原样返回（引用不
+ * 变，调用方据此继续后续流程）。
+ */
+export function checkImportScope(state: CheckoutPanelState, fresh: ImportEnumeration): CheckoutPanelState {
+  if (state.step !== 'review' || state.review.snapshot === null) {
+    return state;
+  }
+  if (snapshotDigest(enumerationToSnapshot(fresh)) === snapshotDigest(state.review.snapshot)) {
+    return state;
+  }
+  return {
+    ...state,
+    review: {
+      ...state.review,
+      checked: false,
+      confirmPending: false,
+      scopeChanged: 'source',
+      error: strings.checkoutPanel.importScopeChangedNotice,
+    },
+  };
+}
+
+/** 范围确认勾选：存在任一阻止条件时拒绝置位（取消勾选始终允许）。 */
+export function setChecked(state: CheckoutPanelState, checked: boolean): CheckoutPanelState {
+  if (state.mode !== 'import' || state.step !== 'review') {
+    return state;
+  }
+  if (checked && importConfirmBlockReason(state.review) !== null) {
+    return state;
+  }
+  return { ...state, review: { ...state.review, checked } };
+}
+
+/** 仓库提交确认框标记（打开/关闭——Esc 关闭不发起，勾选保留可再次点开始）。 */
+export function setConfirmState(state: CheckoutPanelState, pending: boolean): CheckoutPanelState {
+  if (state.mode !== 'import') {
+    return state;
+  }
+  return { ...state, review: { ...state.review, confirmPending: pending } };
+}
+
+/** 空说明二次确认标记（allowEmptyCommitMessage 开启时由开始流程置位，宿主确认后清除）。 */
+export function setEmptyMessageConfirm(state: CheckoutPanelState, pending: boolean): CheckoutPanelState {
+  if (state.mode !== 'import') {
+    return state;
+  }
+  return { ...state, review: { ...state.review, emptyMessageConfirm: pending } };
+}
+
+/**
+ * 确认通过后、写命令前的完整重检结论（recheckImportTarget 的结果）：
+ * - targetChanged 类（父身份不一致 identityChanged/目标已存在 targetExists/
+ *   父变文件节点 parentNotDir）→ scopeChanged='target'、清勾选与确认、
+ *   提示返回修改 URL 重新测试核对（不写记录不发起——不向已有目标混入内容）；
+ * - 网络/认证失败（parentUnreachable/targetCheckFailed）→ review 页顶部
+ *   错误横幅 + 清确认保留参数——重新勾选后再点「开始」重走重检（未勾选
+ *   期间开始禁用由渲染断言；不进 result 失败页：命令未发出，「尚未开始」
+ *   不得误呈为一次导入失败）；
+ * - 通过 → 清除错误横幅，并把身份快照 lastChangedRevision 刷新为重检时
+ *   读取值（「最后一次远端确认目标不存在」的锚点，随 begin 定格；UUID/root
+ *   才是重检比对条件，revision 不参与 targetChanged 判定）。
+ */
+export function setRecheckOutcome(state: CheckoutPanelState, result: ImportRecheckResult): CheckoutPanelState {
+  if (result.ok) {
+    return { ...state, review: { ...state.review, parentIdentity: result.parentIdentity, error: null } };
+  }
+  const targetChanged =
+    result.failure === 'identityChanged' || result.failure === 'targetExists' || result.failure === 'parentNotDir';
+  return {
+    ...state,
+    step: 'review',
+    review: {
+      ...state.review,
+      checked: false,
+      confirmPending: false,
+      scopeChanged: targetChanged ? ('target' as const) : state.review.scopeChanged,
+      error: result.message,
+    },
+  };
+}
+
+/** 发起导入（startImport 的模型侧转移）：进入 running 步并建立任务绑定（同 beginTask 转移表）。 */
+export function beginImportTask(
+  state: CheckoutPanelState,
+  task: { opId: string; targetPath: string; resultScope?: { entryKey: string; mode: P3Mode } },
+): CheckoutPanelState {
+  return beginTask(state, task);
+}
+
+/** begin 成功落盘后、紧邻写命令发出前清除父身份快照（与检出侧 §4.3 时序同口径；失败保留供同页重试取参）。 */
+export function consumeParentIdentity(state: CheckoutPanelState): CheckoutPanelState {
+  return { ...state, review: { ...state.review, parentIdentity: null } };
+}
+
+/** 导入结果页的表单快照（retryImport/abandonUnknownImport 回填数据源；§4.1 result import formSnapshot）。 */
+export interface ImportFormSnapshot {
+  url: string;
+  sourceDir: string;
+  message: string;
+  nameMode: 'auto' | 'manual';
+}
+
+/** setImportResult 的输入（字段与 §4.1 result import 分支一一对应）。 */
+export interface ImportResultInput {
+  kind: 'success' | 'failed' | 'unknown' | 'merged';
+  /** 源目录路径（结果页 path 字段 = 任务的 targetPath）。 */
+  path: string;
+  revision?: number;
+  detail?: string;
+  /** kind='success'/'failed' 的结论来源：命令直接结束 / unknown 核实转结论。 */
+  evidence?: 'command' | 'verified';
+  /** 仅 kind='unknown' 合法：核实不唯一的结论。 */
+  resolution?: 'unresolved';
+  /** kind='failed'/'unknown' 页的表单快照。 */
+  formSnapshot?: ImportFormSnapshot;
+  /** 仅 kind='unknown' 合法：核实第 0 步快照不完整（abandonUnknownImport 的判定载体）。 */
+  snapshotIncomplete?: true;
+  /** 仅 kind='merged' 合法：acknowledgeMerged 收口后的「已完成」形态。 */
+  settled?: true;
+}
+
+/** 导入结果页写入（任务终态与 unknown 核实结论共用——任务镜像随即清空）。 */
+export function setImportResult(state: CheckoutPanelState, input: ImportResultInput): CheckoutPanelState {
+  return setResult(state, { mode: 'import', ...input });
+}
+
+/**
+ * 回表单的共用投影（retryImport/abandonUnknownImport 同款，§7.2 两层回填）：
+ * 会话 form 非空优先 form（用户可能已就地修改），否则按结果页快照回填
+ * （urlInput 按规范 URI 派生显示值）；conn 回 untested（重试需重新测试
+ * 与核对）、review 全清（勾选/快照/确认标记）、结果页与绑定清除、解除
+ * 任务绑定（离开结果页回表单的动作）。
+ */
+function restoreImportForm(state: CheckoutPanelState): CheckoutPanelState {
+  const snapshot = state.result?.mode === 'import' ? state.result.formSnapshot : undefined;
+  let form = state.form;
+  if (state.form.url === '' && snapshot) {
+    form = {
+      ...state.form,
+      url: snapshot.url,
+      urlInput: editableURL(snapshot.url),
+      sourceDir: snapshot.sourceDir,
+      message: snapshot.message,
+      nameMode: snapshot.nameMode,
+    };
+  }
+  return {
+    ...state,
+    step: 'form',
+    result: null,
+    task: null,
+    binding: null,
+    recovered: null,
+    conn: { ...freshConn(), checkSeq: state.conn.checkSeq },
+    review: freshReview(),
+    form: refreshDerived(form),
+  };
+}
+
+/** 「返回填写并重试」（failed 页与 unknown 核实未提交）：保留表单值回 form，重试重走连接检查。 */
+export function retryImportReducer(state: CheckoutPanelState): CheckoutPanelState {
+  return restoreImportForm(state);
+}
+
+/** 「放弃核实并解除限制」（快照不完整的 unknown 页专用出口）：与 retryImport 同款回表单。 */
+export function abandonUnknownImportReducer(state: CheckoutPanelState): CheckoutPanelState {
+  return restoreImportForm(state);
+}
+
+/**
+ * 「另选新目录检出」（success 页 handoffToCheckout）：切 checkout 模式、
+ * 保留目标 URL、revMode='number' + revision（不覆盖原目录，仍要求完整
+ * 测试、核对与确认）；其余字段按入口初始值重建。切换后的草稿写回
+ * （键 = 源目录 + checkout）由控制器执行，模型只出切换后状态。
+ */
+export function handoffReducer(state: CheckoutPanelState): CheckoutPanelState {
+  const revision = state.result?.mode === 'import' ? state.result.revision : undefined;
+  const fresh = createCheckoutPanelState({
+    sessionId: state.sessionId,
+    ...state.entry,
+    mode: 'checkout',
+    parentDir: state.entry.parentDir,
+    history: state.history,
+  });
+  const form: CheckoutFormState = {
+    ...fresh.form,
+    url: state.form.url,
+    urlInput: state.form.url === '' ? '' : editableURL(state.form.url),
+    revMode: revision !== undefined ? 'number' : 'head',
+    rev: revision !== undefined ? String(revision) : '',
+  };
+  return { ...fresh, form: refreshDerived(applyAutoNaming(form)) };
+}
+
+/**
+ * 「已人工核对，完成」（merged 页 acknowledgeMerged 确认后的模型侧收口
+ * 形态）：settled 置位——动作集切换为 新建/日志/关闭，「核实」与收口
+ * 动作不再渲染（记录与快照的删除收口由控制器执行；非 merged 页或已
+ * 收口时原样返回）。
+ */
+export function acknowledgeMergedReducer(state: CheckoutPanelState): CheckoutPanelState {
+  const result = state.result;
+  if (result?.mode !== 'import' || result.kind !== 'merged' || result.settled) {
+    return state;
+  }
+  return { ...state, result: { ...result, settled: true } };
+}
+
+/**
+ * 核实发起（verifyImport）的模型侧前置：先把快照不完整 unknown 页的
+ * snapshotIncomplete 重置（快照修复后的再核实、第 0 步成功但证据不唯一
+ * 保持 unknown 时，旧 true 残留会让页面错误保留「放弃核实」动作）；
+ * 会话缓存镜像的同步由控制器执行。
+ */
+export function beginImportVerify(state: CheckoutPanelState): CheckoutPanelState {
+  const result = state.result;
+  if (result?.mode !== 'import' || result.kind !== 'unknown' || result.snapshotIncomplete === undefined) {
+    return state;
+  }
+  return { ...state, result: { ...result, snapshotIncomplete: undefined } };
 }
 
 /* ---------------------------------------------------------------------------
@@ -824,7 +1433,7 @@ export function fromDraft(state: CheckoutPanelState, draft: CheckoutFormDraft): 
     ...state.form,
     ...draft,
   };
-  const revalidated = refreshDerived({ ...form, ...revalidateUrl(form) });
+  const revalidated = refreshDerived({ ...form, ...revalidateUrl(form, state.mode) });
   return {
     ...state,
     step: 'form',
@@ -848,6 +1457,14 @@ export interface BuildCheckoutPanelOptions {
   verifyPending?: boolean;
   /** resumable 页「继续原检出」的占用判定（beginResume 谓词求值结果，默认可用）。 */
   resumeAvailable?: boolean;
+  /** 导入核对页文件表当前页码（分页视图状态由宿主表格实例持有，模型按传入页码切片）。 */
+  importPreviewPage?: number;
+  /** 导入核对页文件表当前排序（同上由宿主持有回喂；缺省路径升序）。 */
+  importPreviewSort?: TableSpec['sort'];
+  /** 导入核对页文件表当前筛选值（同上由宿主持有回喂；缺省无活动筛选）。 */
+  importPreviewFilters?: TableFilterSpec[];
+  /** merged 页核实第 0 步失败（快照不完整）——页面横幅提示、不转 unknown 不写 snapshotIncomplete。 */
+  importVerifySnapshotFailed?: boolean;
 }
 
 /** 会话状态 → 宿主渲染态（三步条、表单/核对/进度/结果页、横幅、页脚全量派生）。 */
@@ -864,14 +1481,37 @@ export function buildCheckoutPanelState(
   if (state.step === 'review' && state.review.error) {
     banners.push({ id: 'reviewError', level: 'error', title: t.reviewErrorTitle, detail: state.review.error, preformatted: true });
   }
+  if (state.step === 'review' && state.mode === 'import') {
+    // 存在不可读/嵌套/不支持条目：范围不被声称完整（阻止勾选确认与开始）。
+    if (state.review.previewBlockers.length > 0) {
+      banners.push({
+        id: 'importBlockers',
+        level: 'error',
+        title: t.importBlockersTitle,
+        detail: state.review.previewBlockers.map((reason) => importBlockerText(reason)).join('；'),
+      });
+    }
+    // 空说明二次确认进行中（宿主模态框期间的过程提示，无手动关闭需求）。
+    if (state.review.emptyMessageConfirm) {
+      banners.push({ id: 'emptyMessageConfirm', level: 'info', title: t.emptyMessageConfirmTitle, dismissable: false });
+    }
+  }
   let form: FormSpec | undefined;
   let footer: FooterSpec | undefined;
+  let table: TableSpec | undefined;
   if (state.step === 'form') {
     form = buildFormSpec(state);
     footer = buildFormFooter(state);
   } else if (state.step === 'review') {
     form = buildReviewSpec(state);
     footer = buildReviewFooter(state);
+    if (state.mode === 'import') {
+      table = buildImportPreviewTable(state, {
+        sort: options.importPreviewSort,
+        filters: options.importPreviewFilters,
+        page: options.importPreviewPage ?? 1,
+      });
+    }
   } else if (state.step === 'running') {
     form = buildProgressSpec(state);
     footer = buildProgressFooter(state);
@@ -891,9 +1531,23 @@ export function buildCheckoutPanelState(
     banners,
     form,
     footer,
+    table,
     steps: { labels: [t.stepForm, t.stepReview, t.stepResult], current: stepIndexOf(state.step) },
     headerBadges: connBadges(state),
   };
+}
+
+/** 枚举阻止原因的可读文本（blockers 横幅逐条拼接）。 */
+function importBlockerText(reason: ImportBlockReason): string {
+  const t = strings.checkoutPanel;
+  switch (reason) {
+    case 'unreadable':
+      return t.importBlockerUnreadable;
+    case 'nested':
+      return t.importBlockerNested;
+    case 'unsupported':
+      return t.importBlockerUnsupported;
+  }
 }
 
 function stepIndexOf(step: CheckoutStep): number {
@@ -1015,8 +1669,12 @@ function buildFormSpec(state: CheckoutPanelState): FormSpec {
     if (form.nameMode === 'manual' && !form.directMode) {
       tools.push({ id: 'useUrlName', label: t.useUrlName });
     }
-  } else if (form.nameMode === 'manual') {
-    tools.push({ id: 'useDirName', label: t.useDirName });
+  } else {
+    // 导入：源目录选择器 + 手动命名后的「使用本地目录名」（恢复末段联动）。
+    tools.push({ id: 'pickSourceDir', label: t.pickSourceDir });
+    if (form.nameMode === 'manual') {
+      tools.push({ id: 'useDirName', label: t.useDirName });
+    }
   }
   return { id: mode === 'checkout' ? 'checkoutForm' : 'importForm', fields, tools: tools.length > 0 ? tools : undefined, busy: false };
 }
@@ -1037,7 +1695,135 @@ function buildFormFooter(state: CheckoutPanelState): FooterSpec {
   };
 }
 
-/** 核对页（§7.1：键值行用 FormSpec 禁用字段承载；导入核对含确认勾选）。 */
+/** 导入核对页文件表的页大小（§7.2：导入/磁盘表格默认 50 行一页）。 */
+export const IMPORT_PREVIEW_PAGE_SIZE = 50;
+
+/** 字节数展示文本（B/KB/MB/GB，一位小数；cells 只放展示文本、排序值另走 sortValues）。 */
+function formatSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) {
+    return '—';
+  }
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let unit = -1;
+  do {
+    value /= 1024;
+    unit += 1;
+  } while (value >= 1024 && unit < units.length - 1);
+  const rounded = value >= 10 ? Math.round(value) : Math.round(value * 10) / 10;
+  return `${rounded} ${units[unit]}`;
+}
+
+/** 条目状态标注：unsupported > nested > unreadable > ignored > 将导入（与枚举阻止优先级同源）。 */
+function previewStateText(entry: { unsupported: boolean; nested: boolean; unreadable: boolean; ignored: boolean }): string {
+  const t = strings.checkoutPanel;
+  if (entry.unsupported) {
+    return t.previewStateUnsupported;
+  }
+  if (entry.nested) {
+    return t.previewStateNested;
+  }
+  if (entry.unreadable) {
+    return t.previewStateUnreadable;
+  }
+  if (entry.ignored) {
+    return t.previewStateIgnored;
+  }
+  return t.previewStateWillImport;
+}
+
+/** 导入预览表的默认排序（宿主视图状态重置值）：路径升序。 */
+export const IMPORT_PREVIEW_SORT_DEFAULT: TableSpec['sort'] = { key: 'path', direction: 'asc' };
+
+/**
+ * 导入预览表的筛选器骨架（§7.1）：path 列文本子串筛选（大小写不敏感、
+ * 宿主侧执行）+ state 列精确筛选（'all' 哨兵不过滤）。value 是宿主持有
+ * 的视图状态，重置/换源时以本工厂重建。
+ */
+export function createImportPreviewFilters(pathValue = '', stateValue = 'all'): TableFilterSpec[] {
+  const t = strings.checkoutPanel;
+  return [
+    { id: 'previewPath', kind: 'text', cellKey: 'path', value: pathValue },
+    {
+      id: 'previewState',
+      kind: 'select',
+      cellKey: 'state',
+      value: stateValue,
+      options: [
+        { value: 'all', label: strings.panel.filterAll },
+        ...[t.previewStateWillImport, t.previewStateIgnored, t.previewStateUnreadable, t.previewStateNested, t.previewStateUnsupported].map(
+          (label) => ({ value: label, label }),
+        ),
+      ],
+    },
+  ];
+}
+
+/**
+ * 导入核对页文件表（§7.1 TableSpec）：全量条目投影为行（路径/类型/
+ * 大小/状态，四列均可点表头排序，size 按字节数值排序），宿主传入当前
+ * 排序/筛选/页码经 sliceTableRows 切片——视图状态由宿主表格实例唯一
+ * 持有，模型不建第二份；预览未回填（快照尚未写入）时无表格可渲染。
+ */
+function buildImportPreviewTable(
+  state: CheckoutPanelState,
+  view: { sort?: TableSpec['sort']; filters?: TableFilterSpec[]; page: number },
+): TableSpec | undefined {
+  const snapshot = state.review.snapshot;
+  if (!snapshot) {
+    return undefined;
+  }
+  const t = strings.checkoutPanel;
+  const kindLabel: Record<ImportEntryKind, string> = {
+    file: t.previewKindFile,
+    dir: t.previewKindDir,
+    symlink: t.previewKindSymlink,
+    special: t.previewKindSpecial,
+  };
+  const columns: TableSpec['columns'] = [
+    { key: 'path', label: t.previewColumnPath, sortable: true },
+    { key: 'kind', label: t.previewColumnKind, sortable: true },
+    { key: 'size', label: t.previewColumnSize, align: 'right', sortable: true, sortType: 'number' },
+    { key: 'state', label: t.previewColumnState, sortable: true },
+  ];
+  const items = snapshot.entries.map((entry) => ({
+    row: {
+      id: `preview:${entry.path}`,
+      cells: {
+        path: entry.path,
+        kind: kindLabel[entry.kind],
+        size: entry.kind === 'dir' ? '—' : formatSize(entry.size),
+        state: previewStateText(entry),
+      },
+    },
+    sortValues: { size: entry.size },
+  }));
+  const sort = view.sort ?? IMPORT_PREVIEW_SORT_DEFAULT;
+  const slice = sliceTableRows(items, columns, sort, view.filters, view.page, IMPORT_PREVIEW_PAGE_SIZE);
+  return {
+    id: 'importPreview',
+    columns,
+    sort,
+    filters: view.filters,
+    pagination: {
+      page: slice.page,
+      pageSize: IMPORT_PREVIEW_PAGE_SIZE,
+      total: slice.total,
+      pageCount: slice.pageCount,
+    },
+    rows: slice.rows,
+    empty: { title: t.previewEmptyTitle, detail: t.previewEmptyDetail },
+    filterEmpty: { title: strings.panel.filterEmptyTitle },
+  };
+}
+
+/**
+ * 核对页（§7.1：键值行用 FormSpec 禁用字段承载；导入核对含计数汇总、
+ * 确认勾选与「原目录仍未版本控制」说明——文件列表由 TableSpec 承载）。
+ */
 function buildReviewSpec(state: CheckoutPanelState): FormSpec {
   const t = strings.checkoutPanel;
   const { form, conn, review, mode } = state;
@@ -1062,15 +1848,38 @@ function buildReviewSpec(state: CheckoutPanelState): FormSpec {
           row('reviewUrl', t.reviewUrl, editableURL(form.url)),
           row('reviewSourceDir', t.reviewSourceDir, form.sourceDir),
           row('reviewMessage', t.reviewMessage, form.message),
-          { id: 'checked', label: t.reviewCheckedLabel, value: review.checked ? 'true' : 'false', type: 'checkbox' },
+          row('reviewSourceUnversioned', t.reviewSourceUnversioned, ''),
+          row('reviewFileCount', t.reviewFileCountLabel, format(t.reviewFileCountUnit, { count: String(review.previewSummary?.fileCount ?? 0) })),
+          row('reviewTotalBytes', t.reviewTotalBytesLabel, review.previewSummary === null ? '—' : formatSize(review.previewSummary.totalBytes)),
+          // 忽略项计数不在 core 摘要字段内（§4.1 ImportSourceSummary 无 ignoredCount），从快照条目现算。
+          row('reviewIgnoredCount', t.reviewIgnoredCountLabel, String(review.snapshot?.entries.filter((entry) => entry.ignored).length ?? 0)),
+          row('reviewSymlinkCount', t.reviewSymlinkCountLabel, String(review.previewSummary?.symlinkCount ?? 0)),
+          row('reviewUnreadableCount', t.reviewUnreadableCountLabel, String(review.previewSummary?.unreadableCount ?? 0)),
+          row('reviewNestedCount', t.reviewNestedCountLabel, String(review.previewSummary?.nestedCount ?? 0)),
+          row('reviewUnsupportedCount', t.reviewUnsupportedCountLabel, String(review.previewSummary?.unsupportedCount ?? 0)),
+          {
+            id: 'checked',
+            label: t.reviewCheckedLabel,
+            value: review.checked ? 'true' : 'false',
+            type: 'checkbox',
+            // 阻止勾选的场景（预览未回填/解析失败/阻止条目/范围变化）与
+            // setChecked 守卫同源置 disabled，原因以 error 呈现（可解释的不可用）。
+            disabled: importConfirmBlockReason(review) !== null,
+            error: importConfirmBlockReason(review) ?? undefined,
+          },
         ];
   return { id: mode === 'checkout' ? 'checkoutReview' : 'importReview', fields, busy: false };
 }
 
-/** 核对页页脚：开始（导入未勾选禁用）+ 返回。 */
+/** 核对页页脚：开始（导入未勾选禁用）+ 返回；源范围变化时提供「重新预览」。 */
 function buildReviewFooter(state: CheckoutPanelState): FooterSpec {
   const t = strings.checkoutPanel;
   const importBlocked = state.mode === 'import' && !state.review.checked;
+  const secondary: ActionSpec[] = [{ id: 'checkoutBack', label: t.backLabel }];
+  if (state.mode === 'import' && state.review.scopeChanged === 'source') {
+    secondary.push({ id: 'refreshImportPreview', label: t.actRefreshPreview });
+  }
+  secondary.push({ id: 'closePanel', label: strings.panel.closeButton });
   return {
     summary: '',
     primary: {
@@ -1079,10 +1888,7 @@ function buildReviewFooter(state: CheckoutPanelState): FooterSpec {
       disabled: importBlocked,
       disabledReason: importBlocked ? t.startImportReason : undefined,
     },
-    secondary: [
-      { id: 'checkoutBack', label: t.backLabel },
-      { id: 'closePanel', label: strings.panel.closeButton },
-    ],
+    secondary,
   };
 }
 
@@ -1307,13 +2113,26 @@ function buildResultBanners(state: CheckoutPanelState, options: BuildCheckoutPan
           : result.kind === 'resumable'
             ? 'info'
             : 'warn';
-    banners.push({ id: `result.${result.kind}`, level, title: t.resultTitles[result.kind] });
+    // 标题按 mode 分列（清单 §二/§三）：导入失败页不显示检出「文件保留」语义。
+    const title =
+      result.mode === 'import' ? t.importResultTitles[result.kind] : t.resultTitles[result.kind];
+    banners.push({ id: `result.${result.kind}`, level, title });
   }
   if (options.verifyPending) {
     banners.push({
       id: 'verifyPending',
       level: 'info',
       title: t.verifyPendingTitle,
+      dismissable: false,
+    });
+  }
+  // merged 页核实第 0 步失败：保持 merged 不转 unknown、不写 snapshotIncomplete，
+  // 以页面横幅提示（§5 第 0 步 merged 分支——dismissable:false，过程态无手动关闭需求）。
+  if (options.importVerifySnapshotFailed && result?.mode === 'import' && result.kind === 'merged') {
+    banners.push({
+      id: 'importVerifySnapshotFailed',
+      level: 'info',
+      title: t.importVerifySnapshotFailedTitle,
       dismissable: false,
     });
   }

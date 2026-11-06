@@ -13,6 +13,12 @@ import {
   startCheckoutTask,
   verifyCheckoutOnly,
 } from './host/panel/checkoutTask';
+import {
+  abandonUnknownImportTask,
+  acknowledgeImportTask,
+  startImportTask,
+  verifyImportTask,
+} from './host/panel/importTask';
 import { readSessionResult } from './host/sessionResults';
 import { format, strings } from './host/i18n';
 import { decodingRunOptions, disposeOutputChannel, getOutputChannel, logCommand, logLine, resetOutputState } from './host/output';
@@ -125,4 +131,20 @@ export const __checkoutTaskApi = {
   /** 读取检出面板的会话结果缓存（自动化断言「后台终态写缓存」用）。 */
   readCachedResult: (entryKey: string) =>
     readSessionResult('checkout', { entryKey, mode: 'checkout' }),
+};
+
+/**
+ * 导入任务执行器的自动化驱动出口（mock-host 真实 svn 场景使用，形态对齐
+ * __checkoutTaskApi）。P3 导入侧面板控制器接线由后续任务完成——接入前
+ * 执行器经本出口可被 out/extension.js 的宿主脚本直接驱动；真实 VSCode
+ * 宿主只调用 activate/deactivate，不消费本导出。
+ */
+export const __importTaskApi = {
+  startImportTask,
+  verifyImportTask,
+  acknowledgeImportTask,
+  abandonUnknownImportTask,
+  /** 读取导入面板（P3 共用面板类别）的会话结果缓存（自动化断言用）。 */
+  readCachedResult: (entryKey: string) =>
+    readSessionResult('checkout', { entryKey, mode: 'import' }),
 };

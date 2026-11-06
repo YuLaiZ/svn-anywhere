@@ -4,7 +4,8 @@
  * 还用本地 svnadmin + file:// 临时副本驱动真实的更新/状态/清理命令链路。
  * 用法：`pnpm run mock-host`（先构建再运行）。任一场景失败退出码为 1。
  */
-const { mkdtempSync, rmSync, mkdirSync, writeFileSync, realpathSync, existsSync, readFileSync, symlinkSync, statSync } = require('node:fs');
+const { mkdtempSync, rmSync, mkdirSync, writeFileSync, realpathSync, existsSync, readFileSync, symlinkSync, statSync, readdirSync } = require('node:fs');
+const { createHash } = require('node:crypto');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const { execFileSync } = require('node:child_process');
@@ -3050,6 +3051,362 @@ async function main() {
       state.confirmResult = confirmBefore61;
     }
     rmSync(lab61.lab, { recursive: true, force: true });
+  }
+
+  /* ---------------- P3 导入任务执行器（真实 file:// svn） ---------------- */
+
+  // 快照/digest/说明 hash 的脚本侧构造（与 core 的规范化口径一致：entries 按
+  // path 字典序、字段按 schema 声明序、dirs 排序；说明按 LF 归一 UTF-8 字节）。
+  const importSnapshotOf = (items) => {
+    const entries = [...items]
+      .sort((a, b) => (a.path < b.path ? -1 : 1))
+      .map((item) => ({
+        path: item.path, kind: item.kind, size: item.size, mtimeMs: 1,
+        ignored: false, unreadable: false, nested: false, unsupported: false,
+      }));
+    const dirs = [...new Set(items.filter((item) => item.kind === 'dir').map((item) => item.path))].sort();
+    return { version: 1, entries, dirs };
+  };
+  const importSnapshotDigest = (snapshot) =>
+    createHash('sha256').update(JSON.stringify(snapshot), 'utf8').digest('hex');
+  const importMessageDigest = (message) =>
+    createHash('sha256').update(Buffer.from(message.replace(/\r\n|\r/g, '\n'), 'utf8')).digest('hex');
+  const importParentIdentity = (parentUrl) => {
+    const xml = svn(['info', '--xml', parentUrl]);
+    const pick = (re) => re.exec(xml)?.[1] ?? '';
+    return {
+      repositoryUuid: pick(/<uuid>([^<]+)<\/uuid>/),
+      repositoryRootUrl: pick(/<root>([^<]+)<\/root>/),
+      lastChangedRevision: Number(pick(/<commit[^>]*revision="(\d+)"/)),
+    };
+  };
+  const importFormOf = (url, sourceDir, message) => ({
+    url, urlInput: url, nameMode: 'manual', parentDir: '', dirName: '',
+    directMode: false, directDir: '', revMode: 'head', rev: '', depth: 'infinity',
+    sourceDir, message,
+  });
+  const importRecords = () => (state.globalStateMap.get('svnAnywhere.operations') || [])
+    .filter((record) => record.kind === 'import');
+
+  console.log('场景 62：P3 导入执行器——正常全链、结果未知核实、merged 收口（真实 file://）');
+  {
+    const api = extension.__importTaskApi;
+    if (!api) {
+      throw new Error('扩展未导出 __importTaskApi（自动化驱动出口缺失）');
+    }
+    // 关闭前面场景存活的面板：其任务移除/结果更新订阅会在导入任务结算时
+    // 重跑恢复（按旧入口基准读缓存，作用域不一致即清缓存），干扰断言。
+    for (const panel of [...state.panels]) {
+      if (!panel.disposed) {
+        panel.dispose();
+      }
+    }
+
+    // 62a 正常导入全链：快照落盘 → begin → import → 证据 A → done → 快照删除 + URL 历史回调。
+    const lab62a = makeSvnLab();
+    svn(['mkdir', '-q', '-m', 'seed', `${lab62a.repoUrl}/trunk@`]);
+    const src62a = join(lab62a.lab, 'src');
+    mkdirSync(join(src62a, 'sub'), { recursive: true });
+    writeFileSync(join(src62a, 'a.txt'), 'import-a');
+    writeFileSync(join(src62a, 'sub', 'b.txt'), 'import-b');
+    const snapshot62a = importSnapshotOf([
+      { path: 'a.txt', kind: 'file', size: 8 },
+      { path: 'sub', kind: 'dir', size: 0 },
+      { path: 'sub/b.txt', kind: 'file', size: 8 },
+    ]);
+    const storage62a = makeTempDir('svn-anywhere-import-storage-');
+    const target62a = `${lab62a.repoUrl}/trunk/imported`;
+    const succeeded62a = [];
+    const progress62a = [];
+    const done62a = await api.startImportTask({
+      svnPath: 'svn', snapshotDir: storage62a,
+      sourceDir: src62a, targetUrl: target62a,
+      parentIdentity: importParentIdentity(`${lab62a.repoUrl}/trunk`),
+      message: 'mock import message', nameMode: 'manual',
+      snapshot: snapshot62a, entryKey: src62a, initiatorSessionId: 'mock-session-62',
+      formSnapshot: importFormOf(target62a, src62a, 'mock import message'),
+      callbacks: {
+        onProgress: (progress) => progress62a.push(progress.count),
+        onSucceeded: (info) => succeeded62a.push(info),
+      },
+    }).done;
+    check('导入 success（证据 A → done，附 revision）',
+      done62a.outcome === 'finished' && done62a.result.kind === 'success'
+        && Number.isInteger(done62a.result.revision),
+      JSON.stringify(done62a).slice(0, 300));
+    check('远端目标已创建且内容完整',
+      svn(['cat', `${target62a}/sub/b.txt@`]).trim() === 'import-b');
+    check('流式 Adding 计数（文件与目录共 3 项）',
+      progress62a.at(-1) === 3, JSON.stringify(progress62a));
+    check('onSucceeded 触发（共用 URL 历史的数据源）',
+      succeeded62a.length === 1 && succeeded62a[0].targetUrl === target62a
+        && succeeded62a[0].revision === done62a.result.revision,
+      JSON.stringify(succeeded62a));
+    check('成功后记录终态收口（无 import 记录残留）',
+      importRecords().length === 0, JSON.stringify(importRecords()));
+    check('成功后快照删除（storage 无 op- 文件）',
+      !readdirSync(storage62a).some((name) => name.startsWith('op-')));
+    check('导入频道有命令回显与 Committed 尾行',
+      channelTextOf('SVN Anywhere · 导入').includes('import --non-interactive')
+        && channelTextOf('SVN Anywhere · 导入').includes('Committed revision'),
+      channelTextOf('SVN Anywhere · 导入').slice(-300));
+    check('成功页写入会话缓存（import 作用域）',
+      api.readCachedResult(src62a)?.page?.kind === 'success');
+    rmSync(storage62a, { recursive: true, force: true });
+    rmSync(lab62a.lab, { recursive: true, force: true });
+
+    // 62b 结果未知核实链：真实提交后构造 unknown 记录 + 快照 → verifyImport
+    // committed → done 收口 + 快照删除。
+    const lab62b = makeSvnLab();
+    svn(['mkdir', '-q', '-m', 'seed', `${lab62b.repoUrl}/trunk@`]);
+    const src62b = join(lab62b.lab, 'src-unknown');
+    mkdirSync(join(src62b, 'sub'), { recursive: true });
+    writeFileSync(join(src62b, 'a.txt'), 'verify-a');
+    writeFileSync(join(src62b, 'sub', 'b.txt'), 'verify-b');
+    const snapshot62b = importSnapshotOf([
+      { path: 'a.txt', kind: 'file', size: 8 },
+      { path: 'sub', kind: 'dir', size: 0 },
+      { path: 'sub/b.txt', kind: 'file', size: 8 },
+    ]);
+    const storage62b = makeTempDir('svn-anywhere-import-storage-');
+    const target62b = `${lab62b.repoUrl}/trunk/verify-target`;
+    const message62b = 'verify-chain message';
+    // 模拟「已提交但结果未知」：真实 svn import 已发生，记录与快照按锚点构造。
+    const parentIdentity62b = importParentIdentity(`${lab62b.repoUrl}/trunk`);
+    svn(['import', '-q', '-m', message62b, src62b, target62b]);
+    writeFileSync(join(storage62b, 'op-verify-mock'), JSON.stringify(snapshot62b));
+    state.globalStateMap.set('svnAnywhere.operations', [
+      ...(state.globalStateMap.get('svnAnywhere.operations') || []),
+      {
+        operationId: 'op-verify-mock', wcRoot: src62b, lockKey: src62b, kind: 'import',
+        targetRelPath: '.', nodeKind: 'dir', phase: 'unknown', knownRevisions: [],
+        updatedAt: Date.now(), targetPath: src62b,
+        importIntent: {
+          targetUrl: target62b, parentIdentity: parentIdentity62b,
+          message: message62b, nameMode: 'manual',
+          messageHash: importMessageDigest(message62b),
+          startedAt: 1,
+          summary: { fileCount: 2, totalBytes: 16 },
+          snapshotDigest: importSnapshotDigest(snapshot62b),
+          fileRefs: 'op-verify-mock',
+        },
+      },
+    ]);
+    await extension.activate(secondContext);
+    const verify62b = await api.verifyImportTask({
+      svnPath: 'svn', snapshotDir: storage62b, operationId: 'op-verify-mock',
+      resultScope: { entryKey: src62b, mode: 'import' }, epoch: 1,
+    });
+    check('核实结论 committed（done 收口 + resolvedRevision）',
+      verify62b.conclusion === 'committed' && verify62b.recordSettled === true
+        && Number.isInteger(verify62b.revision),
+      JSON.stringify(verify62b).slice(0, 300));
+    check('核实后记录 finish 移除',
+      !importRecords().some((record) => record.operationId === 'op-verify-mock'),
+      JSON.stringify(importRecords()));
+    check('核实后快照删除', !existsSync(join(storage62b, 'op-verify-mock')));
+    rmSync(storage62b, { recursive: true, force: true });
+    rmSync(lab62b.lab, { recursive: true, force: true });
+
+    // 62c merged 收口链：目标已存在（空目录）→ import 合并提交 → 证据非 A →
+    // unknown outcome=merged → acknowledge 收口（finish + 快照删除）。
+    const lab62c = makeSvnLab();
+    svn(['mkdir', '-q', '-m', 'seed', `${lab62c.repoUrl}/trunk@`]);
+    const src62c = join(lab62c.lab, 'src-merged');
+    mkdirSync(src62c, { recursive: true });
+    writeFileSync(join(src62c, 'm.txt'), 'merged-m');
+    const snapshot62c = importSnapshotOf([{ path: 'm.txt', kind: 'file', size: 7 }]);
+    const storage62c = makeTempDir('svn-anywhere-import-storage-');
+    const target62c = `${lab62c.repoUrl}/trunk/merged-target`;
+    svn(['mkdir', '-q', '-m', 'pre-create', `${target62c}@`]);
+    const done62c = await api.startImportTask({
+      svnPath: 'svn', snapshotDir: storage62c,
+      sourceDir: src62c, targetUrl: target62c,
+      parentIdentity: importParentIdentity(`${lab62c.repoUrl}/trunk`),
+      message: 'merged-chain message', nameMode: 'auto',
+      snapshot: snapshot62c, entryKey: src62c, initiatorSessionId: 'mock-session-62',
+      formSnapshot: importFormOf(target62c, src62c, 'merged-chain message'),
+    }).done;
+    check('合并形态 → merged 结果（保留 revision、不显示为普通成功）',
+      done62c.outcome === 'finished' && done62c.result.kind === 'merged'
+        && Number.isInteger(done62c.result.revision),
+      JSON.stringify(done62c).slice(0, 300));
+    const mergedRecords62c = importRecords();
+    check('记录转 unknown ∧ outcome=merged ∧ resolvedRevision 落盘',
+      mergedRecords62c.length === 1 && mergedRecords62c[0].phase === 'unknown'
+        && mergedRecords62c[0].outcome === 'merged'
+        && mergedRecords62c[0].resolvedRevision === done62c.result.revision,
+      JSON.stringify(mergedRecords62c));
+    check('merged 快照保留（acknowledge 前的证据在）',
+      readdirSync(storage62c).some((name) => name.startsWith('op-')));
+    const ack62c = await api.acknowledgeImportTask(mergedRecords62c[0].operationId, storage62c);
+    check('acknowledge 收口 settled', ack62c.settled === true, JSON.stringify(ack62c));
+    check('收口后记录移除 + 快照删除',
+      importRecords().length === 0
+        && !readdirSync(storage62c).some((name) => name.startsWith('op-')),
+      JSON.stringify(importRecords()));
+    rmSync(storage62c, { recursive: true, force: true });
+    rmSync(lab62c.lab, { recursive: true, force: true });
+  }
+
+  /* ---------------- P3 导入面板消息级全链（真实 file:// svn） ---------------- */
+
+  console.log('场景 63：P3 导入面板全链——切模式→填源→下一步→预览→勾选→确认→重检→执行→结果（真实 file://）');
+  {
+    const lab63 = makeSvnLab();
+    svn(['mkdir', '-q', '-m', 'seed', `${lab63.repoUrl}/trunk@`]);
+    // 面板流程的快照目录经 activate 的 globalStorageUri 挂载（场景 62 尾部
+    // 的二次 activate 已将其清空，此处重新挂载专用目录）。
+    const storage63 = makeTempDir('svn-anywhere-import-storage-63-');
+    await extension.activate({
+      subscriptions: [],
+      extensionUri: context.extensionUri,
+      globalState: context.globalState,
+      globalStorageUri: { scheme: 'file', path: storage63, fsPath: storage63, toString: () => `file://${storage63}` },
+    });
+    // 关闭其他存活面板：其订阅会在导入结算时按旧入口基准重跑，干扰断言。
+    for (const panel of [...state.panels]) {
+      if (!panel.disposed) {
+        panel.dispose();
+      }
+    }
+
+    // 1) 命令入口打开面板（导入命令入口属下一任务——经既有 checkout 入口 + 模式切换进入）。
+    const parent63 = join(lab63.lab, 'work');
+    mkdirSync(parent63, { recursive: true });
+    await state.registered.get('svnAnywhere.checkout')({ fsPath: parent63, scheme: 'file' });
+    const panel63 = [...state.panels].reverse().find((p) => p.viewType === 'svn-anywhere-checkout' && !p.disposed);
+    check('面板创建', Boolean(panel63), `panels=${state.panels.map((p) => p.viewType).join(',')}`);
+    panel63.sendReady();
+    await waitRender(panel63, '仓库 URL');
+
+    // 2) 切 import 模式（新会话无草稿无结果，切换无需确认）。
+    panel63.sendAuto({ kind: 'switchP3Mode' });
+    const importForm63 = await waitRender(panel63, '本地源目录（未版本控制）');
+    check('切换到导入表单', Boolean(importForm63), importForm63 ? '' : '导入表单帧未出现');
+
+    // 3) 源目录（未版本控制的本地目录）与目标 URL、说明。
+    const src63 = join(lab63.lab, 'import-src');
+    mkdirSync(join(src63, 'sub'), { recursive: true });
+    writeFileSync(join(src63, 'a.txt'), 'panel-a');
+    writeFileSync(join(src63, 'sub', 'b.txt'), 'panel-b');
+    const target63 = `${lab63.repoUrl}/trunk/panel-imported`;
+    panel63.sendAuto({ kind: 'syncInput', fieldId: 'sourceDir', value: src63, inputRevision: state.intentSeq + 1000 });
+    await waitRender(panel63, src63);
+    panel63.sendAuto({ kind: 'syncInput', fieldId: 'url', value: target63, inputRevision: state.intentSeq + 1000 });
+    await waitRender(panel63, 'panel-imported');
+    panel63.sendAuto({ kind: 'syncInput', fieldId: 'message', value: '面板导入说明', inputRevision: state.intentSeq + 1000 });
+
+    // 4) 下一步：真实 svn info（父）+ ls（目标不存在）→ 核对页 + 范围预览装载。
+    panel63.sendAuto({ kind: 'importNext' });
+    const review63 = await waitRender(panel63, '我已核对导入范围');
+    check('连接检查通过进入核对页（预览装载、含源文件行）',
+      Boolean(review63) && review63.html.includes('a.txt') && review63.html.includes('sub/b.txt'),
+      review63 ? '' : '核对页帧未出现');
+
+    // 5) 勾选范围确认 → 开始 → 仓库提交确认（modal）→ 第三次比对 + 远端重检 → 真实 svn import → 证据检查。
+    panel63.sendAuto({ kind: 'syncInput', fieldId: 'checked', value: 'true', inputRevision: state.intentSeq + 1000 });
+    await waitRender(panel63, 'startImport');
+    const confirmBefore63 = state.confirmResult;
+    state.confirmResult = '确认导入';
+    try {
+      panel63.sendAuto({ kind: 'startImport' });
+      const done63 = await waitNewRender(panel63, 'data-intent="handoffToCheckout"', panel63.webview.posted.length);
+      check('面板内导入成功页（证据 A → done）', Boolean(done63),
+        done63 ? '' : String(panel63.webview.posted.at(-1)?.html ?? '').slice(0, 300));
+      check('远端目标真实创建且内容完整',
+        svn(['cat', `${target63}/sub/b.txt@`]).trim() === 'panel-b');
+      check('成功后记录终态收口（无 import 记录残留）',
+        !(state.globalStateMap.get('svnAnywhere.operations') || []).some((r) => r.kind === 'import'),
+        JSON.stringify((state.globalStateMap.get('svnAnywhere.operations') || []).filter((r) => r.kind === 'import')));
+      check('URL 历史共用写入（成功时点）',
+        (state.globalStateMap.get('svnAnywhere.checkoutUrlHistory') || []).includes(target63),
+        JSON.stringify(state.globalStateMap.get('svnAnywhere.checkoutUrlHistory')));
+      check('成功后快照删除', !readdirSync(storage63).some((name) => name.startsWith('op-')));
+    } finally {
+      state.confirmResult = confirmBefore63;
+    }
+
+    // 6) 成功页动作：查看原目录（revealFileInOS 指向源目录）。
+    panel63.sendAuto({ kind: 'revealSourceDir' });
+    check('查看原目录经 revealFileInOS 指向源目录',
+      state.executedCommands.some(([cmd, uri]) => cmd === 'revealFileInOS' && uri && uri.fsPath === src63),
+      JSON.stringify(state.executedCommands.filter(([cmd]) => cmd === 'revealFileInOS')));
+
+    rmSync(storage63, { recursive: true, force: true });
+    rmSync(lab63.lab, { recursive: true, force: true });
+  }
+
+  console.log('场景 64：svnAnywhere.importLocal 命令入口——右键目录以 import 模式打开面板、源目录带出、入口级推进（真实 file://）');
+  {
+    // 场景 63 的面板全链已覆盖核对→确认→执行；本场景只验命令入口形态：
+    // 命令触发面板以 import 模式打开 + 源目录带出 + 连接检查进核对页即止。
+    const lab64 = makeSvnLab();
+    svn(['mkdir', '-q', '-m', 'seed', `${lab64.repoUrl}/trunk@`]);
+    // 关闭场景 63 遗留的存活面板（成功页会话），避免入口切换确认干扰断言。
+    for (const panel of [...state.panels]) {
+      if (!panel.disposed) {
+        panel.dispose();
+      }
+    }
+
+    // 1) 右键目录形态：命令直接以 import 模式打开面板（已纳管与否不在此拦）。
+    const src64 = join(lab64.lab, 'import-src');
+    mkdirSync(join(src64, 'sub'), { recursive: true });
+    writeFileSync(join(src64, 'a.txt'), 'entry-a');
+    writeFileSync(join(src64, 'sub', 'b.txt'), 'entry-b');
+    const panelsBefore64 = state.panels.filter((p) => !p.disposed).length;
+    await state.registered.get('svnAnywhere.importLocal')({ fsPath: src64, scheme: 'file' });
+    const panel64 = [...state.panels].reverse().find((p) => p.viewType === 'svn-anywhere-checkout' && !p.disposed);
+    check('命令以 import 模式创建面板', Boolean(panel64) && state.panels.filter((p) => !p.disposed).length === panelsBefore64 + 1,
+      `panels=${state.panels.map((p) => p.viewType).join(',')}`);
+    panel64.sendReady();
+    const form64 = await waitRender(panel64, '仓库 URL');
+    check('导入表单页呈现且源目录带出（标题=导入、入口键=源目录）',
+      Boolean(form64) && form64.html.includes('导入') && form64.html.includes('本地源目录') && form64.html.includes(src64),
+      form64 ? '' : '表单页帧未出现');
+
+    // 2) 入口级推进一小步：填目标 URL → 下一步（真实 svn info 父 + ls 目标不存在）→ 核对页预览。
+    panel64.sendAuto({ kind: 'syncInput', fieldId: 'url', value: `${lab64.repoUrl}/trunk/entry-imported`, inputRevision: state.intentSeq + 1000 });
+    await waitRender(panel64, 'entry-imported');
+    panel64.sendAuto({ kind: 'importNext' });
+    const review64 = await waitRender(panel64, '我已核对导入范围');
+    check('连接检查通过进入核对页（预览含源文件行）',
+      Boolean(review64) && review64.html.includes('a.txt') && review64.html.includes('sub/b.txt'),
+      review64 ? '' : '核对页帧未出现');
+
+    // 3) 命令面板无路径回退：无参且无活动编辑器 → 弹目录选择框（只可选目录）；取消静默。
+    const dialogBefore64 = state.openDialogCalls;
+    const infoBefore64 = state.information.length;
+    const aliveBefore64 = state.panels.filter((p) => !p.disposed).length;
+    state.openDialogResult = undefined;
+    await state.registered.get('svnAnywhere.importLocal')(undefined);
+    const dialogOptions64 = state.openDialogOptions[state.openDialogOptions.length - 1];
+    check('无参调用弹目录选择框（canSelectFolders、不可选文件）',
+      state.openDialogCalls === dialogBefore64 + 1
+        && dialogOptions64?.canSelectFolders === true && dialogOptions64?.canSelectFiles === false,
+      JSON.stringify(dialogOptions64));
+    check('选择框取消静默：无新面板、无提示',
+      state.panels.filter((p) => !p.disposed).length === aliveBefore64
+        && state.information.length === infoBefore64);
+
+    // 4) 右键文件 URI：提示「导入源必须是目录」并弹目录选择框改选源目录。
+    const infoBeforeFile64 = state.information.length;
+    state.openDialogResult = [{ fsPath: src64 }];
+    try {
+      await state.registered.get('svnAnywhere.importLocal')({ fsPath: join(src64, 'a.txt'), scheme: 'file' });
+      check('文件 URI 提示「导入源必须是目录」并弹选择框',
+        state.information.length === infoBeforeFile64 + 1
+          && state.information[state.information.length - 1].includes('导入源必须是目录')
+          && state.openDialogCalls === dialogBefore64 + 2);
+      // 同源目录（同入口键 + import 模式）：面板 reveal 复用，不新开实例。
+      check('选择框选中源目录后命中既有会话（同入口 reveal）',
+        state.panels.filter((p) => !p.disposed).length === aliveBefore64);
+    } finally {
+      state.openDialogResult = undefined;
+    }
+
+    rmSync(lab64.lab, { recursive: true, force: true });
   }
 
   rmSync(igLab.lab, { recursive: true, force: true });
