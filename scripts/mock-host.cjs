@@ -3561,6 +3561,76 @@ async function main() {
     rmSync(lab65.lab, { recursive: true, force: true });
   }
 
+  if (process.env.SVN_HTTP_MATRIX === '1') {
+    console.log('场景 66：HTTP 多版本扩展宿主矩阵——四版本检出与导入');
+    const checkoutApi = extension.__checkoutTaskApi;
+    const importApi = extension.__importTaskApi;
+    if (!checkoutApi || !importApi) {
+      throw new Error('HTTP 矩阵缺少检出/导入自动化驱动出口');
+    }
+    const ports = [9061, 9081, 9101, 9141];
+    for (const port of ports) {
+      const baseUrl = `http://127.0.0.1:${port}/svn/test`;
+      const parentDir = makeTempDir(`svn-anywhere-http-matrix-${port}-`);
+      const targetDir = join(parentDir, `checkout-${port}`);
+      const identity = remoteIdentityOf(baseUrl);
+      const checkout = await checkoutApi.startCheckoutTask({
+        svnPath: 'svn',
+        url: baseUrl,
+        pinnedRevision: identity.revision,
+        depth: 'infinity',
+        targetDir,
+        parentDir,
+        dirName: `checkout-${port}`,
+        directMode: false,
+        directDir: '',
+        identity,
+        entryKey: parentDir,
+        initiatorSessionId: `mock-http-matrix-checkout-${port}`,
+        formSnapshot: draftFormOf(baseUrl, identity.revision, 'infinity', parentDir, `checkout-${port}`),
+      }).done;
+      check(
+        `HTTP ${port} 检出 success 且工作副本完整`,
+        checkout.outcome === 'finished'
+          && checkout.result.kind === 'success'
+          && existsSync(join(targetDir, '.svn', 'wc.db'))
+          && existsSync(join(targetDir, 'trunk', 'src', 'hello.txt')),
+        JSON.stringify(checkout).slice(0, 300),
+      );
+
+      const sourceDir = join(parentDir, 'import-src');
+      mkdirSync(sourceDir, { recursive: true });
+      writeFileSync(join(sourceDir, 'matrix.txt'), `HTTP matrix ${port}\n`);
+      const storageDir = makeTempDir(`svn-anywhere-http-import-${port}-`);
+      const targetUrl = `${baseUrl}/trunk/http-matrix-${port}`;
+      const snapshot = importSnapshotOf([
+        { path: 'matrix.txt', kind: 'file', size: Buffer.byteLength(`HTTP matrix ${port}\n`) },
+      ]);
+      const imported = await importApi.startImportTask({
+        svnPath: 'svn',
+        snapshotDir: storageDir,
+        sourceDir,
+        targetUrl,
+        parentIdentity: importParentIdentity(`${baseUrl}/trunk`),
+        message: `HTTP matrix ${port}`,
+        nameMode: 'manual',
+        snapshot,
+        entryKey: sourceDir,
+        initiatorSessionId: `mock-http-matrix-import-${port}`,
+        formSnapshot: importFormOf(targetUrl, sourceDir, `HTTP matrix ${port}`),
+      }).done;
+      check(
+        `HTTP ${port} 导入 success`,
+        imported.outcome === 'finished'
+          && imported.result.kind === 'success'
+          && Number.isInteger(imported.result.revision),
+        JSON.stringify(imported).slice(0, 300),
+      );
+      rmSync(storageDir, { recursive: true, force: true });
+      rmSync(parentDir, { recursive: true, force: true });
+    }
+  }
+
   rmSync(igLab.lab, { recursive: true, force: true });
 
   rmSync(panelLab.lab, { recursive: true, force: true });

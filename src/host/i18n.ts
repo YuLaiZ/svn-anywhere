@@ -302,6 +302,7 @@ export const strings = {
     switchDiscardTitle: '切换目标并放弃草稿？',
     switchDiscardDetail: '当前提交说明与勾选尚未提交，返回可继续编辑；切换到新目标将放弃本次草稿。',
     switchDiscardButton: '放弃并切换',
+    noticeDraftRestored: '已恢复上次关闭面板时未提交的说明与勾选。',
     reviewTitle: '核对本次提交范围',
     reviewTotal: '共 {count} 项。',
     reviewHiddenSuffix: '包含 {count} 项筛选后不可见的已选项。',

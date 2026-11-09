@@ -298,7 +298,13 @@ beforeEach(() => {
     subscriptions: [],
     globalState: {
       get: <T>(key: string, defaultValue?: T) => (vscodeMock.globalState.has(key) ? vscodeMock.globalState.get(key) as T : defaultValue as T),
-      update: async (key: string, value: unknown) => { vscodeMock.globalState.set(key, value); },
+      update: async (key: string, value: unknown) => {
+        if (value === undefined) {
+          vscodeMock.globalState.delete(key);
+        } else {
+          vscodeMock.globalState.set(key, value);
+        }
+      },
     } as never,
   });
   wcRoot = realpathSync(mkdtempSync(join(tmpdir(), 'svn-anywhere-commitflow-')));
@@ -318,6 +324,52 @@ afterEach(() => {
 });
 
 describe('P1 提交面板 提交闭环', () => {
+  it('原生关闭暂存说明与勾选，同目标重开恢复后一次性消费', async () => {
+    writeFileSync(join(wcRoot, 'b.txt'), 'unversioned');
+    vi.mocked(runStatus).mockResolvedValue({
+      targetPath: '.',
+      entries: [
+        { path: 'a.txt', wcStatus: 'modified', props: 'none', changelist: null },
+        { path: 'b.txt', wcStatus: 'unversioned', props: 'none', changelist: null },
+      ],
+      externals: [],
+    });
+    const panel = await openPanelAndWait(join(wcRoot, 'a.txt'), 'a.txt');
+    panel.sendIntent({ kind: 'toggleRow', rowId: 'b.txt', selected: true }, 'toggle-b');
+    panel.sendIntent({ kind: 'syncInput', fieldId: 'message', value: '关闭恢复草稿', inputRevision: 1 }, 'draft-1');
+    await vi.waitFor(() => expect([...vscodeMock.globalState.keys()]).toHaveLength(0));
+
+    panel.dispose();
+    await vi.waitFor(() => {
+      const stashKey = [...vscodeMock.globalState.keys()].find((key) => key.startsWith('commitPanel.stash|'));
+      expect(stashKey).toBeDefined();
+      expect(vscodeMock.globalState.get(stashKey!)).toMatchObject({
+        message: '关闭恢复草稿',
+        selectedPaths: expect.arrayContaining(['a.txt', 'b.txt']),
+      });
+    });
+
+    const reopened = await openPanelAndWait(join(wcRoot, 'a.txt'), 'a.txt');
+    const render = [...reopened.posted].reverse().find((m) => m.type === 'render' && String(m.html ?? '').includes('a.txt'));
+    expect(String(render?.html)).toContain('关闭恢复草稿');
+    expect(String(render?.html)).toMatch(/data-row-id="b\.txt"[^>]*checked/);
+    expect(String(render?.html)).toContain(strings.panel.noticeDraftRestored);
+    expect([...vscodeMock.globalState.keys()].some((key) => key.startsWith('commitPanel.stash|'))).toBe(false);
+  });
+
+  it('面板内确认放弃草稿后原生销毁不暂存恢复', async () => {
+    const panel = await openPanelAndWait(join(wcRoot, 'a.txt'), 'a.txt');
+    panel.sendIntent({ kind: 'syncInput', fieldId: 'message', value: '明确放弃草稿', inputRevision: 1 }, 'draft-discard');
+    vscodeMock.confirmResult = strings.commit.continueButton;
+    panel.sendIntent({ kind: 'closePanel' }, 'close-discard');
+    await vi.waitFor(() => expect(panel.disposed).toBe(true));
+    expect([...vscodeMock.globalState.keys()].some((key) => key.startsWith('commitPanel.stash|'))).toBe(false);
+
+    const reopened = await openPanelAndWait(join(wcRoot, 'a.txt'), 'a.txt');
+    const render = [...reopened.posted].reverse().find((m) => m.type === 'render' && String(m.html ?? '').includes('a.txt'));
+    expect(String(render?.html)).not.toContain('明确放弃草稿');
+  });
+
   it('普通提交：默认勾选本地项，参数含临时文件与 UTF-8，反馈新 revision，提交后刷新状态', async () => {
     const panel = await openPanelAndWait(join(wcRoot, 'a.txt'), 'a.txt');
     const render = [...panel.posted].reverse().find((m) => m.type === 'render' && String(m.html ?? '').includes('a.txt'));

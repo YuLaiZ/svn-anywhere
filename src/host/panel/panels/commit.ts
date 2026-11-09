@@ -75,8 +75,14 @@ const HISTORY_KEY = 'svnAnywhere.commitHistory';
 const PREFIX_KEY = 'svnAnywhere.commitPrefixes';
 const MAX_PREFIXES = 10;
 const MAX_HISTORY = 20;
+const STASH_KEY_PREFIX = 'commitPanel.stash|';
 /** 删除目录确认框中影响子树的最大列举条数。 */
 const SUBTREE_LIST_LIMIT = 50;
+
+interface StashedCommitDraft {
+  message: string;
+  selectedPaths: string[];
+}
 
 interface PanelContext {
   extensionUri: vscode.Uri;
@@ -92,6 +98,8 @@ let formRevision = 0;
 let activeOperationId: string | undefined;
 /** 提交前远端检查看到的 HEAD（against），核实结果未知时作对照。 */
 let commitBaseAgainst: number | undefined;
+/** 面板内确认放弃草稿后销毁，不进入原生关闭暂存。 */
+let discardOnDispose = false;
 
 /** activate 时注入宿主上下文（extensionUri / subscriptions / globalState）。 */
 export function setCommitPanelContext(context: PanelContext): void {
@@ -197,7 +205,59 @@ function onViewReady(): void {
   pushRender();
 }
 
+function stashKey(wcRoot: string, targetPaths: string[]): string {
+  return `${STASH_KEY_PREFIX}${JSON.stringify([wcRoot, ...[...targetPaths].sort()])}`;
+}
+
+/**
+ * 原生关闭（⌘W/标签 X）无法弹确认：ready 会话有说明或勾选变化时按
+ * 工作副本与目标集合暂存，重开同目标恢复。面板内确认放弃、忙碌、未知
+ * 或 foreign 写锁不暂存，后两类继续由操作记录承接恢复。
+ */
+function restoreStashedDraft(target: CommitSessionState): boolean {
+  if (!panelContext) {
+    return false;
+  }
+  const key = stashKey(target.wcRoot, target.targetPaths);
+  const stash = panelContext.globalState.get<StashedCommitDraft | undefined>(key);
+  if (!stash) {
+    return false;
+  }
+  void panelContext.globalState.update(key, undefined);
+  if (
+    typeof stash.message !== 'string' ||
+    !Array.isArray(stash.selectedPaths) ||
+    stash.selectedPaths.some((path) => typeof path !== 'string')
+  ) {
+    return false;
+  }
+  const validPaths = new Set(
+    stash.selectedPaths.filter((path) => target.metas.some((meta) => meta.path === path)),
+  );
+  target.message = stash.message;
+  target.selectedPaths = applyDirectoryLinkage(target.metas, validPaths);
+  return true;
+}
+
 function onPanelDispose(): void {
+  const current = session;
+  const shouldStash = !discardOnDispose
+    && panelContext !== undefined
+    && current !== undefined
+    && current.phase === 'ready'
+    && current.foreignLocked !== true
+    && sessionChanged(current);
+  discardOnDispose = false;
+  if (shouldStash && current && panelContext) {
+    const stash: StashedCommitDraft = {
+      message: current.message,
+      selectedPaths: [...current.selectedPaths],
+    };
+    void panelContext.globalState.update(
+      stashKey(current.wcRoot, current.targetPaths),
+      stash,
+    );
+  }
   handle = undefined;
   session = undefined;
   activeOperationId = undefined;
@@ -338,6 +398,9 @@ async function loadSession(
     if (!keepDraft) {
       session.initialMessage = session.message;
       session.initialSelectionKey = selectionKeyOf(session.selectedPaths);
+      if (restoreStashedDraft(session)) {
+        session.notice = strings.panel.noticeDraftRestored;
+      }
     }
     pushRender();
   } catch (err) {
@@ -1651,8 +1714,9 @@ async function resolveUnknown(sessionId: string): Promise<void> {
 /* ------------------------------ 关闭面板 ------------------------------ */
 
 async function closePanel(): Promise<void> {
+  const panel = handle;
   if (!session) {
-    handle?.dispose();
+    panel?.dispose();
     return;
   }
   if (sessionChanged(session)) {
@@ -1664,6 +1728,10 @@ async function closePanel(): Promise<void> {
     if (ok !== strings.commit.continueButton) {
       return;
     }
+    if (handle !== panel) {
+      return;
+    }
+    discardOnDispose = true;
   }
-  handle?.dispose();
+  panel?.dispose();
 }
