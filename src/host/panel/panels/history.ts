@@ -41,6 +41,20 @@ import {
 } from '../../../core/history';
 import { SvnError } from '../../../core/errors';
 import {
+  checkHistoryUpdatePreconditions,
+  prepareHistoryUpdate,
+  rescanHistoryUpdate,
+  runHistoryUpdate,
+  type HistoryUpdateBlockReason,
+  type HistoryUpdateIntent,
+} from '../../../core/historyUpdate';
+import {
+  getOperationRegistry,
+  kindOf,
+  randomOperationId,
+  type OperationRecord,
+} from '../../../core/operations';
+import {
   classifyBrowseFailure,
   extractSvnStatusCodes,
   parseRemoteInfoXml,
@@ -61,11 +75,24 @@ import {
 import { format, strings } from '../../i18n';
 import { decodingRunOptions, logCommand, logLine } from '../../output';
 import {
+  clearM4TerminalPage,
   putM4ScopeSession,
   readM4ScopeSession,
   type M4SessionScope,
 } from '../../sessionResults';
+import {
+  addTask,
+  findTaskByScope,
+  hasActiveTask,
+  onTaskRemoved,
+  sameResultScope,
+  settleTask,
+  type TaskObject,
+  type TaskRemovedSubscription,
+} from '../../taskRegistry';
 import type { HistoryResultScope } from '../../taskRegistry';
+import { confirmModal } from '../../ui/confirm';
+import { openConflictTarget } from '../../commands/conflicts';
 import { createP6Gates, resolvePanelOccupancy, type PanelOccupancy } from '../gates';
 import { createPanel, type PanelHandle, type ReadRequestTicket } from '../host';
 import type { Intent } from '../protocol';
@@ -74,9 +101,20 @@ import {
   historyText,
   HistoryModel,
   parentRepositoryPath,
+  applyHistoryUpdateRescan,
+  applyHistoryUpdateResult,
+  beginHistoryUpdateRescan,
+  createHistoryUpdateState,
+  historyUpdateIntentOf,
+  historyUpdateSettled,
+  historyUpdateTaskContext,
+  historyUpdateTerminalPage,
+  restoreHistoryUpdateState,
   type HistoryDetailResolutionView,
   type HistoryModelContext,
   type HistoryPhase,
+  type HistoryUpdatePhase,
+  type HistoryUpdateState,
 } from '../historyModel';
 import {
   applySnapshotCandidateProbes,
@@ -141,6 +179,77 @@ let compareState: SnapshotCompareState | undefined;
 let compareSort: { key: string; direction: 'asc' | 'desc' } | undefined;
 /** 比较端点解析/候选探测在途请求（reset/切换目标/关闭时取消）。 */
 let compareController: AbortController | undefined;
+
+/* ---------------- P6 更新到历史 revision（M4 阶段 6） ---------------- */
+
+/** P6 更新任务执行器扩展字段（面板关闭后任务继续，状态由任务自带）。 */
+interface HistoryUpdateTaskCallbacks {
+  render(): void;
+  toast(level: 'info' | 'error', message: string): void;
+  /** 面板存活且仍在同一目标时，按回读事实刷新节点 BASE 与历史会话。 */
+  settled(state: HistoryUpdateState): void;
+}
+
+interface HistoryUpdateTaskExtra {
+  kind: 'update' | 'rescan';
+  scope: HistoryResultScope;
+  /** 固定意图（命令发出前经 prepare 定格；回扫只读复用同一意图）。 */
+  intent: HistoryUpdateIntent;
+  /** 更新状态（权威回读事实；任务终态写终态页的数据源）。 */
+  state: HistoryUpdateState;
+  callbacks: HistoryUpdateTaskCallbacks;
+  done: Promise<void>;
+}
+
+type HistoryUpdateTask = TaskObject<HistoryUpdateTaskExtra> & { extra: HistoryUpdateTaskExtra };
+
+/** 当前目标的更新状态（updating/updated/updateConflict/updateRescanning/updateUnknown）。 */
+let updateState: HistoryUpdateState | undefined;
+let updateTaskRemovalSub: TaskRemovedSubscription | undefined;
+
+/** 更新文案：优先 i18n.historyUpdatePanel（阶段 1 已落地同名键）。 */
+function updateText(key: keyof typeof strings.historyUpdatePanel, params: Record<string, string> = {}): string {
+  return format(strings.historyUpdatePanel[key], params);
+}
+
+/** 更新写前阻断原因文案（core 只给枚举与原始 message）。 */
+function updateBlockText(reason: HistoryUpdateBlockReason, message?: string): string {
+  switch (reason) {
+    case 'invalid-revision':
+      return updateText('blockInvalidRevision');
+    case 'missing-local':
+      return updateText('blockMissingLocal');
+    case 'not-versioned':
+      return updateText('blockNotVersioned');
+    case 'not-in-working-copy':
+      return updateText('blockNotInWorkingCopy');
+    case 'nested-working-copy':
+      return updateText('blockNestedWorkingCopy');
+    case 'local-modifications':
+      return updateText('blockLocalModifications');
+    case 'target-absent-at-revision':
+      return updateText('blockTargetAbsentAtRevision');
+    case 'kind-mismatch':
+      return updateText('blockKindMismatch');
+    default:
+      return format(strings.historyUpdatePanel.blockInfoError, { message: message ?? '' });
+  }
+}
+
+/** 当前工作副本锁键（本地入口 realpath 后的副本根；handoff 无本地副本）。 */
+function localLockKey(): string | undefined {
+  return entryTarget?.source === 'local' ? entryTarget.wcRoot : undefined;
+}
+
+/** 当前目标的 history-update 未决操作记录（写锁持有者；无则 undefined）。 */
+function pendingHistoryUpdateRecord(): OperationRecord | undefined {
+  const lockKey = localLockKey();
+  if (lockKey === undefined) {
+    return undefined;
+  }
+  const held = getOperationRegistry().writeRestriction(lockKey);
+  return held !== undefined && kindOf(held) === 'history-update' ? held : undefined;
+}
 
 /** activate 时注入宿主上下文（extensionUri / subscriptions）。 */
 export function setHistoryPanelContext(context: HistoryPanelContext): void {
@@ -413,7 +522,115 @@ function buildStateWithOccupancy(): PanelState | undefined {
   state.busy = state.busy || occupancy.busy;
   state.writeLocked = occupancy.writeLocked;
   applyCompareOverlay(state);
+  applyUpdateOverlay(state, occupancy);
   return state;
+}
+
+/**
+ * 更新状态覆盖层：顶部横幅（在途/成功/冲突/未知）+ 徽标（请求 revision、
+ * 更新前 BASE、回读节点 BASE）。未知时只提供只读回扫/日志/关闭；冲突时
+ * 提供 P7 入口（冲突集合经内存快照交接，不重拼 URL）。
+ */
+function applyUpdateOverlay(state: PanelState, occupancy: PanelOccupancy): void {
+  if (updateState === undefined) {
+    return;
+  }
+  const update = updateState;
+  const badges: NonNullable<PanelState['headerBadges']> = [];
+  badges.push({ text: updateText('badgeRequested', { revision: String(update.requestedRevision) }) });
+  if (update.postNodeRevision !== undefined) {
+    badges.push({ text: updateText('badgePost', { revision: String(update.postNodeRevision) }) });
+  } else {
+    badges.push({ text: updateText('badgePre', { revision: String(update.preRevision) }) });
+  }
+  state.headerBadges = [...(state.headerBadges ?? []), ...badges];
+  const readbackDetail = update.commandError !== undefined
+    ? ` ${format(strings.historyUpdatePanel.unknownReadback, { message: update.commandError })}`
+    : update.readbackError !== undefined
+      ? ` ${format(strings.historyUpdatePanel.unknownReadback, { message: update.readbackError })}`
+      : '';
+  const baseDetail = format(strings.historyUpdatePanel.updatingDetail, {
+    target: update.targetRelPath === '.' ? '.' : update.targetRelPath,
+    pre: String(update.preRevision),
+  });
+  switch (update.phase) {
+    case 'updating':
+      state.banners = [{
+        id: 'historyUpdate',
+        level: 'info',
+        title: updateText('updatingTitle', { revision: String(update.requestedRevision) }),
+        detail: baseDetail,
+        dismissable: false,
+        actions: [
+          { id: 'viewTaskLog', label: strings.panel.taskProgressLog },
+          { id: 'closePanel', label: strings.panel.taskProgressClose },
+        ],
+      }, ...state.banners];
+      return;
+    case 'updateRescanning':
+      state.banners = [{
+        id: 'historyUpdate',
+        level: 'info',
+        title: updateText('rescanningTitle'),
+        detail: format(strings.historyUpdatePanel.rescanningDetail, {
+          target: update.targetRelPath === '.' ? '.' : update.targetRelPath,
+        }),
+        dismissable: false,
+        actions: [
+          { id: 'viewTaskLog', label: strings.panel.taskProgressLog },
+          { id: 'closePanel', label: strings.panel.taskProgressClose },
+        ],
+      }, ...state.banners];
+      return;
+    case 'updated':
+      state.banners = [{
+        id: 'historyUpdate',
+        level: 'info',
+        title: updateText('updatedTitle'),
+        detail: format(strings.historyUpdatePanel.updatedDetail, {
+          target: update.targetRelPath === '.' ? '.' : update.targetRelPath,
+          revision: String(update.postNodeRevision ?? update.requestedRevision),
+          pre: String(update.preRevision),
+        }),
+        dismissable: !occupancy.busy && !occupancy.writeLocked,
+      }, ...state.banners];
+      return;
+    case 'updateConflict': {
+      state.banners = [{
+        id: 'historyUpdate',
+        level: 'warn',
+        title: updateText('conflictTitle'),
+        detail: format(strings.historyUpdatePanel.conflictDetail, {
+          target: update.targetRelPath === '.' ? '.' : update.targetRelPath,
+          revision: String(update.postNodeRevision ?? update.requestedRevision),
+          base: String(update.postNodeRevision ?? update.requestedRevision),
+          count: String(update.conflicts.length),
+        }),
+        dismissable: false,
+        actions: [
+          { id: 'openUpdateConflicts', label: updateText('openConflictsAction') },
+          { id: 'viewTaskLog', label: strings.panel.taskProgressLog },
+        ],
+      }, ...state.banners];
+      return;
+    }
+    default:
+      state.banners = [{
+        id: 'historyUpdate',
+        level: 'error',
+        title: updateText('unknownTitle'),
+        detail: format(strings.historyUpdatePanel.unknownDetail, {
+          target: update.targetRelPath === '.' ? '.' : update.targetRelPath,
+          pre: String(update.preRevision),
+        }) + readbackDetail,
+        dismissable: false,
+        actions: [
+          { id: 'rescanHistoryUpdate', label: updateText('rescanAction') },
+          { id: 'viewTaskLog', label: strings.panel.taskProgressLog },
+          { id: 'closePanel', label: strings.panel.taskProgressClose },
+        ],
+      }, ...state.banners];
+  }
 }
 
 function push(): void {
@@ -568,6 +785,9 @@ async function resetAndOpen(target: HistoryOpenTarget): Promise<void> {
   const scope = scopeOfContext(context);
   model = new HistoryModel({ pageSize: readHistoryPageSize() });
   sessionTicket = handle.beginReadRequest(scopeTicketKey(scope));
+  // 更新层恢复（活动任务 → 未决 operation record → 终态页）；历史会话
+  // 数据本身仍按 m4SessionStore.browsable 独立恢复，两层不互相反推。
+  restoreUpdateLayer(scope);
   // 关闭重开恢复：LRU 未淘汰时恢复目标/筛选/勾选/详情与已加载数据，
   // 不重解析 HEAD、不伪造旧 upper；恢复无数据时才重读首批。
   const stored = readM4ScopeSession(scope);
@@ -1636,6 +1856,422 @@ async function compareBase(captured: CapturedSession): Promise<void> {
   }
 }
 
+/* ------------------------- P6 更新到历史 revision ------------------------- */
+
+/** 本地写命令运行选项：解码/日志口径与只读一致；更新长任务不限时。 */
+function updateRunOptions(): ReturnType<typeof decodingRunOptions> {
+  return decodingRunOptions('history');
+}
+
+function updateTaskCallbacksFor(scope: HistoryResultScope): HistoryUpdateTaskCallbacks {
+  const sameScope = (): boolean => {
+    const current = currentScope();
+    return current !== undefined && sameResultScope(current, scope);
+  };
+  return {
+    render: () => {
+      if (handle !== undefined && sameScope()) {
+        push();
+      }
+    },
+    toast: (level, message) => {
+      if (sameScope()) {
+        toast(level, message);
+      }
+    },
+    settled: (state) => {
+      if (handle !== undefined && sameScope()) {
+        void applySettledUpdate(state);
+      }
+    },
+  };
+}
+
+function makeUpdateTask(
+  kind: 'update' | 'rescan',
+  scope: HistoryResultScope,
+  intent: HistoryUpdateIntent,
+  state: HistoryUpdateState,
+  taskId: string,
+): HistoryUpdateTask {
+  return {
+    taskId,
+    panelKind: 'history',
+    phase: kind === 'update' ? 'updating' : 'rescanning',
+    resultScope: scope,
+    lockKey: intent.wcRoot,
+    initiatorSessionId: handle?.sessionId ?? '',
+    abortController: new AbortController(),
+    extra: {
+      kind,
+      scope,
+      intent,
+      state,
+      callbacks: updateTaskCallbacksFor(scope),
+      done: Promise.resolve(),
+    },
+  };
+}
+
+/** 绑定即订阅：任务终态结算（先写终态页再移除）后重跑恢复顺序。 */
+function subscribeUpdateTaskRemoval(): void {
+  updateTaskRemovalSub?.dispose();
+  updateTaskRemovalSub = undefined;
+  if (handle === undefined) {
+    return;
+  }
+  const sessionId = handle.sessionId;
+  updateTaskRemovalSub = onTaskRemoved('history', sessionId, () => {
+    void onUpdateTaskRemoved();
+  });
+}
+
+/** 写更新终态页（m4SessionStore.terminalPage；settleTask 的写侧回调）。 */
+function persistUpdateTerminal(scope: HistoryResultScope, state: HistoryUpdateState): void {
+  putM4ScopeSession(scope, { terminalPage: historyUpdateTerminalPage(state) });
+}
+
+/**
+ * 任务推进后把权威状态同步回面板控制器（仅当控制器仍持有同一更新）：
+ * 关闭面板后模块状态已清空，任务只写终态页；重开绑定后再次同步。
+ */
+function syncUpdateState(state: HistoryUpdateState): void {
+  if (updateState !== undefined && updateState.operationId === state.operationId) {
+    updateState = state;
+  }
+}
+
+/**
+ * 任务移除后的恢复（非发起会话路径）：终态页已写入，按它恢复更新状态
+ * 与 BASE 徽标；不重复发起任何 SVN 命令。
+ */
+async function onUpdateTaskRemoved(): Promise<void> {
+  if (handle === undefined || model === undefined) {
+    return;
+  }
+  const scope = currentScope();
+  if (scope === undefined) {
+    return;
+  }
+  const restored = restoreHistoryUpdateState(readM4ScopeSession(scope)?.terminalPage);
+  if (restored !== undefined) {
+    updateState = restored;
+  }
+  await applySettledUpdate(updateState);
+  push();
+}
+
+/**
+ * 恢复层的更新部分（顺序固定：活动任务 → 未决 operation record → 终态页）：
+ * - 活动任务：绑定任务自带的更新状态，任务继续；关闭面板不丢在途页；
+ * - 未决 record（prepared/running 被 kill/重启折算为 unknown）：不重复
+ *   盲写，只进入 updateUnknown 并复用记录中的固定意图，开放只读回扫；
+ *   未知记录属于工作副本级写锁，即使目标不同也必须给出回扫出口
+ *   （横幅展示记录的目标路径，不冒充当前目标的更新结果）；
+ * - 终态页：恢复 updated/updateConflict/updateUnknown 页，settled 时以
+ *   回读值同步本地 BASE（unknown 不覆盖旧 BASE）。
+ */
+function restoreUpdateLayer(scope: HistoryResultScope): void {
+  updateState = undefined;
+  updateTaskRemovalSub?.dispose();
+  updateTaskRemovalSub = undefined;
+  const task = findTaskByScope('history', scope);
+  if (task !== undefined) {
+    const extra = task.extra as HistoryUpdateTaskExtra | undefined;
+    if (extra !== undefined && extra.state !== undefined) {
+      updateState = extra.state;
+      extra.callbacks = updateTaskCallbacksFor(extra.scope);
+      subscribeUpdateTaskRemoval();
+      return;
+    }
+  }
+  const record = pendingHistoryUpdateRecord();
+  if (record !== undefined && record.phase === 'unknown' && record.historyUpdateIntent !== undefined) {
+    const intent = record.historyUpdateIntent;
+    updateState = {
+      ...createHistoryUpdateState(intent, record.operationId, record.updatedAt),
+      phase: 'updateUnknown',
+    };
+    return;
+  }
+  const restored = restoreHistoryUpdateState(readM4ScopeSession(scope)?.terminalPage);
+  if (restored === undefined) {
+    return;
+  }
+  updateState = restored;
+  if (historyUpdateSettled(restored) && restored.postNodeRevision !== undefined) {
+    model?.applyLocalBaseRevision(restored.postNodeRevision);
+  }
+}
+
+/**
+ * 更新结算后的面板刷新（仅权威回读确认的 updated/updateConflict）：
+ * - 同步本地 BASE 徽标（旧 BASE 不被预期值覆盖；unknown 时本函数不执行）；
+ * - base-fallback 会话按新 BASE 刷新上限并重读首批（数据锚定旧 BASE 时失效）；
+ * - 重新解析当前详情的实际节点；成功/冲突提示由横幅承担。
+ */
+async function applySettledUpdate(state: HistoryUpdateState | undefined): Promise<void> {
+  if (state === undefined || model === undefined || handle === undefined) {
+    return;
+  }
+  if (!historyUpdateSettled(state) || state.postNodeRevision === undefined) {
+    return;
+  }
+  const captured = captureSession();
+  if (captured === undefined) {
+    return;
+  }
+  model.applyLocalBaseRevision(state.postNodeRevision);
+  resetCompareState();
+  const session = model.sessionView();
+  if (session.upperSource === 'base-fallback' && session.upperRevision !== null
+    && session.upperRevision !== state.postNodeRevision) {
+    await refreshBaseFallback(captured);
+    return;
+  }
+  const detail = model.detailState();
+  if (detail !== undefined) {
+    void resolveDetail(captured, { revision: detail.revision, epoch: detail.epoch });
+  }
+  pushIfCurrent(captured);
+}
+
+/**
+ * 「更新到此版本」：写前检查（本地目标/复制前禁用/status 本地修改）→
+ * 模态确认 → operation begin 落盘 → 后台更新任务。写命令发出前任何一步
+ * 失败都不产生可执行意图；已有任务或写锁时只提示，不替换、不抢锁。
+ */
+async function updateToHistoryRevision(captured: CapturedSession): Promise<void> {
+  const context = captured.model.context;
+  const target = entryTarget;
+  if (context === undefined || target === undefined || target.source !== 'local') {
+    toast('info', historyText('detailActionDisabledNotLocal'));
+    return;
+  }
+  if (hasActiveTask('history')) {
+    toast('info', strings.historyUpdatePanel.taskHeld);
+    return;
+  }
+  const detail = detailActionTarget();
+  const revision = detail?.actualRevision ?? detail?.revision;
+  if (detail === undefined || revision === undefined) {
+    toast('info', historyText('detailActionDisabledDeleted'));
+    return;
+  }
+  const relPath = relativePathWithin(target.wcRoot, context.localPath ?? target.localPath);
+  const svnPath = readSvnPath();
+  const options = updateRunOptions();
+  const prepared = await prepareHistoryUpdate(svnPath, target.wcRoot, relPath, revision, options);
+  if (!isSessionCurrent(captured)) {
+    return;
+  }
+  if (!prepared.ok) {
+    toast('error', updateBlockText(prepared.reason, prepared.message));
+    return;
+  }
+  // 写锁判定用固定意图中的规范化副本根（prepare 已 realpath），与
+  // operation record 的 lockKey 同值，避免入口路径形态差异漏判。
+  const registry = getOperationRegistry();
+  if (registry.hasActive(prepared.intent.wcRoot) || registry.hasRunning(prepared.intent.wcRoot)
+    || registry.writeRestriction(prepared.intent.wcRoot) !== undefined) {
+    toast('info', strings.historyUpdatePanel.taskHeld);
+    return;
+  }
+  const precondition = await checkHistoryUpdatePreconditions(svnPath, prepared.intent, options);
+  if (!isSessionCurrent(captured)) {
+    return;
+  }
+  if (!precondition.ok) {
+    const hasConflict = (precondition.blocking ?? []).some((entry) =>
+      entry.wcStatus === 'conflicted' || entry.props === 'conflicted');
+    toast('error', hasConflict
+      ? strings.historyUpdatePanel.conflictBlocked
+      : updateBlockText(precondition.reason ?? 'info-error', precondition.message));
+    return;
+  }
+  const confirmed = await confirmModal(
+    format(strings.historyUpdatePanel.confirmDetail, {
+      revision: String(prepared.intent.requestedRevision),
+      target: prepared.intent.targetRelPath === '.' ? target.localPath : prepared.intent.targetRelPath,
+    }),
+    strings.historyUpdatePanel.confirmButton,
+  );
+  if (!confirmed || !isSessionCurrent(captured)) {
+    return;
+  }
+  const operationId = randomOperationId();
+  const begin = await registry.begin({
+    wcRoot: prepared.intent.wcRoot,
+    lockKey: prepared.intent.wcRoot,
+    kind: 'history-update',
+    operationId,
+    targetRelPath: prepared.intent.targetRelPath,
+    nodeKind: prepared.intent.targetKind,
+    baseRevision: prepared.intent.preRevision,
+    historyUpdateIntent: prepared.intent,
+  });
+  if (!begin.ok) {
+    toast('info', strings.historyUpdatePanel.taskHeld);
+    return;
+  }
+  if (!isSessionCurrent(captured)) {
+    // 面板在确认/落盘窗口被关闭：写命令尚未发出，安全收口不留写锁。
+    await registry.finalizeOperation(operationId, 'failed-unconfirmed');
+    return;
+  }
+  await registry.markPhase(operationId, 'running');
+  const scope = scopeOfContext(context);
+  const state = createHistoryUpdateState(prepared.intent, operationId);
+  updateState = state;
+  const task = makeUpdateTask('update', scope, prepared.intent, state, operationId);
+  addTask(task);
+  subscribeUpdateTaskRemoval();
+  logLine(`[history-update] ${operationId} target=${prepared.intent.targetRelPath} r${prepared.intent.requestedRevision}`, 'history');
+  push();
+  task.extra.done = runUpdateTask(task).catch((err: unknown) => {
+    logLine(`[history-update] ${operationId} executor error: ${err instanceof Error ? err.message : String(err)}`, 'history');
+  });
+}
+
+/**
+ * 更新执行体（面板关闭后继续）：固定参数命令 → 权威回读 → 三态结算。
+ * updated/updateConflict（回读与固定请求一致）才 finalize done；unknown
+ * 保持记录 unknown 相位（跨面板写锁），只开放只读回扫收口。
+ */
+async function runUpdateTask(task: HistoryUpdateTask): Promise<void> {
+  const extra = task.extra;
+  const registry = getOperationRegistry();
+  const operationId = task.taskId;
+  let state = extra.state;
+  try {
+    const result = await runHistoryUpdate(readSvnPath(), extra.intent, updateRunOptions());
+    if (result.outcome === 'unknown') {
+      await registry.markPhase(operationId, 'unknown');
+      logLine(`[history-update] ${operationId} outcome=unknown${result.readbackError !== undefined ? ` readback=${result.readbackError}` : ''}`, 'history');
+    } else {
+      await registry.finalizeOperation(operationId, 'done', {
+        ...(result.postNodeRevision !== undefined ? { baseRevision: result.postNodeRevision } : {}),
+        resolvedRevision: result.requestedRevision,
+      });
+      logLine(
+        `[history-update] ${operationId} outcome=${result.outcome} base=${result.postNodeRevision ?? '?'} conflicts=${result.conflicts.length}`,
+        'history',
+      );
+    }
+    state = applyHistoryUpdateResult(state, result);
+  } catch (err) {
+    // core 已兜住命令/回读错误；此处是进程级异常，保守保持写限制。
+    const message = err instanceof Error ? err.message : String(err);
+    await registry.markPhase(operationId, 'unknown');
+    logLine(`[history-update] ${operationId} error: ${message}`, 'history');
+    state = {
+      ...state,
+      phase: 'updateUnknown',
+      commandError: message,
+      updatedAt: Date.now(),
+    };
+  } finally {
+    extra.state = state;
+    syncUpdateState(state);
+    settleTask(task.taskId, () => persistUpdateTerminal(extra.scope, state));
+    extra.callbacks.settled(state);
+    extra.callbacks.render();
+  }
+}
+
+/**
+ * updateUnknown 的只读回扫：复用记录中的固定意图回读节点 revision 与
+ * 本次范围冲突；三出口（仍未知/成功/冲突）中只有取得明确一致证据才
+ * finalize operation 并释放写锁。不重复写命令。
+ */
+async function rescanUpdate(captured: CapturedSession): Promise<void> {
+  const state = updateState;
+  if (state === undefined || state.phase !== 'updateUnknown') {
+    return;
+  }
+  if (hasActiveTask('history')) {
+    toast('info', strings.historyUpdatePanel.taskHeld);
+    return;
+  }
+  const scope = currentScope();
+  if (scope === undefined) {
+    return;
+  }
+  const intent = historyUpdateIntentOf(state);
+  const taskId = state.operationId ?? randomOperationId();
+  const next = beginHistoryUpdateRescan(state);
+  updateState = next;
+  const task = makeUpdateTask('rescan', scope, intent, next, taskId);
+  addTask(task);
+  subscribeUpdateTaskRemoval();
+  logLine(`[history-update] ${taskId} rescan start target=${intent.targetRelPath} r${intent.requestedRevision}`, 'history');
+  push();
+  task.extra.done = runUpdateRescanTask(task).catch((err: unknown) => {
+    logLine(`[history-update] ${taskId} rescan error: ${err instanceof Error ? err.message : String(err)}`, 'history');
+  });
+}
+
+/** 回扫执行体：只读回读 + 三出口收口（与更新执行体同一终态写法）。 */
+async function runUpdateRescanTask(task: HistoryUpdateTask): Promise<void> {
+  const extra = task.extra;
+  const registry = getOperationRegistry();
+  const operationId = extra.state.operationId;
+  let state = extra.state;
+  try {
+    const rescan = await rescanHistoryUpdate(readSvnPath(), extra.intent, updateRunOptions());
+    state = applyHistoryUpdateRescan(state, rescan);
+    if (rescan.outcome === 'still-unknown') {
+      if (operationId !== undefined) {
+        await registry.markPhase(operationId, 'unknown');
+      }
+      logLine(`[history-update] ${operationId ?? '-'} rescan still-unknown`, 'history');
+      toast('info', strings.historyUpdatePanel.rescanStillUnknown);
+    } else {
+      if (operationId !== undefined) {
+        await registry.finalizeOperation(operationId, 'done', {
+          ...(rescan.postNodeRevision !== undefined ? { baseRevision: rescan.postNodeRevision } : {}),
+          resolvedRevision: extra.intent.requestedRevision,
+        });
+      }
+      logLine(`[history-update] ${operationId ?? '-'} rescan outcome=${rescan.outcome} conflicts=${rescan.conflicts.length}`, 'history');
+      if (rescan.outcome === 'updated') {
+        toast('info', format(strings.historyUpdatePanel.rescanUpdated, {
+          revision: String(rescan.postNodeRevision ?? extra.intent.requestedRevision),
+        }));
+      } else {
+        toast('info', format(strings.historyUpdatePanel.rescanConflict, {
+          count: String(rescan.conflicts.length),
+        }));
+      }
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    state = { ...state, phase: 'updateUnknown', readbackError: message, updatedAt: Date.now() };
+    toast('error', strings.historyUpdatePanel.rescanStillUnknown);
+    logLine(`[history-update] ${operationId ?? '-'} rescan error: ${message}`, 'history');
+  } finally {
+    extra.state = state;
+    syncUpdateState(state);
+    settleTask(task.taskId, () => persistUpdateTerminal(extra.scope, state));
+    extra.callbacks.settled(state);
+    extra.callbacks.render();
+  }
+}
+
+/** 从更新任务进入 P7：经内存快照交接本次冲突与任务上下文（不重拼 URL）。 */
+async function openUpdateConflicts(): Promise<void> {
+  const state = updateState;
+  if (state === undefined) {
+    return;
+  }
+  await openConflictTarget({
+    source: 'update',
+    wcRoot: state.wcRoot,
+    scopeRelPath: state.targetRelPath,
+    taskContext: historyUpdateTaskContext(state),
+  });
+}
+
 /* ------------------------- 意图分发 ------------------------- */
 
 async function onIntent(intent: Intent, context: { sessionId: string; busy: boolean }): Promise<void> {
@@ -1764,6 +2400,14 @@ async function onIntent(intent: Intent, context: { sessionId: string; busy: bool
       await viewHistoryRevision(captured);
       return;
     }
+    case 'updateToHistoryRevision': {
+      await updateToHistoryRevision(captured);
+      return;
+    }
+    case 'rescanHistoryUpdate': {
+      await rescanUpdate(captured);
+      return;
+    }
     case 'checkoutHistoryDirectory': {
       await checkoutHistoryDirectory(captured);
       return;
@@ -1832,9 +2476,29 @@ async function onIntent(intent: Intent, context: { sessionId: string; busy: bool
         closeCompare(captured);
         return;
       }
+      if (intent.actionId === 'openUpdateConflicts') {
+        await openUpdateConflicts();
+        return;
+      }
+      if (intent.actionId === 'rescanHistoryUpdate') {
+        await rescanUpdate(captured);
+        return;
+      }
       return;
     }
     case 'dismissBanner': {
+      if (intent.bannerId === 'historyUpdate') {
+        // 更新成功提示可关闭；冲突/未知页保留（P7 入口与回扫出口）。
+        if (updateState?.phase === 'updated') {
+          updateState = undefined;
+          const scope = currentScope();
+          if (scope !== undefined) {
+            clearM4TerminalPage(scope);
+          }
+          pushIfCurrent(captured);
+        }
+        return;
+      }
       if (intent.bannerId === 'historyRound') {
         captured.model.dismissRoundBanner();
       } else {
@@ -1853,9 +2517,9 @@ async function onIntent(intent: Intent, context: { sessionId: string; busy: bool
       return;
     }
     default:
-      // 追溯（阶段 4）与更新（阶段 6）尚未接线：给出明确提示，不静默吞掉
-      // 用户动作；其余未登记动作沿用协议层白名单拒绝。
-      if (intent.kind === 'blameHistoryRevision' || intent.kind === 'updateToHistoryRevision') {
+      // 追溯（阶段 4）尚未接线：给出明确提示，不静默吞掉用户动作；
+      // 其余未登记动作沿用协议层白名单拒绝。
+      if (intent.kind === 'blameHistoryRevision') {
         toast('info', historyText('actionNotReady'));
       }
       return;
@@ -1886,6 +2550,12 @@ function onViewReady(): void {
 function onPanelDispose(): void {
   cancelAllInflight();
   resetCompareState();
+  // 更新任务与面板解耦：只解除移除订阅，不取消任务、不清任务 extra
+  // 状态；重开按活动任务绑定或终态页恢复（宿主 kill 由 operation record
+  // unknown 分诊）。任务回调在 handle/model 置空后自动不再推送。
+  updateTaskRemovalSub?.dispose();
+  updateTaskRemovalSub = undefined;
+  updateState = undefined;
   handle = undefined;
   model = undefined;
   entryTarget = undefined;
@@ -1917,6 +2587,15 @@ export function historySessionSnapshot(): {
   selection: number[];
   filter?: HistoryFilter;
   hasLoadedData?: boolean;
+  updatePhase?: HistoryUpdatePhase;
+  updateRequestedRevision?: number;
+  updatePreRevision?: number;
+  updatePostRevision?: number;
+  updateConflicts?: number;
+  updateReadbackError?: string;
+  updateCommandError?: string;
+  updateOperationId?: string;
+  updateTargetRelPath?: string;
 } {
   const context = model?.context;
   const session = model?.sessionView();
@@ -1937,6 +2616,27 @@ export function historySessionSnapshot(): {
     selection: model?.selectedRevisions() ?? [],
     ...(model !== undefined ? { filter: model.currentFilter() } : {}),
     ...(model !== undefined ? { hasLoadedData: model.hasLoadedData() } : {}),
+    ...(updateState !== undefined
+      ? {
+          updatePhase: updateState.phase,
+          updateRequestedRevision: updateState.requestedRevision,
+          updatePreRevision: updateState.preRevision,
+          ...(updateState.postNodeRevision !== undefined
+            ? { updatePostRevision: updateState.postNodeRevision }
+            : {}),
+          updateConflicts: updateState.conflicts.length,
+          ...(updateState.readbackError !== undefined
+            ? { updateReadbackError: updateState.readbackError }
+            : {}),
+          ...(updateState.commandError !== undefined
+            ? { updateCommandError: updateState.commandError }
+            : {}),
+          ...(updateState.operationId !== undefined
+            ? { updateOperationId: updateState.operationId }
+            : {}),
+          updateTargetRelPath: updateState.targetRelPath,
+        }
+      : {}),
   };
 }
 
@@ -1975,6 +2675,9 @@ export function historyCompareForTest(): {
 export function resetHistoryPanelController(): void {
   cancelAllInflight();
   resetCompareState();
+  updateTaskRemovalSub?.dispose();
+  updateTaskRemovalSub = undefined;
+  updateState = undefined;
   handle?.dispose();
   handle = undefined;
   model = undefined;

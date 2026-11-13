@@ -142,13 +142,58 @@ vi.mock('../src/host/panel/panels/checkout', () => ({
   openCheckoutPanelFromHistory: vi.fn(),
 }));
 
+// P6 更新（M4 阶段 6）编排测试：core 写前检查/执行/回扫由本文件 mock
+// 控制返回值与时序；真实 prepare/update/回读链路由 historyUpdate.test.ts
+// （真实 svnadmin+file://）与 historyUpdateController.test.ts 覆盖。
+vi.mock('../src/core/historyUpdate', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/core/historyUpdate')>();
+  return {
+    ...actual,
+    prepareHistoryUpdate: vi.fn(),
+    checkHistoryUpdatePreconditions: vi.fn(),
+    runHistoryUpdate: vi.fn(),
+    rescanHistoryUpdate: vi.fn(),
+  };
+});
+
+vi.mock('../src/host/ui/confirm', () => ({
+  confirmModal: vi.fn(),
+}));
+
+vi.mock('../src/host/commands/conflicts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/host/commands/conflicts')>();
+  return { ...actual, openConflictTarget: vi.fn() };
+});
+
 import { run, runOrThrow } from '../src/core/svnCli';
 import { SvnError, extractSvnErrorCodes } from '../src/core/errors';
+import type { ConflictRecord } from '../src/core/conflict';
+import { historyTargetKey } from '../src/host/panel/historyModel';
+import {
+  checkHistoryUpdatePreconditions,
+  prepareHistoryUpdate,
+  rescanHistoryUpdate,
+  runHistoryUpdate,
+  type HistoryUpdateIntent,
+  type HistoryUpdateResult,
+  type HistoryUpdateRescan,
+} from '../src/core/historyUpdate';
+import {
+  getOperationRegistry,
+  OperationRegistry,
+  resetRunningOperationsForTest,
+  setOperationRegistryForTest,
+  type OperationRecord,
+  type OperationStore,
+} from '../src/core/operations';
+import { getActiveTask, resetTaskRegistry } from '../src/host/taskRegistry';
+import { confirmModal } from '../src/host/ui/confirm';
+import { openConflictTarget } from '../src/host/commands/conflicts';
 import { openSnapshotBaseCompareEntry } from '../src/host/diffView';
 import { openCheckoutPanelFromHistory } from '../src/host/panel/panels/checkout';
 import { planSnapshotBaseCompare } from '../src/host/panel/snapshotModel';
 import { resetPanelRegistry } from '../src/host/panel/host';
-import { resetM4SessionStore } from '../src/host/sessionResults';
+import { readM4ScopeSession, resetM4SessionStore } from '../src/host/sessionResults';
 import { resetOutputState } from '../src/host/output';
 import {
   historyModelForTest,
@@ -456,6 +501,9 @@ beforeEach(() => {
   resetHistoryPanelController();
   resetM4SessionStore();
   resetOutputState();
+  resetTaskRegistry();
+  resetRunningOperationsForTest();
+  setOperationRegistryForTest(new OperationRegistry());
   vscodeMock.information.length = 0;
   vscodeMock.warning.length = 0;
   vscodeMock.errors.length = 0;
@@ -467,6 +515,14 @@ beforeEach(() => {
   vi.mocked(openSnapshotBaseCompareEntry).mockReset();
   vi.mocked(openCheckoutPanelFromHistory).mockReset();
   vi.mocked(openCheckoutPanelFromHistory).mockResolvedValue({ ok: true });
+  vi.mocked(prepareHistoryUpdate).mockReset();
+  vi.mocked(checkHistoryUpdatePreconditions).mockReset();
+  vi.mocked(runHistoryUpdate).mockReset();
+  vi.mocked(rescanHistoryUpdate).mockReset();
+  vi.mocked(confirmModal).mockReset();
+  vi.mocked(confirmModal).mockResolvedValue(true);
+  vi.mocked(openConflictTarget).mockReset();
+  vi.mocked(openConflictTarget).mockResolvedValue(undefined);
   setHistoryPanelContext({
     extensionUri: { scheme: 'file', path: '/extension' } as unknown as vscode.Uri,
     subscriptions: [],
@@ -476,6 +532,9 @@ beforeEach(() => {
 afterEach(() => {
   resetHistoryPanelController();
   resetPanelRegistry();
+  resetTaskRegistry();
+  resetRunningOperationsForTest();
+  setOperationRegistryForTest(undefined);
 });
 
 /* ------------------------------ 打开 ------------------------------ */
@@ -1205,5 +1264,404 @@ describe('关闭重开与目标切换', () => {
     expect(historyModelForTest()?.target?.relativePath).toBe('trunk/b.txt');
     expect(historyModelForTest()?.detailState()).toBeUndefined();
     expect(fakePanel().latestRenderHtml()).not.toContain('/trunk/a.txt');
+  });
+});
+
+/* ---------------------------------------------------------------------------
+ * M4 阶段 6：P6 更新到历史 revision 的控制器编排
+ * （写前检查 → 确认 → begin/写锁 → 更新任务状态机 → 回扫三出口 →
+ *  P7 交接 → 关闭重开/宿主重启恢复）
+ * ------------------------------------------------------------------------- */
+
+const UPDATE_SCOPE = {
+  scopeKind: 'history' as const,
+  targetKey: historyTargetKey('uuid-1', {
+    repositoryRootUrl: ROOT,
+    relativePath: 'trunk/a.txt',
+    kind: 'file',
+  }),
+  targetKind: 'file' as const,
+};
+
+function updateIntent(overrides: Partial<HistoryUpdateIntent> = {}): HistoryUpdateIntent {
+  return {
+    wcRoot: '/wc',
+    targetRelPath: 'trunk/a.txt',
+    targetKind: 'file',
+    targetUrl: NODE,
+    requestedRevision: 41,
+    preRevision: 40,
+    ...overrides,
+  };
+}
+
+function updateConflictRecord(): ConflictRecord {
+  return {
+    id: 'conflict-1',
+    path: 'trunk/a.txt',
+    kinds: ['text'],
+    contentKind: 'text',
+    nodeBaseRevision: 41,
+    baselineRevision: 40,
+    incomingRevision: 41,
+    artifacts: [],
+  };
+}
+
+function updateResult(overrides: Partial<HistoryUpdateResult> = {}): HistoryUpdateResult {
+  return {
+    targetRelPath: 'trunk/a.txt',
+    requestedRevision: 41,
+    preRevision: 40,
+    postNodeRevision: 41,
+    outcome: 'updated',
+    conflicts: [],
+    conflictSummary: { text: 0, property: 0, tree: 0, total: 0 },
+    ...overrides,
+  };
+}
+
+function updateRescan(overrides: Partial<HistoryUpdateRescan> = {}): HistoryUpdateRescan {
+  return {
+    outcome: 'updated',
+    postNodeRevision: 41,
+    conflicts: [],
+    conflictSummary: { text: 0, property: 0, tree: 0, total: 0 },
+    ...overrides,
+  };
+}
+
+/** 内存操作存储（宿主 globalState 的测试替身）。 */
+function memoryStore(): OperationStore & { records: OperationRecord[] } {
+  const records: OperationRecord[] = [];
+  return {
+    records,
+    load: () => records.map((record) => ({ ...record })),
+    save(record) {
+      const index = records.findIndex((item) => item.operationId === record.operationId);
+      if (index >= 0) {
+        records[index] = { ...record };
+      } else {
+        records.push({ ...record });
+      }
+    },
+    remove(operationId) {
+      const index = records.findIndex((item) => item.operationId === operationId);
+      if (index >= 0) {
+        records.splice(index, 1);
+      }
+    },
+  };
+}
+
+/** 打开面板并让详情解析到 r41（更新动作的目标）。 */
+async function openWithDetail(): Promise<void> {
+  infoHandler = standardInfo(42);
+  logHandler = () => ({
+    ok: true,
+    xml: logXml([
+      { revision: 41, author: 'alice', message: '目标提交' },
+      { revision: 40, author: 'bob', message: '基线' },
+    ]),
+  });
+  await openHistoryPanel(localTarget());
+  await waitFor(() => historySessionSnapshot().hasLoadedData === true);
+  detailInfoHandler = () => ({ ok: true, xml: infoXml(NODE, 41) });
+  fakePanel().sendIntent({ kind: 'selectHistoryRevision', id: 'r41' });
+  await waitFor(() => historyModelForTest()?.detailState()?.revision === 41);
+}
+
+describe('P6 更新：执行链与状态机', () => {
+  it('成功：写前检查→确认→begin(running)→updated；BASE/终态页/记录收口正确', async () => {
+    await openWithDetail();
+    vi.mocked(prepareHistoryUpdate).mockResolvedValue({ ok: true, intent: updateIntent() });
+    vi.mocked(checkHistoryUpdatePreconditions).mockResolvedValue({ ok: true });
+    let releaseUpdate: ((result: HistoryUpdateResult) => void) | undefined;
+    vi.mocked(runHistoryUpdate).mockImplementation(() => new Promise<HistoryUpdateResult>((resolve) => {
+      releaseUpdate = resolve;
+    }));
+
+    fakePanel().sendIntent({ kind: 'updateToHistoryRevision' });
+    await waitFor(() => historySessionSnapshot().updatePhase === 'updating');
+
+    // 固定意图来自详情实际 revision 与 prepare 快照；确认框只在检查通过后出现。
+    expect(vi.mocked(prepareHistoryUpdate)).toHaveBeenCalledWith(
+      'svn',
+      '/wc',
+      'trunk/a.txt',
+      41,
+      expect.anything(),
+    );
+    expect(vi.mocked(confirmModal)).toHaveBeenCalledTimes(1);
+    const records = await getOperationRegistry().loadAllRecords();
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({
+      kind: 'history-update',
+      phase: 'running',
+      lockKey: '/wc',
+      historyUpdateIntent: updateIntent(),
+    });
+    expect(getActiveTask('history')?.phase).toBe('updating');
+    expect(historySessionSnapshot()).toMatchObject({
+      updatePhase: 'updating',
+      updateRequestedRevision: 41,
+      updatePreRevision: 40,
+      updateOperationId: records[0].operationId,
+    });
+    expect(fakePanel().latestRenderHtml()).toContain('正在更新到 revision 41');
+    expect(fakePanel().latestRenderHtml()).toContain('更新前 BASE r40');
+
+    releaseUpdate?.(updateResult());
+    await waitFor(() => historySessionSnapshot().updatePhase === 'updated');
+    await waitFor(() => getActiveTask('history') === undefined);
+
+    expect(await getOperationRegistry().loadAllRecords()).toEqual([]);
+    expect(historySessionSnapshot()).toMatchObject({
+      updatePostRevision: 41,
+      updateConflicts: 0,
+    });
+    // 回读确认后 BASE 徽标按新值刷新；终态页写入当前作用域。
+    expect(historyModelForTest()?.localBaseRevision()).toBe(41);
+    const page = readM4ScopeSession(UPDATE_SCOPE)?.terminalPage;
+    expect(page).toMatchObject({ version: 1, kind: 'history-update' });
+    expect(fakePanel().latestRenderHtml()).toContain('更新完成');
+    expect(fakePanel().latestRenderHtml()).toContain('回读节点 BASE r41');
+  });
+
+  it('未知：保持旧 BASE、记录 unknown 写锁；回扫仍未知保持，成功出口收口并释放写锁', async () => {
+    await openWithDetail();
+    vi.mocked(prepareHistoryUpdate).mockResolvedValue({ ok: true, intent: updateIntent() });
+    vi.mocked(checkHistoryUpdatePreconditions).mockResolvedValue({ ok: true });
+    vi.mocked(runHistoryUpdate).mockResolvedValue(updateResult({
+      outcome: 'unknown',
+      postNodeRevision: undefined,
+      readbackError: 'svn update 退出码 1',
+    }));
+
+    fakePanel().sendIntent({ kind: 'updateToHistoryRevision' });
+    await waitFor(() => historySessionSnapshot().updatePhase === 'updateUnknown');
+    const unknownRecord = getOperationRegistry().writeRestriction('/wc');
+    expect(unknownRecord?.phase).toBe('unknown');
+    expect(historySessionSnapshot()).toMatchObject({
+      updatePreRevision: 40,
+      updateReadbackError: 'svn update 退出码 1',
+    });
+    // 旧 BASE 不被预期值覆盖。
+    expect(historyModelForTest()?.localBaseRevision()).toBe(40);
+    expect(fakePanel().latestRenderHtml()).toContain('更新结果未知');
+    expect(fakePanel().latestRenderHtml()).toContain('data-action-id="rescanHistoryUpdate"');
+
+    // 回扫仍未知：记录保持 unknown，页面保持 updateUnknown。
+    vi.mocked(rescanHistoryUpdate).mockResolvedValue(updateRescan({
+      outcome: 'still-unknown',
+      postNodeRevision: 40,
+      readbackError: 'revision 不符',
+    }));
+    fakePanel().sendIntent({ kind: 'rescanHistoryUpdate' });
+    await waitFor(() => historySessionSnapshot().updatePhase === 'updateUnknown'
+      && getActiveTask('history') === undefined);
+    expect(vi.mocked(rescanHistoryUpdate)).toHaveBeenCalledTimes(1);
+    expect(getOperationRegistry().writeRestriction('/wc')?.phase).toBe('unknown');
+    expect(historyModelForTest()?.localBaseRevision()).toBe(40);
+
+    // 回扫成功出口：回读请求 revision 且无冲突 → updated，记录 finalize。
+    vi.mocked(rescanHistoryUpdate).mockResolvedValue(updateRescan({ outcome: 'updated', postNodeRevision: 41 }));
+    fakePanel().sendIntent({ kind: 'rescanHistoryUpdate' });
+    await waitFor(() => historySessionSnapshot().updatePhase === 'updated');
+    await waitFor(() => getActiveTask('history') === undefined);
+    expect(getOperationRegistry().writeRestriction('/wc')).toBeUndefined();
+    expect(await getOperationRegistry().loadAllRecords()).toEqual([]);
+    expect(historyModelForTest()?.localBaseRevision()).toBe(41);
+  });
+
+  it('冲突：updateConflict 展示回读 BASE 与冲突；横幅动作把同一结果对象交给 P7', async () => {
+    await openWithDetail();
+    vi.mocked(prepareHistoryUpdate).mockResolvedValue({ ok: true, intent: updateIntent() });
+    vi.mocked(checkHistoryUpdatePreconditions).mockResolvedValue({ ok: true });
+    vi.mocked(runHistoryUpdate).mockResolvedValue(updateResult({
+      outcome: 'conflict',
+      conflicts: [updateConflictRecord()],
+      conflictSummary: { text: 1, property: 0, tree: 0, total: 1 },
+    }));
+
+    fakePanel().sendIntent({ kind: 'updateToHistoryRevision' });
+    await waitFor(() => historySessionSnapshot().updatePhase === 'updateConflict');
+    expect(historySessionSnapshot()).toMatchObject({
+      updatePostRevision: 41,
+      updateConflicts: 1,
+    });
+    expect(historyModelForTest()?.localBaseRevision()).toBe(41);
+    expect(fakePanel().latestRenderHtml()).toContain('更新完成，存在冲突');
+    expect(fakePanel().latestRenderHtml()).toContain('data-intent="bannerAction"');
+    expect(fakePanel().latestRenderHtml()).toContain('openUpdateConflicts');
+
+    fakePanel().sendIntent({ kind: 'bannerAction', bannerId: 'historyUpdate', actionId: 'openUpdateConflicts' });
+    await waitFor(() => vi.mocked(openConflictTarget).mock.calls.length === 1);
+    expect(vi.mocked(openConflictTarget)).toHaveBeenCalledWith({
+      source: 'update',
+      wcRoot: '/wc',
+      scopeRelPath: 'trunk/a.txt',
+      taskContext: {
+        targetRelPath: 'trunk/a.txt',
+        targetKind: 'file',
+        requestedRevision: 41,
+        preRevision: 40,
+        postNodeRevision: 41,
+        outcome: 'conflict',
+        conflictCount: 1,
+      },
+    });
+  });
+
+  it('写前阻断：本地修改阻止时不确认、不 begin、不发写命令', async () => {
+    await openWithDetail();
+    vi.mocked(prepareHistoryUpdate).mockResolvedValue({ ok: true, intent: updateIntent() });
+    vi.mocked(checkHistoryUpdatePreconditions).mockResolvedValue({
+      ok: false,
+      reason: 'local-modifications',
+      blocking: [{ path: 'trunk/a.txt', wcStatus: 'modified' }],
+    });
+    fakePanel().sendIntent({ kind: 'updateToHistoryRevision' });
+    await flush();
+    await flush();
+    expect(vi.mocked(confirmModal)).not.toHaveBeenCalled();
+    expect(vi.mocked(runHistoryUpdate)).not.toHaveBeenCalled();
+    expect(await getOperationRegistry().loadAllRecords()).toEqual([]);
+    expect(getActiveTask('history')).toBeUndefined();
+    expect(fakePanel().toasts().join('\n')).toContain('本地存在修改');
+  });
+
+  it('更新成功后历史会话按新 BASE 刷新：base-fallback 上限随之更新并重读首批', async () => {
+    infoHandler = (request) => {
+      if (request.url === ROOT) {
+        return { ok: false, stderr: failStderr(['E170013', 'E120108']) };
+      }
+      return { ok: true, xml: infoXml(NODE, request.revision ?? 40) };
+    };
+    logHandler = (request) => ({
+      ok: true,
+      xml: logXml([
+        { revision: (request.cursor ?? 40) - 1 },
+        { revision: (request.cursor ?? 40) - 2 },
+      ]),
+    });
+    await openHistoryPanel(localTarget());
+    await waitFor(() => historySessionSnapshot().phase === 'ready');
+    fakePanel().sendIntent({ kind: 'refreshHistoryUpper', mode: 'base-fallback' });
+    await waitFor(() => historySessionSnapshot().hasLoadedData === true);
+    expect(historySessionSnapshot()).toMatchObject({ upperRevision: 40, upperSource: 'base-fallback' });
+
+    detailInfoHandler = () => ({ ok: true, xml: infoXml(NODE, 39) });
+    fakePanel().sendIntent({ kind: 'selectHistoryRevision', id: 'r39' });
+    await waitFor(() => historyModelForTest()?.detailState()?.revision === 39);
+
+    vi.mocked(prepareHistoryUpdate).mockResolvedValue({
+      ok: true,
+      intent: updateIntent({ requestedRevision: 39 }),
+    });
+    vi.mocked(checkHistoryUpdatePreconditions).mockResolvedValue({ ok: true });
+    vi.mocked(runHistoryUpdate).mockResolvedValue(updateResult({
+      requestedRevision: 39,
+      postNodeRevision: 39,
+      outcome: 'updated',
+    }));
+
+    fakePanel().sendIntent({ kind: 'updateToHistoryRevision' });
+    await waitFor(() => historySessionSnapshot().updatePhase === 'updated');
+    await waitFor(() => historySessionSnapshot().upperRevision === 39);
+    expect(historySessionSnapshot()).toMatchObject({
+      upperSource: 'base-fallback',
+      updatePostRevision: 39,
+    });
+    expect(svnCalls.some((call) => call.kind === 'log' && call.cursor === 39)).toBe(true);
+    expect(historyModelForTest()?.localBaseRevision()).toBe(39);
+    expect(fakePanel().latestRenderHtml()).toContain('BASE r39');
+  });
+
+  it('复制前更新禁用：prepare 返回 target-absent-at-revision 时给出阻断提示', async () => {
+    await openWithDetail();
+    vi.mocked(prepareHistoryUpdate).mockResolvedValue({ ok: false, reason: 'target-absent-at-revision' });
+    fakePanel().sendIntent({ kind: 'updateToHistoryRevision' });
+    await flush();
+    await flush();
+    expect(fakePanel().toasts().join('\n')).toContain('该 revision 上目标不存在');
+    expect(vi.mocked(checkHistoryUpdatePreconditions)).not.toHaveBeenCalled();
+    expect(vi.mocked(runHistoryUpdate)).not.toHaveBeenCalled();
+  });
+});
+
+describe('P6 更新：关闭重开与宿主重启恢复', () => {
+  it('在途关闭面板：任务继续；重开绑定同一任务，完成后按终态页恢复 updated', async () => {
+    await openWithDetail();
+    vi.mocked(prepareHistoryUpdate).mockResolvedValue({ ok: true, intent: updateIntent() });
+    vi.mocked(checkHistoryUpdatePreconditions).mockResolvedValue({ ok: true });
+    let releaseUpdate: ((result: HistoryUpdateResult) => void) | undefined;
+    vi.mocked(runHistoryUpdate).mockImplementation(() => new Promise<HistoryUpdateResult>((resolve) => {
+      releaseUpdate = resolve;
+    }));
+
+    fakePanel().sendIntent({ kind: 'updateToHistoryRevision' });
+    await waitFor(() => historySessionSnapshot().updatePhase === 'updating');
+    const taskId = getActiveTask('history')?.taskId;
+    expect(taskId).toBeDefined();
+
+    fakePanel().dispose();
+    // 关闭面板不取消任务。
+    expect(getActiveTask('history')?.taskId).toBe(taskId);
+
+    // 重开：绑定仍在运行的任务，回到 updating 页（不重复登记新任务）。
+    await openHistoryPanel(localTarget());
+    await waitFor(() => historySessionSnapshot().updatePhase === 'updating');
+    expect(getActiveTask('history')?.taskId).toBe(taskId);
+    expect(fakePanel().latestRenderHtml()).toContain('正在更新到 revision 41');
+
+    releaseUpdate?.(updateResult());
+    await waitFor(() => historySessionSnapshot().updatePhase === 'updated');
+    await waitFor(() => getActiveTask('history') === undefined);
+    expect(fakePanel().latestRenderHtml()).toContain('更新完成');
+    expect(historyModelForTest()?.localBaseRevision()).toBe(41);
+    expect(await getOperationRegistry().loadAllRecords()).toEqual([]);
+  });
+
+  it('宿主重启：预置 history-update running 记录分诊为 unknown，打开面板进入 updateUnknown 且回扫可收口', async () => {
+    const store = memoryStore();
+    const first = new OperationRegistry(store);
+    const begin = await first.begin({
+      wcRoot: '/wc',
+      lockKey: '/wc',
+      kind: 'history-update',
+      operationId: 'op-pre',
+      targetRelPath: 'trunk/a.txt',
+      nodeKind: 'file',
+      baseRevision: 40,
+      historyUpdateIntent: updateIntent(),
+    });
+    expect(begin.ok).toBe(true);
+    await first.markPhase('op-pre', 'running');
+    // 模拟宿主重启：运行登记清空，新注册表重新加载并按 kind 分诊。
+    resetRunningOperationsForTest();
+    const restarted = new OperationRegistry(store);
+    await restarted.loadPending();
+    const folded = store.records.find((record) => record.operationId === 'op-pre');
+    expect(folded?.phase).toBe('unknown');
+    expect(folded?.historyUpdateIntent).toEqual(updateIntent());
+    setOperationRegistryForTest(restarted);
+
+    await openHistoryPanel(localTarget());
+    await waitFor(() => historySessionSnapshot().updatePhase === 'updateUnknown');
+    expect(historySessionSnapshot()).toMatchObject({
+      updateOperationId: 'op-pre',
+      updateRequestedRevision: 41,
+      updatePreRevision: 40,
+    });
+    expect(fakePanel().latestRenderHtml()).toContain('更新结果未知');
+    expect(fakePanel().latestRenderHtml()).toContain('data-action-id="rescanHistoryUpdate"');
+
+    vi.mocked(rescanHistoryUpdate).mockResolvedValue(updateRescan({ outcome: 'updated', postNodeRevision: 41 }));
+    fakePanel().sendIntent({ kind: 'rescanHistoryUpdate' });
+    await waitFor(() => historySessionSnapshot().updatePhase === 'updated');
+    await waitFor(() => getActiveTask('history') === undefined);
+    expect(store.records).toEqual([]);
+    expect(historyModelForTest()?.localBaseRevision()).toBe(41);
   });
 });

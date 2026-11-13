@@ -4,7 +4,11 @@
  * - 集成用例走本地 svnadmin + file:// 副本：更新成功/冲突/未知、复制前
  *   更新禁用、本地修改阻止、范围冲突、未知回扫三出口。
  */
+import { execFileSync } from 'node:child_process';
+import { chmodSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
+import { scanConflicts } from '../src/core/conflict';
 import { buildHistoryUpdateArgs, checkHistoryUpdatePreconditions, checkLocalUpdateTarget, prepareHistoryUpdate, rescanHistoryUpdate, runHistoryUpdate, type HistoryUpdateIntent } from '../src/core/historyUpdate';
 import { createSvnLab, writeFile } from './helpers';
 
@@ -260,5 +264,129 @@ describe('runHistoryUpdate 执行与回读', () => {
     const rescan = await rescanHistoryUpdate('definitely-not-a-svn-binary', intent);
     expect(rescan.outcome).toBe('still-unknown');
     expect(rescan.readbackError).toBeDefined();
+  });
+});
+
+/* ---------------------------------------------------------------------------
+ * M4 阶段 6：未知回扫三出口（成功/冲突）、external 内部副本隔离
+ * ------------------------------------------------------------------------- */
+
+/**
+ * 模拟「svn update 实际写入成功但命令输出失败」：wrapper 转发真实 svn，
+ * 只把 update 的退出码改为 1。用于覆盖未知态后回扫的成功/冲突出口
+ * （与「进程失败但写入可能已发生」的真实 kill 形态同构）。
+ */
+function createFailingUpdateSvn(): string {
+  const realSvn = execFileSync('which', ['svn'], { encoding: 'utf8' }).trim();
+  const wrapper = join(lab.root, `svn-update-fails-${Date.now()}-${Math.random().toString(16).slice(2, 6)}.sh`);
+  writeFileSync(wrapper, `#!/bin/sh\n"${realSvn}" "$@"\nrc=$?\nif [ "$1" = "update" ]; then\n  exit 1\nfi\nexit $rc\n`);
+  chmodSync(wrapper, 0o755);
+  return wrapper;
+}
+
+describe('未知回扫三出口：命令输出失败但写入已生效', () => {
+  it('成功出口：update 实际成功但退出码非零 → unknown；回扫确认请求 revision 且无冲突 → updated', async () => {
+    const baseRev = seedFile('hu-rescan-ok.txt');
+    const wc = lab.checkout('hu-rescan-ok');
+    lab.svn(['update', '-q', '-r', String(baseRev)], wc);
+    const other = lab.checkout('hu-rescan-ok-other');
+    writeFile(other, 'hu-rescan-ok.txt', 'v2\n');
+    lab.svn(['commit', '-q', '-m', 'rescan ok remote'], other);
+    const targetRev = headRevision();
+    const prepared = await prepareHistoryUpdate('svn', wc, 'hu-rescan-ok.txt', targetRev);
+    expect(prepared.ok).toBe(true);
+    if (!prepared.ok) {
+      return;
+    }
+    const failing = createFailingUpdateSvn();
+    const result = await runHistoryUpdate(failing, prepared.intent);
+    // 命令被记为失败 → unknown（即使写入实际发生、回读 revision 已等于请求）。
+    expect(result.outcome).toBe('unknown');
+    expect(result.postNodeRevision).toBe(targetRev);
+    expect(readFileSync(join(wc, 'hu-rescan-ok.txt'), 'utf8')).toBe('v2\n');
+
+    const rescan = await rescanHistoryUpdate(failing, prepared.intent);
+    expect(rescan.outcome).toBe('updated');
+    expect(rescan.postNodeRevision).toBe(targetRev);
+    expect(rescan.conflicts).toEqual([]);
+    expect(rescan.conflictSummary.total).toBe(0);
+  });
+
+  it('冲突出口：写入实际产生冲突但退出码非零 → unknown；回扫确认请求 revision 且有冲突 → conflict', async () => {
+    const baseRev = seedFile('hu-rescan-conflict/sub/a.txt');
+    const wc = lab.checkout('hu-rescan-conflict');
+    lab.svn(['update', '-q', '-r', String(baseRev)], wc);
+    const other = lab.checkout('hu-rescan-conflict-other');
+    writeFile(other, 'hu-rescan-conflict/sub/a.txt', 'v1\nremote\n');
+    lab.svn(['commit', '-q', '-m', 'rescan conflict remote'], other);
+    writeFile(wc, 'hu-rescan-conflict/sub/a.txt', 'v1\nlocal\n');
+    const targetRev = headRevision();
+    const prepared = await prepareHistoryUpdate('svn', wc, 'hu-rescan-conflict/sub', targetRev);
+    expect(prepared.ok).toBe(true);
+    if (!prepared.ok) {
+      return;
+    }
+    const failing = createFailingUpdateSvn();
+    const result = await runHistoryUpdate(failing, prepared.intent);
+    expect(result.outcome).toBe('unknown');
+    expect(result.postNodeRevision).toBe(targetRev);
+    expect(result.conflicts.map((record) => record.path)).toEqual(['hu-rescan-conflict/sub/a.txt']);
+
+    const rescan = await rescanHistoryUpdate(failing, prepared.intent);
+    expect(rescan.outcome).toBe('conflict');
+    expect(rescan.postNodeRevision).toBe(targetRev);
+    expect(rescan.conflicts.map((record) => record.path)).toEqual(['hu-rescan-conflict/sub/a.txt']);
+    expect(rescan.conflictSummary).toEqual({ text: 1, property: 0, tree: 0, total: 1 });
+  });
+});
+
+describe('external 内部副本隔离（P6 更新与 P7 范围）', () => {
+  it('P6 --ignore-externals 不更新 external 内部；external 内部冲突不进入本次结果与范围扫描', async () => {
+    const seeder = lab.checkout(`hu-ext-seed-${Date.now()}`);
+    writeFile(seeder, 'hu-ext/extsrc/f.txt', 'ext v1\n', true);
+    writeFile(seeder, 'hu-ext/proj/main.txt', 'main v1\n', true);
+    lab.svn(['commit', '-q', '-m', 'ext base'], seeder);
+    lab.svn(['propset', 'svn:externals', `ext ${lab.repoUrl}/hu-ext/extsrc`, 'hu-ext/proj'], seeder);
+    lab.svn(['commit', '-q', '-m', 'ext definition'], seeder);
+    const defRev = headRevision();
+
+    const wc = lab.checkout(`hu-ext-wc-${Date.now()}`);
+    lab.svn(['update', '-q', '-r', String(defRev)], wc);
+    const externalFile = join(wc, 'hu-ext/proj/ext/f.txt');
+    expect(existsSync(externalFile)).toBe(true);
+    const externalRevisionBefore = lab.svn(['info', '--show-item', 'revision', 'hu-ext/proj/ext'], wc).trim();
+
+    // external 内部本地修改（不属于本副本更新范围） + 外部源与主目标远程前进。
+    writeFile(wc, 'hu-ext/proj/ext/f.txt', 'ext local\n');
+    writeFile(seeder, 'hu-ext/extsrc/f.txt', 'ext v2\n');
+    writeFile(seeder, 'hu-ext/proj/main.txt', 'main v2\n');
+    lab.svn(['commit', '-q', '-m', 'ext remote + main'], seeder);
+    const targetRev = headRevision();
+
+    const prepared = await prepareHistoryUpdate('svn', wc, 'hu-ext/proj', targetRev);
+    expect(prepared.ok).toBe(true);
+    if (!prepared.ok) {
+      return;
+    }
+    // 写前检查不因 external 内部修改阻止（status --ignore-externals）。
+    expect(await checkHistoryUpdatePreconditions('svn', prepared.intent)).toEqual({ ok: true });
+
+    const result = await runHistoryUpdate('svn', prepared.intent);
+    expect(result.outcome).toBe('updated');
+    expect(result.conflicts).toEqual([]);
+    expect(readFileSync(join(wc, 'hu-ext/proj/main.txt'), 'utf8')).toBe('main v2\n');
+    // external 内部 revision 未被 P6 更新推进，本地修改保留。
+    expect(lab.svn(['info', '--show-item', 'revision', 'hu-ext/proj/ext'], wc).trim()).toBe(externalRevisionBefore);
+    expect(readFileSync(externalFile, 'utf8')).toBe('ext local\n');
+
+    // 普通 update（含 external）会产生外部内部冲突：真实 status 能看到。
+    lab.svn(['update', '-q'], wc);
+    const rawStatus = lab.svn(['status', '--xml'], wc);
+    expect(rawStatus).toContain('hu-ext/proj/ext/f.txt');
+    // P7 范围扫描同源（status --ignore-externals + external 边界过滤）不计外部内部冲突。
+    const scoped = await scanConflicts('svn', wc, { scope: 'hu-ext/proj' });
+    expect(scoped.records.some((record) => record.path.startsWith('hu-ext/proj/ext'))).toBe(false);
+    const whole = await scanConflicts('svn', wc);
+    expect(whole.records.some((record) => record.path.startsWith('hu-ext/proj/ext'))).toBe(false);
   });
 });

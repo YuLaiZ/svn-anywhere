@@ -1016,6 +1016,70 @@ describe('P7 面板控制器（mock SVN）', () => {
     expect(statusCalls[statusCalls.length - 1]).toEqual(['status', '--xml', '--ignore-externals', '--', '.']);
   });
 
+  it('更新任务上下文：顶部展示请求 revision、更新前 BASE 与回读节点 BASE；非法载荷不展示', async () => {
+    writeWorkFile('sub/text.txt');
+    conflicts = [textConflict('sub/text.txt')];
+    setup();
+    await openConflictPanel({
+      source: 'update',
+      wcRoot,
+      scopeRelPath: 'sub',
+      taskContext: {
+        targetRelPath: 'sub',
+        targetKind: 'dir',
+        requestedRevision: 5,
+        preRevision: 3,
+        postNodeRevision: 4,
+        outcome: 'conflict',
+        conflictCount: 1,
+      },
+    });
+    await waitIdle();
+    expect(conflictsSessionSnapshot().updateTaskContext).toMatchObject({
+      requestedRevision: 5,
+      preRevision: 3,
+      postNodeRevision: 4,
+      outcome: 'conflict',
+      conflictCount: 1,
+    });
+    const html = fakePanel().latestRenderHtml();
+    expect(html).toContain('更新请求 r5');
+    expect(html).toContain('更新前 BASE r3');
+    expect(html).toContain('回读节点 BASE r4');
+    // 范围仍是更新任务范围（保留任务范围，整副本是独立动作）。
+    expect(conflictsSessionSnapshot().scope?.scopeRelPath).toBe('sub');
+
+    // 回读缺失：显示明确的未知徽标，不用请求 revision 冒充。
+    fakePanel().dispose();
+    await openConflictPanel({
+      source: 'update',
+      wcRoot,
+      scopeRelPath: 'sub',
+      taskContext: {
+        targetRelPath: 'sub',
+        targetKind: 'dir',
+        requestedRevision: 5,
+        preRevision: 3,
+        outcome: 'unknown',
+        conflictCount: 0,
+      },
+    });
+    await waitIdle();
+    expect(fakePanel().latestRenderHtml()).toContain('回读节点 BASE 未知');
+
+    // 非法载荷：整段拒绝，不展示任何更新上下文徽标。
+    fakePanel().dispose();
+    await openConflictPanel({
+      source: 'update',
+      wcRoot,
+      scopeRelPath: 'sub',
+      taskContext: { requestedRevision: 5 },
+    });
+    await waitIdle();
+    expect(conflictsSessionSnapshot().updateTaskContext).toBeUndefined();
+    expect(fakePanel().latestRenderHtml()).not.toContain('更新请求 r5');
+  });
+
   it('终态页恢复：resolve 结果提示在重开后一次性展示', async () => {
     writeWorkFile('text.txt');
     conflicts = [textConflict('text.txt')];

@@ -158,6 +158,7 @@ export type Intent =
   | { kind: 'copyHistoryText'; copyKind: HistoryCopyKind; id: string }
   | { kind: 'blameHistoryRevision' }
   | { kind: 'updateToHistoryRevision' }
+  | { kind: 'rescanHistoryUpdate' }
   | { kind: 'checkoutHistoryDirectory' }
   /* ---------------- M4：P7 冲突处理 ---------------- */
   | { kind: 'selectConflict'; id: string }
@@ -278,6 +279,7 @@ export const M4_INTENT_KINDS = [
   'copyHistoryText',
   'blameHistoryRevision',
   'updateToHistoryRevision',
+  'rescanHistoryUpdate',
   'checkoutHistoryDirectory',
   // P7 冲突处理
   'selectConflict',
@@ -461,6 +463,7 @@ function parseIntent(raw: unknown): { ok: true; intent: Intent } | { ok: false; 
     case 'exportHistoryVersion':
     case 'blameHistoryRevision':
     case 'updateToHistoryRevision':
+    case 'rescanHistoryUpdate':
     case 'checkoutHistoryDirectory':
     // M4：P7 无参动作。
     case 'applyConflictResolution':

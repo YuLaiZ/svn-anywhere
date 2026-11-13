@@ -29,6 +29,10 @@ import { join } from 'node:path';
 
 import type { ConflictRecord, ConflictSummary } from '../../../core/conflict';
 import {
+  isHistoryUpdateTaskContext,
+  type HistoryUpdateTaskContext,
+} from '../../../core/historyUpdate';
+import {
   getOperationRegistry,
   kindOf,
   lockKeyOf,
@@ -72,7 +76,7 @@ import {
 import { allowedActions, createP7Gates, resolvePanelOccupancy } from '../gates';
 import { createPanel, type PanelHandle } from '../host';
 import type { Intent } from '../protocol';
-import type { ActionSpec, BannerSpec, DetailPropertyValueSpec, DetailSectionSpec, DetailSpec } from '../state';
+import type { ActionSpec, BannerSpec, DetailPropertyValueSpec, DetailSectionSpec, DetailSpec, PanelState } from '../state';
 
 const PANEL_ID = 'conflicts';
 
@@ -163,6 +167,12 @@ let handle: PanelHandle | undefined;
 let model: ConflictModel | undefined;
 let entryTarget: ConflictOpenTarget | undefined;
 let taskRemovalSub: TaskRemovedSubscription | undefined;
+/**
+ * P6 更新任务上下文（仅 source='update' 入口）：面板顶部展示请求
+ * revision、更新前 BASE 与回读节点 BASE。只展示，不从它生成冲突记录；
+ * 整副本扫描切到独立 local 作用域时清除。
+ */
+let updateTaskContext: HistoryUpdateTaskContext | undefined;
 /** 扫描取消通道（关闭面板不取消；重新扫描/取消动作才中止旧扫描进程）。 */
 let scanAbort: AbortController | undefined;
 /** 待确认动作（横幅确认；key + 类型 + 每次新请求的 requestId）。 */
@@ -332,7 +342,42 @@ function push(): void {
   if (extra.length > 0) {
     state.banners = [...extra, ...state.banners];
   }
+  const contextBadges = updateTaskContextBadges();
+  if (contextBadges.length > 0) {
+    state.headerBadges = [...(state.headerBadges ?? []), ...contextBadges];
+  }
   handle.update(state, handle.sessionId);
+}
+
+/**
+ * P6 更新任务上下文顶部徽标（请求 revision / 更新前 BASE / 回读节点 BASE）：
+ * 回读值缺失时明确显示「回读节点 BASE 未知」，不用预期值冒充。
+ */
+function updateTaskContextBadges(): NonNullable<PanelState['headerBadges']> {
+  const context = updateTaskContext;
+  if (context === undefined) {
+    return [];
+  }
+  const badges: NonNullable<PanelState['headerBadges']> = [
+    {
+      text: format(strings.conflictPanel.updateContextRequested, {
+        revision: String(context.requestedRevision),
+      }),
+    },
+    {
+      text: format(strings.conflictPanel.updateContextPreBase, {
+        revision: String(context.preRevision),
+      }),
+    },
+  ];
+  badges.push(context.postNodeRevision !== undefined
+    ? {
+        text: format(strings.conflictPanel.updateContextPostBase, {
+          revision: String(context.postNodeRevision),
+        }),
+      }
+    : { text: strings.conflictPanel.updateContextPostUnknown, warn: true });
+  return badges;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1200,6 +1245,11 @@ export async function openConflictPanel(target: ConflictOpenTarget): Promise<voi
     );
   }
   entryTarget = target;
+  // P6 更新任务上下文（source='update'）：只接受通过形状校验的展示事实；
+  // 普通入口与未知载荷一律清空，不从 taskContext 生成任何冲突记录。
+  updateTaskContext = target.source === 'update' && isHistoryUpdateTaskContext(target.taskContext)
+    ? target.taskContext
+    : undefined;
   await recoverSession();
 }
 
@@ -1512,7 +1562,9 @@ async function scanWholeWorkCopy(): Promise<void> {
   // 整副本扫描是写锁下也放行的独立回扫入口（不进 switchSession 的
   // busy/writeLocked 拒绝分支）：同面板换范围，旧目标回包由模型代次 +
   // 作用域守卫丢弃，并强制真实扫描（不因缓存恢复而跳过本次动作）。
+  // 整副本是独立作用域页：P6 更新任务上下文只属于更新范围，切走后清除。
   entryTarget = { source: 'local', wcRoot: scope.wcRoot, scopeRelPath: '.' };
+  updateTaskContext = undefined;
   await recoverSession({ forceScan: true });
 }
 
@@ -1548,6 +1600,7 @@ function onPanelDispose(): void {
   handle = undefined;
   model = undefined;
   entryTarget = undefined;
+  updateTaskContext = undefined;
   pendingConfirm = undefined;
   resolveNotice = undefined;
   scanAbort = undefined;
@@ -1570,6 +1623,13 @@ export function conflictsSessionSnapshot(): {
   taskPhase?: string;
   resolveNotice?: string;
   pendingOperationId?: string;
+  updateTaskContext?: {
+    requestedRevision: number;
+    preRevision: number;
+    postNodeRevision?: number;
+    outcome: string;
+    conflictCount: number;
+  };
 } {
   const task = getActiveTask('conflicts');
   const extra = task?.extra as ConflictTaskExtra | undefined;
@@ -1598,6 +1658,19 @@ export function conflictsSessionSnapshot(): {
     ...(extra?.kind !== undefined ? { taskKind: extra.kind } : {}),
     ...(resolveNotice !== undefined ? { resolveNotice: resolveNotice.message } : {}),
     ...(pendingRecord !== undefined ? { pendingOperationId: pendingRecord.operationId } : {}),
+    ...(updateTaskContext !== undefined
+      ? {
+          updateTaskContext: {
+            requestedRevision: updateTaskContext.requestedRevision,
+            preRevision: updateTaskContext.preRevision,
+            ...(updateTaskContext.postNodeRevision !== undefined
+              ? { postNodeRevision: updateTaskContext.postNodeRevision }
+              : {}),
+            outcome: updateTaskContext.outcome,
+            conflictCount: updateTaskContext.conflictCount,
+          },
+        }
+      : {}),
   };
 }
 
@@ -1615,6 +1688,7 @@ export function resetConflictPanelController(): void {
   handle = undefined;
   model = undefined;
   entryTarget = undefined;
+  updateTaskContext = undefined;
   pendingConfirm = undefined;
   resolveNotice = undefined;
   confirmSeq = 0;

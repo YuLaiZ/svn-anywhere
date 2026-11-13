@@ -273,6 +273,16 @@ describe('P6 放行表（history-update 在途与写锁）', () => {
     }
   });
 
+  it('未知回扫：writeLocked 放行 rescanHistoryUpdate，busy（写入在途）拒绝', () => {
+    expect(gatePermits(gates, false, true, { kind: 'rescanHistoryUpdate' })).toBe(true);
+    expect(
+      gatePermits(gates, false, true, { kind: 'bannerAction', actionId: 'rescanHistoryUpdate' }),
+    ).toBe(true);
+    expect(gatePermits(gates, true, false, { kind: 'rescanHistoryUpdate' })).toBe(false);
+    expect(allowedActions(gates.writeLocked)).toContain('rescanHistoryUpdate');
+    expect(allowedActions(gates.busy)).not.toContain('rescanHistoryUpdate');
+  });
+
   it('拒绝集与放行表对账：占用态必须等待的动作不出现在任何一行', () => {
     const blocked = p6BlockedInOccupancyActions();
     expect(blocked).toEqual([
@@ -492,8 +502,8 @@ describe('M4 占用态派生（与 M1-M3 共享写锁注册表）', () => {
 });
 
 describe('M4 意图全量对账（放行表与协议白名单同源）', () => {
-  it('45 个 M4 意图每个都在某张 P5/P6/P7 表的放行或显式阻塞集中有归宿', () => {
-    expect(M4_INTENT_KINDS).toHaveLength(45);
+  it('46 个 M4 意图每个都在某张 P5/P6/P7 表的放行或显式阻塞集中有归宿', () => {
+    expect(M4_INTENT_KINDS).toHaveLength(46);
     const p5 = createP5Gates();
     const p6 = createP6Gates();
     const p7 = createP7Gates();

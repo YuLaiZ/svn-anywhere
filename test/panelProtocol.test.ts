@@ -190,6 +190,7 @@ const M4_LEGAL_INTENTS: Array<Record<string, unknown>> = [
   { kind: 'copyHistoryText', copyKind: 'message', id: 'r1281' },
   { kind: 'blameHistoryRevision' },
   { kind: 'updateToHistoryRevision' },
+  { kind: 'rescanHistoryUpdate' },
   { kind: 'checkoutHistoryDirectory' },
   // P7 冲突处理。
   { kind: 'selectConflict', id: 'conflict-1' },
@@ -338,7 +339,7 @@ describe('parseViewMessage：M4 参数校验', () => {
   });
 
   it('M4 无参动作忽略多余载荷字段（只回传 kind）', () => {
-    for (const kind of ['scanWholeWorkCopy', 'loadMoreHistory', 'startConflictBatch', 'updateToHistoryRevision']) {
+    for (const kind of ['scanWholeWorkCopy', 'loadMoreHistory', 'startConflictBatch', 'updateToHistoryRevision', 'rescanHistoryUpdate']) {
       const parsed = parseIntentOf({ kind, path: '/tmp/evil', id: 'x' });
       expect(parsed.ok, kind).toBe(true);
       if (parsed.ok) {

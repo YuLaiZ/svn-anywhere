@@ -61,7 +61,56 @@ export interface HistoryUpdateResult {
   /** 本次更新目标范围内的冲突记录（不是整副本扫描）。 */
   conflicts: ConflictRecord[];
   conflictSummary: ConflictSummary;
+  /** 权威回读失败/不一致的原因（读不到时缺省）。 */
   readbackError?: string;
+  /** 命令级失败（退出码非零/超时/进程错误）；结论仍以回读为准。 */
+  commandError?: string;
+}
+
+/**
+ * P6→P7 更新任务上下文（技术方案 §5.5）：从 P6 更新任务进入 P7 时随
+ * openConflictPanel(source='update') 内存传递，面板顶部展示更新目标、
+ * 请求 revision、更新前 BASE 与回读节点 BASE。只承载展示事实，冲突集合
+ * 始终由 P7 对真实 SVN 重新扫描，不从本对象伪造。
+ */
+export interface HistoryUpdateTaskContext {
+  targetRelPath: string;
+  targetKind: 'file' | 'dir';
+  requestedRevision: number;
+  /** 更新开始前已确认的节点 BASE（旧 BASE）。 */
+  preRevision: number;
+  /** 权威回读的节点 BASE（回读不可用时缺省）。 */
+  postNodeRevision?: number;
+  outcome: 'updated' | 'conflict' | 'unknown';
+  conflictCount: number;
+  readbackError?: string;
+}
+
+/** P7 收到的外部 taskContext 形状校验（未知来源一律拒绝，不猜测）。 */
+export function isHistoryUpdateTaskContext(value: unknown): value is HistoryUpdateTaskContext {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record.targetRelPath !== 'string'
+    || (record.targetKind !== 'file' && record.targetKind !== 'dir')
+    || !Number.isSafeInteger(record.requestedRevision)
+    || (record.requestedRevision as number) <= 0
+    || !Number.isSafeInteger(record.preRevision)
+    || (record.preRevision as number) <= 0
+    || (record.outcome !== 'updated' && record.outcome !== 'conflict' && record.outcome !== 'unknown')
+    || !Number.isSafeInteger(record.conflictCount)
+    || (record.conflictCount as number) < 0) {
+    return false;
+  }
+  if (record.postNodeRevision !== undefined
+    && (!Number.isSafeInteger(record.postNodeRevision) || (record.postNodeRevision as number) <= 0)) {
+    return false;
+  }
+  if (record.readbackError !== undefined && typeof record.readbackError !== 'string') {
+    return false;
+  }
+  return true;
 }
 
 /** 写前检查/准备失败原因（文案由 host/i18n 提供）。 */
@@ -462,6 +511,7 @@ export async function runHistoryUpdate(
     conflicts: readback.conflicts,
     conflictSummary: readback.conflictSummary,
     readbackError: readback.readbackError,
+    commandError,
   };
 }
 

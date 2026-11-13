@@ -59,6 +59,13 @@ import {
   type HistoryUpperSource,
 } from '../../core/history';
 import type { BrowserError } from '../../core/remoteBrowse';
+import type { ConflictRecord, ConflictSummary } from '../../core/conflict';
+import type {
+  HistoryUpdateIntent,
+  HistoryUpdateRescan,
+  HistoryUpdateResult,
+  HistoryUpdateTaskContext,
+} from '../../core/historyUpdate';
 import { format, strings } from '../i18n';
 import {
   appendPagination,
@@ -335,6 +342,283 @@ export interface HistoryModelOptions {
 }
 
 /* ---------------------------------------------------------------------------
+ * P6 更新到历史 revision 的状态机（M4 阶段 6，交互状态清单冻结五态）
+ *
+ * 五态：updating（命令在途）/ updated（回读确认成功）/ updateConflict
+ * （回读确认冲突）/ updateRescanning（未知后的只读回扫）/ updateUnknown
+ * （结果未决）。状态只由控制器在执行链的权威回读事实之上推进：
+ * - 旧 BASE（preRevision）在命令与回扫期间始终保留，不被请求 revision
+ *   或预期值覆盖；只有 updated/updateConflict（回读与固定请求一致）才
+ *   把回读的 postNodeRevision 作为新 BASE 交给面板刷新；
+ * - 记录中的固定意图（路径/revision/目标 URL）随状态保存，未知回扫只
+ *   复用同一意图（只读），不重新解析 HEAD、不发起第二次写入；
+ * - 终态页形状经 version 校验后恢复；损坏/未知形态按无恢复处理。
+ * ------------------------------------------------------------------------- */
+
+/** 更新状态形状版本（结构变化时旧终态页按无恢复处理）。 */
+export const HISTORY_UPDATE_STATE_VERSION = 1;
+
+/** P6 更新状态机相位（交互状态清单 §P6）。 */
+export type HistoryUpdatePhase = 'updating' | 'updated' | 'updateConflict' | 'updateRescanning' | 'updateUnknown';
+
+/** P6 更新状态：固定意图 + 权威回读事实 + 本次范围冲突（P7 共用结果对象）。 */
+export interface HistoryUpdateState {
+  version: typeof HISTORY_UPDATE_STATE_VERSION;
+  phase: HistoryUpdatePhase;
+  /** 规范化工作副本根（operation record 锁键同值；P7 交接需要）。 */
+  wcRoot: string;
+  targetRelPath: string;
+  targetKind: 'file' | 'dir';
+  targetUrl: string;
+  requestedRevision: number;
+  /** 更新开始前已确认的节点 BASE（旧 BASE；未知期间保持原值）。 */
+  preRevision: number;
+  /** 权威回读的节点 BASE；回读失败时缺省（不按预期值伪造）。 */
+  postNodeRevision?: number;
+  /** 本次更新目标范围内的冲突记录（未知时也保留回读事实）。 */
+  conflicts: ConflictRecord[];
+  conflictSummary: ConflictSummary;
+  readbackError?: string;
+  /** 命令级失败原因（退出码非零/超时/进程错误；仅作未知页说明）。 */
+  commandError?: string;
+  /** operation record ID（写锁、日志与回扫收口定位）。 */
+  operationId?: string;
+  updatedAt: number;
+}
+
+/** 更新终态页（m4SessionStore.terminalPage 的 P6 形状）。 */
+export interface HistoryUpdateTerminalPage {
+  version: typeof HISTORY_UPDATE_STATE_VERSION;
+  kind: 'history-update';
+  state: HistoryUpdateState;
+}
+
+function validPositiveRevision(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
+
+function cloneConflicts(conflicts: readonly ConflictRecord[]): ConflictRecord[] {
+  return conflicts.map((record) => ({
+    ...record,
+    kinds: [...record.kinds],
+    artifacts: Array.isArray(record.artifacts)
+      ? record.artifacts.map((artifact) => ({ ...artifact }))
+      : [],
+  }));
+}
+
+function emptyConflictSummary(): ConflictSummary {
+  return { text: 0, property: 0, tree: 0, total: 0 };
+}
+
+/** 摘要恢复：非数字字段按 0 处理（损坏终态页不产生 NaN 计数）。 */
+function sanitizeConflictSummary(value: unknown): ConflictSummary {
+  const source = typeof value === 'object' && value !== null
+    ? value as Partial<Record<keyof ConflictSummary, unknown>>
+    : {};
+  const count = (input: unknown): number =>
+    typeof input === 'number' && Number.isFinite(input) && input >= 0 ? input : 0;
+  const text = count(source.text);
+  const property = count(source.property);
+  const tree = count(source.tree);
+  const total = count(source.total);
+  return { text, property, tree, total: total > 0 ? total : text + property + tree };
+}
+
+/** 固定意图 → 初始 updating 状态（begin 成功后、命令发出前调用）。 */
+export function createHistoryUpdateState(
+  intent: HistoryUpdateIntent,
+  operationId?: string,
+  now: number = Date.now(),
+): HistoryUpdateState {
+  return {
+    version: HISTORY_UPDATE_STATE_VERSION,
+    phase: 'updating',
+    wcRoot: intent.wcRoot,
+    targetRelPath: intent.targetRelPath,
+    targetKind: intent.targetKind,
+    targetUrl: intent.targetUrl,
+    requestedRevision: intent.requestedRevision,
+    preRevision: intent.preRevision,
+    conflicts: [],
+    conflictSummary: emptyConflictSummary(),
+    ...(operationId !== undefined ? { operationId } : {}),
+    updatedAt: now,
+  };
+}
+
+/** 从状态重建固定意图（未知回扫只读复用；不重新解析 HEAD）。 */
+export function historyUpdateIntentOf(state: HistoryUpdateState): HistoryUpdateIntent {
+  return {
+    wcRoot: state.wcRoot,
+    targetRelPath: state.targetRelPath,
+    targetKind: state.targetKind,
+    targetUrl: state.targetUrl,
+    requestedRevision: state.requestedRevision,
+    preRevision: state.preRevision,
+  };
+}
+
+/**
+ * 命令结束后的状态推进：outcome='updated' → updated；'conflict' →
+ * updateConflict；'unknown' → updateUnknown。回读事实（postNodeRevision/
+ * conflicts/readbackError）原样保留，旧 BASE 在 unknown 时不被替换。
+ */
+export function applyHistoryUpdateResult(
+  state: HistoryUpdateState,
+  result: HistoryUpdateResult,
+  now: number = Date.now(),
+): HistoryUpdateState {
+  const phase: HistoryUpdatePhase = result.outcome === 'updated'
+    ? 'updated'
+    : result.outcome === 'conflict'
+      ? 'updateConflict'
+      : 'updateUnknown';
+  return {
+    ...state,
+    phase,
+    ...(result.postNodeRevision !== undefined ? { postNodeRevision: result.postNodeRevision } : { postNodeRevision: undefined }),
+    conflicts: cloneConflicts(result.conflicts),
+    conflictSummary: { ...result.conflictSummary },
+    ...(result.readbackError !== undefined ? { readbackError: result.readbackError } : { readbackError: undefined }),
+    ...(result.commandError !== undefined ? { commandError: result.commandError } : { commandError: undefined }),
+    updatedAt: now,
+  };
+}
+
+/** 进入未知回扫：只读回读同一更新范围，不发起第二次写命令。 */
+export function beginHistoryUpdateRescan(
+  state: HistoryUpdateState,
+  now: number = Date.now(),
+): HistoryUpdateState {
+  return { ...state, phase: 'updateRescanning', updatedAt: now };
+}
+
+/**
+ * 未知回扫结果推进（三出口）：仍未知 → updateUnknown（保留上次事实）；
+ * 成功 → updated；冲突 → updateConflict。回扫以真实回读为准，不以预期值
+ * 冒充成功。
+ */
+export function applyHistoryUpdateRescan(
+  state: HistoryUpdateState,
+  rescan: HistoryUpdateRescan,
+  now: number = Date.now(),
+): HistoryUpdateState {
+  const phase: HistoryUpdatePhase = rescan.outcome === 'updated'
+    ? 'updated'
+    : rescan.outcome === 'conflict'
+      ? 'updateConflict'
+      : 'updateUnknown';
+  return {
+    ...state,
+    phase,
+    ...(rescan.postNodeRevision !== undefined ? { postNodeRevision: rescan.postNodeRevision } : { postNodeRevision: undefined }),
+    conflicts: cloneConflicts(rescan.conflicts),
+    conflictSummary: { ...rescan.conflictSummary },
+    ...(rescan.readbackError !== undefined ? { readbackError: rescan.readbackError } : { readbackError: undefined }),
+    updatedAt: now,
+  };
+}
+
+/** 已结算（updated/updateConflict）：回读到与固定请求一致的权威事实。 */
+export function historyUpdateSettled(state: HistoryUpdateState): boolean {
+  return state.phase === 'updated' || state.phase === 'updateConflict';
+}
+
+/** P7 交接上下文：只取展示事实，冲突集合由 P7 重新真实扫描。 */
+export function historyUpdateTaskContext(state: HistoryUpdateState): HistoryUpdateTaskContext {
+  return {
+    targetRelPath: state.targetRelPath,
+    targetKind: state.targetKind,
+    requestedRevision: state.requestedRevision,
+    preRevision: state.preRevision,
+    ...(state.postNodeRevision !== undefined ? { postNodeRevision: state.postNodeRevision } : {}),
+    outcome: state.phase === 'updated' ? 'updated' : state.phase === 'updateConflict' ? 'conflict' : 'unknown',
+    conflictCount: state.conflicts.length,
+    ...(state.readbackError !== undefined ? { readbackError: state.readbackError } : {}),
+  };
+}
+
+/** 状态 → 终态页（先写会话缓存、再移除任务的载荷）。 */
+export function historyUpdateTerminalPage(
+  state: HistoryUpdateState,
+): HistoryUpdateTerminalPage {
+  return { version: HISTORY_UPDATE_STATE_VERSION, kind: 'history-update', state };
+}
+
+/**
+ * 终态页恢复：形状/版本/相位/字段不合法时返回 undefined（按无恢复处理，
+ * 不猜测半截数据）。冲突记录只校验稳定字段，其余保持原样。
+ */
+export function restoreHistoryUpdateState(page: unknown): HistoryUpdateState | undefined {
+  if (typeof page !== 'object' || page === null) {
+    return undefined;
+  }
+  const terminal = page as Partial<HistoryUpdateTerminalPage>;
+  if (terminal.version !== HISTORY_UPDATE_STATE_VERSION || terminal.kind !== 'history-update') {
+    return undefined;
+  }
+  const state = terminal.state as Partial<HistoryUpdateState> | undefined;
+  if (typeof state !== 'object' || state === null || state.version !== HISTORY_UPDATE_STATE_VERSION) {
+    return undefined;
+  }
+  const phases: readonly HistoryUpdatePhase[] = [
+    'updating', 'updated', 'updateConflict', 'updateRescanning', 'updateUnknown',
+  ];
+  if (!phases.includes(state.phase as HistoryUpdatePhase)) {
+    return undefined;
+  }
+  if (typeof state.wcRoot !== 'string'
+    || typeof state.targetRelPath !== 'string'
+    || (state.targetKind !== 'file' && state.targetKind !== 'dir')
+    || typeof state.targetUrl !== 'string'
+    || !validPositiveRevision(state.requestedRevision)
+    || !validPositiveRevision(state.preRevision)
+    || typeof state.updatedAt !== 'number') {
+    return undefined;
+  }
+  if (state.postNodeRevision !== undefined && !validPositiveRevision(state.postNodeRevision)) {
+    return undefined;
+  }
+  if (!Array.isArray(state.conflicts)
+    || !state.conflicts.every((record) =>
+      typeof record === 'object' && record !== null
+      && typeof (record as { path?: unknown }).path === 'string'
+      && Array.isArray((record as { kinds?: unknown }).kinds))) {
+    return undefined;
+  }
+  if (typeof state.conflictSummary !== 'object' || state.conflictSummary === null) {
+    return undefined;
+  }
+  if (state.readbackError !== undefined && typeof state.readbackError !== 'string') {
+    return undefined;
+  }
+  if (state.commandError !== undefined && typeof state.commandError !== 'string') {
+    return undefined;
+  }
+  if (state.operationId !== undefined && typeof state.operationId !== 'string') {
+    return undefined;
+  }
+  return {
+    version: HISTORY_UPDATE_STATE_VERSION,
+    phase: state.phase as HistoryUpdatePhase,
+    wcRoot: state.wcRoot,
+    targetRelPath: state.targetRelPath,
+    targetKind: state.targetKind,
+    targetUrl: state.targetUrl,
+    requestedRevision: state.requestedRevision,
+    preRevision: state.preRevision,
+    ...(state.postNodeRevision !== undefined ? { postNodeRevision: state.postNodeRevision } : {}),
+    conflicts: cloneConflicts(state.conflicts as ConflictRecord[]),
+    conflictSummary: sanitizeConflictSummary(state.conflictSummary),
+    ...(state.readbackError !== undefined ? { readbackError: state.readbackError } : {}),
+    ...(state.commandError !== undefined ? { commandError: state.commandError } : {}),
+    ...(state.operationId !== undefined ? { operationId: state.operationId } : {}),
+    updatedAt: state.updatedAt,
+  };
+}
+
+/* ---------------------------------------------------------------------------
  * 通用小工具
  * ------------------------------------------------------------------------- */
 
@@ -496,6 +780,18 @@ export class HistoryModel {
   /** 本地 BASE revision（仅本地入口；handoff 无）。 */
   localBaseRevision(): number | undefined {
     return this.ctx?.localBaseRevision;
+  }
+
+  /**
+   * 更新权威回读确认后同步本地 BASE（M4 阶段 6）：只有 updated/updateConflict
+   * 的 postNodeRevision 允许调用；unknown 不得用请求 revision 或外部并发值
+   * 覆盖旧 BASE。同步后 BASE 徽标与 base-fallback 上限刷新都以新值为准。
+   */
+  applyLocalBaseRevision(revision: number): void {
+    if (this.ctx === undefined || !Number.isSafeInteger(revision) || revision <= 0) {
+      return;
+    }
+    this.ctx.localBaseRevision = revision;
   }
 
   /* ------------------------- 生命周期：打开与 upper ------------------------- */

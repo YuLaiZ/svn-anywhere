@@ -292,7 +292,11 @@ const P6_READONLY_INTENTS: readonly GateRule[] = [
   { action: 'closePanel' },
 ];
 
-/** P6 会话重读与写意图：占用态必须等待。 */
+/**
+ * P6 会话重读与写意图：占用态必须等待。rescanHistoryUpdate 是唯一例外——
+ * 它是 updateUnknown 的只读回扫入口（writeLocked 行放行、busy 行不放行），
+ * 不发起第二次写命令，只回读节点 revision 与本次范围冲突。
+ */
 const P6_BLOCKED_IN_OCCUPANCY: readonly GateRule[] = [
   // 推进会话网络读取：与更新任务结果页/会话交错。
   { action: 'loadMoreHistory' },
@@ -304,16 +308,22 @@ const P6_BLOCKED_IN_OCCUPANCY: readonly GateRule[] = [
   { action: 'checkoutHistoryDirectory' },
 ];
 
+/** P6 写锁未决（含 updateUnknown）时放行的只读回扫意图。 */
+const P6_RESCAN_INTENTS: readonly GateRule[] = [
+  { action: 'rescanHistoryUpdate' },
+];
+
 /**
  * P6 放行表：busy（history-update 在途）与 writeLocked（写锁未决）
  * 均「禁止刷新、重复写入与切换目标，可关闭面板查看已有数据」——
- * 放行只读查看集，拒绝会话重读/刷新/写/检出交接集。未知结果时
- * 的重新扫描入口由阶段 3 的控制器在业务层提供，不混入本表。
+ * 放行只读查看集；writeLocked 额外放行未知回扫（rescanHistoryUpdate），
+ * 作为解除 updateUnknown 写锁的唯一读路径。busy 行不放行回扫：
+ * 更新命令在途时回读会与写入交错。
  */
 export function createP6Gates(): PanelGates {
   return {
     busy: [...P6_READONLY_INTENTS],
-    writeLocked: [...P6_READONLY_INTENTS],
+    writeLocked: [...P6_READONLY_INTENTS, ...P6_RESCAN_INTENTS],
   };
 }
 

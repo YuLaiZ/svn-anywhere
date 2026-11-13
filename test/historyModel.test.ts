@@ -8,13 +8,24 @@
  */
 import { describe, expect, it } from 'vitest';
 import type { HistoryEntry, HistoryLimits } from '../src/core/history';
+import type { ConflictRecord } from '../src/core/conflict';
+import type { HistoryUpdateIntent, HistoryUpdateRescan, HistoryUpdateResult } from '../src/core/historyUpdate';
 import {
+  applyHistoryUpdateRescan,
+  applyHistoryUpdateResult,
+  beginHistoryUpdateRescan,
+  createHistoryUpdateState,
+  historyUpdateIntentOf,
+  historyUpdateSettled,
+  historyUpdateTaskContext,
+  historyUpdateTerminalPage,
   historyRowId,
   historyTargetKey,
   historyText,
   HistoryModel,
   parentRepositoryPath,
   normalizeRelativePath,
+  restoreHistoryUpdateState,
   type HistoryModelContext,
 } from '../src/host/panel/historyModel';
 
@@ -765,5 +776,215 @@ describe('目标身份与路径工具', () => {
     expect(parentRepositoryPath('trunk')).toBe('');
     expect(parentRepositoryPath('')).toBeUndefined();
     expect(normalizeRelativePath('/trunk/a.txt/')).toBe('trunk/a.txt');
+  });
+});
+
+/* ---------------------------------------------------------------------------
+ * M4 阶段 6：P6 更新状态机（updating/updated/updateConflict/updateRescanning/
+ * updateUnknown）、终态页形状与 P7 taskContext 交接
+ * ------------------------------------------------------------------------- */
+
+const UPDATE_INTENT: HistoryUpdateIntent = {
+  wcRoot: '/wc',
+  targetRelPath: 'trunk/sub',
+  targetKind: 'dir',
+  targetUrl: 'https://example.com/repo/trunk/sub',
+  requestedRevision: 40,
+  preRevision: 37,
+};
+
+function conflictRecord(path: string): ConflictRecord {
+  return {
+    id: `id-${path}`,
+    path,
+    kinds: ['text'],
+    contentKind: 'text',
+    nodeBaseRevision: 40,
+    baselineRevision: 37,
+    incomingRevision: 41,
+    artifacts: [
+      { role: 'base', path: `${path}.r37`, revision: 37 },
+      { role: 'mine', path: `${path}.mine` },
+      { role: 'incoming', path: `${path}.r41`, revision: 41 },
+    ],
+  };
+}
+
+function updateResult(overrides: Partial<HistoryUpdateResult> = {}): HistoryUpdateResult {
+  return {
+    targetRelPath: 'trunk/sub',
+    requestedRevision: 40,
+    preRevision: 37,
+    postNodeRevision: 40,
+    outcome: 'updated',
+    conflicts: [],
+    conflictSummary: { text: 0, property: 0, tree: 0, total: 0 },
+    ...overrides,
+  };
+}
+
+describe('P6 更新状态机（五态与固定意图）', () => {
+  it('createHistoryUpdateState：固定意图原样保存、相位 updating、旧 BASE 不被动', () => {
+    const state = createHistoryUpdateState(UPDATE_INTENT, 'op-1', 1000);
+    expect(state).toMatchObject({
+      phase: 'updating',
+      wcRoot: '/wc',
+      targetRelPath: 'trunk/sub',
+      targetKind: 'dir',
+      targetUrl: 'https://example.com/repo/trunk/sub',
+      requestedRevision: 40,
+      preRevision: 37,
+      operationId: 'op-1',
+      updatedAt: 1000,
+    });
+    expect(state.postNodeRevision).toBeUndefined();
+    expect(state.conflicts).toEqual([]);
+    expect(historyUpdateSettled(state)).toBe(false);
+    expect(historyUpdateIntentOf(state)).toEqual(UPDATE_INTENT);
+  });
+
+  it('applyHistoryUpdateResult：updated/conflict/unknown 三态映射且回读事实原样保留', () => {
+    const base = createHistoryUpdateState(UPDATE_INTENT, 'op-1', 1000);
+    const updated = applyHistoryUpdateResult(base, updateResult({ postNodeRevision: 40 }), 1100);
+    expect(updated.phase).toBe('updated');
+    expect(updated.postNodeRevision).toBe(40);
+    expect(updated.preRevision).toBe(37);
+    expect(historyUpdateSettled(updated)).toBe(true);
+
+    const conflict = applyHistoryUpdateResult(base, updateResult({
+      outcome: 'conflict',
+      conflicts: [conflictRecord('trunk/sub/a.txt')],
+      conflictSummary: { text: 1, property: 0, tree: 0, total: 1 },
+    }), 1200);
+    expect(conflict.phase).toBe('updateConflict');
+    expect(conflict.conflicts.map((record) => record.path)).toEqual(['trunk/sub/a.txt']);
+    expect(conflict.conflictSummary.total).toBe(1);
+
+    const unknown = applyHistoryUpdateResult(base, updateResult({
+      outcome: 'unknown',
+      postNodeRevision: undefined,
+      readbackError: 'svn info 失败',
+    }), 1300);
+    expect(unknown.phase).toBe('updateUnknown');
+    expect(unknown.postNodeRevision).toBeUndefined();
+    expect(unknown.preRevision).toBe(37);
+    expect(unknown.readbackError).toBe('svn info 失败');
+    expect(historyUpdateSettled(unknown)).toBe(false);
+  });
+
+  it('外部并发导致回读 revision 不等于请求：结果仍 unknown，旧 BASE 不被替换', () => {
+    const base = createHistoryUpdateState(UPDATE_INTENT, 'op-1', 1000);
+    const unknown = applyHistoryUpdateResult(base, updateResult({
+      outcome: 'unknown',
+      postNodeRevision: 39,
+    }));
+    expect(unknown.phase).toBe('updateUnknown');
+    expect(unknown.preRevision).toBe(37);
+    expect(unknown.postNodeRevision).toBe(39);
+    // 未知不写回读值：面板 BASE 不可通过 settled 路径刷新。
+    expect(historyUpdateSettled(unknown)).toBe(false);
+  });
+
+  it('未知回扫三出口：仍未知保持 unknown；成功→updated；冲突→updateConflict', () => {
+    const base = applyHistoryUpdateResult(createHistoryUpdateState(UPDATE_INTENT, 'op-1', 1000), updateResult({
+      outcome: 'unknown',
+      postNodeRevision: undefined,
+      readbackError: '命令退出码 1',
+    }), 1100);
+    const rescanning = beginHistoryUpdateRescan(base, 1200);
+    expect(rescanning.phase).toBe('updateRescanning');
+    expect(rescanning.preRevision).toBe(37);
+
+    const stillUnknown: HistoryUpdateRescan = {
+      outcome: 'still-unknown',
+      postNodeRevision: 37,
+      conflicts: [],
+      conflictSummary: { text: 0, property: 0, tree: 0, total: 0 },
+      readbackError: 'identity mismatch',
+    };
+    const kept = applyHistoryUpdateRescan(rescanning, stillUnknown, 1300);
+    expect(kept.phase).toBe('updateUnknown');
+    expect(kept.preRevision).toBe(37);
+
+    const success = applyHistoryUpdateRescan(rescanning, {
+      outcome: 'updated',
+      postNodeRevision: 40,
+      conflicts: [],
+      conflictSummary: { text: 0, property: 0, tree: 0, total: 0 },
+    }, 1400);
+    expect(success.phase).toBe('updated');
+    expect(success.postNodeRevision).toBe(40);
+
+    const conflicted = applyHistoryUpdateRescan(rescanning, {
+      outcome: 'conflict',
+      postNodeRevision: 40,
+      conflicts: [conflictRecord('trunk/sub/a.txt')],
+      conflictSummary: { text: 1, property: 0, tree: 0, total: 1 },
+    }, 1500);
+    expect(conflicted.phase).toBe('updateConflict');
+    expect(conflicted.postNodeRevision).toBe(40);
+  });
+
+  it('taskContext：请求 revision/更新前 BASE/回读节点 BASE 分开记录；unknown 时不冒充成功', () => {
+    const updated = applyHistoryUpdateResult(
+      createHistoryUpdateState(UPDATE_INTENT, 'op-1'),
+      updateResult({ postNodeRevision: 40 }),
+    );
+    expect(historyUpdateTaskContext(updated)).toEqual({
+      targetRelPath: 'trunk/sub',
+      targetKind: 'dir',
+      requestedRevision: 40,
+      preRevision: 37,
+      postNodeRevision: 40,
+      outcome: 'updated',
+      conflictCount: 0,
+    });
+    const unknown = applyHistoryUpdateResult(
+      createHistoryUpdateState(UPDATE_INTENT, 'op-1'),
+      updateResult({ outcome: 'unknown', postNodeRevision: undefined }),
+    );
+    const context = historyUpdateTaskContext(unknown);
+    expect(context.outcome).toBe('unknown');
+    expect(context.postNodeRevision).toBeUndefined();
+    expect(context.preRevision).toBe(37);
+  });
+
+  it('终态页序列化/恢复：形状合法时原样恢复，损坏/版本不符/相位未知时拒绝', () => {
+    const state = applyHistoryUpdateResult(
+      createHistoryUpdateState(UPDATE_INTENT, 'op-1', 1000),
+      updateResult({ outcome: 'conflict', conflicts: [conflictRecord('trunk/sub/a.txt')] }),
+      1100,
+    );
+    const page = historyUpdateTerminalPage(state);
+    const restored = restoreHistoryUpdateState(page);
+    expect(restored).toEqual(state);
+    expect(restoreHistoryUpdateState(undefined)).toBeUndefined();
+    expect(restoreHistoryUpdateState({ version: 2, kind: 'history-update', state })).toBeUndefined();
+    expect(restoreHistoryUpdateState({ version: 1, kind: 'scan', state })).toBeUndefined();
+    expect(restoreHistoryUpdateState({ version: 1, kind: 'history-update', state: { ...state, phase: 'bogus' } })).toBeUndefined();
+    expect(restoreHistoryUpdateState({
+      version: 1,
+      kind: 'history-update',
+      state: { ...state, requestedRevision: 0 },
+    })).toBeUndefined();
+    expect(restoreHistoryUpdateState({
+      version: 1,
+      kind: 'history-update',
+      state: { ...state, conflicts: [{ path: 'x' }] },
+    })).toBeUndefined();
+  });
+
+  it('HistoryModel.applyLocalBaseRevision：只接受正整数，BASE 徽标随之刷新', () => {
+    const model = new HistoryModel();
+    model.beginOpen(localContext());
+    expect(model.localBaseRevision()).toBe(7);
+    model.applyLocalBaseRevision(0);
+    model.applyLocalBaseRevision(-3);
+    model.applyLocalBaseRevision(2.5);
+    expect(model.localBaseRevision()).toBe(7);
+    model.applyLocalBaseRevision(40);
+    expect(model.localBaseRevision()).toBe(40);
+    const badges = model.buildPanelState('s').headerBadges ?? [];
+    expect(badges.some((badge) => badge.text.includes('40'))).toBe(true);
   });
 });
