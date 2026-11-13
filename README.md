@@ -41,8 +41,25 @@ pnpm run watch      # 监听模式构建
 pnpm run typecheck  # tsc --noEmit
 pnpm run test       # vitest 单元测试
 pnpm run mock-host  # 先构建，再以 mock 宿主加载打包产物验证命令行为
+node scripts/extension-host-test.mjs  # 真实 Extension Host 冒烟（需本机安装 VS Code 桌面版）
 ```
 
 调试：F5 以「扩展开发宿主」启动（`.vscode/launch.json` 已配置自动构建并指向真实工作副本），在宿主的输出面板选择「SVN Anywhere」查看命令输出。
+
+## 真实 Extension Host 测试
+
+`scripts/extension-host-test.mjs` 用本机 VS Code CLI（`--extensionDevelopmentPath` + `--extensionTestsPath`）启动真实 Extension Host，默认执行编辑器装饰冒烟：`OverviewRulerLane` / `DecorationRangeBehavior` 枚举、`createTextEditorDecorationType`、`setDecorations` 更新与清空、`onDidSaveTextDocument` 触发与退订。M4 阶段 4 的快速差异与行内追溯验收复用同一入口。
+
+前置条件：本机安装 VS Code 桌面版 1.85+；扩展宿主需要图形会话，不能用于纯无头 CI。默认使用 macOS 的 `/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code`，其他平台用 `VSCODE_BIN` 环境变量或 `--vscode` 指定。每次运行使用隔离的 user-data 与 extensions 目录，不修改本机 VS Code 配置。
+
+```bash
+node scripts/extension-host-test.mjs                       # 内置冒烟
+node scripts/extension-host-test.mjs --keep                # 保留临时产物（result.json、宿主日志）
+node scripts/extension-host-test.mjs --extension . --tests <验收测试入口>  # 阶段 4 复用（先 pnpm run build）
+```
+
+结果写入产物目录的 `result.json` 并打印检查项，任一检查失败退出码为 1。`--out <目录>` 可固定产物位置，`--verbose` 输出宿主完整日志，`--timeout <毫秒>` 调整超时。
+
+mock 宿主（`scripts/mock-host.cjs`）的 `fakeVscode` 同步实现了上述装饰与保存事件语义，`test/mockHost.test.ts` 锁定其行为；`pnpm run mock-host` 仍负责真实命令链路的端到端场景。
 
 打包与本地安装流程在首个可用版本时补充（`vsce package` 产出 vsix，本地分发，不上架 Marketplace）。

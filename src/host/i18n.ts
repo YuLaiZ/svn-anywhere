@@ -42,6 +42,8 @@ export const strings = {
     importLocal: '导入本地目录',
     /** 磁盘治理（P4）：与「清理」（svn cleanup 语义，3_update 组）明确区分——不单用「清理」字样。 */
     diskUsage: '磁盘治理',
+    /** 浏览仓库（P5）：打开只读仓库浏览器（资源管理器节点或命令面板输入 URL）。 */
+    browseRepository: '浏览仓库',
   },
   target: {
     resolved: '[定位] {command}：目标 {target}，副本根 {wcRoot}',
@@ -202,6 +204,105 @@ export const strings = {
     copyFailed: '复制到剪贴板失败：{message}',
     copyManualPrompt: '自动复制失败，请在下方输入框中手动选择并复制：',
     unversioned: '该路径未纳入版本控制，没有远端信息。',
+  },
+  /** P5 仓库浏览器入口与只读内容（M4 阶段 2）。 */
+  browse: {
+    /** 命令面板远端 URL 输入框。 */
+    urlPrompt: '输入要浏览的远端仓库 URL',
+    urlPlaceholder: 'https://svn.example.com/repos/project/trunk',
+    urlEmpty: 'URL 不能为空',
+    /** P5 远端入口只接受可补录凭据的三种协议（检出侧通用校验另有 svn+ssh/file）。 */
+    urlSchemeOnly: '仅支持 http、https、svn 协议的仓库 URL',
+    /** 右键路径不在任何工作副本内。 */
+    notWorkingCopy: '所选路径不在任何 SVN 工作副本内，无法浏览仓库。',
+    /** 副本内但节点未纳管/不存在：不借父目录 URL 误报成功。 */
+    unversioned: '所选路径未纳入版本控制，无法读取仓库地址；请选择已提交的节点。',
+    /** P5 面板控制器尚未接入时的明确提示（并行开发期间不静默吞动作）。 */
+    panelNotReady: '仓库浏览面板尚未接入本版本。',
+    /** P6 历史交接未接线（阶段 3 注册 showHistory 前）。 */
+    historyNotReady: '历史面板将在后续版本提供。',
+    /** 只读文本打开日志（输出频道 browse）。 */
+    openTextLog: '打开远端文件 {url}@{revision}（{bytes} 字节，编码 {encoding}）',
+    /** 临时资源下载日志（输出频道 browse）。 */
+    openExternalLog: '远端文件 {url}@{revision} 已保存到临时文件 {path}（{bytes} 字节）',
+    /** 系统默认应用打开失败：文件保留，供手动打开。 */
+    openExternalFailed: '文件已保存到 {path}，但系统默认应用打开失败；可从该路径手动打开。',
+    /** provider 文档关闭释放后的重开提示。 */
+    documentReleased: '远端内容已释放，请从仓库浏览重新打开该文件。',
+    /** 非法文档 URI 的兜底文本。 */
+    documentInvalid: '无法识别的远端文档地址。',
+    /** 只读内容服务初始化失败（fake 宿主/受限环境降级日志）。 */
+    initFailed: '远端只读内容服务初始化失败：{message}',
+    /** P5 控制器展示：大文本未使用内置预览（readonlyContent 的 textTooLarge 状态）。 */
+    textTooLargeNotice: '文件过大，未使用内置文本预览；已下载到临时文件并用系统默认应用打开。',
+    /** P5 控制器展示：二进制内容不内嵌渲染。 */
+    binaryNotice: '二进制文件不做文本预览；已下载到临时文件并用系统默认应用打开。',
+  },
+  /**
+   * P5 仓库浏览面板（M4 阶段 2）：面板标题、树/详情标签、节点状态与错误
+   * 文案。browseModel 通过可选读取本段优先取 i18n（未落地时用内置默认
+   * 中文兜底）；键集合与 browseModel 的 BROWSE_TEXT_DEFAULTS 一一对应。
+   */
+  browsePanel: {
+    panelTitle: '仓库浏览',
+    masterLabel: '目录树',
+    detailLabel: '节点详情',
+    openHint: '只读浏览远端仓库；不产生写命令，不在工作副本产生文件。',
+    treeAriaLabel: '远端仓库目录树',
+    openingTitle: '正在打开仓库…',
+    openingDetail: '正在读取入口节点的仓库身份与浏览 revision。',
+    emptyDir: '空目录',
+    /** 目录行空态补充说明（Webview 代理语义键：空目录不是错误）。 */
+    emptyDirDetail: '这个目录没有直属条目。',
+    emptyTree: '没有可显示的节点',
+    emptyTreeDetail: '展开目录或刷新仓库后重试。',
+    detailEmpty: '选择左侧节点查看详情。',
+    detailLoading: '正在读取节点信息…',
+    detailFailed: '节点信息读取失败：{message}',
+    rootFailedTitle: '无法打开仓库',
+    loadFailedTitle: '目录读取失败',
+    tooLargeTitle: '目录超出当前完整读取上限',
+    tooLargeEntries: '直属条目超过 {limit} 条，未展示部分结果；可重试或关闭该目录。',
+    tooLargeBytes: '目录清单超过 {limit} MiB，未展示部分结果；可重试或关闭该目录。',
+    tooLargeBannerDetail: '{path}：{reason}',
+    /** tooLarge 降级通用说明（Webview 代理语义键：不展示部分条目或伪总数）。 */
+    tooLargeDetail: '不展示部分条目或伪总数；请重试或关闭面板。',
+    notFoundMessage: '路径在当前浏览 revision 不存在。',
+    revisionNotFoundMessage: '浏览 revision r{revision} 不存在。',
+    permissionMessage: '没有访问该路径的权限。',
+    authCancelledMessage: '认证已取消，读取未完成；可重试。',
+    networkMessage: '网络错误：{message}',
+    unknownMessage: '读取失败：{message}',
+    cancelMetadata: '取消元数据补全',
+    metadataBannerDetail: '目录 {path} 的可见片正在补全；取消后保留已补全部分，未补全行保持占位。',
+    metadataBannerMulti: '共 {count} 个目录正在补全可见片元数据；取消后保留已补全部分。',
+    refreshHead: '刷新仓库（读取最新 HEAD）',
+    refreshNode: '刷新',
+    copyUrl: '复制原始 URL',
+    openFile: '打开远端文件',
+    openFileTooLarge: '文件大小 {size} 超过 {limit} 的临时资源上限，未打开。',
+    openHistory: '查看变更日志',
+    detailKindDir: '目录',
+    detailKindFile: '文件',
+    /** 节点类型未知（Webview 代理语义键：无法判定目录/文件时展示）。 */
+    kindUnknown: '未知',
+    detailUrl: '节点 URL',
+    detailRelativePath: '仓库相对路径',
+    detailRepoRoot: '仓库根',
+    detailSnapshot: '浏览快照 revision',
+    detailLastChanged: '节点最后修改',
+    detailAuthor: '最后修改作者',
+    detailDate: '最后修改时间',
+    detailSize: '文件大小',
+    detailDirCounts: '已读取 / 总数',
+    detailValueMissing: '—',
+    snapshotBadge: '浏览 revision r{revision}',
+    rootLabel: '仓库根',
+    refreshAuth: '重新读取',
+    copyUrlDone: '已复制原始 URL：{url}',
+    urlCopiedLog: '已复制节点 URL：{url}',
+    metadataProgressLine: '元数据补全中：已补全 {completed} / {total}',
+    selectedSummary: '已选择：{name}',
   },
   panel: {
     statusListTitle: 'SVN 状态',

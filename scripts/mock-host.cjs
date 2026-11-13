@@ -2,6 +2,8 @@
  * mock 宿主验证脚本：拦截 require('vscode')，加载打包产物 out/extension.js，
  * 直接驱动 activate 与注册的命令 handler。除命令骨架场景外，
  * 还用本地 svnadmin + file:// 临时副本驱动真实的更新/状态/清理命令链路。
+ * fakeVscode 同时按 VS Code API 契约提供编辑器装饰与保存事件语义；
+ * 模块被 require（而非主程序运行）时导出 fakeVscode/state 供 test/mockHost.test.ts 验证。
  * 用法：`pnpm run mock-host`（先构建再运行）。任一场景失败退出码为 1。
  */
 const { mkdtempSync, rmSync, mkdirSync, writeFileSync, realpathSync, existsSync, readFileSync, symlinkSync, statSync, readdirSync } = require('node:fs');
@@ -59,11 +61,422 @@ const state = {
   configOverrides: undefined,
   /** 全部频道的追加式写入序列（分频道后保持 channelText() 的追加语义）。 */
   allLines: [],
+  /** createTextEditorDecorationType 创建的装饰类型（按创建顺序）。 */
+  decorationTypes: [],
+  /** 装饰类型 key 自增序号（保证不同类型 key 唯一）。 */
+  decorationTypeSeq: 0,
+  /** setDecorations 调用记录：{ key, count, cleared }。 */
+  decorationCalls: [],
+  /** onDidSaveTextDocument 注册的处理器（保存事件按注册顺序触发）。 */
+  saveDocHandlers: [],
+  /** document.save() 触发的保存事件记录。 */
+  saveDocEvents: [],
+  /** 保存/装饰事件处理器抛出的错误（模拟宿主捕获 listener 异常，不中断事件分发）。 */
+  listenerErrors: [],
+  /** workspace.openTextDocument 创建的文档（按 uri.toString() 缓存，同 URI 返回同一实例）。 */
+  textDocuments: new Map(),
+  /** window.showTextDocument 创建并激活的编辑器。 */
+  editors: [],
+  /** untitled 文档自增序号。 */
+  untitledSeq: 0,
+  /** workspace.registerTextDocumentContentProvider 注册的 provider（按 scheme）。 */
+  contentProviders: new Map(),
+  /** env.clipboard.writeText 调用记录。 */
+  clipboard: [],
+  /** env.openExternal 打开记录（uri.toString()）。 */
+  openedExternal: [],
 };
+
+/* ------------------------------------------------------------------ *
+ * 编辑器装饰与保存事件替身（M4 阶段 4 F107/F108 验收依赖）。
+ * 按 VS Code API 契约实现：
+ * - OverviewRulerLane / DecorationRangeBehavior 枚举值与真实 API 一致；
+ * - createTextEditorDecorationType 校验 DecorationRenderOptions 形态；
+ * - setDecorations 同类型集合可更新、空数组清空、类型 dispose 后撤下；
+ * - onDidSaveTextDocument 注册/触发/退订，document.save() 触发保存事件。
+ * ------------------------------------------------------------------ */
+
+const OVERVIEW_RULER_LANE = Object.freeze({ Left: 1, Center: 2, Right: 4, Full: 7 });
+const DECORATION_RANGE_BEHAVIOR = Object.freeze({ OpenOpen: 0, ClosedClosed: 1, OpenClosed: 2, ClosedOpen: 3 });
+
+function isThemeColor(value) {
+  return Boolean(value) && typeof value === 'object' && typeof value.id === 'string';
+}
+
+function assertThemeableString(value, label) {
+  if (typeof value === 'string' || isThemeColor(value)) {
+    return;
+  }
+  throw new Error(`Illegal argument: ${label} must be a string or ThemeColor`);
+}
+
+function isUriLike(value) {
+  return Boolean(value) && typeof value === 'object'
+    && typeof value.scheme === 'string' && typeof value.toString === 'function';
+}
+
+function validateAttachmentOptions(value, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`Illegal argument: ${label} must be an object`);
+  }
+  if (value.contentText !== undefined && typeof value.contentText !== 'string') {
+    throw new Error(`Illegal argument: ${label}.contentText must be a string`);
+  }
+  if (value.color !== undefined) {
+    assertThemeableString(value.color, `${label}.color`);
+  }
+  if (value.backgroundColor !== undefined) {
+    assertThemeableString(value.backgroundColor, `${label}.backgroundColor`);
+  }
+  for (const field of ['border', 'borderColor', 'borderRadius', 'borderSpacing', 'borderStyle', 'borderWidth',
+    'fontStyle', 'fontWeight', 'textDecoration', 'margin', 'width', 'height', 'opacity', 'letterSpacing']) {
+    if (value[field] !== undefined && typeof value[field] !== 'string') {
+      throw new Error(`Illegal argument: ${label}.${field} must be a string`);
+    }
+  }
+  if (value.contentIconPath !== undefined && !isUriLike(value.contentIconPath)) {
+    throw new Error(`Illegal argument: ${label}.contentIconPath must be a Uri`);
+  }
+}
+
+function validateDecorationRenderOptions(options, label = 'DecorationRenderOptions') {
+  if (!options || typeof options !== 'object' || Array.isArray(options)) {
+    throw new Error(`Illegal argument: ${label} must be an object`);
+  }
+  if (options.overviewRulerLane !== undefined && ![1, 2, 4, 7].includes(options.overviewRulerLane)) {
+    throw new Error(`Illegal argument: ${label}.overviewRulerLane must be one of Left(1)/Center(2)/Right(4)/Full(7)`);
+  }
+  if (options.rangeBehavior !== undefined && ![0, 1, 2, 3].includes(options.rangeBehavior)) {
+    throw new Error(`Illegal argument: ${label}.rangeBehavior must be a DecorationRangeBehavior value (0-3)`);
+  }
+  if (options.isWholeLine !== undefined && typeof options.isWholeLine !== 'boolean') {
+    throw new Error(`Illegal argument: ${label}.isWholeLine must be a boolean`);
+  }
+  for (const field of ['backgroundColor', 'outlineColor', 'borderColor', 'color', 'overviewRulerColor']) {
+    if (options[field] !== undefined) {
+      assertThemeableString(options[field], `${label}.${field}`);
+    }
+  }
+  for (const field of ['outline', 'outlineStyle', 'outlineWidth', 'border', 'borderRadius', 'borderSpacing',
+    'borderStyle', 'borderWidth', 'fontStyle', 'fontWeight', 'textDecoration', 'cursor', 'opacity',
+    'letterSpacing', 'gutterIconSize']) {
+    if (options[field] !== undefined && typeof options[field] !== 'string') {
+      throw new Error(`Illegal argument: ${label}.${field} must be a string`);
+    }
+  }
+  if (options.before !== undefined) {
+    validateAttachmentOptions(options.before, `${label}.before`);
+  }
+  if (options.after !== undefined) {
+    validateAttachmentOptions(options.after, `${label}.after`);
+  }
+  if (options.gutterIconPath !== undefined) {
+    const valid = isUriLike(options.gutterIconPath)
+      || (options.gutterIconPath !== null && typeof options.gutterIconPath === 'object'
+        && isUriLike(options.gutterIconPath.light) && isUriLike(options.gutterIconPath.dark));
+    if (!valid) {
+      throw new Error(`Illegal argument: ${label}.gutterIconPath must be a Uri or a { light, dark } Uri pair`);
+    }
+  }
+  if (options.light !== undefined) {
+    validateDecorationRenderOptions(options.light, `${label}.light`);
+  }
+  if (options.dark !== undefined) {
+    validateDecorationRenderOptions(options.dark, `${label}.dark`);
+  }
+}
+
+class TextEditorDecorationType {
+  constructor(options, key) {
+    this.key = key;
+    this.options = options;
+    this.disposed = false;
+  }
+
+  dispose() {
+    if (this.disposed) {
+      return;
+    }
+    this.disposed = true;
+    // 与真实宿主一致：释放类型会同步撤下所有编辑器上的该类型装饰。
+    for (const editor of state.editors) {
+      editor._removeDecorationsByKey(this.key);
+    }
+  }
+}
+
+/** Position 替身：与真实 API 一致，行/列必须为非负整数。 */
+class TextEditorPosition {
+  constructor(line, character) {
+    if (!Number.isInteger(line) || line < 0) {
+      throw new Error(`Illegal argument: line must be a non-negative integer (got ${String(line)})`);
+    }
+    if (!Number.isInteger(character) || character < 0) {
+      throw new Error(`Illegal argument: character must be a non-negative integer (got ${String(character)})`);
+    }
+    this.line = line;
+    this.character = character;
+  }
+
+  isBefore(other) {
+    return this.line < other.line || (this.line === other.line && this.character < other.character);
+  }
+
+  isBeforeOrEqual(other) {
+    return this.isBefore(other) || this.isEqual(other);
+  }
+
+  isAfter(other) {
+    return other.isBefore(this);
+  }
+
+  isAfterOrEqual(other) {
+    return other.isBeforeOrEqual(this);
+  }
+
+  isEqual(other) {
+    return this.line === other.line && this.character === other.character;
+  }
+
+  compareTo(other) {
+    if (this.isBefore(other)) return -1;
+    if (this.isEqual(other)) return 0;
+    return 1;
+  }
+
+  translate(lineDeltaOrChange, characterDelta = 0) {
+    if (lineDeltaOrChange && typeof lineDeltaOrChange === 'object') {
+      return new TextEditorPosition(
+        this.line + (lineDeltaOrChange.lineDelta ?? 0),
+        this.character + (lineDeltaOrChange.characterDelta ?? 0),
+      );
+    }
+    return new TextEditorPosition(this.line + lineDeltaOrChange, this.character + characterDelta);
+  }
+
+  with(lineOrChange, character) {
+    if (lineOrChange && typeof lineOrChange === 'object') {
+      return new TextEditorPosition(lineOrChange.line ?? this.line, lineOrChange.character ?? this.character);
+    }
+    return new TextEditorPosition(lineOrChange ?? this.line, character ?? this.character);
+  }
+}
+
+/** Range 替身：与真实 API 一致，起点不得位于终点之后。 */
+class TextEditorRange {
+  constructor(startLineOrStart, startCharacterOrEnd, endLine, endCharacter) {
+    let start;
+    let end;
+    if (startLineOrStart instanceof TextEditorPosition) {
+      start = startLineOrStart;
+      end = startCharacterOrEnd;
+    } else {
+      start = new TextEditorPosition(startLineOrStart, startCharacterOrEnd);
+      end = new TextEditorPosition(endLine, endCharacter);
+    }
+    if (!(end instanceof TextEditorPosition)) {
+      throw new Error('Illegal argument: Range requires two Position arguments or four line/character numbers');
+    }
+    if (start.isAfter(end)) {
+      throw new Error('Illegal argument: start position must not be after end position');
+    }
+    this.start = start;
+    this.end = end;
+  }
+
+  static from(positions) {
+    return new TextEditorRange(positions[0], positions[1]);
+  }
+
+  get isEmpty() {
+    return this.start.isEqual(this.end);
+  }
+
+  get isSingleLine() {
+    return this.start.line === this.end.line;
+  }
+
+  contains(positionOrRange) {
+    if (positionOrRange instanceof TextEditorRange) {
+      return this.contains(positionOrRange.start) && this.contains(positionOrRange.end);
+    }
+    return !positionOrRange.isBefore(this.start) && !positionOrRange.isAfter(this.end);
+  }
+
+  isEqual(other) {
+    return this.start.isEqual(other.start) && this.end.isEqual(other.end);
+  }
+
+  with(startOrChange, end) {
+    const nextStart = startOrChange instanceof TextEditorPosition ? startOrChange : this.start;
+    const nextEnd = end instanceof TextEditorPosition ? end : this.end;
+    return new TextEditorRange(nextStart, nextEnd);
+  }
+}
+
+function assertDecorationType(value) {
+  if (!(value instanceof TextEditorDecorationType)) {
+    throw new Error('Illegal argument: decorationType must be created by window.createTextEditorDecorationType');
+  }
+  if (value.disposed) {
+    throw new Error('Illegal argument: decorationType has already been disposed');
+  }
+}
+
+/** 接受 Range[] 与 DecorationOptions[] 两种形态，统一存为 { range, ... } 项。 */
+function normalizeDecorations(value) {
+  if (!Array.isArray(value)) {
+    throw new Error('Illegal argument: decorations must be an array of Range or DecorationOptions');
+  }
+  return value.map((item, index) => {
+    if (item instanceof TextEditorRange) {
+      return { range: item };
+    }
+    if (item !== null && typeof item === 'object' && item.range instanceof TextEditorRange) {
+      return item;
+    }
+    throw new Error(`Illegal argument: decorations[${index}] must be a Range or an object with a Range "range"`);
+  });
+}
+
+function createTextEditorDecorationType(options) {
+  validateDecorationRenderOptions(options);
+  state.decorationTypeSeq += 1;
+  const decorationType = new TextEditorDecorationType(options, `mock-decoration-${state.decorationTypeSeq}`);
+  state.decorationTypes.push(decorationType);
+  return decorationType;
+}
+
+/** 模拟宿主分发保存事件：宿主捕获 listener 异常，不中断其余 listener。 */
+function fireDidSaveTextDocument(document) {
+  state.saveDocEvents.push(document);
+  for (const handler of [...state.saveDocHandlers]) {
+    try {
+      const pending = handler(document);
+      if (pending && typeof pending.then === 'function') {
+        pending.catch((err) => state.listenerErrors.push(err));
+      }
+    } catch (err) {
+      state.listenerErrors.push(err);
+    }
+  }
+}
+
+function countLines(text) {
+  let count = 1;
+  for (let i = 0; i < text.length; i += 1) {
+    if (text.charCodeAt(i) === 10) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function positionAtOffset(text, offset) {
+  const clamped = Math.max(0, Math.min(text.length, offset));
+  let line = 0;
+  let lineStart = 0;
+  for (let i = 0; i < clamped; i += 1) {
+    if (text.charCodeAt(i) === 10) {
+      line += 1;
+      lineStart = i + 1;
+    }
+  }
+  return new TextEditorPosition(line, clamped - lineStart);
+}
+
+function makeTextDocument(uri, options = {}) {
+  const { content, fileName } = options;
+  // content 为 undefined 时沿用提交说明替身语义：内容跟随 state.inputResult。
+  let storedContent = content;
+  const document = {
+    uri,
+    fileName: fileName ?? 'svn-commit-message.txt',
+    languageId: 'plaintext',
+    get isUntitled() { return uri.scheme === 'untitled'; },
+    get isDirty() { return false; },
+    get lineCount() { return countLines(document.getText()); },
+    getText() { return storedContent === undefined ? (state.inputResult ?? '') : storedContent; },
+    positionAt(offset) { return positionAtOffset(document.getText(), offset); },
+    offsetAt(position) {
+      const text = document.getText();
+      let offset = 0;
+      for (let line = 0; line < position.line; line += 1) {
+        const next = text.indexOf('\n', offset);
+        if (next < 0) {
+          return text.length;
+        }
+        offset = next + 1;
+      }
+      return Math.min(text.length, offset + position.character);
+    },
+    /** 真实 API 语义：保存文档并触发 onDidSaveTextDocument。 */
+    save() {
+      fireDidSaveTextDocument(document);
+      return Promise.resolve(true);
+    },
+  };
+  return document;
+}
+
+function makeTextEditor(document, showOptions = {}) {
+  const decorations = new Map();
+  const editor = {
+    document,
+    options: showOptions ?? {},
+    selections: [],
+    get visibleRanges() {
+      return [new TextEditorRange(0, 0, Math.max(0, document.lineCount - 1), 0)];
+    },
+    get active() {
+      return fakeVscode.window.activeTextEditor === editor;
+    },
+    /** 同类型再次调用覆盖旧集合；空数组等价清空（集合移除，不残留空项）。 */
+    setDecorations(decorationType, value) {
+      assertDecorationType(decorationType);
+      const normalized = normalizeDecorations(value);
+      if (normalized.length === 0) {
+        decorations.delete(decorationType.key);
+      } else {
+        decorations.set(decorationType.key, normalized);
+      }
+      state.decorationCalls.push({ key: decorationType.key, count: normalized.length, cleared: normalized.length === 0 });
+    },
+    /** 测试驱动：读取某类型当前装饰集合（真实 API 不提供读取入口）。 */
+    _getDecorations(decorationType) {
+      return decorations.get(decorationType.key) ?? [];
+    },
+    /** 宿主内部：装饰类型 dispose 时撤下该类型全部装饰。 */
+    _removeDecorationsByKey(key) {
+      decorations.delete(key);
+    },
+    revealRange() {},
+    edit() {
+      return Promise.resolve(false);
+    },
+    show() {},
+    hide() {},
+    dispose() {
+      decorations.clear();
+      const index = state.editors.indexOf(editor);
+      if (index >= 0) {
+        state.editors.splice(index, 1);
+      }
+      if (fakeVscode.window.activeTextEditor === editor) {
+        fakeVscode.window.activeTextEditor = undefined;
+      }
+    },
+  };
+  return editor;
+}
 
 const fakeVscode = {
   ProgressLocation: { Notification: 15 },
   ViewColumn: { Active: 1, Beside: 2 },
+  OverviewRulerLane: OVERVIEW_RULER_LANE,
+  DecorationRangeBehavior: DECORATION_RANGE_BEHAVIOR,
+  Position: TextEditorPosition,
+  Range: TextEditorRange,
   ThemeIcon: class {
     constructor(id) { this.id = id; }
   },
@@ -73,6 +486,26 @@ const fakeVscode = {
     joinPath: (base, ...parts) => {
       const path = [base.path.replace(/\/$/, ''), ...parts].join('/');
       return { scheme: 'file', path, fsPath: path, toString: () => `file://${path}` };
+    },
+    /** 与真实 API 同形：按 components 组装 URI（自定义 scheme 的 provider 场景用）。 */
+    from: (components) => {
+      const scheme = String(components.scheme ?? '');
+      if (scheme === '') {
+        throw new Error('Illegal argument: Uri.from requires a scheme');
+      }
+      const path = String(components.path ?? '');
+      const query = components.query === undefined ? '' : String(components.query);
+      const fragment = components.fragment === undefined ? '' : String(components.fragment);
+      const authority = components.authority === undefined ? '' : String(components.authority);
+      const suffix = `${query === '' ? '' : `?${query}`}${fragment === '' ? '' : `#${fragment}`}`;
+      return {
+        scheme,
+        path,
+        query,
+        fragment,
+        ...(scheme === 'file' ? { fsPath: path } : {}),
+        toString: () => `${scheme}:${authority === '' ? '' : `//${authority}`}${path}${suffix}`,
+      };
     },
   },
   TabInputText: class {},
@@ -133,7 +566,27 @@ const fakeVscode = {
       }
       return Promise.resolve(state.inputResult);
     },
-    showTextDocument: async () => undefined,
+    /** 创建装饰类型：按 VS Code 契约校验 DecorationRenderOptions。 */
+    createTextEditorDecorationType(options) {
+      return createTextEditorDecorationType(options);
+    },
+    /**
+     * 显示文档并返回编辑器；与真实宿主一致，同一文档可同时存在多个编辑器，
+     * 且新显示的编辑器成为 activeTextEditor。
+     */
+    async showTextDocument(documentOrUri, showOptions) {
+      let document;
+      if (documentOrUri && typeof documentOrUri === 'object'
+        && documentOrUri.uri && typeof documentOrUri.getText === 'function') {
+        document = documentOrUri;
+      } else {
+        document = await fakeVscode.workspace.openTextDocument(documentOrUri);
+      }
+      const editor = makeTextEditor(document, showOptions);
+      state.editors.push(editor);
+      fakeVscode.window.activeTextEditor = editor;
+      return editor;
+    },
     tabGroups: { all: [], close: async () => true },
     showQuickPick(items, options) {
       state.quickPickTitles.push(options?.title ?? '');
@@ -240,15 +693,100 @@ const fakeVscode = {
   },
   workspace: {
     workspaceFolders: [],
-    // 说明编辑文档：内容直接取 state.inputResult，配合 messageChoice 模拟确认。
-    openTextDocument: async (uri) => ({
-      uri,
-      fileName: 'svn-commit-message.txt',
-      getText: () => state.inputResult ?? '',
-    }),
+    /**
+     * 打开文档：支持文件路径字符串、Uri 与 { content } 未命名文档；
+     * 同一 URI 返回同一实例（真实宿主语义）。Uri 参数在文件不存在时
+     * 沿用提交说明替身：内容取 state.inputResult，配合 messageChoice 模拟确认。
+     */
+    openTextDocument: async (arg) => {
+      let uri;
+      let content;
+      let fileName;
+      if (typeof arg === 'string') {
+        uri = fakeVscode.Uri.file(arg);
+        fileName = arg.split('/').pop();
+        try {
+          if (statSync(arg).isFile()) {
+            content = readFileSync(arg, 'utf8');
+          }
+        } catch {
+          // 路径不存在或不可读：保留无内容文档，保存事件仍可驱动。
+        }
+      } else if (arg !== null && typeof arg === 'object' && typeof arg.content === 'string') {
+        state.untitledSeq += 1;
+        const name = `Untitled-${state.untitledSeq}`;
+        uri = { scheme: 'untitled', path: name, fsPath: name, toString: () => `untitled:${name}` };
+        content = arg.content;
+        fileName = name;
+      } else if (arg !== null && typeof arg === 'object' && typeof arg.toString === 'function') {
+        uri = arg;
+        if (uri.scheme === 'file' && typeof uri.fsPath === 'string') {
+          fileName = uri.fsPath.split('/').pop();
+          try {
+            if (statSync(uri.fsPath).isFile()) {
+              content = readFileSync(uri.fsPath, 'utf8');
+            }
+          } catch {
+            // 走提交说明替身语义。
+          }
+        }
+      } else {
+        throw new Error('Illegal argument: openTextDocument requires a path, Uri, or { content }');
+      }
+      const key = uri.toString();
+      const cached = state.textDocuments.get(key);
+      if (cached !== undefined) {
+        return cached;
+      }
+      const document = makeTextDocument(uri, { content, fileName });
+      state.textDocuments.set(key, document);
+      return document;
+    },
+    /** 保存事件：返回 Disposable，dispose 后不再收到事件。 */
+    onDidSaveTextDocument: (handler) => {
+      if (typeof handler !== 'function') {
+        throw new Error('Illegal argument: onDidSaveTextDocument requires a function');
+      }
+      state.saveDocHandlers.push(handler);
+      let active = true;
+      return {
+        dispose() {
+          if (!active) {
+            return;
+          }
+          active = false;
+          const index = state.saveDocHandlers.indexOf(handler);
+          if (index >= 0) {
+            state.saveDocHandlers.splice(index, 1);
+          }
+        },
+      };
+    },
     onDidCloseTextDocument: (handler) => {
       state.closeDocHandlers.push(handler);
       return { dispose() {} };
+    },
+    /** 只读内容 provider（P5 svn-anywhere-remote scheme）：按 scheme 登记，dispose 撤下。 */
+    registerTextDocumentContentProvider: (scheme, provider) => {
+      if (typeof scheme !== 'string' || scheme === '') {
+        throw new Error('Illegal argument: registerTextDocumentContentProvider requires a scheme');
+      }
+      if (!provider || typeof provider.provideTextDocumentContent !== 'function') {
+        throw new Error('Illegal argument: provider must implement provideTextDocumentContent');
+      }
+      state.contentProviders.set(scheme, provider);
+      let active = true;
+      return {
+        dispose() {
+          if (!active) {
+            return;
+          }
+          active = false;
+          if (state.contentProviders.get(scheme) === provider) {
+            state.contentProviders.delete(scheme);
+          }
+        },
+      };
     },
     getConfiguration() {
       // state.configOverrides 可按场景覆盖配置项（如 svnPath 指向包装脚本）。
@@ -265,6 +803,18 @@ const fakeVscode = {
           size: st.size,
         };
       },
+    },
+  },
+  env: {
+    // 剪贴板与系统默认应用打开：P1 远端信息复制与 P5 二进制/大文本降级路径使用。
+    clipboard: {
+      writeText: async (value) => {
+        state.clipboard.push(String(value));
+      },
+    },
+    openExternal: async (uri) => {
+      state.openedExternal.push(uri && typeof uri.toString === 'function' ? uri.toString() : String(uri));
+      return true;
     },
   },
   commands: {
@@ -290,13 +840,22 @@ const fakeVscode = {
   },
 };
 
-const originalLoad = Module._load;
-Module._load = function (request, parent, isMain) {
-  if (request === 'vscode') {
-    return fakeVscode;
-  }
-  return originalLoad.call(this, request, parent, isMain);
-};
+/**
+ * 安装 require('vscode') 拦截，仅主程序运行时调用；
+ * 被测试代码 require 本文件时不修改全局模块加载器。
+ */
+function installVscodeMock() {
+  const originalLoad = Module._load;
+  Module._load = function (request, parent, isMain) {
+    if (request === 'vscode') {
+      return fakeVscode;
+    }
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  return () => {
+    Module._load = originalLoad;
+  };
+}
 
 let failures = 0;
 
@@ -313,8 +872,15 @@ function makeTempDir(prefix) {
   return realpathSync(mkdtempSync(join(tmpdir(), prefix)));
 }
 
+/**
+ * 与产品 core/svnCli.svnEnv() 同源：场景脚本直接调用的 svn 固定
+ * en_US.UTF-8，避免宿主 LANG/LC_ALL=C 时 svn 把非 ASCII 转义成
+ * {U+XXXX}（多行提交说明、重命名来源日志等断言依赖 UTF-8 原文）。
+ */
+const SVN_ENV = { ...process.env, LANG: 'en_US.UTF-8', LC_ALL: 'en_US.UTF-8' };
+
 function svn(args, cwd) {
-  return execFileSync('svn', args, { cwd, encoding: 'utf8' });
+  return execFileSync('svn', args, { cwd, encoding: 'utf8', env: SVN_ENV });
 }
 
 function channelText() {
@@ -494,6 +1060,7 @@ function makeSvnLab() {
 }
 
 async function main() {
+  installVscodeMock();
   const extension = require('../out/extension.js');
   const pkg = require('../package.json');
   const context = {
@@ -520,8 +1087,9 @@ async function main() {
     expectedIds.length === state.registered.size && expectedIds.every((id) => state.registered.has(id)),
     `贡献点 ${expectedIds.length} 个，实际注册 ${state.registered.size} 个：${[...state.registered.keys()].join(', ')}`,
   );
-  // subscriptions = 命令句柄数 + activate 推入的输出频道释放句柄。
-  check('注册句柄挂到 context.subscriptions', context.subscriptions.length === expectedIds.length + 1);
+  // subscriptions = 命令句柄数 + activate 推入的 3 个资源释放句柄：
+  // 输出频道、只读内容 provider（svn-anywhere-remote）与文档关闭监听。
+  check('注册句柄挂到 context.subscriptions', context.subscriptions.length === expectedIds.length + 3);
 
   console.log('场景 2：右键工作副本内路径，命令定位到副本根并留痕');
   // 所有 M1 命令已实装，占位模板退役；用重定位命令验证「右键 → 定位 → 执行」链路。
@@ -3646,7 +4214,18 @@ async function main() {
   console.log('\n全部场景通过');
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
+
+// 供 test/mockHost.test.ts 验证 fakeVscode 的 API 语义；被 require 时不执行场景。
+module.exports = {
+  fakeVscode,
+  state,
+  installVscodeMock,
+  createTextEditorDecorationType,
+  fireDidSaveTextDocument,
+};

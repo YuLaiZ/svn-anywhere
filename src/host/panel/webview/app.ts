@@ -8,6 +8,10 @@
  *   `data-scroll-key` 容器的滚动位置（P5 树、P6/P7 左右 pane、表格与
  *   现有 .list 共用一条通道，不保留第二套列表滚动恢复），替换 DOM 后
  *   按稳定标识恢复；目标切换时丢弃旧目标的滚动记忆；
+ * - P5 加载更多可走 append 增量消息：宿主只发新增切片（每次 ≤40 个节点）
+ *   的已渲染片段，视图按 data-append-key 追加而不整段重绘，保持滚动与
+ *   焦点；同一会话内 revision 严格更旧的 render/append 帧一律丢弃，旧
+ *   回包不覆盖当前树；
  * - 待确认的较新输入不被旧 formRevision 覆盖：本地记录每个字段最后
  *   发送的 inputRevision，宿主 render 的 formRevision 更旧时保留本地值；
  *   宿主在 ready 握手递增 viewEpoch，视图收到新代次帧即重置确认空间
@@ -82,6 +86,12 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
 
   let currentSessionId = '';
   let lastFormRevision = -1;
+  /**
+   * 已应用的最新界面 revision：同一会话内宿主 revision 单调递增。
+   * 低于已应用值的迟到帧（旧目标缓存回包被误推等）不得覆盖当前树。
+   * 目标切换时重置（新会话从较小 revision 重新计数）。
+   */
+  let lastAppliedRevision = -1;
   /** 当前视图代次（宿主 ready 握手递增）；跨代帧到达时重置输入确认空间。 */
   let currentViewEpoch: number | null = null;
   /** 已折叠的导航目录 key（data-nav-key）；视图瞬时状态，宿主重绘后恢复。 */
@@ -592,8 +602,10 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
       const sessionChanged = nextSessionId !== currentSessionId;
       if (sessionChanged) {
         // 目标切换：上一会话的折叠状态与待发筛选值不带入新目标
-        // （滚动记忆在 applyRender 捕获旧 DOM 后清空）。
+        // （滚动记忆在 applyRender 捕获旧 DOM 后清空）；新会话 revision
+        // 从较小值重新计数，旧会话的已应用 revision 不再可比。
         foldedNavKeys.clear();
+        lastAppliedRevision = -1;
         for (const timer of filterTimers.values()) {
           doc.defaultView?.clearTimeout(timer);
         }
@@ -602,6 +614,15 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
         // 清除组合态并丢弃旧会话暂存帧，新目标后续渲染照常上屏。
         isComposing = false;
         pendingComposingRender = null;
+      }
+      // 旧帧防护（P5 树刷新/取消补全的迟到回包）：同一会话内 revision
+      // 单调递增，严格更旧的帧不得覆盖已渲染的当前树与详情。
+      const revision = Number(message.revision);
+      if (Number.isFinite(revision)) {
+        if (revision < lastAppliedRevision) {
+          return;
+        }
+        lastAppliedRevision = Math.max(lastAppliedRevision, revision);
       }
       currentSessionId = nextSessionId;
       // 视图代次变化（webview 重建握手）：输入确认空间随视图重启，
@@ -623,6 +644,39 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
         return;
       }
       applyRender(String(message.html ?? ''), lastFormRevision, sessionChanged);
+      return;
+    }
+    if (message.type === 'append') {
+      // P5 加载更多增量：宿主只发新增切片（每次 ≤40 个节点）的已渲染
+      // 片段，视图按 `treeId:nodeId` 定位到目标节点的 .tree-node-children
+      // 容器后追加，不重建整棵树、不打断滚动位置、焦点与输入法。目标
+      // 切换后的旧 append 与更旧 revision 的迟到帧一律丢弃；容器不存在
+      // （树已重绘为另一目标/形状或节点已折叠）也丢弃。
+      const messageSessionId = String(message.sessionId ?? '');
+      if (currentSessionId === '' || messageSessionId !== currentSessionId) {
+        return;
+      }
+      const revision = Number(message.revision);
+      if (Number.isFinite(revision)) {
+        if (revision < lastAppliedRevision) {
+          return;
+        }
+        lastAppliedRevision = Math.max(lastAppliedRevision, revision);
+      }
+      const target = String(message.target ?? '');
+      const html = String(message.html ?? '');
+      if (!target || !html) {
+        return;
+      }
+      // 只追加到节点的子行容器；不能回退到树顶层 .tree-rows，否则新增
+      // 行会成为根行的兄弟而不是它的子行。
+      const container = root.querySelector<HTMLElement>(
+        `.tree-node-children[data-append-key="${cssEscape(target)}"]`,
+      );
+      if (!container) {
+        return;
+      }
+      container.insertAdjacentHTML('beforeend', html);
       return;
     }
     if (message.type === 'toast') {

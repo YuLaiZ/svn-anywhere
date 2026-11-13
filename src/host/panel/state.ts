@@ -554,6 +554,22 @@ export interface LazyTreeRowSpec {
   selectLabel?: string;
   /** 节点行内动作（重试/刷新/复制 URL 等，意图只带稳定 ID）。 */
   actions?: ActionSpec[];
+  /** 节点 URL 展示值（宿主可逐段解码；复制动作仍由宿主使用原始 URI）。 */
+  nodeUrl?: string;
+  /** 仓库相对路径（`^/` 前缀的展示值，原始名称不做重编码）。 */
+  repoPath?: string;
+  /** 节点最后修改：宿主已格式化的 revision/author/date 展示文本，缺省项不显示。 */
+  lastChanged?: { revision?: string; author?: string; date?: string };
+  /** 节点自身元数据（文件大小、目录条目数等宿主格式化文本）。 */
+  metaText?: string;
+  /** 节点自身类型展示名（宿主 i18n：目录/文件/符号链接/未知）。 */
+  kindLabel?: string;
+  /** 空目录徽标文案（ready + total=0；宿主 i18n，空目录不是错误）。 */
+  emptyText?: string;
+  /** 超出完整读取上限（tooLarge）终态；说明文字由 statusText 提供。 */
+  tooLarge?: boolean;
+  /** 两段式元数据补全的取消动作（意图由宿主提供，视图附加节点 ID）。 */
+  metadataCancelAction?: ActionSpec;
   /** 已加载子节点（仅展开层的切片，不递归未读取内容）。 */
   children?: LazyTreeRowSpec[];
 }

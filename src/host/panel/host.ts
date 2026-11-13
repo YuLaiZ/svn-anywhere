@@ -127,6 +127,15 @@ export interface PanelHandle {
   readonly sessionId: string;
   /** 更新状态并渲染推送；目标切换/销毁后的迟到结果被丢弃。 */
   update(next: PanelState, forSessionId?: string): void;
+  /**
+   * 追加 P5 懒加载树的新增节点片段（每次 ≤40 个节点）：只发已渲染的
+   * 行 HTML，视图按 `data-append-key`（`treeId:nodeId`，节点的 children
+   * 容器）追加、不重建整棵树；revision 与 render 共用同一会话单调序列。
+   * snapshot 是本会话包含新增行后的完整状态快照，只更新宿主内部的意图
+   * 校验/视图重建重推依据，不触发整帧渲染。尚无整段渲染（树容器不存在）
+   * 或参数为空时静默丢弃，调用方随后用整帧 render 兜底。
+   */
+  appendTreeNodes(target: string, html: string, snapshot: PanelState): void;
   /** 推送瞬时提示。 */
   toast(level: 'info' | 'error', message: string): void;
   /** 切换目标：生成新会话代次；忙碌（或按面板配置的写锁）时返回 undefined 并提示。 */
@@ -273,6 +282,30 @@ function handleFor(entry: PanelEntry): PanelHandle {
         sessionId: entry.sessionId,
         level,
         message,
+      });
+    },
+    appendTreeNodes(target, html, snapshot) {
+      if (entry.disposed || entry.state === undefined) {
+        // 还没有整段渲染时树容器不存在，append 无目标可追加。
+        return;
+      }
+      if (target === '' || html === '') {
+        return;
+      }
+      if (snapshot.sessionId !== entry.sessionId) {
+        // 旧会话快照不写入当前面板（与 update 的会话校验同口径）。
+        return;
+      }
+      // 只更新校验/重推快照，不发送整帧：视图侧仅追加新增切片。
+      entry.state = snapshot;
+      entry.revision += 1;
+      postToView(entry, {
+        type: 'append',
+        protocolVersion: PROTOCOL_VERSION,
+        sessionId: entry.sessionId,
+        revision: entry.revision,
+        target,
+        html,
       });
     },
     switchSession() {

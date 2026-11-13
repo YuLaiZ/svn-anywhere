@@ -10,9 +10,11 @@ import { DEFAULT_HISTORY_PAGE_SIZE, HISTORY_PAGE_SIZES } from '../src/core/histo
 import { strings } from '../src/host/i18n';
 
 interface Manifest {
+  activationEvents?: string[];
   contributes: {
     commands: Array<{ command: string; title: string; category?: string }>;
     submenus?: Array<{ id: string; label: string }>;
+    menus?: Record<string, Array<{ command: string; group?: string }>>;
     configuration?: {
       properties: Record<string, { type?: string; enum?: unknown[]; default?: unknown; description?: string }>;
     };
@@ -46,6 +48,21 @@ describe('贡献点与 i18n 命令标签一致性', () => {
     for (const c of pkg.contributes.commands) {
       expect(c.category, `${c.command} 的 category 不是 SVN Anywhere`).toBe('SVN Anywhere');
     }
+  });
+});
+
+describe('P5 仓库浏览器入口贡献点（M4 阶段 2）', () => {
+  it('browseRepository 已登记命令、1_info 菜单、命令面板与激活事件', () => {
+    const command = pkg.contributes.commands.find((c) => c.command === 'svnAnywhere.browseRepository');
+    expect(command).toBeDefined();
+    expect(command?.title).toBe(strings.command.browseRepository);
+    expect(pkg.activationEvents).toContain('onCommand:svnAnywhere.browseRepository');
+    const submenu = pkg.contributes.menus?.['svnAnywhere.submenu'] ?? [];
+    const menuItem = submenu.find((item) => item.command === 'svnAnywhere.browseRepository');
+    expect(menuItem, '浏览仓库应挂在 SVN 子菜单 1_info 组').toBeDefined();
+    expect(menuItem?.group?.startsWith('1_info')).toBe(true);
+    const palette = pkg.contributes.menus?.commandPalette ?? [];
+    expect(palette.some((item) => item.command === 'svnAnywhere.browseRepository')).toBe(true);
   });
 });
 

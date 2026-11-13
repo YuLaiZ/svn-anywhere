@@ -25,6 +25,7 @@ import {
   appendUrlSegment,
   buildRemoteInfoArgs,
   buildRemoteListArgs,
+  buildRemoteNameListArgs,
   buildRemotePropgetArgs,
   classifyBrowseFailure,
   entryNodeRef,
@@ -32,9 +33,11 @@ import {
   hasNulByte,
   mimeTypeIsBinary,
   parseDirectoryListXml,
+  parseDirectoryNameList,
   parseRemoteInfoXml,
   parseRemotePropertyXml,
   readRemoteDirectory,
+  readRemoteDirectoryNames,
   readRemoteMimeType,
   readRemoteNode,
   relativePathFromRelativeUrl,
@@ -752,5 +755,156 @@ describe('MIME/NUL 判据', () => {
     expect(hasNulByte(insideWindow)).toBe(true);
     // UTF-16LE BOM + 字符间 NUL 落在窗口内。
     expect(hasNulByte(Buffer.from([0xff, 0xfe, 0x61, 0x00]))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 无元数据名称列表（大目录两段式第一段）
+// ---------------------------------------------------------------------------
+
+describe('parseDirectoryNameList（无元数据 svn list）', () => {
+  it('目录行以 / 结尾、文件行原样；名称不 trim，空行/仅斜杠行按解析失败拒绝', () => {
+    const listing = parseDirectoryNameList('dir/\n leading.txt\ntrail \nwith space & 中文.txt\nat@name.txt\nhash#name.txt\n');
+    expect(listing.total).toBe(6);
+    expect(listing.entries).toEqual([
+      { name: 'dir', kind: 'dir' },
+      { name: ' leading.txt', kind: 'file' },
+      { name: 'trail ', kind: 'file' },
+      { name: 'with space & 中文.txt', kind: 'file' },
+      { name: 'at@name.txt', kind: 'file' },
+      { name: 'hash#name.txt', kind: 'file' },
+    ]);
+    expect(listing.bytes).toBeGreaterThan(0);
+    // 空输出 = 空目录（ready 判定由 exit 0 承担）。
+    expect(parseDirectoryNameList('').total).toBe(0);
+    // 空行（输出损坏/名称异常）不静默少计条目。
+    expect(() => parseDirectoryNameList('a.txt\n\nb.txt\n')).toThrow(/异常空行/);
+    expect(() => parseDirectoryNameList('/\n')).toThrow(/异常空行/);
+  });
+
+  it('任意字节分块（切在多字节字符中间）与整段结果一致；CRLF 行结束符被剥离', () => {
+    const text = '中文目录/\n名称 & emoji 🚀.txt\nplain.txt\n';
+    const data = Buffer.from(text, 'utf8');
+    const whole = parseDirectoryNameList(data);
+    for (const sizes of [[1], [2], [3], [5, 7, 11]]) {
+      expect(parseDirectoryNameList(chunkBuffer(data, sizes))).toEqual(whole);
+    }
+    for (const entry of whole.entries) {
+      expect(entry.name).not.toContain('�');
+      expect(entry.name).not.toContain('\r');
+    }
+    expect(parseDirectoryNameList('win-dir/\r\nwin.txt\r\n').entries).toEqual([
+      { name: 'win-dir', kind: 'dir' },
+      { name: 'win.txt', kind: 'file' },
+    ]);
+  });
+
+  it('条目预算：超过 maxEntries 立即以 entries 原因中止', () => {
+    try {
+      parseDirectoryNameList('a\nb\nc\n', { maxEntries: 2 });
+      expect.unreachable('应当抛出 BrowseLimitExceededError');
+    } catch (err) {
+      expect(err).toBeInstanceOf(BrowseLimitExceededError);
+      expect((err as BrowseLimitExceededError).reason).toBe('entries');
+    }
+    expect(parseDirectoryNameList('a\nb\nc\n', { maxEntries: 3 }).total).toBe(3);
+  });
+
+  it('字节预算：原始 stdout 超过 maxXmlBytes 立即以 bytes 原因中止', () => {
+    try {
+      parseDirectoryNameList('a-very-long-name.txt\n', { maxXmlBytes: 4 });
+      expect.unreachable('应当抛出 BrowseLimitExceededError');
+    } catch (err) {
+      expect((err as BrowseLimitExceededError).reason).toBe('bytes');
+    }
+  });
+
+  it('名称列表命令形态：--depth immediates 且 peg 与 -r 同为快照 revision', () => {
+    expect(buildRemoteNameListArgs('https://h/repo/at@file#1', 7)).toEqual([
+      'list',
+      '--non-interactive',
+      '--depth',
+      'immediates',
+      '-r',
+      '7',
+      '--',
+      'https://h/repo/at@file#1@7',
+    ]);
+  });
+});
+
+describe('真实 svn 名称列表（file:// 实验仓库）', () => {
+  it.runIf(hasSvn && hasSvnadmin)('名称与目录 kind、空目录 exit0、不存在 notFound、文件目标单条', async () => {
+    const lab = createSvnLab('svn-anywhere-namelist-');
+    try {
+      const src = join(lab.root, 'src');
+      mkdirSync(join(src, 'dir'), { recursive: true });
+      mkdirSync(join(src, 'empty'), { recursive: true });
+      writeFile(src, 'plain.txt', 'hello\n');
+      writeFile(src, 'with space & 中文.txt', 'x\n');
+      writeFile(src, 'at@name.txt', 'y\n');
+      writeFile(src, 'hash#name.txt', 'z\n');
+      lab.svn(['import', '-q', '-m', 'init', src, `${lab.repoUrl}/trunk`]);
+      const trunkUrl = `${lab.repoUrl}/trunk`;
+
+      const names = await readRemoteDirectoryNames('svn', trunkUrl, { revision: 1 });
+      expect(names.status).toBe('ready');
+      if (names.status !== 'ready') {
+        return;
+      }
+      expect(names.listing.total).toBe(6);
+      expect(names.listing.entries.map((entry) => entry.name).sort()).toEqual([
+        'at@name.txt',
+        'dir',
+        'empty',
+        'hash#name.txt',
+        'plain.txt',
+        'with space & 中文.txt',
+      ].sort());
+      expect(names.listing.entries.find((entry) => entry.name === 'dir')?.kind).toBe('dir');
+      expect(names.listing.entries.find((entry) => entry.name === 'plain.txt')?.kind).toBe('file');
+
+      const empty = await readRemoteDirectoryNames('svn', `${trunkUrl}/empty`, { revision: 1 });
+      expect(empty.status).toBe('ready');
+      if (empty.status === 'ready') {
+        expect(empty.listing.total).toBe(0);
+      }
+
+      const missing = await readRemoteDirectoryNames('svn', `${trunkUrl}/nope`, { revision: 1 });
+      expect(missing.status).toBe('notFound');
+      if (missing.status === 'notFound') {
+        expect(missing.error.codes).toEqual(expect.arrayContaining(['W160013', 'E200009']));
+      }
+
+      const fileTarget = await readRemoteDirectoryNames('svn', `${trunkUrl}/plain.txt`, { revision: 1 });
+      expect(fileTarget.status).toBe('ready');
+      if (fileTarget.status === 'ready') {
+        expect(fileTarget.listing.entries).toEqual([{ name: 'plain.txt', kind: 'file' }]);
+      }
+    } finally {
+      lab.cleanup();
+    }
+  });
+
+  it.runIf(hasSvn && hasSvnadmin)('名称列表条目预算越限：真实 svn 进程被中止并返回 tooLarge', async () => {
+    const lab = createSvnLab('svn-anywhere-namelist-limit-');
+    try {
+      const src = join(lab.root, 'src');
+      for (let index = 0; index < 8; index += 1) {
+        writeFile(src, `f${index}.txt`, 'x\n');
+      }
+      lab.svn(['import', '-q', '-m', 'init', src, `${lab.repoUrl}/trunk`]);
+      const limited = await readRemoteDirectoryNames('svn', `${lab.repoUrl}/trunk`, {
+        revision: 1,
+        maxEntries: 2,
+      });
+      expect(limited.status).toBe('tooLarge');
+      if (limited.status === 'tooLarge') {
+        expect(limited.reason).toBe('entries');
+        expect(limited.limit).toBe(2);
+      }
+    } finally {
+      lab.cleanup();
+    }
   });
 });

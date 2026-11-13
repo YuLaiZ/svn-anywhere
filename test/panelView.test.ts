@@ -2,10 +2,12 @@
  * view.ts 渲染测试：关键 HTML 片段（筛选栏、两种空态、禁用态、动作按钮、
  * 忙碌态）与转义边界；DOM 结构沿用原型 class 基线。
  */
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { commitFixture } from '../src/host/panel/fixture';
-import { render } from '../src/host/panel/view';
-import type { FormFieldSpec, PanelState, RowSpec } from '../src/host/panel/state';
+import { render, renderLazyNodeSlice, type LazyTreeRowView } from '../src/host/panel/view';
+import type { FormFieldSpec, LazyTreeRowSpec, PanelState, RowSpec } from '../src/host/panel/state';
 import { strings } from '../src/host/i18n';
 
 function baseState(patch: Partial<PanelState> = {}): PanelState {
@@ -530,6 +532,11 @@ describe('render：向导步骤条（steps）', () => {
 });
 
 describe('render：P5 懒加载树（LazyTreeSpec）', () => {
+  /** 以 P5 扩展行形状构造节点（字段在 state.ts 声明前先按结构验证渲染）。 */
+  function nodeView(row: LazyTreeRowView): LazyTreeRowSpec {
+    return row;
+  }
+
   function treeState(patch: Partial<PanelState> = {}): PanelState {
     return baseState({
       layout: {
@@ -543,7 +550,7 @@ describe('render：P5 懒加载树（LazyTreeSpec）', () => {
         id: 'browser',
         ariaLabel: '远端目录树',
         rows: [
-          {
+          nodeView({
             id: 'trunk',
             label: 'trunk',
             kind: 'dir',
@@ -555,8 +562,13 @@ describe('render：P5 懒加载树（LazyTreeSpec）', () => {
             selected: true,
             statusText: '已读取 40 / 总计 1,284',
             expandLabel: '折叠目录 trunk',
+            repoPath: '^/trunk',
+            nodeUrl: 'https://example.com/svn/trunk',
+            kindLabel: '目录',
+            metaText: '1,284 项',
+            lastChanged: { revision: 'r1284', author: 'alice', date: '2026-11-13' },
             children: [
-              {
+              nodeView({
                 id: 'trunk/docs',
                 label: 'docs',
                 kind: 'dir',
@@ -564,18 +576,40 @@ describe('render：P5 懒加载树（LazyTreeSpec）', () => {
                 phase: 'loading',
                 metadata: 'filling',
                 metadataProgress: { completed: 20, total: 40 },
-              },
-              {
+                metadataCancelAction: { id: 'refreshBrowserNode', label: '取消补全' },
+              }),
+              nodeView({
                 id: 'trunk/a.ts',
                 label: 'a.ts',
                 kind: 'file',
                 depth: 1,
                 phase: 'idle',
                 metadata: 'pending',
-              },
+                kindLabel: '文件',
+                metaText: '12.4 KB',
+              }),
+              nodeView({
+                id: 'trunk/empty',
+                label: 'empty',
+                kind: 'dir',
+                depth: 1,
+                phase: 'ready',
+                loaded: 0,
+                total: 0,
+                emptyText: '空目录',
+              }),
+              nodeView({
+                id: 'trunk/huge',
+                label: 'huge',
+                kind: 'dir',
+                depth: 1,
+                phase: 'error',
+                tooLarge: true,
+                statusText: '目录超出当前完整读取上限',
+              }),
             ],
-          },
-          {
+          }),
+          nodeView({
             id: 'trunk/broken',
             label: 'broken',
             kind: 'dir',
@@ -583,7 +617,7 @@ describe('render：P5 懒加载树（LazyTreeSpec）', () => {
             phase: 'error',
             statusText: '读取该目录失败',
             actions: [{ id: 'retryBrowserNode', label: '重试' }],
-          },
+          }),
         ],
         empty: { title: '空目录', detail: '这个目录没有直属条目。' },
         loadMoreAction: { id: 'loadMoreBrowserNode', label: '加载更多', payload: { 'node-id': 'trunk' } },
@@ -651,6 +685,145 @@ describe('render：P5 懒加载树（LazyTreeSpec）', () => {
     } as Partial<PanelState>));
     expect(empty).toContain('空目录');
     expect(empty).toContain('layout-balanced');
+  });
+
+  it('节点行显示名称、节点 URL、^/ 相对路径、最后修改与自身元数据（size/kind）', () => {
+    const html = render(treeState());
+    expect(html).toContain('class="node-label" data-intent="selectBrowserNode" data-node-id="trunk"');
+    expect(html).toContain('class="node-repo-path mono">^/trunk</span>');
+    expect(html).toContain('class="node-url mono" title="https://example.com/svn/trunk">https://example.com/svn/trunk</span>');
+    expect(html).toContain('class="node-last-changed">r1284 · alice · 2026-11-13</span>');
+    expect(html).toContain('class="node-kind">目录</span>');
+    expect(html).toContain('class="node-size">1,284 项</span>');
+    expect(html).toContain('class="node-kind">文件</span>');
+    expect(html).toContain('class="node-size">12.4 KB</span>');
+  });
+
+  it('两段式元数据：pending 待补全、filling 已补全 X / Y 与取消按钮、cancelled 已取消', () => {
+    const html = render(treeState());
+    expect(html).toContain(strings.panel.metadataPending);
+    expect(html).toContain('元数据补全中：已补全 20 / 40');
+    expect(html).toMatch(
+      /<button[^>]*data-intent="refreshBrowserNode"[^>]*data-node-id="trunk\/docs"[^>]*>取消补全<\/button>/,
+    );
+    const cancelled = render(treeState({
+      lazyTree: {
+        id: 'browser',
+        rows: [
+          nodeView({
+            id: 'trunk',
+            label: 'trunk',
+            kind: 'dir',
+            depth: 0,
+            phase: 'ready',
+            loaded: 40,
+            total: 1284,
+            metadata: 'cancelled',
+            metadataProgress: { completed: 20, total: 1284 },
+          }),
+        ],
+        empty: { title: '空目录' },
+      },
+    } as Partial<PanelState>));
+    expect(cancelled).toContain(strings.panel.metadataCancelled);
+  });
+
+  it('节点错误徽标、空目录徽标与 tooLarge 降级说明分开渲染', () => {
+    const html = render(treeState());
+    expect(html).toContain('class="node-error-badge" title="读取该目录失败">读取失败</span>');
+    // 空目录只由 ready + total=0 派生，不是读取失败。
+    expect(html).toContain('class="node-empty">空目录</span>');
+    expect(html).toMatch(/class="node-limit" role="alert">目录超出当前完整读取上限<\/div>/);
+    // tooLarge 行不叠加「读取失败」徽标（超限不是节点读取错误）。
+    const hugeStart = html.indexOf('data-node-id="trunk/huge"');
+    const hugeEnd = html.indexOf('data-node-id="trunk/broken"');
+    expect(hugeStart).toBeGreaterThan(-1);
+    expect(hugeEnd).toBeGreaterThan(hugeStart);
+    expect(html.slice(hugeStart, hugeEnd)).not.toContain('node-error-badge');
+  });
+
+  it('首批 40 切片与加载更多：只渲染宿主切片，按钮只带稳定节点 ID', () => {
+    const slice = (start: number, count: number) =>
+      Array.from({ length: count }, (_, index) =>
+        nodeView({
+          id: `file-${start + index}.txt`,
+          label: `file-${start + index}.txt`,
+          kind: 'file',
+          depth: 0,
+          phase: 'ready',
+        }),
+      );
+    const first = render(treeState({
+      lazyTree: {
+        id: 'browser',
+        rows: slice(0, 40),
+        empty: { title: '空目录' },
+        loadMoreAction: { id: 'loadMoreBrowserNode', label: '加载更多', payload: { 'node-id': 'root' } },
+      },
+    } as Partial<PanelState>));
+    expect((first.match(/role="treeitem"/g) ?? []).length).toBe(40);
+    expect(first).toContain('class="tree-rows" role="group" data-append-key="browser"');
+    expect(first).toContain('data-intent="loadMoreBrowserNode" data-node-id="root"');
+    expect(first).not.toMatch(/data-intent="loadMoreBrowserNode"[^>]*data-tree-id/);
+    // append 累积切片：第二批后 80 行，仍只有一个加载更多入口。
+    const appended = render(treeState({
+      lazyTree: {
+        id: 'browser',
+        rows: [...slice(0, 40), ...slice(40, 40)],
+        empty: { title: '空目录' },
+        loadMoreAction: { id: 'loadMoreBrowserNode', label: '加载更多', payload: { 'node-id': 'root' } },
+      },
+    } as Partial<PanelState>));
+    expect((appended.match(/role="treeitem"/g) ?? []).length).toBe(80);
+    expect((appended.match(/data-intent="loadMoreBrowserNode"/g) ?? []).length).toBe(1);
+    // append 消息载荷：只渲染新增节点片段，不含树容器/空态/加载更多。
+    const sliceHtml = renderLazyNodeSlice(treeState(), slice(40, 40), 'browser');
+    expect((sliceHtml.match(/role="treeitem"/g) ?? []).length).toBe(40);
+    expect(sliceHtml).not.toContain('class="lazy-tree"');
+    expect(sliceHtml).not.toContain('tree-load-more');
+  });
+
+  it('append 定位键挂在节点子行容器上：treeId:nodeId，不在每个行节点上', () => {
+    const html = render(treeState());
+    // 根行 trunk 的 children 容器是加载更多的追加目标。
+    expect(html).toContain(
+      'class="tree-node-children" role="group" data-append-key="browser:trunk"',
+    );
+    // 行节点自身不带 data-append-key（追加目标是子容器，不是行）。
+    expect(html).not.toMatch(/<div class="tree-node [^"]*"[^>]*data-append-key/);
+    // 增量片段内展开节点的子容器同样按 treeId:nodeId 定位，供后续 append 使用。
+    const nested = renderLazyNodeSlice(treeState(), [
+      nodeView({
+        id: 'trunk/docs',
+        label: 'docs',
+        kind: 'dir',
+        depth: 1,
+        phase: 'ready',
+        expanded: true,
+        children: [
+          nodeView({ id: 'trunk/docs/deep.txt', label: 'deep.txt', kind: 'file', depth: 2, phase: 'ready' }),
+        ],
+      }),
+    ], 'browser');
+    expect(nested).toContain(
+      'class="tree-node-children" role="group" data-append-key="browser:trunk/docs"',
+    );
+    expect(nested).toContain('data-node-id="trunk/docs/deep.txt"');
+    expect(nested).not.toContain('class="tree-rows"');
+  });
+
+  it('CSS 契约：P5 行在 294/400 宽度无横向溢出（对齐既有断点）', () => {
+    const css = readFileSync(join(process.cwd(), 'media/panel.css'), 'utf8');
+    // 400px 既有断点内改为上下布局，并收缩节点次级信息缩进与详情键值列。
+    expect(css).toContain('@media (max-width: 400px)');
+    expect(css).toContain('.split-layout { flex-direction: column; }');
+    expect(css).toMatch(/\.node-sub,\s*\.node-flags \{ padding-left: 12px; \}/);
+    expect(css).toContain('grid-template-columns: minmax(0, max-content) minmax(0, 1fr)');
+    // 长 URL/路径允许任意换行且可收缩，树在 pane-scroll 内滚动。
+    expect(css).toMatch(
+      /\.node-repo-path,\s*\.node-url \{ min-width: 0; overflow-wrap: anywhere; word-break: break-all; \}/,
+    );
+    expect(css).toContain('.pane-scroll > .lazy-tree { flex: none; min-height: auto; overflow: visible; }');
   });
 });
 

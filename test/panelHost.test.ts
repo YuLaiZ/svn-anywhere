@@ -219,6 +219,76 @@ describe('消息链路', () => {
     expect(panelsCreated[0].posted).toHaveLength(0);
   });
 
+  it('appendTreeNodes 只追加片段：revision 与 render 共用单调序列、会话一致', async () => {
+    const handle = createPanel('t1', { title: 'T' }, { onIntent: () => {} }, context);
+    handle.update(state({ sessionId: handle.sessionId }));
+    const panel = panelsCreated[0];
+    const render = renderMessage(panel.posted) as { revision: number; sessionId: string };
+    expect(panel.posted).toHaveLength(1);
+    const snapshot = state({ sessionId: handle.sessionId, targetLabel: '追加快照' });
+    handle.appendTreeNodes(
+      'browse:b1',
+      '<div class="tree-node" role="treeitem">f41</div>',
+      snapshot,
+    );
+    expect(panel.posted).toHaveLength(2);
+    const append = panel.posted[1] as {
+      type: string;
+      protocolVersion: number;
+      sessionId: string;
+      revision: number;
+      target: string;
+      html: string;
+    };
+    expect(append.type).toBe('append');
+    expect(append.protocolVersion).toBe(1);
+    expect(append.sessionId).toBe(handle.sessionId);
+    expect(append.revision).toBe(render.revision + 1);
+    expect(append.target).toBe('browse:b1');
+    expect(append.html).toContain('f41');
+    // 快照只更新校验/重推依据、不追加发送整帧：ready 重推使用该快照。
+    expect(panel.posted).toHaveLength(2);
+    await panel.receive({ type: 'ready', protocolVersion: 1 });
+    const reissued = renderMessage(panel.posted) as { revision: number; html: string };
+    expect(reissued.html).toContain('追加快照');
+    // 后续整帧 render 的 revision 继续递增（视图按 revision 丢弃旧帧）。
+    handle.update(state({ sessionId: handle.sessionId }));
+    expect((renderMessage(panel.posted) as { revision: number }).revision).toBe(reissued.revision + 1);
+    handle.dispose();
+  });
+
+  it('旧会话快照的 append 丢弃：不发送也不覆盖当前校验快照', async () => {
+    const handle = createPanel('t1', { title: 'T' }, { onIntent: () => {} }, context);
+    handle.update(state({ sessionId: handle.sessionId, targetLabel: '当前目标' }));
+    const panel = panelsCreated[0];
+    panel.posted.length = 0;
+    handle.appendTreeNodes(
+      'browse:b1',
+      '<div class="tree-node" role="treeitem">old</div>',
+      state({ sessionId: 'stale-session', targetLabel: '旧会话' }),
+    );
+    expect(panel.posted.filter((m) => (m as { type?: string }).type === 'append')).toHaveLength(0);
+    await panel.receive({ type: 'ready', protocolVersion: 1 });
+    expect((renderMessage(panel.posted) as { html: string }).html).toContain('当前目标');
+    handle.dispose();
+  });
+
+  it('尚无整段渲染、目标或片段为空、dispose 后 append 均静默丢弃', () => {
+    const handle = createPanel('t1', { title: 'T' }, { onIntent: () => {} }, context);
+    const panel = panelsCreated[0];
+    const snapshot = state({ sessionId: handle.sessionId });
+    // 未 update：树容器不存在，append 丢弃。
+    handle.appendTreeNodes('browse:b1', '<div></div>', snapshot);
+    expect(panel.posted.filter((m) => (m as { type?: string }).type === 'append')).toHaveLength(0);
+    handle.update(state({ sessionId: handle.sessionId }));
+    handle.appendTreeNodes('', '<div></div>', snapshot);
+    handle.appendTreeNodes('browse:b1', '', snapshot);
+    expect(panel.posted.filter((m) => (m as { type?: string }).type === 'append')).toHaveLength(0);
+    handle.dispose();
+    handle.appendTreeNodes('browse:b1', '<div></div>', snapshot);
+    expect(panel.posted.filter((m) => (m as { type?: string }).type === 'append')).toHaveLength(0);
+  });
+
   it('协议版本不兼容的 ready 弹错误 toast（不静默）', async () => {
     const handle = createPanel('t1', { title: 'T' }, { onIntent: () => {} }, context);
     const panel = panelsCreated[0];

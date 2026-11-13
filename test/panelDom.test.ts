@@ -652,6 +652,103 @@ describe('M4 多滚动容器与 toast 命中', () => {
     app.dispose();
   });
 
+  it('append 消息只追加新增节点片段：不重建树、保持滚动与既有节点', () => {
+    const { app } = setup(treeState());
+    const master = document.querySelector<HTMLElement>('[data-scroll-key="browser-tree"]')!;
+    master.scrollTop = 40;
+    const trunk = document.querySelector<HTMLElement>('[data-node-id="trunk"]');
+    expect(trunk).not.toBeNull();
+    app.handleHostMessage({
+      type: 'append',
+      protocolVersion: 1,
+      sessionId: 's1',
+      revision: 2,
+      target: 'browser:trunk',
+      html: '<div class="tree-node" role="treeitem" data-node-id="trunk/new" aria-level="2"><div class="tree-node-row">new</div></div>',
+    });
+    // 新增切片已追加，既有节点仍是同一 DOM 引用（append 不是整段重绘）。
+    const added = document.querySelector<HTMLElement>('[data-node-id="trunk/new"]');
+    expect(added).not.toBeNull();
+    expect(document.querySelector('[data-node-id="trunk"]')).toBe(trunk);
+    // 新增行落入目标根行的 children 容器，而不是根行的兄弟。
+    expect(added!.parentElement?.classList.contains('tree-node-children')).toBe(true);
+    expect(added!.parentElement?.getAttribute('data-append-key')).toBe('browser:trunk');
+    expect(
+      document.querySelector('.tree-node-children[data-append-key="browser:trunk"] [data-node-id="trunk/new"]'),
+    ).not.toBeNull();
+    expect(document.querySelector<HTMLElement>('[data-scroll-key="browser-tree"]')!.scrollTop).toBe(40);
+    app.dispose();
+  });
+
+  it('旧 revision 帧与旧会话 append 不覆盖当前树', () => {
+    const { app } = setup(treeState());
+    // 新帧（revision 3）先应用，树换成新目标形状（带可追加的 children 容器）。
+    const next = treeState({
+      lazyTree: {
+        id: 'browser',
+        rows: [{
+          id: 'new-root',
+          label: 'new-root',
+          kind: 'dir',
+          depth: 0,
+          phase: 'ready',
+          expanded: true,
+          children: [{ id: 'new-root/a.txt', label: 'a.txt', kind: 'file', depth: 1, phase: 'ready' }],
+        }],
+        empty: { title: '空目录' },
+      },
+    });
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's1', revision: 3, formRevision: 0,
+      html: render(next),
+    });
+    expect(document.querySelector('[data-node-id="new-root"]')).not.toBeNull();
+    // 旧帧（revision 2）迟到：不得覆盖当前树。
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's1', revision: 2, formRevision: 0,
+      html: render(treeState()),
+    });
+    expect(document.querySelector('[data-node-id="trunk"]')).toBeNull();
+    expect(document.querySelector('[data-node-id="new-root"]')).not.toBeNull();
+    // 旧 append（revision 2 < 已应用 3）同样丢弃。
+    app.handleHostMessage({
+      type: 'append', protocolVersion: 1, sessionId: 's1', revision: 2,
+      target: 'browser:new-root', html: '<div data-node-id="stale"></div>',
+    });
+    expect(document.querySelector('[data-node-id="stale"]')).toBeNull();
+    // 目标切换后旧会话 append 丢弃（目标容器在新会话树中存在）。
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's2', revision: 1, formRevision: 0,
+      html: render(treeState({ sessionId: 's2' })),
+    });
+    app.handleHostMessage({
+      type: 'append', protocolVersion: 1, sessionId: 's1', revision: 9,
+      target: 'browser:trunk', html: '<div data-node-id="old-session"></div>',
+    });
+    expect(document.querySelector('[data-node-id="old-session"]')).toBeNull();
+    // 目标子行容器不存在（节点未展开）或树已换成另一形状时静默丢弃。
+    app.handleHostMessage({
+      type: 'append', protocolVersion: 1, sessionId: 's2', revision: 2,
+      target: 'browser:trunk/docs', html: '<div data-node-id="orphan"></div>',
+    });
+    expect(document.querySelector('[data-node-id="orphan"]')).toBeNull();
+    app.handleHostMessage({
+      type: 'append', protocolVersion: 1, sessionId: 's2', revision: 2,
+      target: 'missing-tree:root', html: '<div data-node-id="orphan"></div>',
+    });
+    expect(document.querySelector('[data-node-id="orphan"]')).toBeNull();
+    // 当前会话、节点子行容器存在的 append 正常落入 children 容器。
+    app.handleHostMessage({
+      type: 'append', protocolVersion: 1, sessionId: 's2', revision: 2,
+      target: 'browser:trunk', html: '<div data-node-id="fresh"></div>',
+    });
+    expect(document.querySelector('[data-node-id="fresh"]')).not.toBeNull();
+    expect(
+      document.querySelector('.tree-node-children[data-append-key="browser:trunk"] [data-node-id="fresh"]'),
+    ).not.toBeNull();
+    app.dispose();
+  });
+
   it('toast 不拦截页脚点击：pointer-events:none 且位于页脚之前', () => {
     const { app, sent } = setup();
     app.handleHostMessage({ type: 'toast', protocolVersion: 1, sessionId: 's1', level: 'info', message: '已复制' });
@@ -683,9 +780,13 @@ describe('M4 通用组件事件转发', () => {
           loaded: 0,
           total: 0,
           expanded: false,
-          actions: [{ id: 'retryBrowserNode', label: '重试' }],
+          actions: [
+            { id: 'retryBrowserNode', label: '重试' },
+            { id: 'copyBrowserNodeUrl', label: '复制 URL' },
+          ],
         }],
         empty: { title: '空目录' },
+        loadMoreAction: { id: 'loadMoreBrowserNode', label: '加载更多', payload: { 'node-id': 'trunk/docs' } },
       },
       detail: { title: 'trunk', sections: [] },
     });
@@ -707,6 +808,15 @@ describe('M4 通用组件事件转发', () => {
     expect(lastIntent(sent)?.intent).toEqual({ kind: 'selectBrowserNode', nodeId: 'trunk/docs' });
     document.querySelector<HTMLButtonElement>('[data-intent="retryBrowserNode"]')?.click();
     expect(lastIntent(sent)?.intent).toEqual({ kind: 'retryBrowserNode', nodeId: 'trunk/docs' });
+    app.dispose();
+  });
+
+  it('加载更多与复制 URL 只发送稳定节点 ID（加载目标来自 payload）', () => {
+    const { app, sent } = treeSetup();
+    document.querySelector<HTMLButtonElement>('[data-intent="loadMoreBrowserNode"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'loadMoreBrowserNode', nodeId: 'trunk/docs' });
+    document.querySelector<HTMLButtonElement>('[data-intent="copyBrowserNodeUrl"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'copyBrowserNodeUrl', nodeId: 'trunk/docs' });
     app.dispose();
   });
 

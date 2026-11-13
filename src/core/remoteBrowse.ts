@@ -53,6 +53,13 @@ export const REMOTE_BROWSE_MAX_ENTRIES = 100_000;
 export const REMOTE_BROWSE_MAX_XML_BYTES = 64 * 1024 * 1024;
 
 /**
+ * 大目录两段式加载的直属条目数阈值（技术方案 §3.2 定案）：超过该值时
+ * 先用无元数据 `svn list` 取得名称与精确总数并立即首屏，`list --xml`
+ * 元数据改由选中节点 `svn info` 与可取消后台任务按可见片补全。
+ */
+export const REMOTE_BROWSE_METADATA_THRESHOLD = 5_000;
+
+/**
  * 二进制内容探测窗口：前 8 KiB 含 NUL 判二进制。已知限制：窗口之后的
  * NUL 不识别；UTF-16 文本会因字符间 NUL 被判二进制。
  */
@@ -732,6 +739,245 @@ export async function readRemoteDirectory(
         reason: err.reason,
         limit: err.limit,
         xmlBytes: parser.bytesRead,
+        entriesParsed: parser.entryCount,
+        error: { kind: 'tooLarge', message: err.message, codes: [] },
+      };
+    }
+    const error = classifyBrowseFailure(err, url);
+    return error.kind === 'notFound' ? { status: 'notFound', error } : { status: 'error', error };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 目录直属名称列表（无元数据 svn list，大目录两段式第一段）
+// ---------------------------------------------------------------------------
+
+/** 名称模式条目：只有名称与 kind，元数据由按需 info/后台补全得到。 */
+export interface BrowseNameEntry {
+  /** 原样名称：UTF-8、不 trim（SVN 禁止路径中的控制字符，故不存在内嵌换行）。 */
+  name: string;
+  /** 目录以输出行末尾的 `/` 判定，其余按文件。 */
+  kind: 'file' | 'dir';
+}
+
+/** 一次无元数据目录读取的结果（total 为精确直属条目数）。 */
+export interface BrowseDirectoryNames {
+  entries: BrowseNameEntry[];
+  total: number;
+  /** 已读取的原始 stdout 字节数。 */
+  bytes: number;
+}
+
+/**
+ * 无元数据 `svn list` 输出解析器：每行一个条目，目录行以 `/` 结尾。
+ *
+ * 事实依据（本机 SVN 1.15 file:// 实测）：文件/目录名称原样 UTF-8 输出
+ * （空格、`&`、中文、`@`、`#` 均不转义）；空目录输出为空；不存在路径
+ * exit 1 + `W160013` + `E200009`，由调用方按退出码分类；SVN 禁止路径
+ * 含控制字符（含换行，`E160005`），因此按 `\n` 分行是安全的——若真出现
+ * 空行（输出损坏/异常），end 时按解析错误拒绝，不静默少计条目。
+ *
+ * 预算与 XML 模式一致（100k 条目 / 64 MiB 原始字节），越限抛
+ * BrowseLimitExceededError；认证补录重试前调用 reset 清空状态。
+ */
+export class DirectoryNameListParser {
+  private readonly decoder = new Utf8StreamDecoder();
+  private readonly maxEntries: number;
+  private readonly maxBytes: number;
+  private entries: BrowseNameEntry[] = [];
+  private partial = '';
+  private bytes = 0;
+  private malformedLines = 0;
+
+  constructor(limits: DirectoryListLimits = {}) {
+    this.maxEntries = limits.maxEntries ?? REMOTE_BROWSE_MAX_ENTRIES;
+    this.maxBytes = limits.maxXmlBytes ?? REMOTE_BROWSE_MAX_XML_BYTES;
+  }
+
+  /** 已读取的原始 stdout 字节数（含触发越限的块）。 */
+  get bytesRead(): number {
+    return this.bytes;
+  }
+
+  /** 已解析出的条目数（越限中止时为部分计数，仅用于诊断）。 */
+  get entryCount(): number {
+    return this.entries.length;
+  }
+
+  /** 清空全部状态（认证补录重试前调用，避免两次尝试的数据混合）。 */
+  reset(): void {
+    this.entries = [];
+    this.partial = '';
+    this.bytes = 0;
+    this.malformedLines = 0;
+  }
+
+  /** 喂入一块原始 stdout 字节。 */
+  write(chunk: Buffer): void {
+    this.bytes += chunk.length;
+    if (this.bytes > this.maxBytes) {
+      throw new BrowseLimitExceededError('bytes', this.maxBytes);
+    }
+    this.consume(this.decoder.write(chunk));
+  }
+
+  /** 进程成功结束后收口：返回名称列表；异常空行按解析失败抛错。 */
+  end(): BrowseDirectoryNames {
+    this.consume(this.decoder.end());
+    // 防御：最后一行未以换行结束时同样收口（正常 svn 会输出末尾换行）。
+    if (this.partial.length > 0) {
+      const tail = this.partial;
+      this.partial = '';
+      this.finishLine(tail);
+    }
+    if (this.malformedLines > 0) {
+      throw new Error(`svn list 输出含 ${this.malformedLines} 个异常空行，拒绝按名称列表解析`);
+    }
+    return { entries: this.entries, total: this.entries.length, bytes: this.bytes };
+  }
+
+  private consume(text: string): void {
+    let start = 0;
+    for (let index = 0; index < text.length; index += 1) {
+      if (text.charCodeAt(index) === 0x0a) {
+        this.finishLine(this.partial + text.slice(start, index));
+        this.partial = '';
+        start = index + 1;
+      }
+    }
+    this.partial += text.slice(start);
+  }
+
+  private finishLine(rawLine: string): void {
+    // Windows 客户端可能输出 CRLF；SVN 禁止名称含控制字符，尾部 CR 只可能
+    // 来自行结束符，剥离后再判定目录后缀。
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    if (line === '') {
+      // 正常输出不会出现空行（名称不可能是空串、不能含换行）；记录后由
+      // end 统一拒绝，避免把损坏输出当成完整精确总数。
+      this.malformedLines += 1;
+      return;
+    }
+    const isDir = line.endsWith('/');
+    const name = isDir ? line.slice(0, -1) : line;
+    if (name === '') {
+      this.malformedLines += 1;
+      return;
+    }
+    this.entries.push({ name, kind: isDir ? 'dir' : 'file' });
+    if (this.entries.length > this.maxEntries) {
+      throw new BrowseLimitExceededError('entries', this.maxEntries);
+    }
+  }
+}
+
+/** 纯解析入口：把内联 fixture 或已读字节按任意分块喂给名称列表解析器。 */
+export function parseDirectoryNameList(
+  input: string | Buffer | readonly Buffer[],
+  limits: DirectoryListLimits = {},
+): BrowseDirectoryNames {
+  const parser = new DirectoryNameListParser(limits);
+  const chunks: readonly Buffer[] = typeof input === 'string'
+    ? [Buffer.from(input, 'utf8')]
+    : Buffer.isBuffer(input)
+      ? [input]
+      : input;
+  for (const chunk of chunks) {
+    parser.write(chunk);
+  }
+  return parser.end();
+}
+
+/** 无元数据 `svn list --depth immediates` 命令参数；peg 与 -r 同为快照 revision。 */
+export function buildRemoteNameListArgs(url: string, revision: number): string[] {
+  return [
+    'list',
+    '--non-interactive',
+    '--depth',
+    'immediates',
+    '-r',
+    String(revision),
+    '--',
+    urlWithPeg(url, revision),
+  ];
+}
+
+export interface ReadRemoteDirectoryNamesOptions extends RunOptions {
+  /** 浏览快照 revision（来自节点 info 的 snapshotRevision）。 */
+  revision: number;
+  maxEntries?: number;
+  maxXmlBytes?: number;
+}
+
+export type BrowseNameListResult =
+  | { status: 'ready'; listing: BrowseDirectoryNames }
+  | { status: 'notFound'; error: BrowserError }
+  | {
+      status: 'tooLarge';
+      reason: 'entries' | 'bytes';
+      limit: number;
+      bytesRead: number;
+      entriesParsed: number;
+      error: BrowserError;
+    }
+  | { status: 'error'; error: BrowserError };
+
+/**
+ * 读取远端目录的直属名称与精确总数（无元数据 `svn list`，不加载
+ * last-changed/author/date/size；阶段 0 实测 100k 条目 0.16 s）。
+ *
+ * 返回语义与 readRemoteDirectory 对齐：exit 0 且零条目 → ready（空目录，
+ * total=0）；路径不存在（W160013/W170000 + E200009）→ notFound；条目或
+ * 字节越限 → tooLarge，不返回部分名称与伪总数；其余失败按 BrowserError
+ * 分类。认证失败经补录重试，重试前 reset 解析器。
+ */
+export async function readRemoteDirectoryNames(
+  svnPath: string,
+  url: string,
+  options: ReadRemoteDirectoryNamesOptions,
+): Promise<BrowseNameListResult> {
+  const { revision, maxEntries, maxXmlBytes, ...runOptions } = options;
+  const parser = new DirectoryNameListParser({ maxEntries, maxXmlBytes });
+  const args = buildRemoteNameListArgs(url, revision);
+  const scoped = withRemoteAuthScope(url, runOptions);
+  const streamOptions: RunOptions = {
+    ...scoped,
+    onCredentialRetry: (retryArgs) => {
+      parser.reset();
+      return scoped.onCredentialRetry?.(retryArgs);
+    },
+  };
+  try {
+    await runOrThrowWithRunner(
+      svnPath,
+      args,
+      streamOptions,
+      (runnerPath, runnerArgs, runnerOptions = {}) => runStream(runnerPath, runnerArgs, {
+        ...runnerOptions,
+        onStdoutChunk: (chunk) => parser.write(chunk),
+      }),
+    );
+    let listing: BrowseDirectoryNames;
+    try {
+      listing = parser.end();
+    } catch (err) {
+      return {
+        status: 'error',
+        error: {
+          kind: 'parse',
+          message: err instanceof Error ? err.message : String(err),
+          codes: [],
+        },
+      };
+    }
+    return { status: 'ready', listing };
+  } catch (err) {
+    if (err instanceof BrowseLimitExceededError) {
+      return {
+        status: 'tooLarge',
+        reason: err.reason,
+        limit: err.limit,
+        bytesRead: parser.bytesRead,
         entriesParsed: parser.entryCount,
         error: { kind: 'tooLarge', message: err.message, codes: [] },
       };

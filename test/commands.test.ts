@@ -90,6 +90,10 @@ import { SvnError, tailText } from '../src/core/errors';
 import { resetOutputState, disposeOutputChannel, getOutputChannel } from '../src/host/output';
 import { registerCommand, showCommandError } from '../src/host/commands/registry';
 import { registerAllCommands } from '../src/host/commands';
+import {
+  disposeBrowseRepositoryCommandForTest,
+  registerBrowseRepositoryCommand,
+} from '../src/host/commands/browse';
 import { resolveBatchTargetGroups, resolveWorkingCopyTarget } from '../src/host/commands/target';
 import { strings } from '../src/host/i18n';
 
@@ -119,6 +123,7 @@ let context: vscode.ExtensionContext;
 beforeEach(() => {
   disposeOutputChannel();
   resetOutputState();
+  disposeBrowseRepositoryCommandForTest();
   vscodeMock.channels.length = 0;
   vscodeMock.information.length = 0;
   vscodeMock.warning.length = 0;
@@ -330,15 +335,19 @@ describe('registerAllCommands 二次激活', () => {
     };
     // registerAllCommands 已 async 化（首载折算 + 孤儿快照清理先于命令注册）：
     // 必须 await 后断言，同步断言会拿到未完成的注册计数。
+    // M4 阶段 2：命令数 17→18——browseRepository 由 extension.activate 在
+    // registerAllCommands 之后经独立句柄接线（同一注册序列在本用例中复现）。
     const firstContext = { subscriptions: [], globalState } as unknown as vscode.ExtensionContext;
     await registerAllCommands(firstContext);
-    expect(vscodeMock.registered).toHaveLength(17);
+    registerBrowseRepositoryCommand(firstContext);
+    expect(vscodeMock.registered).toHaveLength(18);
     const firstHandles = vscodeMock.registered.map((r) => r.disposable);
 
     const secondContext = { subscriptions: [], globalState } as unknown as vscode.ExtensionContext;
     await expect(registerAllCommands(secondContext)).resolves.toBeUndefined();
+    registerBrowseRepositoryCommand(secondContext);
     expect(firstHandles.every((d) => d.disposed)).toBe(true);
-    expect(vscodeMock.registered).toHaveLength(34);
-    expect(vscodeMock.activeCommandIds.size).toBe(17);
+    expect(vscodeMock.registered).toHaveLength(36);
+    expect(vscodeMock.activeCommandIds.size).toBe(18);
   });
 });

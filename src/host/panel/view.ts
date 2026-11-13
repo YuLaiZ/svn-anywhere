@@ -104,7 +104,10 @@ export function render(state: PanelState): string {
  * 「占用即全禁」的现状——守卫放行迟到输入不代表 DOM 解禁输入控件；
  * 携带视图的面板只禁用表中未放行的动作，避免「可点被拒」的假可用。
  */
-function actionGated(state: PanelState, action: string): boolean {
+function actionGated(
+  state: Pick<PanelState, 'busy' | 'writeLocked' | 'gate'>,
+  action: string,
+): boolean {
   if (!state.busy && !(state.writeLocked ?? false)) {
     return false;
   }
@@ -479,34 +482,94 @@ function renderDetailSection(section: DetailSectionSpec, state: PanelState): str
 }
 
 /**
+ * P5 节点行的扩展展示字段：宿主在 LazyTreeRowSpec 基础上按需提供，
+ * 缺省时保持基础行、不渲染对应次级信息。所有文案（kindLabel/emptyText/
+ * statusText/metadataCancelAction.label）由宿主经 i18n 生成，视图只排版
+ * 与转义，不解释业务语义。
+ *
+ * 字段声明已上移到 state.ts 的 LazyTreeRowSpec（宿主按类型构建行）；
+ * 此别名保留给既有渲染代码与测试使用。
+ */
+export type LazyTreeRowView = LazyTreeRowSpec;
+
+/**
+ * 懒树渲染只读取占用态与放行视图：整段渲染传完整 PanelState 即可，
+ * 增量 append 片段可用同形状的轻量状态直接渲染，不必构建整帧状态。
+ */
+type LazyTreeRenderState = Pick<PanelState, 'busy' | 'writeLocked' | 'gate'>;
+
+/**
  * P5 当前层懒加载树：节点行只承载已加载切片；展开/选择/重试是独立意图，
  * 展开不改变选中。行 DOM 复用既有转义与动作按钮，滚动由 pane 的
  * data-scroll-key 统一保持。
+ *
+ * 节点行结构（自上而下）：
+ * 1. 主行：展开/选择、名称、类型徽标、自身元数据、加载状态、行内动作；
+ * 2. 次级信息：`^/` 相对路径、原始节点 URL、最后修改（revision/author/date）；
+ * 3. 状态行：两段式元数据补全占位/进度/取消、节点错误徽标、空目录徽标；
+ * 4. tooLarge 降级说明（独立 alert 区）与已加载子节点切片。
+ * 树容器与每个展开节点的子行容器都带 data-append-key：树容器用 tree.id，
+ * 节点的 children 容器用 `${treeId}:${nodeId}`，宿主增量 append 消息据此
+ * 只追加新增切片（每次 ≤40 个节点），不重复发送整棵树。
  */
 function renderLazyTree(state: PanelState): string {
   const tree = state.lazyTree;
   if (!tree) {
     return '';
   }
-  const rows = tree.rows.map((row) => renderLazyNode(state, row)).join('');
+  const rows = tree.rows.map((row) => renderLazyNode(state, row as LazyTreeRowView, tree.id)).join('');
   const empty = tree.rows.length === 0
     ? `<div class="empty"><h3>${escapeHtml(tree.empty.title)}</h3>${tree.empty.detail ? `<p class="muted">${escapeHtml(tree.empty.detail)}</p>` : ''}</div>`
     : '';
+  // 加载更多的目标节点由宿主 payload[node-id] 提供；意图只带稳定节点 ID。
+  const loadMoreNodeId = tree.loadMoreAction?.payload?.['node-id'] ?? '';
   const loadMore = tree.loadMoreAction
-    ? `<div class="tree-load-more">${renderActionButton(tree.loadMoreAction, {
-        intent: tree.loadMoreAction.id,
-        argName: 'data-tree-id',
-        argValue: tree.id,
-        extraId: '',
-        gated: actionGated(state, tree.loadMoreAction.id),
-      })}</div>`
+    ? `<div class="tree-load-more">${renderActionButton(
+        withoutPayloadKey(tree.loadMoreAction, 'node-id'),
+        {
+          intent: tree.loadMoreAction.id,
+          argName: 'data-node-id',
+          argValue: loadMoreNodeId,
+          extraId: '',
+          gated: actionGated(state, tree.loadMoreAction.id),
+        },
+      )}</div>`
     : '';
   const busy = tree.busy ? `<div class="progress" role="status" aria-hidden="true"><i></i></div>` : '';
   const aria = tree.ariaLabel ? ` aria-label="${escapeHtml(tree.ariaLabel)}"` : '';
-  return `<div class="lazy-tree" role="tree" data-tree-id="${escapeHtml(tree.id)}"${aria}>${rows}${empty}${loadMore}${busy}</div>`;
+  return (
+    `<div class="lazy-tree" role="tree" data-tree-id="${escapeHtml(tree.id)}"${aria}>` +
+    `<div class="tree-rows" role="group" data-append-key="${escapeHtml(tree.id)}">${rows}</div>` +
+    `${empty}${loadMore}${busy}</div>`
+  );
 }
 
-function renderLazyNode(state: PanelState, row: LazyTreeRowSpec): string {
+/** 复制动作并去掉已提升为绑定参数的 payload 键（避免重复 data-* 属性）。 */
+function withoutPayloadKey(action: ActionSpec, key: string): ActionSpec {
+  if (!action.payload || !(key in action.payload)) {
+    return action;
+  }
+  const payload = { ...action.payload };
+  delete payload[key];
+  return { ...action, payload };
+}
+
+/**
+ * 渲染 P5 树节点追加片段（宿主 append 增量消息的 html 载荷）：
+ * 调用方按宿主切片契约每次最多传 40 个新增节点，视图不再二次截断；
+ * 片段只含节点行，不含树容器/空态/加载更多（它们由整段 render 维护）。
+ * treeId 用于给片段内展开节点的 children 容器生成 `treeId:nodeId`
+ * 定位键，保证后续 append 仍能唯一定位到该子树容器。
+ */
+export function renderLazyNodeSlice(
+  state: LazyTreeRenderState,
+  rows: LazyTreeRowSpec[],
+  treeId: string,
+): string {
+  return rows.map((row) => renderLazyNode(state, row as LazyTreeRowView, treeId)).join('');
+}
+
+function renderLazyNode(state: LazyTreeRenderState, row: LazyTreeRowView, treeId: string): string {
   const id = escapeHtml(row.id);
   const isDir = row.kind === 'dir';
   const expanded = isDir && row.expanded === true;
@@ -527,10 +590,16 @@ function renderLazyNode(state: PanelState, row: LazyTreeRowSpec): string {
     : `<span class="node-spacer" aria-hidden="true"></span>`;
   const selectLabel = row.selectLabel ? ` aria-label="${escapeHtml(row.selectLabel)}"` : '';
   const label = `<button type="button" class="node-label" data-intent="selectBrowserNode" data-node-id="${id}" data-focus="node-select-${id}"${selectLabel}${actionGated(state, 'selectBrowserNode') ? ' disabled' : ''}>${escapeHtml(row.label)}</button>`;
+  // 节点自身类型与元数据：kindLabel/metaText 均由宿主生成，缺省不渲染。
+  const kind = row.kindLabel ? `<span class="node-kind">${escapeHtml(row.kindLabel)}</span>` : '';
+  const size = row.metaText ? `<span class="node-size">${escapeHtml(row.metaText)}</span>` : '';
+  const loading = row.phase === 'loading'
+    ? `<span class="node-loading muted">${escapeHtml(strings.panel.nodeLoading)}</span>`
+    : '';
   const status = row.statusText
     ? `<span class="node-status muted">${escapeHtml(row.statusText)}</span>`
     : '';
-  const metadata = renderLazyMetadata(row);
+  const metadata = renderLazyMetadata(state, row);
   const actions = (row.actions ?? [])
     .map((action) =>
       renderActionButton(action, {
@@ -543,28 +612,120 @@ function renderLazyNode(state: PanelState, row: LazyTreeRowSpec): string {
     )
     .join('');
   const acts = actions ? `<div class="acts">${actions}</div>` : '';
+  const sub = renderLazyNodeSub(row);
+  const flags = renderLazyNodeFlags(row, metadata);
   const children = expanded && row.children && row.children.length > 0
-    ? `<div class="tree-node-children" role="group">${row.children.map((child) => renderLazyNode(state, child)).join('')}</div>`
+    ? `<div class="tree-node-children" role="group" data-append-key="${escapeHtml(`${treeId}:${row.id}`)}">${row.children.map((child) => renderLazyNode(state, child as LazyTreeRowView, treeId)).join('')}</div>`
     : '';
   return (
     `<div class="${classes}" role="treeitem" aria-level="${row.depth + 1}" aria-selected="${selected}" data-node-id="${id}"${indent}>` +
-    `<div class="tree-node-row">${toggle}${label}${status}${metadata}${acts}</div>${children}</div>`
+    `<div class="tree-node-row">${toggle}${label}${kind}${size}${loading}${status}${acts}</div>` +
+    `${sub}${flags}${children}</div>`
   );
 }
 
-/** 两段式加载的元数据占位/进度：只显示计数，不把首批数量当总数。 */
-function renderLazyMetadata(row: LazyTreeRowSpec): string {
-  if (row.metadata === 'pending' || row.metadata === 'cancelled') {
-    return `<span class="node-pending muted" aria-hidden="true">…</span>`;
+/**
+ * 节点次级信息行：仓库相对路径、原始节点 URL、最后修改。
+ * URL 与路径按原始值展示（不二次拼接），窄面板允许任意位置换行。
+ */
+function renderLazyNodeSub(row: LazyTreeRowView): string {
+  const parts: string[] = [];
+  if (row.repoPath) {
+    parts.push(`<span class="node-repo-path mono">${escapeHtml(row.repoPath)}</span>`);
   }
-  if (row.metadata === 'filling' && row.metadataProgress) {
-    const ratio = row.metadataProgress.total > 0
-      ? Math.min(1, Math.max(0, row.metadataProgress.completed / row.metadataProgress.total))
-      : 0;
+  if (row.nodeUrl) {
+    parts.push(
+      `<span class="node-url mono" title="${escapeHtml(row.nodeUrl)}">${escapeHtml(row.nodeUrl)}</span>`,
+    );
+  }
+  const changed = [row.lastChanged?.revision, row.lastChanged?.author, row.lastChanged?.date]
+    .filter((value): value is string => Boolean(value));
+  if (changed.length > 0) {
+    const text = changed.join(' · ');
+    parts.push(`<span class="node-last-changed">${escapeHtml(text)}</span>`);
+  }
+  if (parts.length === 0) {
+    return '';
+  }
+  return `<div class="node-sub">${parts.join('')}</div>`;
+}
+
+/**
+ * 节点状态行：两段式元数据补全占位/进度/取消、错误徽标与空目录徽标，
+ * tooLarge 终态单独成块（role=alert），不把部分条目伪装成完整结果。
+ * 空目录只由 ready + total=0 派生（协议语义：空目录不是错误）。
+ */
+function renderLazyNodeFlags(row: LazyTreeRowView, metadata: string): string {
+  const emptyDir = row.phase === 'ready' && row.kind === 'dir' && row.total === 0;
+  const badges: string[] = [];
+  // tooLarge 是规模终态而非节点读取失败：只渲染降级说明，不叠加错误徽标。
+  if (row.phase === 'error' && !row.tooLarge) {
+    const detail = row.statusText ? ` title="${escapeHtml(row.statusText)}"` : '';
+    badges.push(
+      `<span class="node-error-badge"${detail}>${escapeHtml(strings.panel.nodeReadFailed)}</span>`,
+    );
+  }
+  if (emptyDir && row.emptyText) {
+    badges.push(`<span class="node-empty">${escapeHtml(row.emptyText)}</span>`);
+  }
+  const flags = [metadata, badges.join('')].filter(Boolean).join('');
+  const tooLarge = row.tooLarge
+    ? `<div class="node-limit" role="alert">${escapeHtml(row.statusText ?? '')}</div>`
+    : '';
+  if (!flags && !tooLarge) {
+    return '';
+  }
+  return `${flags ? `<div class="node-flags">${flags}</div>` : ''}${tooLarge}`;
+}
+
+/**
+ * 两段式加载的元数据占位/进度：只显示补全计数，不把首批数量当总数。
+ * pending/filling/cancelled 都按宿主 i18n 文案展示；filling 时附加
+ * 进度条与取消入口（取消动作由宿主提供，视图只附加稳定节点 ID）。
+ */
+function renderLazyMetadata(state: LazyTreeRenderState, row: LazyTreeRowView): string {
+  const cancel = row.metadataCancelAction
+    ? renderActionButton(row.metadataCancelAction, {
+        intent: row.metadataCancelAction.id,
+        argName: 'data-node-id',
+        argValue: row.id,
+        extraId: '',
+        gated: actionGated(state, row.metadataCancelAction.id),
+      })
+    : '';
+  if (row.metadata === 'pending') {
+    // 未补全的行只显示占位符，完整说明放 title，避免逐行长文案挤压名称。
     return (
-      `<span class="node-metadata-progress" title="${row.metadataProgress.completed} / ${row.metadataProgress.total}">` +
-      `<span class="node-progress-bar"><i style="width:${(ratio * 100).toFixed(1)}%"></i></span>` +
-      `<span class="num">${row.metadataProgress.completed} / ${row.metadataProgress.total}</span></span>`
+      `<span class="node-metadata pending" title="${escapeHtml(strings.panel.metadataPending)}">` +
+      `<span class="node-pending muted" aria-hidden="true">—</span>${cancel}</span>`
+    );
+  }
+  if (row.metadata === 'filling') {
+    const progress = row.metadataProgress;
+    const ratio = progress && progress.total > 0
+      ? Math.min(1, Math.max(0, progress.completed / progress.total))
+      : 0;
+    const text = progress
+      ? format(strings.panel.metadataFilling, {
+          completed: String(progress.completed),
+          total: String(progress.total),
+        })
+      : strings.panel.metadataPending;
+    const numbers = progress
+      ? `<span class="num">${progress.completed} / ${progress.total}</span>`
+      : '';
+    return (
+      `<span class="node-metadata filling" title="${escapeHtml(text)}">` +
+      `<span class="node-metadata-progress">` +
+      `<span class="node-progress-bar" aria-hidden="true"><i style="width:${(ratio * 100).toFixed(1)}%"></i></span>` +
+      `${numbers}</span>` +
+      `<span class="node-metadata-text muted">${escapeHtml(text)}</span>${cancel}</span>`
+    );
+  }
+  if (row.metadata === 'cancelled') {
+    return (
+      `<span class="node-metadata cancelled">` +
+      `<span class="muted">${escapeHtml(strings.panel.metadataCancelled)}</span>${cancel}</span>`
     );
   }
   return '';

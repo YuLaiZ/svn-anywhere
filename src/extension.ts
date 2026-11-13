@@ -7,6 +7,8 @@ import { SvnError, tailText } from './core/errors';
 import { escapePeg, findWorkingCopy } from './core/workspace';
 import { readSvnPath, readTimeoutMs } from './host/config';
 import { registerAllCommands } from './host/commands';
+import { registerBrowseRepositoryCommand, setBrowsePanelOpener } from './host/commands/browse';
+import { openBrowsePanel, setBrowsePanelContext } from './host/panel/panels/browse';
 import {
   cancelCheckoutTask,
   resumeCheckoutTask,
@@ -26,6 +28,7 @@ import {
   startVacuumTask,
 } from './host/panel/diskTask';
 import { openDiskPanel } from './host/panel/panels/disk';
+import { disposeRemoteContent, initializeRemoteContent } from './host/readonlyContent';
 import { readSessionResult } from './host/sessionResults';
 import { format, strings } from './host/i18n';
 import { decodingRunOptions, disposeOutputChannel, getOutputChannel, logCommand, logLine, resetOutputState } from './host/output';
@@ -34,9 +37,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   resetOutputState();
   context.subscriptions.push({ dispose: disposeOutputChannel });
   getOutputChannel();
+  // P5 远端只读内容（M4 阶段 2）：注册带仓库身份/revision 的
+  // TextDocumentContentProvider、文档关闭释放监听，并后台回收过期临时资源。
+  initializeRemoteContent(context);
+  // P5 面板上下文与命令层打开器注入：browseRepository 命令解析出的目标
+  // 交给面板控制器；P6 历史交接（阶段 3 注册 showHistory 后接 setHistoryHandoffHandler）。
+  setBrowsePanelContext(context);
+  setBrowsePanelOpener(openBrowsePanel);
   // await 注册（含操作记录首载折算与孤儿快照清理）：activate 返回后命令
   // 可用即意味着注册表已折算完成（M3 §2.2 首载时序）。
   await registerAllCommands(context);
+  // M4 入口命令接线（命令数 17→18）：浏览仓库入口与 registerAllCommands
+  // 分开管理，二次激活由各自的句柄数组保证幂等。
+  registerBrowseRepositoryCommand(context);
   probeSvn().catch((err: unknown) => {
     logLine(format(strings.activation.probeFailed, {
       message: err instanceof Error ? err.message : String(err),
@@ -121,6 +134,7 @@ async function probeWorkspace(svnPath: string): Promise<void> {
 
 export function deactivate(): void {
   killAllActive();
+  disposeRemoteContent();
   disposeOutputChannel();
 }
 

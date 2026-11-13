@@ -25,6 +25,7 @@
     "onCommand:svnAnywhere.move",
     "onCommand:svnAnywhere.revealInFinder",
     "onCommand:svnAnywhere.showRemoteInfo",
+    "onCommand:svnAnywhere.browseRepository",
     "onCommand:svnAnywhere.checkout",
     "onCommand:svnAnywhere.importLocal",
     "onCommand:svnAnywhere.diskUsage"
@@ -108,6 +109,11 @@
         "category": "SVN Anywhere"
       },
       {
+        "command": "svnAnywhere.browseRepository",
+        "title": "浏览仓库",
+        "category": "SVN Anywhere"
+      },
+      {
         "command": "svnAnywhere.checkout",
         "title": "检出",
         "category": "SVN Anywhere"
@@ -143,6 +149,10 @@
         {
           "command": "svnAnywhere.showRemoteInfo",
           "group": "1_info@3"
+        },
+        {
+          "command": "svnAnywhere.browseRepository",
+          "group": "1_info@4"
         },
         {
           "command": "svnAnywhere.commit",
@@ -243,6 +253,9 @@
         },
         {
           "command": "svnAnywhere.showRemoteInfo"
+        },
+        {
+          "command": "svnAnywhere.browseRepository"
         },
         {
           "command": "svnAnywhere.checkout"

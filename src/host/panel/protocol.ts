@@ -199,7 +199,27 @@ export interface ToastMessage {
   message: string;
 }
 
-export type HostToViewMessage = RenderMessage | ToastMessage;
+/**
+ * 宿主 → 视图：P5 懒加载树增量追加（每批 ≤40 个节点）。只携带新增节点
+ * 行的已渲染片段，视图按 data-append-key 追加到对应树容器，不重建整棵
+ * 树；revision 与 render 共用同一单调序列，旧帧/旧会话由视图丢弃。
+ */
+export interface AppendMessage {
+  type: 'append';
+  protocolVersion: number;
+  sessionId: string;
+  revision: number;
+  /**
+   * 目标节点的子行容器定位键：`${treeId}:${nodeId}`（如 `browse:b1`），
+   * 对应视图 `.tree-node-children` 上的 data-append-key；树顶层容器仍用
+   * LazyTreeSpec.id，不承载加载更多追加。
+   */
+  target: string;
+  /** 宿主已本地化并转义的节点行 HTML 片段。 */
+  html: string;
+}
+
+export type HostToViewMessage = RenderMessage | ToastMessage | AppendMessage;
 
 /** 视图 → 宿主：加载完成握手，显式交换协议版本。 */
 export interface ReadyMessage {
