@@ -14,9 +14,21 @@ import { format, strings } from './i18n';
 /**
  * 操作域频道分类；错误收口与探测等无明确域的输出归 other。
  * checkout 频道承载检出/续检任务日志（F128）；import 频道承载 P3 导入
- * 任务日志；disk 频道承载 P4 磁盘治理（扫描/清理）任务日志。
+ * 任务日志；disk 频道承载 P4 磁盘治理（扫描/清理）任务日志；browse /
+ * history / conflict 分别承载 M4 P5 仓库浏览、P6 历史与比较、P7 冲突
+ * 解决的任务日志（不再让各阶段自行复用 other）。
  */
-export type OutputKind = 'status' | 'update' | 'commit' | 'checkout' | 'import' | 'disk' | 'other';
+export type OutputKind =
+  | 'status'
+  | 'update'
+  | 'commit'
+  | 'checkout'
+  | 'import'
+  | 'disk'
+  | 'browse'
+  | 'history'
+  | 'conflict'
+  | 'other';
 
 function kindTitle(kind: OutputKind): string {
   switch (kind) {
@@ -32,6 +44,12 @@ function kindTitle(kind: OutputKind): string {
       return strings.output.titleImport;
     case 'disk':
       return strings.output.titleDisk;
+    case 'browse':
+      return strings.output.titleBrowse;
+    case 'history':
+      return strings.output.titleHistory;
+    case 'conflict':
+      return strings.output.titleConflict;
     default:
       return strings.output.title;
   }

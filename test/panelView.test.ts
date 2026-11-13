@@ -529,6 +529,297 @@ describe('render：向导步骤条（steps）', () => {
   });
 });
 
+describe('render：P5 懒加载树（LazyTreeSpec）', () => {
+  function treeState(patch: Partial<PanelState> = {}): PanelState {
+    return baseState({
+      layout: {
+        layout: 'master-detail',
+        masterLabel: '远端目录',
+        detailLabel: '节点详情',
+        masterScrollKey: 'browser-tree',
+        detailScrollKey: 'browser-detail',
+      },
+      lazyTree: {
+        id: 'browser',
+        ariaLabel: '远端目录树',
+        rows: [
+          {
+            id: 'trunk',
+            label: 'trunk',
+            kind: 'dir',
+            depth: 0,
+            phase: 'ready',
+            loaded: 40,
+            total: 1284,
+            expanded: true,
+            selected: true,
+            statusText: '已读取 40 / 总计 1,284',
+            expandLabel: '折叠目录 trunk',
+            children: [
+              {
+                id: 'trunk/docs',
+                label: 'docs',
+                kind: 'dir',
+                depth: 1,
+                phase: 'loading',
+                metadata: 'filling',
+                metadataProgress: { completed: 20, total: 40 },
+              },
+              {
+                id: 'trunk/a.ts',
+                label: 'a.ts',
+                kind: 'file',
+                depth: 1,
+                phase: 'idle',
+                metadata: 'pending',
+              },
+            ],
+          },
+          {
+            id: 'trunk/broken',
+            label: 'broken',
+            kind: 'dir',
+            depth: 0,
+            phase: 'error',
+            statusText: '读取该目录失败',
+            actions: [{ id: 'retryBrowserNode', label: '重试' }],
+          },
+        ],
+        empty: { title: '空目录', detail: '这个目录没有直属条目。' },
+        loadMoreAction: { id: 'loadMoreBrowserNode', label: '加载更多', payload: { 'node-id': 'trunk' } },
+      },
+      detail: {
+        title: 'trunk',
+        subtitle: '远端目录 · 节点最后修改 r1284',
+        sections: [
+          { kind: 'kv', heading: '节点信息', entries: [
+            { label: '节点 URL', value: 'https://example.com/svn/trunk', mono: true },
+            { label: '仓库相对路径', value: '^/trunk', mono: true },
+          ] },
+          { kind: 'text', heading: '说明', paragraphs: ['只读浏览。'] },
+          { kind: 'pre', heading: '原始输出', text: 'svn: <info> & more' },
+          { kind: 'actions', actions: [{ id: 'copyBrowserNodeUrl', label: '复制 URL' }] },
+        ],
+      },
+      ...patch,
+    });
+  }
+
+  it('主从布局渲染两个独立滚动 pane（data-scroll-key）与稳定节点标识', () => {
+    const html = render(treeState());
+    expect(html).toContain('class="split-layout layout-master-detail"');
+    expect(html).toContain('data-scroll-key="browser-tree"');
+    expect(html).toContain('data-scroll-key="browser-detail"');
+    expect((html.match(/class="pane-scroll"/g) ?? []).length).toBe(2);
+    expect(html).toContain('aria-label="远端目录树"');
+    expect(html).toContain('role="treeitem"');
+    expect(html).toContain('aria-level="2"');
+  });
+
+  it('展开、选择、重试是独立标记：节点动作只带稳定 nodeId', () => {
+    const html = render(treeState());
+    expect(html).toContain('data-intent="toggleBrowserNode" data-node-id="trunk"');
+    expect(html).toContain('data-intent="selectBrowserNode" data-node-id="trunk"');
+    expect(html).toContain('data-intent="retryBrowserNode" data-node-id="trunk/broken"');
+    expect(html).toContain('data-intent="loadMoreBrowserNode"');
+    expect(html).toContain('data-node-id="trunk"');
+    expect(html).toContain('aria-expanded="true"');
+  });
+
+  it('已读取/总数与元数据补全状态分开显示；pending 行显示占位', () => {
+    const html = render(treeState());
+    expect(html).toContain('已读取 40 / 总计 1,284');
+    expect(html).toContain('class="node-pending muted"');
+    expect(html).toContain('node-metadata-progress');
+    expect(html).toContain('20 / 40');
+    expect(html).toContain('width:50.0%');
+  });
+
+  it('详情段：键值/文本/预格式/动作，动态值全部转义', () => {
+    const html = render(treeState());
+    expect(html).toContain('class="detail-title">trunk<');
+    expect(html).toContain('class="kv"');
+    expect(html).toContain('<dt>节点 URL</dt><dd class="mono">https://example.com/svn/trunk</dd>');
+    expect(html).toContain('<pre>svn: &lt;info&gt; &amp; more</pre>');
+    expect(html).toContain('data-intent="copyBrowserNodeUrl"');
+  });
+
+  it('空目录渲染空态；balanced 布局带独立修饰类', () => {
+    const empty = render(treeState({
+      lazyTree: { id: 'browser', rows: [], empty: { title: '空目录' } },
+      layout: { layout: 'balanced' },
+    } as Partial<PanelState>));
+    expect(empty).toContain('空目录');
+    expect(empty).toContain('layout-balanced');
+  });
+});
+
+describe('render：P6 表格选择与 append 分页', () => {
+  function historyState(patch: Partial<NonNullable<PanelState['table']>> = {}, statePatch: Partial<PanelState> = {}): PanelState {
+    return baseState({
+      table: {
+        id: 'history',
+        columns: [
+          { key: 'revision', label: 'Revision', sortable: true },
+          { key: 'message', label: '说明' },
+        ],
+        sort: { key: 'revision', direction: 'desc' },
+        pagination: { page: 1, pageSize: 2, total: 50, pageCount: 1, mode: 'append' },
+        selection: { mode: 'revision', maxSelected: 2, ariaLabel: '选择要比较的 revision' },
+        rows: [
+          {
+            id: 'r9',
+            cells: { revision: 'r9', message: 'fix' },
+            selected: true,
+            selectionLabel: '勾选 revision r9',
+          },
+          {
+            id: 'r8',
+            cells: { revision: 'r8', message: 'feat' },
+            selectionLabel: '勾选 revision r8',
+          },
+          {
+            id: 'r7',
+            cells: { revision: 'r7', message: 'chore' },
+            disabled: true,
+            disabledReason: '节点在该 revision 不存在',
+            selectionLabel: '勾选 revision r7',
+          },
+        ],
+        loadMoreAction: { id: 'loadMoreHistory', label: '加载更多' },
+        empty: { title: '无历史' },
+        ...patch,
+      },
+      ...statePatch,
+    });
+  }
+
+  it('selection 渲染勾选列：checked/disabled/可访问名称与行选中态', () => {
+    const html = render(historyState());
+    expect(html).toContain('<th class="col select" scope="col" aria-label="选择要比较的 revision">');
+    expect(html).toContain('data-intent="toggleHistoryRevision" data-row-id="r9"');
+    expect(html).toMatch(/data-row-id="r9"[^>]*data-intent="selectHistoryRevision"/);
+    expect(html).toContain('aria-label="勾选 revision r7"');
+    expect(html).toMatch(/data-row-id="r9"[^>]*checked/);
+    expect(html).toMatch(/data-row-id="r7"[^>]*disabled/);
+    expect(html).toContain('title="节点在该 revision 不存在"');
+    expect(html).toMatch(/<tr data-row-id="r9" class="selected"/);
+  });
+
+  it('append 模式不渲染上一页/下一页，只渲染外部加载更多动作', () => {
+    const html = render(historyState({ pagination: { page: 1, pageSize: 2, total: 50, pageCount: 25, mode: 'append' } }));
+    expect(html).not.toContain('data-intent="setPage"');
+    expect(html).toContain('data-intent="loadMoreHistory"');
+    expect(html).toContain('class="table-load-more"');
+  });
+
+  it('append 空态（筛选无匹配）仍保留加载更多入口', () => {
+    const html = render(historyState({ rows: [] }, {
+      filterPanel: undefined,
+    }));
+    expect(html).toContain('无历史');
+    expect(html).toContain('data-intent="loadMoreHistory"');
+  });
+
+  it("page 模式保持既有翻页；滚动键按表格 ID 稳定", () => {
+    const html = render(historyState({
+      pagination: { page: 2, pageSize: 1, total: 2, pageCount: 2 },
+    }));
+    expect(html).toContain('data-intent="setPage"');
+    expect(html).toContain('data-scroll-key="table-history"');
+  });
+
+  it('比较候选表格可覆盖行点击意图（selectCompareCandidate），不写死历史意图', () => {
+    const html = render(historyState({ rowSelectIntent: 'selectCompareCandidate', selection: undefined }));
+    expect(html).toContain('data-intent="selectCompareCandidate" data-focus="table-row-r9"');
+    expect(html).not.toContain('data-intent="selectHistoryRevision"');
+  });
+
+  it('占用态无放行视图时勾选与行选中一并禁用', () => {
+    const html = render(historyState({}, { busy: true }));
+    expect(html).toMatch(/data-intent="toggleHistoryRevision"[^>]*disabled/);
+    expect(html).not.toContain('data-intent="selectHistoryRevision"');
+  });
+});
+
+describe('render：P7 tabs 与进度状态', () => {
+  it('tabs 只表达计数与当前 tab，切换意图带稳定 tab ID', () => {
+    const html = render(baseState({
+      tabs: {
+        id: 'conflicts',
+        ariaLabel: '冲突分组',
+        current: 'text',
+        tabs: [
+          { id: 'all', label: '全部', count: 5 },
+          { id: 'text', label: '文件', count: 3 },
+          { id: 'tree', label: '树', disabled: true, disabledReason: '没有树冲突' },
+        ],
+      },
+    }));
+    expect(html).toContain('class="tabs" role="tablist" aria-label="冲突分组"');
+    expect(html).toContain('data-intent="setConflictTab" data-tab-id="text"');
+    expect(html).toContain('aria-selected="true"');
+    expect(html).toContain('class="tab current"');
+    expect(html).toContain('<span class="tab-count">3</span>');
+    expect(html).toMatch(/data-tab-id="tree"[^>]*disabled/);
+  });
+
+  it('确定进度渲染比例宽度；不确定进度保留动画条', () => {
+    const determinate = render(baseState({
+      progress: { title: '正在扫描冲突', detail: '已完成 3 / 10', ratio: 0.3, actions: [{ id: 'viewTaskLog', label: '查看日志' }] },
+    }));
+    expect(determinate).toContain('class="task-progress"');
+    expect(determinate).toContain('data-determinate="1"');
+    expect(determinate).toContain('width:30.0%');
+    expect(determinate).toContain('data-intent="viewTaskLog"');
+    const indeterminate = render(baseState({ progress: { title: '正在读取历史' } }));
+    expect(indeterminate).toContain('<div class="progress" aria-hidden="true"><i></i></div>');
+    expect(indeterminate).not.toContain('data-determinate');
+  });
+});
+
+describe('render：P6 折叠筛选面板（FilterPanelSpec）', () => {
+  function filterState(patch: Partial<NonNullable<PanelState['filterPanel']>> = {}): PanelState {
+    return baseState({
+      filterPanel: {
+        id: 'historyFilters',
+        title: '筛选',
+        fields: [
+          { id: 'keyword', kind: 'text', label: '关键词', value: 'fix', placeholder: '说明/作者/revision' },
+          { id: 'author', kind: 'select', label: '作者', value: 'all', options: [
+            { value: 'all', label: '全部' },
+            { value: 'alice', label: 'alice' },
+          ] },
+          { id: 'since', kind: 'date', label: '起始日期', value: '2026-01-01', error: '起止日期反序' },
+        ],
+        clearAction: { id: 'clearHistoryFilters', label: '清空筛选' },
+        ...patch,
+      },
+    });
+  }
+
+  it('字段渲染 text/date/select 与错误，值变化走 setHistoryFilter', () => {
+    const html = render(filterState());
+    expect(html).toContain('<details class="filter-panel" data-filter-panel-id="historyFilters" open>');
+    expect(html).toContain('<summary>筛选</summary>');
+    expect(html).toContain('data-intent="setHistoryFilter" data-filter-field-id="keyword"');
+    expect(html).toMatch(/<input type="text" value="fix"/);
+    expect(html).toMatch(/<input type="date" value="2026-01-01"/);
+    expect(html).toMatch(/<select data-intent="setHistoryFilter" data-filter-field-id="author"/);
+    expect(html).toContain('<option value="alice">alice</option>');
+    expect(html).toContain('class="field-error">起止日期反序');
+    expect(html).toContain('data-intent="clearHistoryFilters"');
+  });
+
+  it('collapsed 时不带 open；busy 时字段与清空动作禁用', () => {
+    const collapsed = render(filterState({ collapsed: true }));
+    expect(collapsed).toContain('<details class="filter-panel" data-filter-panel-id="historyFilters">');
+    const busy = render({ ...filterState(), busy: true });
+    expect(busy).toMatch(/data-intent="setHistoryFilter"[^>]*disabled/);
+    expect(busy).toMatch(/data-intent="clearHistoryFilters"[^>]*disabled/);
+  });
+});
+
 describe('render：checkbox 表单字段', () => {
   function checkState(field: Partial<FormFieldSpec>, statePatch: Partial<PanelState> = {}): PanelState {
     return baseState({

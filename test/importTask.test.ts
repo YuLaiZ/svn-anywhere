@@ -373,7 +373,7 @@ describe('快照落盘时点与预命令终止出口', () => {
     expect(onPreCommandExit).toHaveBeenCalledTimes(1);
     expect(store.records.size).toBe(0);
     expect(getActiveTask('checkout')).toBeUndefined();
-    expect(readSessionResult('checkout', { entryKey: SOURCE_DIR, mode: 'import' })).toBeUndefined();
+    expect(readSessionResult('checkout', { scopeKind: 'checkout', entryKey: SOURCE_DIR, mode: 'import' })).toBeUndefined();
     expect(readDraft(SOURCE_DIR, 'import')).toEqual(FORM);
   });
 
@@ -397,7 +397,7 @@ describe('快照落盘时点与预命令终止出口', () => {
     // 「begin 的任何失败都删快照」：同源目录占用反复尝试不累积无主文件。
     expect(snapshotFiles()).toHaveLength(0);
     expect(getActiveTask('checkout')).toBeUndefined();
-    expect(readSessionResult('checkout', { entryKey: SOURCE_DIR, mode: 'import' })).toBeUndefined();
+    expect(readSessionResult('checkout', { scopeKind: 'checkout', entryKey: SOURCE_DIR, mode: 'import' })).toBeUndefined();
     expect(readDraft(SOURCE_DIR, 'import')).toEqual(FORM);
   });
 
@@ -446,7 +446,7 @@ describe('快照落盘时点与预命令终止出口', () => {
     // 删快照（本任务刚写入的那份，归属校验匹配即删除）+ 任务移除。
     expect(snapshotFiles()).toHaveLength(0);
     expect(getActiveTask('checkout')).toBeUndefined();
-    expect(readSessionResult('checkout', { entryKey: SOURCE_DIR, mode: 'import' })).toBeUndefined();
+    expect(readSessionResult('checkout', { scopeKind: 'checkout', entryKey: SOURCE_DIR, mode: 'import' })).toBeUndefined();
   });
 
   it('begin 写盘失败：删快照、出口收口、无记录残留', async () => {
@@ -677,7 +677,7 @@ describe('成功路径证据检查三分类', () => {
     expect(await registry.loadAllRecords()).toHaveLength(0);
     expect(snapshotFiles()).toHaveLength(0);
     // 成功页写入会话缓存（executor 一律写入）。
-    const cached = readSessionResult('checkout', { entryKey: SOURCE_DIR, mode: 'import' });
+    const cached = readSessionResult('checkout', { scopeKind: 'checkout', entryKey: SOURCE_DIR, mode: 'import' });
     expect(cached?.page).toEqual(outcome.result);
   });
 
@@ -701,7 +701,7 @@ describe('成功路径证据检查三分类', () => {
     // 快照保留（核实与 acknowledge 收口的证据）。
     expect(snapshotFiles()).toHaveLength(1);
     // merged 页写缓存。
-    const cached = readSessionResult('checkout', { entryKey: SOURCE_DIR, mode: 'import' });
+    const cached = readSessionResult('checkout', { scopeKind: 'checkout', entryKey: SOURCE_DIR, mode: 'import' });
     expect((cached?.page as { kind?: string })?.kind).toBe('merged');
   });
 
@@ -930,7 +930,7 @@ describe('verifyImportTask（unknown 核实）', () => {
       svnPath: 'svn',
       snapshotDir,
       operationId: 'op-verify-1',
-      resultScope: { entryKey: SOURCE_DIR, mode: 'import' },
+      resultScope: { scopeKind: 'checkout', entryKey: SOURCE_DIR, mode: 'import' },
       epoch: 2,
       callbacks: { onSucceeded },
     });
@@ -974,7 +974,7 @@ describe('verifyImportTask（unknown 核实）', () => {
 
     const result = await verifyImportTask({
       svnPath: 'svn', snapshotDir, operationId: 'op-verify-1',
-      resultScope: { entryKey: SOURCE_DIR, mode: 'import' }, epoch: 3,
+      resultScope: { scopeKind: 'checkout', entryKey: SOURCE_DIR, mode: 'import' }, epoch: 3,
     });
 
     expect(result.conclusion).toBe('notCommitted');
@@ -990,7 +990,7 @@ describe('verifyImportTask（unknown 核实）', () => {
 
     const result = await verifyImportTask({
       svnPath: 'svn', snapshotDir, operationId: 'op-verify-1',
-      resultScope: { entryKey: SOURCE_DIR, mode: 'import' }, epoch: 4,
+      resultScope: { scopeKind: 'checkout', entryKey: SOURCE_DIR, mode: 'import' }, epoch: 4,
     });
 
     expect(result.conclusion).toBe('unknown');
@@ -1004,7 +1004,7 @@ describe('verifyImportTask（unknown 核实）', () => {
 
   it('核实发起即登记只读命令进行中（scope/epoch 由调用方传入；结论返回前登记命中）', async () => {
     await seedUnknownRecord();
-    const scope = { entryKey: SOURCE_DIR, mode: 'import' as const };
+    const scope = { scopeKind: 'checkout' as const, entryKey: SOURCE_DIR, mode: 'import' as const };
     // 慢 ls：核实进行中（数十秒命令链的最小化形态）验证登记与结论送达。
     let releaseLs: (() => void) | undefined;
     mockRun((args) => {
@@ -1054,7 +1054,7 @@ describe('verifyImportTask（unknown 核实）', () => {
   it('记录已不可用（不存在）→ 结论 recordUnavailable、不执行收口', async () => {
     const result = await verifyImportTask({
       svnPath: 'svn', snapshotDir, operationId: 'op-gone',
-      resultScope: { entryKey: SOURCE_DIR, mode: 'import' }, epoch: 7,
+      resultScope: { scopeKind: 'checkout', entryKey: SOURCE_DIR, mode: 'import' }, epoch: 7,
     });
     expect(result.conclusion).toBe('unknown');
     expect(result.reason).toBe('recordUnavailable');
@@ -1078,7 +1078,7 @@ describe('verifyImportTask（unknown 核实）', () => {
 
     const result = await verifyImportTask({
       svnPath: 'svn', snapshotDir, operationId: 'op-verify-1',
-      resultScope: { entryKey: SOURCE_DIR, mode: 'import' }, epoch: 8,
+      resultScope: { scopeKind: 'checkout', entryKey: SOURCE_DIR, mode: 'import' }, epoch: 8,
     });
 
     expect(result.conclusion).toBe('committed');

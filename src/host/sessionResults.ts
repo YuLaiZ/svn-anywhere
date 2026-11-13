@@ -14,8 +14,21 @@
  * 只读命令进行中登记承载「重开先于结论完成」的送达：核验/核实（只读
  * 但可能数十秒的命令链）发起时登记，重开会话恢复到旧结果页时按登记
  * 附「进行中」提示，用户可保持打开等待自动转结论页。
+ *
+ * M4 增补 m4SessionStore：P5/P6/P7 的目标状态不能塞进上面的 M3 单槽
+ * （单槽按面板类别键控，会互相覆盖），改按 scopeKind + identity 多槽
+ * 保存并设 LRU 上限（24 项）。M3 的 checkout/disk 单槽规则不变，两套
+ * 存储互不影响：M4 的 P6/P7 终态页、可浏览状态、upper 三字段与
+ * historyLimitState、P7 冲突快照/推迟/已解决台账全部落在 m4SessionStore。
  */
-import { sameResultScope, type PanelKind, type ResultScope } from './taskRegistry';
+import {
+  findTaskByScope,
+  sameResultScope,
+  type ConflictsResultScope,
+  type HistoryResultScope,
+  type PanelKind,
+  type ResultScope,
+} from './taskRegistry';
 
 /** 缓存项：结果页数据 + 写入时的目标作用域。结果页形状由面板任务定义。 */
 export interface SessionResultEntry {
@@ -211,9 +224,317 @@ function notifyResultUpdated(panelKind: PanelKind): void {
   }
 }
 
+/* --------------------- M4 多作用域会话存储（m4SessionStore） --------------------- */
+
+/** P6 upper 三字段（技术方案冻结形状）：upperRevision=null 只与 unresolved 同时出现。 */
+export interface HistoryUpperState {
+  upperRevision: number | null;
+  upperSource: 'unresolved' | 'live-head' | 'snapshot' | 'base-fallback';
+  headState: 'available' | 'unavailable' | 'unknown';
+}
+
+/** P6 historyLimitState：非阻塞提示，只停止新增网络数据，不截断已加载记录。 */
+export interface HistoryLimitReason {
+  kind: 'matched' | 'scanned';
+  limit: number;
+  actual: number;
+}
+
+export interface HistoryLimitState {
+  reasons: HistoryLimitReason[];
+}
+
+/**
+ * P5 浏览目标的会话作用域：技术方案只冻结了 P6/P7 的任务结果作用域
+ * 形状，P5 树缓存作为单个作用域项参与 LRU，身份由 P5 控制器给出
+ * （本模块把它当作不透明稳定键，例如仓库 UUID + 规范化根 URL）。
+ */
+export interface BrowseSessionScope {
+  scopeKind: 'browse';
+  targetKey: string;
+}
+
+/**
+ * 会话作用域判别联合：P6/P7 直接复用任务注册表的 ResultScope 形状
+ * （同一身份既寻址任务绑定又寻址会话页，不另造第二套字段），P5 树
+ * 缓存补 browse 类别参与同一 LRU。
+ */
+export type M4SessionScope = BrowseSessionScope | ConflictsResultScope | HistoryResultScope;
+
+/**
+ * 一个作用域项的内容。所有载荷字段由各面板控制器定义形状（本模块不
+ * 理解业务结构）：字段为 undefined 表示「该层未写入/已清除」。
+ */
+export interface M4ScopeSession {
+  /** 作用域身份（保存时的拷贝）。 */
+  scope: M4SessionScope;
+  /** 可浏览状态：P5 树缓存 / P6 筛选勾选详情 / P7 列表筛选选择。 */
+  browsable?: unknown;
+  /** P6 upper 三字段（upperRevision/upperSource/headState）。 */
+  upper?: HistoryUpperState;
+  /** P6 历史会话上限状态（null=无提示，属已写入的显式值）。 */
+  historyLimitState?: HistoryLimitState | null;
+  /** P7 冲突快照（归一化冲突记录，控制器定义）。 */
+  conflictSnapshot?: unknown;
+  /** P7 推迟集合（按冲突指纹，控制器定义）。 */
+  postponed?: unknown;
+  /** P7 已解决台账（随作用域项淘汰，不写持久层）。 */
+  resolvedLedger?: unknown;
+  /** 最近终态页（P6/P7 任务终态；任务执行器先写页再移除任务）。 */
+  terminalPage?: unknown;
+}
+
+/**
+ * 作用域项更新补丁：只写入出现在补丁里的字段（undefined=不修改），
+ * 其余字段保留。要显式清空可写 null；整项删除用 clearM4ScopeSession。
+ */
+export interface M4ScopeSessionPatch {
+  browsable?: unknown;
+  upper?: HistoryUpperState;
+  historyLimitState?: HistoryLimitState | null;
+  conflictSnapshot?: unknown;
+  postponed?: unknown;
+  resolvedLedger?: unknown;
+  terminalPage?: unknown;
+}
+
+/** 一次写入触发的淘汰动作：先清终态页（项保留），后整体淘汰作用域项。 */
+export interface M4ScopeEviction {
+  kind: 'scope' | 'terminal-page';
+  scope: M4SessionScope;
+}
+
+export interface M4ScopePutResult {
+  /** 按发生顺序记录的淘汰动作（空数组=未触发淘汰）。 */
+  evictions: M4ScopeEviction[];
+}
+
+/** 淘汰判定上下文：当前打开作用域与活动任务作用域不计入可淘汰集合。 */
+export interface M4SessionStoreContext {
+  /** 当前打开的作用域（面板正在显示的目标）。 */
+  current?: M4SessionScope;
+  /**
+   * 追加的活动作用域谓词（可选）：活动任务作用域默认从共享任务注册表
+   * 派生（见 isActiveTaskScope），本谓词只用于补充保护、不替换默认判定。
+   */
+  isActiveScope?(scope: M4SessionScope): boolean;
+}
+
+/** 作用域项容量上限（技术方案冻结值）。 */
+export const M4_SESSION_STORE_CAPACITY = 24;
+
+/** LRU 序：Map 迭代顺序即最近使用序（旧→新），写入时 delete+set 移到最新。 */
+const m4SessionStore = new Map<string, M4ScopeSession>();
+
+/** 作用域判等：browse 比目标键，P6/P7 复用任务注册表的 switch 判等，跨类别必不等。 */
+export function sameM4SessionScope(a: M4SessionScope, b: M4SessionScope): boolean {
+  if (a.scopeKind === 'browse' || b.scopeKind === 'browse') {
+    return a.scopeKind === 'browse' && b.scopeKind === 'browse' && a.targetKey === b.targetKey;
+  }
+  return sameResultScope(a, b);
+}
+
+/** 稳定键：JSON 数组避免路径分隔符与 identity 字段内容冲突。 */
+function m4ScopeKeyOf(scope: M4SessionScope): string {
+  switch (scope.scopeKind) {
+    case 'browse':
+      return JSON.stringify(['browse', scope.targetKey]);
+    case 'history':
+      return JSON.stringify(['history', scope.targetKind, scope.targetKey]);
+    case 'conflicts':
+      return JSON.stringify(['conflicts', scope.wcRoot, scope.scopeRelPath]);
+  }
+}
+
+function applyM4ScopePatch(target: M4ScopeSession, patch: M4ScopeSessionPatch): void {
+  if (patch.browsable !== undefined) {
+    target.browsable = patch.browsable;
+  }
+  if (patch.upper !== undefined) {
+    target.upper = patch.upper;
+  }
+  if (patch.historyLimitState !== undefined) {
+    target.historyLimitState = patch.historyLimitState;
+  }
+  if (patch.conflictSnapshot !== undefined) {
+    target.conflictSnapshot = patch.conflictSnapshot;
+  }
+  if (patch.postponed !== undefined) {
+    target.postponed = patch.postponed;
+  }
+  if (patch.resolvedLedger !== undefined) {
+    target.resolvedLedger = patch.resolvedLedger;
+  }
+  if (patch.terminalPage !== undefined) {
+    target.terminalPage = patch.terminalPage;
+  }
+}
+
+/**
+ * 活动任务作用域判定：从与 M1-M3 共享的任务注册表派生（P6/P7 的任务
+ * 对象存在且其 resultScope 与候选一致）。任务执行器写入终态页时任务
+ * 仍在注册表中，该作用域据此自动受保护——清页或整体淘汰都不会丢掉
+ * 即将由重开恢复的结果页。P5 树缓存没有任务槽，不受任务保护。
+ */
+function isActiveTaskScope(scope: M4SessionScope): boolean {
+  if (scope.scopeKind === 'browse') {
+    return false;
+  }
+  return findTaskByScope(scope.scopeKind, scope) !== undefined;
+}
+
+/**
+ * 写入/更新一个作用域项（任务执行器与面板控制器的同一接口）。
+ *
+ * 已存在的项合并补丁并移到 LRU 最新；新项插入后若超过 24 项，按技术
+ * 方案固定顺序修剪：① 先清除最旧的非当前（且非活动任务）终态页——
+ * 只清页不删项，减少敏感/陈旧数据；② 随后仍整体淘汰最旧非活动作用域
+ * 直到项数回到 24；若没有终态页可清则跳过 ① 直接整体 LRU。当前作用域
+ * 与活动任务作用域永不淘汰（即使全部项都受保护、无法降到 24 也不删）。
+ *
+ * 返回按发生顺序的淘汰动作，供调用方清理对应面板的视图/提示。
+ */
+export function putM4ScopeSession(
+  scope: M4SessionScope,
+  patch: M4ScopeSessionPatch = {},
+  context: M4SessionStoreContext = {},
+): M4ScopePutResult {
+  const key = m4ScopeKeyOf(scope);
+  const existing = m4SessionStore.get(key);
+  if (existing) {
+    applyM4ScopePatch(existing, patch);
+    m4SessionStore.delete(key);
+    m4SessionStore.set(key, existing);
+  } else {
+    const entry: M4ScopeSession = { scope: { ...scope } };
+    applyM4ScopePatch(entry, patch);
+    m4SessionStore.set(key, entry);
+  }
+
+  const evictions: M4ScopeEviction[] = [];
+  if (m4SessionStore.size <= M4_SESSION_STORE_CAPACITY) {
+    return { evictions };
+  }
+  const isProtected = (candidate: M4ScopeSession): boolean =>
+    (context.current !== undefined && sameM4SessionScope(candidate.scope, context.current)) ||
+    isActiveTaskScope(candidate.scope) ||
+    (context.isActiveScope?.(candidate.scope) ?? false);
+
+  // ① 清除最旧的非当前终态页（若存在）：终态页清除不减少作用域项数。
+  for (const candidate of m4SessionStore.values()) {
+    if (isProtected(candidate)) {
+      continue;
+    }
+    if (candidate.terminalPage !== undefined) {
+      candidate.terminalPage = undefined;
+      evictions.push({ kind: 'terminal-page', scope: { ...candidate.scope } });
+      break;
+    }
+  }
+
+  // ② 整体淘汰最旧非活动作用域，把项数维持回容量上限。
+  while (m4SessionStore.size > M4_SESSION_STORE_CAPACITY) {
+    let removed = false;
+    for (const [candidateKey, candidate] of m4SessionStore) {
+      if (isProtected(candidate)) {
+        continue;
+      }
+      m4SessionStore.delete(candidateKey);
+      evictions.push({ kind: 'scope', scope: { ...candidate.scope } });
+      removed = true;
+      break;
+    }
+    if (!removed) {
+      // 全部项都是当前/活动任务作用域：永不淘汰优先于容量约束。
+      break;
+    }
+  }
+  return { evictions };
+}
+
+/**
+ * 读取作用域项（会话恢复入口）。读取不改变 LRU 序、无副作用；返回浅
+ * 拷贝（含 scope），调用方修改请走 putM4ScopeSession。淘汰后的作用域
+ * 读不到，控制器按恢复顺序落到 fresh，重新读取真实 SVN。
+ */
+export function readM4ScopeSession(scope: M4SessionScope): M4ScopeSession | undefined {
+  const entry = m4SessionStore.get(m4ScopeKeyOf(scope));
+  if (!entry) {
+    return undefined;
+  }
+  return { ...entry, scope: { ...entry.scope } };
+}
+
+/** 删除整个作用域项（切换目标放弃会话、或用户显式清理当前目标）。 */
+export function clearM4ScopeSession(scope: M4SessionScope): boolean {
+  return m4SessionStore.delete(m4ScopeKeyOf(scope));
+}
+
+/**
+ * 清除单个作用域项的终态页（保留可浏览状态与项本身）：用于离页动作
+ * 或未知结果收口后不再展示旧终态页。返回是否发生了清除。
+ */
+export function clearM4TerminalPage(scope: M4SessionScope): boolean {
+  const entry = m4SessionStore.get(m4ScopeKeyOf(scope));
+  if (!entry || entry.terminalPage === undefined) {
+    return false;
+  }
+  entry.terminalPage = undefined;
+  return true;
+}
+
+/** 当前作用域项（LRU 旧→新，诊断与测试用）。 */
+export function listM4ScopeSessions(): M4SessionScope[] {
+  return [...m4SessionStore.values()].map((entry) => ({ ...entry.scope }));
+}
+
+/** 当前作用域项数。 */
+export function m4SessionStoreSize(): number {
+  return m4SessionStore.size;
+}
+
+/**
+ * 控制器恢复计划（技术方案固定顺序）：活动任务绑定 → 当前作用域终态页
+ * → 可浏览状态 → fresh。hasActiveTask 由调用方用共享任务注册表按
+ * resultScope 判定；本函数只按存储值分层，不从一层反推另一层的业务真相。
+ */
+export type M4SessionRestorePlan =
+  | { layer: 'active-task' }
+  | { layer: 'terminal-page'; page: unknown }
+  | { layer: 'browsable'; browsable: unknown }
+  | { layer: 'fresh' };
+
+export interface M4SessionRestoreInput {
+  /** 当前目标存在绑定的活动任务（活动任务层优先于任何缓存页）。 */
+  hasActiveTask: boolean;
+  /** 本次打开的当前作用域。 */
+  scope: M4SessionScope;
+}
+
+export function planM4SessionRestore(input: M4SessionRestoreInput): M4SessionRestorePlan {
+  if (input.hasActiveTask) {
+    return { layer: 'active-task' };
+  }
+  const entry = readM4ScopeSession(input.scope);
+  // null 与 undefined 都视为该层无内容（控制器可用 null 显式清空一层）。
+  if (entry?.terminalPage !== undefined && entry.terminalPage !== null) {
+    return { layer: 'terminal-page', page: entry.terminalPage };
+  }
+  if (entry?.browsable !== undefined && entry.browsable !== null) {
+    return { layer: 'browsable', browsable: entry.browsable };
+  }
+  return { layer: 'fresh' };
+}
+
+/** 测试辅助：清空 M4 多作用域存储（真实宿主不需要）。 */
+export function resetM4SessionStore(): void {
+  m4SessionStore.clear();
+}
+
 /** 测试辅助：清空缓存、登记与重跑回调（真实宿主不需要）。 */
 export function resetSessionResults(): void {
   results.clear();
   pendingVerifies.clear();
   resultUpdatedCallbacks.clear();
+  resetM4SessionStore();
 }

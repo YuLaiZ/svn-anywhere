@@ -26,7 +26,7 @@ import {
   type ViewToHostMessage,
 } from './protocol';
 import { allowedActions, gatePermits, M2_PANEL_GATES, type PanelGates } from './gates';
-import type { PanelState } from './state';
+import type { LazyTreeRowSpec, PanelState, RowSpec, TableRowSpec } from './state';
 import { findRow } from './state';
 import { render } from './view';
 
@@ -64,6 +64,12 @@ export interface PanelEntryOptions {
    * 获得按表推导的 DOM 可交互视图（随渲染注入 PanelState.gate）。
    */
   gates?: PanelGates;
+  /**
+   * writeLocked 时是否拒绝切换目标：M4 的 P6/P7 写入在途禁止切换目标
+   * （技术方案 §7、交互基线「写入在途」行）；不携带时维持 M1-M3 行为
+   * ——只有 busy 拒绝切换，写锁（结果未知/待协调记录）不阻止换目标。
+   */
+  blockSwitchWhenWriteLocked?: boolean;
 }
 
 interface PanelEntry {
@@ -76,6 +82,8 @@ interface PanelEntry {
   revision: number;
   /** 视图代次：ready 握手递增（webview 重建即新代），随 render 下发。 */
   viewEpoch: number;
+  /** 读请求代次：每次 beginReadRequest 递增，旧票据随之过期（目标切换归零重开）。 */
+  readSeq: number;
   /** 已处理的请求 ID：同一请求重复送达直接忽略。 */
   handledRequests: Set<string>;
   messageDisposable: vscode.Disposable;
@@ -121,10 +129,39 @@ export interface PanelHandle {
   update(next: PanelState, forSessionId?: string): void;
   /** 推送瞬时提示。 */
   toast(level: 'info' | 'error', message: string): void;
-  /** 切换目标：生成新会话代次；忙碌时返回 undefined 并提示。 */
+  /** 切换目标：生成新会话代次；忙碌（或按面板配置的写锁）时返回 undefined 并提示。 */
   switchSession(): string | undefined;
+  /**
+   * 发起读请求：递增本会话读请求代次并返回票据。读结果回包时用
+   * isReadRequestCurrent 判定归属，旧请求或旧会话的回包不得覆盖当前页面。
+   */
+  beginReadRequest(targetKey: string): ReadRequestTicket;
+  /**
+   * 读请求票据是否仍属于当前会话且未被更新的读请求取代。targetKey 的
+   * 当前目标比对由控制器完成（宿主不理解目标键语义）；viewEpoch 变化
+   * （视图重建）不使票据失效——宿主状态仍有效，重推即可上屏。
+   */
+  isReadRequestCurrent(ticket: ReadRequestTicket): boolean;
   reveal(): void;
   dispose(): void;
+}
+
+/**
+ * 读请求票据（技术方案 §2.3）：读结果携带 targetKey + requestSeq +
+ * viewEpoch，只写回同一目标会话。targetKey 供旧目标缓存寻址与控制器
+ * 比对当前目标；requestSeq 由 beginReadRequest 递增，同目标的旧回包
+ * 因代次过期被丢弃；viewEpoch 标记发起时的视图代次，供控制器在视图
+ * 重建后决定滚动/焦点恢复策略（不参与归属判定）。
+ */
+export interface ReadRequestTicket {
+  /** 发起时的面板会话：目标切换后旧会话票据全部过期。 */
+  sessionId: string;
+  /** 发起时的目标键（控制器定义的不透明字符串）。 */
+  targetKey: string;
+  /** 本会话读请求代次：发起更新的读请求后旧票据过期。 */
+  requestSeq: number;
+  /** 发起时的视图代次（ready 握手递增）。 */
+  viewEpoch: number;
 }
 
 /**
@@ -165,6 +202,7 @@ export function createPanel(
     state: undefined,
     revision: 0,
     viewEpoch: 0,
+    readSeq: 0,
     handledRequests: new Set(),
     messageDisposable: { dispose: () => {} },
     disposeDisposable: { dispose: () => {} },
@@ -245,10 +283,33 @@ function handleFor(entry: PanelEntry): PanelHandle {
       if (entry.state?.busy) {
         return undefined;
       }
+      // M4 的 P6/P7：写入在途（writeLocked）禁止切换目标；M1-M3 面板不携带
+      // 该选项，写锁不阻止换目标（既有行为）。
+      if (entry.options.blockSwitchWhenWriteLocked && entry.state?.writeLocked) {
+        return undefined;
+      }
       entry.sessionId = newSessionId();
       entry.handledRequests.clear();
       entry.revision = 0;
+      // 会话代次已换：归零读请求代次，旧会话票据因 sessionId 不匹配而过期。
+      entry.readSeq = 0;
       return entry.sessionId;
+    },
+    beginReadRequest(targetKey: string) {
+      entry.readSeq += 1;
+      return {
+        sessionId: entry.sessionId,
+        targetKey,
+        requestSeq: entry.readSeq,
+        viewEpoch: entry.viewEpoch,
+      };
+    },
+    isReadRequestCurrent(ticket: ReadRequestTicket) {
+      if (entry.disposed) {
+        return false;
+      }
+      // 视图重建（viewEpoch 变化）不让宿主状态失效，故只按会话与读代次判定。
+      return ticket.sessionId === entry.sessionId && ticket.requestSeq === entry.readSeq;
     },
     reveal() {
       if (!entry.disposed) {
@@ -357,10 +418,14 @@ async function handleViewMessage(entry: PanelEntry, raw: unknown): Promise<void>
     });
     return;
   }
-  // 条目操作能力校验：意图引用的条目必须存在于当前状态（嵌套行递归查找）。
+  // 条目操作能力校验：意图引用的条目必须存在于当前状态（嵌套行递归查找）；
+  // M4 意图另按稳定 ID 校验——节点在懒加载树、行在列表或表格中，避免
+  // 控制器收到引用不存在节点/行的意图后再各自重复校验。
   if (entry.state) {
     const invalid =
-      intentRequiresItem(intent) && !entry.state.list?.rows.some((row) => findRow([row], intent.itemId));
+      (intentRequiresItem(intent) && !entry.state.list?.rows.some((row) => findRow([row], intent.itemId))) ||
+      (intentRequiresNode(intent) && !findLazyNode(entry.state.lazyTree?.rows, intent.nodeId)) ||
+      (intentRequiresRow(intent) && !findStateRow(entry.state, intent.id));
     if (invalid) {
       return;
     }
@@ -383,6 +448,61 @@ async function handleViewMessage(entry: PanelEntry, raw: unknown): Promise<void>
 
 function intentRequiresItem(intent: Intent): intent is Intent & { itemId: string } {
   return intent.kind === 'openDiff' || intent.kind === 'openFile' || intent.kind === 'rowMore';
+}
+
+/** 意图引用的 P5 稳定节点 ID（协议层只接受 nodeId，路径不进视图）。 */
+function intentRequiresNode(intent: Intent): intent is Intent & { nodeId: string } {
+  switch (intent.kind) {
+    case 'toggleBrowserNode':
+    case 'selectBrowserNode':
+    case 'retryBrowserNode':
+    case 'refreshBrowserNode':
+    case 'loadMoreBrowserNode':
+    case 'copyBrowserNodeUrl':
+    case 'openRemoteNode':
+    case 'openHistoryFromBrowser':
+      return true;
+    default:
+      return false;
+  }
+}
+
+/** 意图引用的 P6/P7 稳定行 ID（历史 revision 行、比较候选行、冲突行）。 */
+function intentRequiresRow(intent: Intent): intent is Intent & { id: string } {
+  switch (intent.kind) {
+    case 'selectHistoryRevision':
+    case 'toggleHistoryRevision':
+    case 'selectCompareCandidate':
+    case 'copyHistoryText':
+    case 'selectConflict':
+    case 'copyConflictPath':
+      return true;
+    default:
+      return false;
+  }
+}
+
+/** 懒加载树按稳定节点 ID 递归查找（只查已下发到视图的行）。 */
+function findLazyNode(rows: LazyTreeRowSpec[] | undefined, nodeId: string): LazyTreeRowSpec | undefined {
+  if (!rows) {
+    return undefined;
+  }
+  for (const row of rows) {
+    if (row.id === nodeId) {
+      return row;
+    }
+    const child = findLazyNode(row.children, nodeId);
+    if (child) {
+      return child;
+    }
+  }
+  return undefined;
+}
+
+/** 行 ID 在列表或表格中查找（M4 面板按数据形态二选一承载行）。 */
+function findStateRow(state: PanelState, id: string): RowSpec | TableRowSpec | undefined {
+  const listRow = state.list ? findRow(state.list.rows, id) : undefined;
+  return listRow ?? state.table?.rows.find((row) => row.id === id);
 }
 
 /**

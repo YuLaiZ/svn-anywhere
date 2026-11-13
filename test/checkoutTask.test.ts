@@ -268,7 +268,7 @@ describe('检出任务状态机', () => {
     // 结算顺序：任务移除通知回调时缓存已就绪（先写缓存、再移除任务）。
     expect(removalSnapshots).toEqual([true]);
     // 缓存页与结果页一致。
-    const cached = readSessionResult('checkout', { entryKey: '/tmp/parent-real', mode: 'checkout' });
+    const cached = readSessionResult('checkout', { scopeKind: 'checkout', entryKey: '/tmp/parent-real', mode: 'checkout' });
     expect(cached?.page).toEqual(outcome.result);
     // 记录 phase 序列：prepared → running → done（begin/命令发出/终态收口）。
     phases.push(...store.phases);
@@ -305,7 +305,7 @@ describe('检出任务状态机', () => {
     expect(records).toHaveLength(1);
     expect(records[0]?.phase).toBe('residue-pending');
     expect(records[0]?.kind).toBe('checkout');
-    const cached = readSessionResult('checkout', { entryKey: '/tmp/parent-real', mode: 'checkout' });
+    const cached = readSessionResult('checkout', { scopeKind: 'checkout', entryKey: '/tmp/parent-real', mode: 'checkout' });
     expect((cached?.page as { kind?: string })?.kind).toBe('canceled');
   });
 
@@ -383,7 +383,7 @@ describe('预命令终止出口（统一收口 helper）', () => {
     // 任务已移除（busy 恢复假值）。
     expect(getActiveTask('checkout')).toBeUndefined();
     // 不写会话缓存。
-    expect(readSessionResult('checkout', { entryKey: '/tmp/parent-real', mode: 'checkout' })).toBeUndefined();
+    expect(readSessionResult('checkout', { scopeKind: 'checkout', entryKey: '/tmp/parent-real', mode: 'checkout' })).toBeUndefined();
     // 草稿已写回：formSnapshot 全字段（敏感过滤后原样保留）。
     expect(readDraft('/tmp/parent-real', 'checkout')).toEqual(FORM);
     // 预置记录不受影响。
@@ -404,7 +404,7 @@ describe('预命令终止出口（统一收口 helper）', () => {
     const outcome = await startCheckoutTask(baseInput()).done;
     expect(outcome).toEqual({ outcome: 'preCommandExit', exit: { kind: 'beginIdConflict' } });
     // 不写缓存、任务移除；既有记录不动。
-    expect(readSessionResult('checkout', { entryKey: '/tmp/parent-real', mode: 'checkout' })).toBeUndefined();
+    expect(readSessionResult('checkout', { scopeKind: 'checkout', entryKey: '/tmp/parent-real', mode: 'checkout' })).toBeUndefined();
     expect(getActiveTask('checkout')).toBeUndefined();
     expect([...store.records.keys()]).toEqual([conflictId]);
   });
@@ -423,7 +423,7 @@ describe('预命令终止出口（统一收口 helper）', () => {
     expect(outcome.exit.kind === 'beginWriteFailed' && outcome.exit.message).toContain('globalState');
     expect(failing.records.size).toBe(0);
     expect(getActiveTask('checkout')).toBeUndefined();
-    expect(readSessionResult('checkout', { entryKey: '/tmp/parent-real', mode: 'checkout' })).toBeUndefined();
+    expect(readSessionResult('checkout', { scopeKind: 'checkout', entryKey: '/tmp/parent-real', mode: 'checkout' })).toBeUndefined();
   });
 
   it('开始前目标重查失败（目标非空）：记录 failed-unconfirmed+finish、草稿写回、无 result', async () => {
@@ -447,7 +447,7 @@ describe('预命令终止出口（统一收口 helper）', () => {
     expect(await registry.loadAllRecords()).toHaveLength(0);
     // 草稿写回 + 不写缓存。
     expect(readDraft('/tmp/parent-real', 'checkout')).toEqual(FORM);
-    expect(readSessionResult('checkout', { entryKey: '/tmp/parent-real', mode: 'checkout' })).toBeUndefined();
+    expect(readSessionResult('checkout', { scopeKind: 'checkout', entryKey: '/tmp/parent-real', mode: 'checkout' })).toBeUndefined();
   });
 
   it('开始前目标重查失败（嵌套副本：父目录是工作副本）', async () => {
@@ -810,7 +810,7 @@ describe('续检（resumeCheckoutTask）', () => {
     expect(records[0]?.phase).toBe('residue-pending');
     // 任务移除；缓存镜像为 resumeBlocked 页。
     expect(getActiveTask('checkout')).toBeUndefined();
-    const cached = readSessionResult('checkout', { entryKey: '/tmp/parent-real', mode: 'checkout' });
+    const cached = readSessionResult('checkout', { scopeKind: 'checkout', entryKey: '/tmp/parent-real', mode: 'checkout' });
     expect((cached?.page as { kind?: string })?.kind).toBe('resumeBlocked');
     // 不发写命令（cleanup/update 未被调用）。
     expect(runCalls.filter(({ args }) => args[0] === 'cleanup' || args[0] === 'update')).toHaveLength(0);
@@ -982,7 +982,7 @@ describe('verifyCheckoutOnly（只读核验链）', () => {
       targetPath: '.', entries: [{ path: 'a.txt', wcStatus: 'modified', props: 'none', changelist: null }], externals: [],
     });
 
-    const scope = { entryKey: '/tmp/parent-real', mode: 'checkout' as const };
+    const scope = { scopeKind: 'checkout' as const, entryKey: '/tmp/parent-real', mode: 'checkout' as const };
     const report = await verifyCheckoutOnly({
       svnPath: 'svn',
       targetDir: join(labRoot, 'target'),

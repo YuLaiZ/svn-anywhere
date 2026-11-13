@@ -21,6 +21,7 @@
 import type { OperationKind } from '../../core/operations';
 import { PRISTINE_UNSUPPORTED_REASON, type DiskUsageFile, type PristineStats, type ScanDiskUsageResult } from '../../core/diskUsage';
 import { format, strings } from '../i18n';
+import type { DiskResultScope } from '../taskRegistry';
 import { sliceTableRows } from './state';
 import type {
   ActionSpec,
@@ -88,7 +89,7 @@ export interface DiskCleanState {
 
 /** 运行中任务绑定（跨入口打开与重开恢复第①段）：页头按任务呈现。 */
 export interface DiskPanelBinding {
-  resultScope: { wcRoot: string };
+  resultScope: DiskResultScope;
   /** 任务创建时记录的打开子目录（运行中任务的页头反映任务发起位置）。 */
   subPath: string;
 }
@@ -504,7 +505,7 @@ export function bindRunningTask(
     phase: task.kind === 'scan' ? 'scanning' : 'cleaning',
     wcRoot: task.wcRoot,
     subPath: task.subPath,
-    binding: { resultScope: { wcRoot: task.wcRoot }, subPath: task.subPath },
+    binding: { resultScope: { scopeKind: 'disk', wcRoot: task.wcRoot }, subPath: task.subPath },
     recovered: 'task',
   };
 }

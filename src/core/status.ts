@@ -21,6 +21,13 @@ export interface StatusEntry {
   props?: string;
   /** 所属 changelist 名称原值（含首尾空格）；未分组条目为 null。 */
   changelist: string | null;
+  /**
+   * 树冲突标记（wc-status@tree-conflicted）：树冲突的 item 可能是
+   * added/replaced/deleted，不能只筛 item=conflicted（技术方案 §5.1）。
+   */
+  treeConflicted?: boolean;
+  /** 条目所在的整副本写锁标记（wc-status@wc-locked，含根 item=incomplete）。 */
+  wcLocked?: boolean;
 }
 
 export interface StatusResult {
@@ -38,6 +45,10 @@ const parser = new XMLParser({
   trimValues: false,
   // SVN 用数字实体表示路径控制字符；解码一次，保留 &amp; 编码的字面实体。
   htmlEntities: true,
+  // 文本节点保持原始字符串：纯数字文件名/属性值不能变成 number（与 M4
+  // 流式解析模块同一语义）；revision 等数值字段由调用方按需转换。
+  parseTagValue: false,
+  parseAttributeValue: false,
   // status XML 里 entry 一定按集合处理，单个条目也要保持数组形态；
   // changelist/target 容器同理（多目标调用时 target 出现多个，单目标也保持数组）。
   isArray: (name) => name === 'entry' || name === 'changelist' || name === 'target',
@@ -116,7 +127,22 @@ interface StatusXmlEntry {
     kind?: string;
     revision?: string | number;
     props?: string;
+    'tree-conflicted'?: string | boolean;
+    'wc-locked'?: string | boolean;
   };
+}
+
+/**
+ * status XML 是否完整（status 目标遍历中断会截断输出）。`parseStatusXml`
+ * 保持既有宽容语义（结构异常按空结果），需要把截断视为整体失败的调用方
+ * （如 P7 冲突扫描）先用本函数做严格检查，不解析残片。
+ */
+export function isCompleteStatusXml(xml: string): boolean {
+  return xml.trimEnd().endsWith('</status>');
+}
+
+function isXmlTrue(value: string | boolean | undefined): boolean {
+  return value === true || value === 'true';
 }
 
 function pushEntry(entries: StatusEntry[], entry: StatusXmlEntry, changelist: string | null): void {
@@ -131,7 +157,15 @@ function pushEntry(entries: StatusEntry[], entry: StatusXmlEntry, changelist: st
     revision: toNumber(wcStatus.revision),
     props: wcStatus.props,
     changelist,
+    treeConflicted: isXmlTrue(wcStatus['tree-conflicted']) || undefined,
+    wcLocked: isXmlTrue(wcStatus['wc-locked']) || undefined,
   });
+}
+
+/** `runStatus` 选项：RunOptions + externals 隔离开关。 */
+export interface RunStatusOptions extends RunOptions {
+  /** 追加 `--ignore-externals`：保留 external 边界但不输出其内部变更。 */
+  ignoreExternals?: boolean;
 }
 
 /** 对目标路径执行 `svn status --xml` 并解析。target 须经 escapePeg 转义；
@@ -139,9 +173,11 @@ function pushEntry(entries: StatusEntry[], entry: StatusXmlEntry, changelist: st
 export async function runStatus(
   svnPath: string,
   target: string | string[],
-  options: RunOptions = {},
+  options: RunStatusOptions = {},
 ): Promise<StatusResult> {
+  const { ignoreExternals, ...runOptions } = options;
   const targets = typeof target === 'string' ? [target] : target;
-  const result = await runOrThrow(svnPath, ['status', '--xml', ...targets.map(escapePeg)], options);
+  const args = ['status', '--xml', ...(ignoreExternals ? ['--ignore-externals'] : []), ...targets.map(escapePeg)];
+  const result = await runOrThrow(svnPath, args, runOptions);
   return parseStatusXml(result.stdout);
 }

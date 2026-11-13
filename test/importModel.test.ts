@@ -687,7 +687,7 @@ describe('清单 §三 running/canceling：执行与取消', () => {
     s = beginImportTask(s, { opId: 'op-9', targetPath: '/data/src' });
     expect(s.step).toBe('running');
     expect(s.task).toEqual({ phase: 'connecting', currentFile: null, count: 0, opId: 'op-9' });
-    expect(s.binding).toEqual({ resultScope: { entryKey: '/src', mode: 'import' }, targetPath: '/data/src' });
+    expect(s.binding).toEqual({ resultScope: { scopeKind: 'checkout', entryKey: '/src', mode: 'import' }, targetPath: '/data/src' });
     expect(s.result).toBeNull();
   });
 

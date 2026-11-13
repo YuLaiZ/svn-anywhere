@@ -4,7 +4,9 @@
  * M3 增量：kind×phase 限制矩阵、lockKey 统一索引与旧记录兜底、
  * residue-pending 不进 active、hasActive/hasRunning 口径分层、
  * 首载陈旧化分诊（按运行登记判定）、beginResume、operationId 预生成、
- * M3 固定字段落盘与终态收口。
+ * M3 固定字段落盘与终态收口；
+ * M4 增量：history-update/resolve 的矩阵、固定意图落盘与重启分诊、
+ * markPhase 白名单与终态残留清理。
  */
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
@@ -13,11 +15,13 @@ import {
   resetRunningOperationsForTest,
   restrictsWrite,
   runWithRunningKey,
+  type HistoryUpdateIntent,
   type MarkPhasePatch,
   type OperationKind,
   type OperationPhase,
   type OperationRecord,
   type OperationStore,
+  type ResolveIntent,
 } from '../src/core/operations';
 
 // 运行登记是模块级单例：每个用例前清空，防失败路径残留键污染 loadPending 分诊。
@@ -929,5 +933,264 @@ describe('loadAllRecords：全量记录（含终态）', () => {
     const all = await registry.loadAllRecords();
     expect(all.map((record) => record.operationId).sort()).toEqual(['op-done']);
     expect(registry.pendingForWcRoot('/wc/a')).toHaveLength(0);
+  });
+});
+
+/* ================================================================================
+ * M4：history-update / resolve
+ * ================================================================================ */
+
+const HISTORY_UPDATE_INTENT: HistoryUpdateIntent = {
+  wcRoot: '/wc/h',
+  targetRelPath: 'src/app.ts',
+  targetKind: 'file',
+  targetUrl: 'http://example.com/svn/trunk/src/app.ts',
+  requestedRevision: 1281,
+  preRevision: 1276,
+};
+
+const RESOLVE_INTENT: ResolveIntent = {
+  scopeRoot: '/wc/h',
+  targets: [
+    { relPath: 'src/app.ts', conflictKinds: ['text'], fingerprint: 'fp-text-1', strategy: 'mine-full' },
+    { relPath: 'assets', conflictKinds: ['property', 'tree'], fingerprint: 'fp-prop-2', strategy: 'working' },
+  ],
+  batchId: 'op-batch-1',
+};
+
+/** M4 用例的记录字面量（独立 helper，避免与上方 describe 的局部函数耦合）。 */
+const m4RecordOf = (phase: OperationPhase, kind: OperationKind): OperationRecord => ({
+  operationId: 'x',
+  wcRoot: '/w',
+  targetRelPath: '.',
+  nodeKind: 'file',
+  phase,
+  knownRevisions: [],
+  updatedAt: 0,
+  kind,
+});
+
+describe('M4 kind×phase 矩阵：history-update / resolve', () => {
+  it('restrictsWrite：prepared/running/unknown 限制；其余不入限制集合', () => {
+    for (const kind of ['history-update', 'resolve'] as const) {
+      for (const phase of ['prepared', 'running', 'unknown'] as const) {
+        expect(restrictsWrite(m4RecordOf(phase, kind)), `${kind} ${phase} 应限制写`).toBe(true);
+      }
+      for (const phase of ['saving', 'committing', 'residue-pending', 'committed-pending-coordination'] as const) {
+        expect(restrictsWrite(m4RecordOf(phase, kind)), `${kind} ${phase} 不应限制写`).toBe(false);
+      }
+      for (const phase of ['done', 'failed-unconfirmed'] as const) {
+        expect(restrictsWrite(m4RecordOf(phase, kind))).toBe(false);
+      }
+    }
+  });
+
+  it('begin → running → unknown：hasRunning 随相位收放，unknown 拦截同键新 begin', async () => {
+    for (const kind of ['history-update', 'resolve'] as const) {
+      const registry = new OperationRegistry();
+      const begun = await registry.begin({
+        wcRoot: '/wc/m4', targetRelPath: '.', nodeKind: 'dir', kind, lockKey: '/wc/m4',
+      });
+      const operationId = operationIdOf(begun);
+      expect(registry.hasRunning('/wc/m4')).toBe(true);
+      await registry.markPhase(operationId, 'running');
+      expect(registry.hasRunning('/wc/m4')).toBe(true);
+      expect(registry.hasActive('/wc/m4')).toBe(true);
+      await registry.markPhase(operationId, 'unknown');
+      expect(registry.hasRunning('/wc/m4')).toBe(false);
+      expect(registry.writeRestriction('/wc/m4')?.phase).toBe('unknown');
+      const retry = await registry.begin({
+        wcRoot: '/wc/m4', targetRelPath: '.', nodeKind: 'dir', kind, lockKey: '/wc/m4',
+      });
+      expect(retry.ok).toBe(false);
+      if (!retry.ok && retry.reason === 'busy') {
+        expect(retry.heldBy.phase).toBe('unknown');
+      }
+    }
+  });
+});
+
+describe('M4 固定意图随 begin 落盘与重启分诊', () => {
+  it('history-update：固定意图一次写入，重启 prepared/running → unknown 且记录保留（不走 M1 安全重跑）', async () => {
+    for (const from of ['prepared', 'running'] as const) {
+      const store = memoryStore();
+      const first = new OperationRegistry(store);
+      const begun = await first.begin({
+        wcRoot: '/wc/h',
+        targetRelPath: 'src/app.ts',
+        nodeKind: 'file',
+        kind: 'history-update',
+        lockKey: '/wc/h',
+        historyUpdateIntent: HISTORY_UPDATE_INTENT,
+      });
+      const operationId = operationIdOf(begun);
+      if (from === 'running') {
+        await first.markPhase(operationId, 'running');
+      }
+      // 重启模拟：进程终止清空运行登记，新 registry + 同一 store 折算。
+      resetRunningOperationsForTest();
+      const second = new OperationRegistry(store);
+      await second.loadPending();
+      const record = second.pendingForWcRoot('/wc/h').find((item) => item.operationId === operationId);
+      expect(record?.phase, `history-update ${from} 应折算 unknown`).toBe('unknown');
+      expect(store.data.has(operationId)).toBe(true);
+      expect(record?.historyUpdateIntent).toEqual(HISTORY_UPDATE_INTENT);
+      // unknown 冻结新 begin（P6/P7 只开放回扫，不直接重试写命令）。
+      const retry = await second.begin({
+        wcRoot: '/wc/h', targetRelPath: '.', nodeKind: 'dir', kind: 'history-update', lockKey: '/wc/h',
+      });
+      expect(retry.ok).toBe(false);
+    }
+  });
+
+  it('resolve：批量固定意图（targets/batchId）落盘，重启 → unknown', async () => {
+    const store = memoryStore();
+    const first = new OperationRegistry(store);
+    const begun = await first.begin({
+      wcRoot: '/wc/h',
+      targetRelPath: '.',
+      nodeKind: 'dir',
+      kind: 'resolve',
+      lockKey: '/wc/h',
+      resolveIntent: RESOLVE_INTENT,
+    });
+    const operationId = operationIdOf(begun);
+    await first.markPhase(operationId, 'running');
+    resetRunningOperationsForTest();
+    const second = new OperationRegistry(store);
+    await second.loadPending();
+    const record = second.pendingForWcRoot('/wc/h').find((item) => item.operationId === operationId);
+    expect(record?.phase).toBe('unknown');
+    expect(record?.resolveIntent).toEqual(RESOLVE_INTENT);
+    expect(record?.resolveIntent?.targets[1].fingerprint).toBe('fp-prop-2');
+    expect(record?.resolveIntent?.targets[1].strategy).toBe('working');
+  });
+
+  it('单项 resolve 不写 batchId（可选字段不传即不写）', async () => {
+    const store = memoryStore();
+    const registry = new OperationRegistry(store);
+    const single: ResolveIntent = {
+      scopeRoot: '/wc/h',
+      targets: [{ relPath: 'src/app.ts', conflictKinds: ['text'], fingerprint: 'fp-1', strategy: 'theirs-full' }],
+    };
+    const begun = await registry.begin({
+      wcRoot: '/wc/h', targetRelPath: 'src/app.ts', nodeKind: 'file', kind: 'resolve', lockKey: '/wc/h',
+      resolveIntent: single,
+    });
+    expect(begun.ok).toBe(true);
+    if (begun.ok) {
+      expect(begun.record.resolveIntent).toEqual(single);
+      expect(begun.record.resolveIntent?.batchId).toBeUndefined();
+    }
+  });
+
+  it('M4 终态残留（kill 落在 markPhase 终态与 finish 之间）由首载顺带清理', async () => {
+    const store = memoryStore();
+    store.data.set(
+      'op-hu-done',
+      seededRecord({ operationId: 'op-hu-done', wcRoot: '/wc/m4', kind: 'history-update', phase: 'done' }),
+    );
+    store.data.set(
+      'op-hu-fail',
+      seededRecord({ operationId: 'op-hu-fail', wcRoot: '/wc/m4', kind: 'history-update', phase: 'failed-unconfirmed' }),
+    );
+    store.data.set(
+      'op-rs-done',
+      seededRecord({ operationId: 'op-rs-done', wcRoot: '/wc/m4', kind: 'resolve', phase: 'done' }),
+    );
+    const registry = new OperationRegistry(store);
+    await registry.loadPending();
+    expect(store.data.has('op-hu-done')).toBe(false);
+    expect(store.data.has('op-hu-fail')).toBe(false);
+    expect(store.data.has('op-rs-done')).toBe(false);
+  });
+
+  it('beginResume 不适用于 M4 kind（非 residue-pending 一律 recordUnavailable）', async () => {
+    const registry = new OperationRegistry();
+    const begun = await registry.begin({
+      wcRoot: '/wc/m4', targetRelPath: '.', nodeKind: 'dir', kind: 'history-update', lockKey: '/wc/m4',
+    });
+    const operationId = operationIdOf(begun);
+    await registry.markPhase(operationId, 'running');
+    const resume = await registry.beginResume(operationId, '/wc/m4');
+    expect(resume).toEqual({ ok: false, reason: 'recordUnavailable' });
+  });
+});
+
+describe('M4 markPhase patch 白名单', () => {
+  it('history-update 可写 baseRevision/resolvedRevision（回读结论），固定意图无补写通道', async () => {
+    const store = memoryStore();
+    const registry = new OperationRegistry(store);
+    const begun = await registry.begin({
+      wcRoot: '/wc/h',
+      targetRelPath: 'src/app.ts',
+      nodeKind: 'file',
+      kind: 'history-update',
+      lockKey: '/wc/h',
+      historyUpdateIntent: HISTORY_UPDATE_INTENT,
+    });
+    const operationId = operationIdOf(begun);
+    await registry.markPhase(operationId, 'running');
+    await registry.markPhase(operationId, 'unknown', { baseRevision: 1281, resolvedRevision: 1281 });
+    let record = store.data.get(operationId);
+    expect(record?.baseRevision).toBe(1281);
+    expect(record?.resolvedRevision).toBe(1281);
+    // 绕过类型模拟越权调用：固定意图/目标字段必须被白名单拒收。
+    await registry.markPhase(operationId, 'unknown', {
+      historyUpdateIntent: { ...HISTORY_UPDATE_INTENT, requestedRevision: 9999, targetUrl: 'http://evil' },
+      url: 'http://evil',
+      targetPath: '/evil',
+      knownRevisions: [7],
+    } as MarkPhasePatch);
+    record = store.data.get(operationId);
+    expect(record?.historyUpdateIntent).toEqual(HISTORY_UPDATE_INTENT);
+    expect(record?.url).toBeUndefined();
+    expect(record?.targetPath).toBeUndefined();
+    expect(record?.knownRevisions).toEqual([]);
+  });
+
+  it('resolve 不放宽 patch：任何增量字段都被过滤（固定意图只读）', async () => {
+    const store = memoryStore();
+    const registry = new OperationRegistry(store);
+    const begun = await registry.begin({
+      wcRoot: '/wc/h',
+      targetRelPath: '.',
+      nodeKind: 'dir',
+      kind: 'resolve',
+      lockKey: '/wc/h',
+      resolveIntent: RESOLVE_INTENT,
+    });
+    const operationId = operationIdOf(begun);
+    await registry.markPhase(operationId, 'running', {
+      baseRevision: 99,
+      resolvedRevision: 5,
+      knownRevisions: [1],
+      committedPaths: ['a'],
+      outcome: 'merged',
+    } as MarkPhasePatch);
+    const record = store.data.get(operationId);
+    expect(record?.baseRevision).toBeUndefined();
+    expect(record?.resolvedRevision).toBeUndefined();
+    expect(record?.knownRevisions).toEqual([]);
+    expect(record?.committedPaths).toBeUndefined();
+    expect(record?.outcome).toBeUndefined();
+    expect(record?.resolveIntent).toEqual(RESOLVE_INTENT);
+  });
+
+  it('M4 记录出口经 finalizeOperation 后不在 records/globalState', async () => {
+    for (const kind of ['history-update', 'resolve'] as const) {
+      const store = memoryStore();
+      const registry = new OperationRegistry(store);
+      const begun = await registry.begin({
+        wcRoot: '/wc/f', targetRelPath: '.', nodeKind: 'dir', kind, lockKey: '/wc/f',
+      });
+      const operationId = operationIdOf(begun);
+      await registry.markPhase(operationId, 'running');
+      await registry.finalizeOperation(operationId, 'done');
+      expect(registry.pendingForWcRoot('/wc/f'), `${kind} done 后 records 应清空`).toHaveLength(0);
+      expect(store.data.has(operationId), `${kind} done 后 globalState 应移除`).toBe(false);
+      expect(registry.hasActive('/wc/f')).toBe(false);
+      expect(registry.hasRunning('/wc/f')).toBe(false);
+    }
   });
 });

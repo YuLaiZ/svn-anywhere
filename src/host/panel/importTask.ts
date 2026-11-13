@@ -445,7 +445,7 @@ function formSnapshotOf(input: StartImportTaskInput): ImportFormSnapshot {
 export function startImportTask(input: StartImportTaskInput): StartedImportTask {
   const svnPath = input.svnPath ?? readSvnPath();
   const lockKey = input.sourceDir;
-  const resultScope: CheckoutResultScope = { entryKey: input.entryKey, mode: 'import' };
+  const resultScope: CheckoutResultScope = { scopeKind: 'checkout', entryKey: input.entryKey, mode: 'import' };
   // 预生成 operationId（begin 沿用、快照文件名同源）；与既有记录的撞车由
   // 执行流在快照落盘前做可用性前置检查（§2.2）。
   const taskId = randomOperationId();

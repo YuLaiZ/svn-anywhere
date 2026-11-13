@@ -495,7 +495,7 @@ describe('P4 磁盘面板 flow：扫描', () => {
     expect(state.files).toHaveLength(2);
     expect(getActiveTask('disk')).toBeUndefined();
     // 执行器结算已写缓存（关闭重开恢复的承载）。
-    const cached = readSessionResult('disk', { wcRoot: wcA });
+    const cached = readSessionResult('disk', { scopeKind: 'disk', wcRoot: wcA });
     expect((cached?.page as { phase?: string }).phase).toBe('ready');
   });
 
@@ -554,7 +554,7 @@ describe('P4 磁盘面板 flow：扫描', () => {
     expect(state.total).toBeNull();
     expect(state.files).toHaveLength(0);
     expect(state.scanCount).toBe(0);
-    const cached = readSessionResult('disk', { wcRoot: wcA });
+    const cached = readSessionResult('disk', { scopeKind: 'disk', wcRoot: wcA });
     const page = cached?.page as { phase?: string; total?: number | null };
     expect(page.phase).toBe('scanCanceled');
     expect(page.total).toBeNull();
@@ -649,7 +649,7 @@ describe('P4 磁盘面板 flow：清理链', () => {
     expect(getActiveTask('disk')).toBeUndefined();
     expect(vacuumRecords()).toHaveLength(0);
     // changed 结果页由 P4 控制器写入（面板内结果转移，非任务终态）。
-    const cached = readSessionResult('disk', { wcRoot: wcA });
+    const cached = readSessionResult('disk', { scopeKind: 'disk', wcRoot: wcA });
     expect((cached?.page as { phase?: string }).phase).toBe('changed');
     const html = lastHtml(panel);
     expect(html).toContain(strings.diskPanel.changedBannerTitle);
@@ -689,7 +689,7 @@ describe('P4 磁盘面板 flow：清理链', () => {
     expect(state.phase).toBe('ready');
     expect(toastMessages(panel)).toContain(strings.diskPanel.vacuumBeginBusyNotice);
     // 缓存仍持清理前结果页（begin 失败不产生清理结果页）。
-    expect((readSessionResult('disk', { wcRoot: wcA })?.page as { phase?: string }).phase).toBe('ready');
+    expect((readSessionResult('disk', { scopeKind: 'disk', wcRoot: wcA })?.page as { phase?: string }).phase).toBe('ready');
     await getOperationRegistry().finish(external.ok ? external.operationId : undefined);
   });
 
@@ -904,7 +904,7 @@ describe('P4 磁盘面板 flow：重检窗口 busy 与送达', () => {
     expect(await waitUntil(() => diskSessionSnapshot()?.phase === 'changed')).toBe(true);
     expect(diskSessionSnapshot()?.binding).toBeNull();
     expect(getActiveTask('disk')).toBeUndefined();
-    expect((readSessionResult('disk', { wcRoot: wcA })?.page as { phase?: string }).phase).toBe('changed');
+    expect((readSessionResult('disk', { scopeKind: 'disk', wcRoot: wcA })?.page as { phase?: string }).phase).toBe('changed');
     expect(reopened.posted.length).toBeGreaterThan(framesBefore);
     expect(lastHtml(reopened)).toContain(strings.diskPanel.changedBannerTitle);
     expect(lastHtml(reopened)).toContain(strings.diskPanel.actRedetect);
@@ -923,7 +923,7 @@ describe('P4 磁盘面板 flow：重检窗口 busy 与送达', () => {
     expect(await waitTaskGone()).toBe(true);
     expect(vacuumRecords()).toHaveLength(0);
     // 缓存不被迟到 changed 覆盖：仍持清理前结果页。
-    expect((readSessionResult('disk', { wcRoot: wcA })?.page as { phase?: string }).phase).toBe('ready');
+    expect((readSessionResult('disk', { scopeKind: 'disk', wcRoot: wcA })?.page as { phase?: string }).phase).toBe('ready');
     void panel;
   });
 });
@@ -987,7 +987,7 @@ describe('P4 磁盘面板 flow：三段恢复与重启', () => {
   it('三段②：fresh open 跨副本打开 → 缓存 wcRoot 不一致丢弃、新副本全新 idle 会话', async () => {
     const panel = await openDisk(wcA);
     await scanToReady(panel);
-    expect(readSessionResult('disk', { wcRoot: wcA })).toBeDefined();
+    expect(readSessionResult('disk', { scopeKind: 'disk', wcRoot: wcA })).toBeDefined();
     panel.dispose();
     await openDisk(wcB);
     const state = diskSessionSnapshot()!;
@@ -995,7 +995,7 @@ describe('P4 磁盘面板 flow：三段恢复与重启', () => {
     expect(state.wcRoot).toBe(wcB);
     expect(state.total).toBeNull();
     // 不一致缓存项被读侧丢弃（不残留）。
-    expect(readSessionResult('disk', { wcRoot: wcA })).toBeUndefined();
+    expect(readSessionResult('disk', { scopeKind: 'disk', wcRoot: wcA })).toBeUndefined();
   });
 
   it('三段③：vacuum unknown 记录分诊派生 cleanupUnknown 页（不经缓存承载）+ writeLocked', async () => {
@@ -1203,7 +1203,7 @@ describe('P4 磁盘面板 flow：占用新鲜度与换副本', () => {
     expect(diskSessionSnapshot()?.phase).toBe('idle');
     expect(diskSessionSnapshot()?.wcRoot).toBe(wcB);
     // 确认放弃清缓存（旧副本结果页不再恢复）。
-    expect(readSessionResult('disk', { wcRoot: wcA })).toBeUndefined();
+    expect(readSessionResult('disk', { scopeKind: 'disk', wcRoot: wcA })).toBeUndefined();
     void panel;
   });
 

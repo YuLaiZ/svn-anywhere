@@ -647,7 +647,7 @@ describe('P3 检出面板 flow', () => {
     // 执行器写入 success 缓存页 + 他人记录锁定同路径。
     const target = join(labRoot, 'trunk');
     const { writeSessionResult } = await import('../src/host/sessionResults');
-    writeSessionResult('checkout', { entryKey: labRoot, mode: 'checkout' }, {
+    writeSessionResult('checkout', { scopeKind: 'checkout', entryKey: labRoot, mode: 'checkout' }, {
       mode: 'checkout',
       kind: 'success',
       revision: 5,
@@ -676,7 +676,7 @@ describe('P3 检出面板 flow', () => {
     expect(openFolder[1]?.[2]).toEqual({ openNewWindow: true });
     // newTask 放行：回空白表单、清结果缓存。
     expect(lastHtml(panel)).toContain(strings.checkoutPanel.stepForm);
-    expect(readSessionResult('checkout', { entryKey: labRoot, mode: 'checkout' })).toBeUndefined();
+    expect(readSessionResult('checkout', { scopeKind: 'checkout', entryKey: labRoot, mode: 'checkout' })).toBeUndefined();
   });
 
   /* ------------------------------ 取消竞态 ------------------------------ */
@@ -740,7 +740,7 @@ describe('P3 检出面板 flow', () => {
     await sleep(30);
     expect(lastHtml(panel)).toContain(strings.checkoutPanel.resultTitles.resumable);
     expect(store.records.get(record.operationId)?.phase).toBe('residue-pending');
-    const cached = readSessionResult('checkout', { entryKey: labRoot, mode: 'checkout' });
+    const cached = readSessionResult('checkout', { scopeKind: 'checkout', entryKey: labRoot, mode: 'checkout' });
     expect(cached).toBeDefined();
     expect((cached?.page as { kind: string }).kind).toBe('resumable');
   });
@@ -835,7 +835,7 @@ describe('P3 检出面板 flow', () => {
 
   it('五段②：缓存终态命中恢复结果页，缓存不一致（跨入口）丢弃落新表单', async () => {
     const { writeSessionResult } = await import('../src/host/sessionResults');
-    writeSessionResult('checkout', { entryKey: labRoot, mode: 'checkout' }, {
+    writeSessionResult('checkout', { scopeKind: 'checkout', entryKey: labRoot, mode: 'checkout' }, {
       mode: 'checkout',
       kind: 'canceled',
       path: join(labRoot, 'trunk'),
@@ -854,7 +854,7 @@ describe('P3 检出面板 flow', () => {
       expect(html).toContain(strings.checkoutPanel.stepForm);
       expect(html).not.toContain(strings.checkoutPanel.resultTitles.canceled);
       // 缓存项已被读侧丢弃。
-      expect(readSessionResult('checkout', { entryKey: labRoot, mode: 'checkout' })).toBeUndefined();
+      expect(readSessionResult('checkout', { scopeKind: 'checkout', entryKey: labRoot, mode: 'checkout' })).toBeUndefined();
     } finally {
       rmSync(otherRoot, { recursive: true, force: true });
     }
@@ -872,7 +872,7 @@ describe('P3 检出面板 flow', () => {
     expect(html).not.toContain('data-intent="revealResultDir"');
     // 宿主未重启（缓存持有同记录终态）时缓存优先：预置 canceled 缓存后重开不再回 interrupted。
     const { writeSessionResult } = await import('../src/host/sessionResults');
-    writeSessionResult('checkout', { entryKey: labRoot, mode: 'checkout' }, {
+    writeSessionResult('checkout', { scopeKind: 'checkout', entryKey: labRoot, mode: 'checkout' }, {
       mode: 'checkout',
       kind: 'failed',
       path: record.targetPath!,
@@ -1052,7 +1052,7 @@ describe('P3 检出面板 flow', () => {
     expect(html).toBeDefined();
     expect(html).toContain('r5');
     expect(store.records.get(record.operationId)).toBeUndefined();
-    const cached = readSessionResult('checkout', { entryKey: labRoot, mode: 'checkout' });
+    const cached = readSessionResult('checkout', { scopeKind: 'checkout', entryKey: labRoot, mode: 'checkout' });
     expect((cached?.page as { kind: string }).kind).toBe('success');
   });
 
@@ -1174,7 +1174,7 @@ describe('P3 检出面板 flow', () => {
       await sleep(250);
       const canceledHtml = findHtml(second, strings.checkoutPanel.resultTitles.canceled);
       expect(canceledHtml).toBeDefined();
-      expect(readSessionResult('checkout', { entryKey: entryA, mode: 'checkout' })).toBeDefined();
+      expect(readSessionResult('checkout', { scopeKind: 'checkout', entryKey: entryA, mode: 'checkout' })).toBeDefined();
     } finally {
       rmSync(entryB, { recursive: true, force: true });
     }
@@ -1227,13 +1227,13 @@ describe('P3 检出面板 flow', () => {
       await fillToReview(second, REPO_URL);
       send(second, { kind: 'startCheckout' });
       await waitFor(() => rendersOf(second).some((html) => html.includes(t.resultTitles.success)));
-      const cached = readSessionResult('checkout', { entryKey: entryB, mode: 'checkout' });
+      const cached = readSessionResult('checkout', { scopeKind: 'checkout', entryKey: entryB, mode: 'checkout' });
       expect((cached?.page as { kind: string }).kind).toBe('success');
       // 旧核验结论返回：单槽缓存仍为 B 的成功页（任务启动递增 + 跨 scope
       // 写侧校验双层——即便递增遗漏，scope A ≠ B 的写入也被写侧拦下）。
       releaseVerify();
       await sleep(60);
-      const after = readSessionResult('checkout', { entryKey: entryB, mode: 'checkout' });
+      const after = readSessionResult('checkout', { scopeKind: 'checkout', entryKey: entryB, mode: 'checkout' });
       expect((after?.page as { kind: string }).kind).toBe('success');
       // 关闭并从 B 重开：恢复 B 成功页、不落空白新表单、不恢复 A 的结论页。
       second.dispose();
@@ -1273,12 +1273,12 @@ describe('P3 检出面板 flow', () => {
     await fillToReview(second, REPO_URL);
     send(second, { kind: 'startCheckout' });
     await waitFor(() => rendersOf(second).some((html) => html.includes(t.resultTitles.success)));
-    const cached = readSessionResult('checkout', { entryKey: labRoot, mode: 'checkout' });
+    const cached = readSessionResult('checkout', { scopeKind: 'checkout', entryKey: labRoot, mode: 'checkout' });
     expect((cached?.page as { kind: string }).kind).toBe('success');
     // 旧核验结论返回：scope 一致、写侧会放行——若代次守卫缺失会覆盖新成功页。
     releaseVerify();
     await sleep(60);
-    const after = readSessionResult('checkout', { entryKey: labRoot, mode: 'checkout' });
+    const after = readSessionResult('checkout', { scopeKind: 'checkout', entryKey: labRoot, mode: 'checkout' });
     expect((after?.page as { kind: string }).kind).toBe('success');
     second.dispose();
     await sleep(0);
@@ -1312,20 +1312,20 @@ describe('P3 检出面板 flow', () => {
       // A 结论先返回（B 尚未写缓存）：代次一致 + 槽空 → 写入 scope A 结论页。
       releaseVerify();
       await sleep(40);
-      const early = readSessionResult('checkout', { entryKey: labRoot, mode: 'checkout' });
+      const early = readSessionResult('checkout', { scopeKind: 'checkout', entryKey: labRoot, mode: 'checkout' });
       expect((early?.page as { kind: string }).kind).toBe('resumable');
       expect(getResultEpoch('checkout')).toBe(epochBefore);
       // B 的执行器终态随后写入：断言不被写侧校验丢弃、覆盖旧结论页（终槽
       // 为 B 的结果页——「执行器写入同受槽空/同 scope 约束」的实现会让 A
       // 先占空槽、B 的真实新结果被跨 scope 丢弃，本对照由此捕获）。
       const { writeSessionResult } = await import('../src/host/sessionResults');
-      writeSessionResult('checkout', { entryKey: entryB, mode: 'checkout' }, {
+      writeSessionResult('checkout', { scopeKind: 'checkout', entryKey: entryB, mode: 'checkout' }, {
         mode: 'checkout',
         kind: 'success',
         path: join(entryB, 'trunk'),
         revision: 5,
       }, 'executor');
-      const final = readSessionResult('checkout', { entryKey: entryB, mode: 'checkout' });
+      const final = readSessionResult('checkout', { scopeKind: 'checkout', entryKey: entryB, mode: 'checkout' });
       expect((final?.page as { kind: string }).kind).toBe('success');
     } finally {
       rmSync(entryB, { recursive: true, force: true });
@@ -1376,7 +1376,7 @@ describe('P3 检出面板 flow', () => {
     releaseVerify();
     await sleep(60);
     expect(
-      matchReadonlyVerify('checkout', { entryKey: labRoot, mode: 'checkout' }, getResultEpoch('checkout')),
+      matchReadonlyVerify('checkout', { scopeKind: 'checkout', entryKey: labRoot, mode: 'checkout' }, getResultEpoch('checkout')),
     ).toBe(false);
   });
 
@@ -1418,7 +1418,7 @@ describe('P3 检出面板 flow', () => {
     // 见上一条用例，新会话的递增动作才使其失效）。
     releaseVerify();
     await sleep(60);
-    expect(readSessionResult('checkout', { entryKey: labRoot, mode: 'checkout' })).toBeUndefined();
+    expect(readSessionResult('checkout', { scopeKind: 'checkout', entryKey: labRoot, mode: 'checkout' })).toBeUndefined();
     // 重开回表单/草稿恢复，不恢复 resumable 结论页。
     second.dispose();
     await sleep(0);
@@ -1562,7 +1562,7 @@ describe('P3 检出面板 flow', () => {
     const { saveDraft } = await import('../src/host/panel/drafts');
     saveDraft(labRoot, 'checkout', { ...FORM, parentDir: labRoot });
     const { writeSessionResult } = await import('../src/host/sessionResults');
-    writeSessionResult('checkout', { entryKey: labRoot, mode: 'checkout' }, {
+    writeSessionResult('checkout', { scopeKind: 'checkout', entryKey: labRoot, mode: 'checkout' }, {
       mode: 'checkout',
       kind: 'failed',
       path: join(labRoot, 'trunk'),
@@ -1578,7 +1578,7 @@ describe('P3 检出面板 flow', () => {
     const html = lastHtml(panel);
     expect(html).toContain(strings.checkoutPanel.sourceDirLabel);
     expect(getResultEpoch('checkout')).toBe(epochBefore + 1);
-    expect(readSessionResult('checkout', { entryKey: labRoot, mode: 'checkout' })).toBeUndefined();
+    expect(readSessionResult('checkout', { scopeKind: 'checkout', entryKey: labRoot, mode: 'checkout' })).toBeUndefined();
     const { readDraft } = await import('../src/host/panel/drafts');
     expect(readDraft(labRoot, 'checkout')).toBeUndefined();
   });
@@ -1672,7 +1672,7 @@ describe('P3 检出面板 flow', () => {
     await sleep(0);
     await getOperationRegistry().finish('op-import-merged');
     const { writeSessionResult } = await import('../src/host/sessionResults');
-    writeSessionResult('checkout', { entryKey: src, mode: 'import' }, {
+    writeSessionResult('checkout', { scopeKind: 'checkout', entryKey: src, mode: 'import' }, {
       mode: 'import',
       kind: 'merged',
       path: src,
@@ -1695,7 +1695,7 @@ describe('P3 检出面板 flow', () => {
   it('canceled 页因他人记录 writeLocked 时确认切换仍可用（对照：不按笼统 writeLocked 拒绝）', async () => {
     const target = join(labRoot, 'trunk');
     const { writeSessionResult } = await import('../src/host/sessionResults');
-    writeSessionResult('checkout', { entryKey: labRoot, mode: 'checkout' }, {
+    writeSessionResult('checkout', { scopeKind: 'checkout', entryKey: labRoot, mode: 'checkout' }, {
       mode: 'checkout',
       kind: 'canceled',
       path: target,

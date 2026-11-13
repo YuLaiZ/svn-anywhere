@@ -1,5 +1,5 @@
 /**
- * 任务对象注册表：检出/导入与磁盘治理长任务的宿主侧内存态。
+ * 任务对象注册表：检出/导入、磁盘治理与 M4 历史/冲突长任务的宿主侧内存态。
  *
  * 任务对象与面板会话生命周期解耦：任务由面板控制器在发起时创建并注册，
  * 此后即使发起面板已关闭，任务对象仍留在注册表——后台任务由执行器自行
@@ -7,17 +7,21 @@
  * 其当前状态。注册表不持久化，扩展宿主重启后自然为空。
  *
  * 目标作用域在任务创建时由发起方一次性捕获（检出/导入面板 = 本次打开
- * 入口键 + 模式；磁盘治理面板 = 工作副本根），不从任务目标路径推导、
+ * 入口键 + 模式；磁盘治理面板 = 工作副本根；P6 历史 = 目标身份键 + 节点
+ * 类型；P7 冲突 = 工作副本根 + 范围相对路径），不从任务目标路径推导、
  * 也不读面板状态——后台结算时面板可能已销毁，作用域必须是任务对象
  * 自带的稳定值。互斥锁键（lockKey）与操作记录同值、独立携带：作用域
  * 只服务结果缓存寻址与会话绑定，锁键服务写限制判定，两者不是同一值
  * （检出任务的锁键按最终目标路径归一，与打开入口键不同源）。
  *
+ * 作用域使用显式 `scopeKind` 判别，`sameResultScope` 按判别值 switch——
+ * 不靠 `'entryKey' in` 之类的形状猜测，M4 新增作用域与既有作用域互不误判。
+ *
  * 本模块不依赖 vscode API（纯内存注册表），单例跨面板会话持续。
  */
 
-/** 任务所属面板类别：检出/导入共用面板与磁盘治理面板。 */
-export type PanelKind = 'checkout' | 'disk';
+/** 任务所属面板类别：检出/导入共用面板、磁盘治理面板、P6 历史、P7 冲突。 */
+export type PanelKind = 'checkout' | 'disk' | 'history' | 'conflicts';
 
 /**
  * 检出/导入面板的目标作用域：打开入口键 + 模式。入口键是入口路径的
@@ -26,39 +30,77 @@ export type PanelKind = 'checkout' | 'disk';
  * 结果缓存因此不用目标路径寻址。
  */
 export interface CheckoutResultScope {
+  scopeKind: 'checkout';
   entryKey: string;
   mode: 'checkout' | 'import';
 }
 
 /** 磁盘治理面板的目标作用域：工作副本根。 */
 export interface DiskResultScope {
+  scopeKind: 'disk';
   wcRoot: string;
 }
 
-export type ResultScope = CheckoutResultScope | DiskResultScope;
+/**
+ * P6 历史面板的目标作用域：目标身份键 + 节点类型。targetKey 是历史目标
+ * 在宿主侧的稳定身份（远端节点身份或本地路径的作用域键），不是展示文本；
+ * 换目标只切换作用域页，不覆盖旧目标已缓存的终态页。
+ */
+export interface HistoryResultScope {
+  scopeKind: 'history';
+  targetKey: string;
+  targetKind: 'file' | 'dir';
+}
 
-/** 作用域判等：检出/导入比入口键与模式，磁盘治理比副本根；跨类别必不等。 */
+/**
+ * P7 冲突面板的目标作用域：工作副本根 + 范围相对路径（整副本为 '.'）。
+ * 从更新任务进入时 scopeRelPath 是更新目标；整副本扫描仍是同一副本根的
+ * 作用域页，不另造第二个冲突面板作用域。
+ */
+export interface ConflictsResultScope {
+  scopeKind: 'conflicts';
+  wcRoot: string;
+  scopeRelPath: string;
+}
+
+export type ResultScope = CheckoutResultScope | DiskResultScope | HistoryResultScope | ConflictsResultScope;
+
+/**
+ * 作用域判等：按显式 scopeKind 判别后逐字段比较；跨类别必不等。
+ * 不用 `'entryKey' in` 形状猜测——M4 新增作用域不参与形状推断。
+ */
 export function sameResultScope(a: ResultScope, b: ResultScope): boolean {
-  if ('entryKey' in a || 'entryKey' in b) {
-    if (!('entryKey' in a && 'entryKey' in b)) {
-      return false;
-    }
-    return a.entryKey === b.entryKey && a.mode === b.mode;
+  switch (a.scopeKind) {
+    case 'checkout':
+      return b.scopeKind === 'checkout' && a.entryKey === b.entryKey && a.mode === b.mode;
+    case 'disk':
+      return b.scopeKind === 'disk' && a.wcRoot === b.wcRoot;
+    case 'history':
+      return b.scopeKind === 'history' && a.targetKey === b.targetKey && a.targetKind === b.targetKind;
+    case 'conflicts':
+      return b.scopeKind === 'conflicts' && a.wcRoot === b.wcRoot && a.scopeRelPath === b.scopeRelPath;
   }
-  if (!('wcRoot' in a && 'wcRoot' in b)) {
-    return false;
-  }
-  return a.wcRoot === b.wcRoot;
 }
 
 /**
  * 任务执行相位。检出/导入任务走 connecting → running → canceling，
  * 终态由执行器结算（成功/失败/取消等不在注册表枚举内——终态即移除）；
  * 磁盘治理任务走 scanning（扫描）或 connecting → cleaning（清理含自动
- * 复测；changed 等预命令出口同样移除任务对象）。connecting 是写命令
- * 发出前的通用准备态，该窗口不提供用户取消。
+ * 复测；changed 等预命令出口同样移除任务对象）；P6 历史任务走
+ * connecting → updating（更新到指定 revision）或 rescanning（更新未知后的
+ * 同范围回扫）；P7 冲突任务复用 scanning（整副本/范围扫描），单项与批量
+ * resolve 走 connecting → resolving。connecting 是写命令发出前的通用
+ * 准备态，该窗口不提供用户取消。
  */
-export type TaskPhase = 'connecting' | 'running' | 'canceling' | 'scanning' | 'cleaning';
+export type TaskPhase =
+  | 'connecting'
+  | 'running'
+  | 'canceling'
+  | 'scanning'
+  | 'cleaning'
+  | 'updating'
+  | 'rescanning'
+  | 'resolving';
 
 /**
  * 注册表中的任务对象。核心字段在任务创建时一次捕获、此后由执行器按
@@ -101,6 +143,11 @@ const removalSubscriptions = new Map<PanelKind, RemovalSubscription[]>();
  * 先按移除流程收口旧任务（通知其绑定会话重跑恢复）再注册新任务：注册表
  * 不得被悬挂任务堵死成永久 busy。正常运行流程中面板 busy 守卫使替换
  * 不可达，本分支只是防御收口。
+ *
+ * M4 的单任务槽面板（conflicts：scan/单项 resolve/batch 共用同一槽）不走
+ * 本函数做正常注册，改用 claimTask：已有任务时只返回持有者供绑定/提示，
+ * 不替换；批内每项使用 operation record 与任务 extra 中的索引，不创建
+ * 嵌套任务。
  */
 export function addTask(task: TaskObject): void {
   const existing = activeTasks.get(task.panelKind);
@@ -108,6 +155,26 @@ export function addTask(task: TaskObject): void {
     removeTask(existing.taskId);
   }
   activeTasks.set(task.panelKind, task);
+}
+
+/** claimTask 结果：成功带注册的任务；已被占用时带原任务（不替换）。 */
+export type ClaimTaskResult =
+  | { ok: true; task: TaskObject }
+  | { ok: false; heldBy: TaskObject };
+
+/**
+ * 单任务槽 claim（M4 conflicts 等）：仅当该面板类别无活动任务时注册；
+ * 已有任务时不替换、不移除、不通知，原任务原样返回供调用方绑定/提示。
+ * 与 addTask 的防御替换不同——M4 正常路径不得把已有任务顶掉，控制器
+ * 发起前应先以 hasActiveTask 与 operation 占用检查判定。
+ */
+export function claimTask(task: TaskObject): ClaimTaskResult {
+  const existing = activeTasks.get(task.panelKind);
+  if (existing) {
+    return { ok: false, heldBy: existing };
+  }
+  activeTasks.set(task.panelKind, task);
+  return { ok: true, task };
 }
 
 /**
@@ -162,6 +229,21 @@ export function removeTask(taskId: string): boolean {
   }
   notifyRemoval(task);
   return true;
+}
+
+/**
+ * 任务终态结算的统一出口（M4）：先同步执行 writeSessionState（写会话
+ * 缓存/终态页，按任务自带的 resultScope 寻址），成功后才移除任务对象并
+ * 通知绑定会话。写缓存抛错时任务保留（重开仍能回到运行页/重试收口），
+ * 不出现「已移除、未写缓存」的窗口；任务不存在时返回 false 且不写缓存。
+ */
+export function settleTask(taskId: string, writeSessionState: () => void): boolean {
+  const task = getTaskById(taskId);
+  if (!task) {
+    return false;
+  }
+  writeSessionState();
+  return removeTask(taskId);
 }
 
 function notifyRemoval(task: TaskObject): void {

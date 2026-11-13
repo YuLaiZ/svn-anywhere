@@ -515,7 +515,7 @@ describe('清单 §二 running/canceling：执行与取消', () => {
     s = beginTask(s, { opId: 'op-1', targetPath: '/parent/dabs' });
     expect(s.step).toBe('running');
     expect(s.task).toEqual({ phase: 'connecting', currentFile: null, count: 0, opId: 'op-1' });
-    expect(s.binding).toEqual({ resultScope: { entryKey: '/parent', mode: 'checkout' }, targetPath: '/parent/dabs' });
+    expect(s.binding).toEqual({ resultScope: { scopeKind: 'checkout', entryKey: '/parent', mode: 'checkout' }, targetPath: '/parent/dabs' });
     expect(s.result).toBeNull();
     expect(s.review.error).toBeNull();
   });

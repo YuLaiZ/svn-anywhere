@@ -3,17 +3,22 @@
  * 本文件打包进 media/panel.js —— 任何业务对错判断都不写在这里，
  * 也不出现面向用户的文案字面量：界面文案全部来自宿主渲染好的 HTML。
  *
- * 状态保持（技术方案 §2.1/§2.2）：
- * - 宿主推送整段 render 时，先记录输入框值、焦点、光标与列表滚动位置，
- *   替换 DOM 后按稳定 data-focus 标识恢复；
+ * 状态保持（技术方案 §2.1/§2.2/§6）：
+ * - 宿主推送整段 render 时，先记录输入框值、焦点、光标与全部
+ *   `data-scroll-key` 容器的滚动位置（P5 树、P6/P7 左右 pane、表格与
+ *   现有 .list 共用一条通道，不保留第二套列表滚动恢复），替换 DOM 后
+ *   按稳定标识恢复；目标切换时丢弃旧目标的滚动记忆；
  * - 待确认的较新输入不被旧 formRevision 覆盖：本地记录每个字段最后
  *   发送的 inputRevision，宿主 render 的 formRevision 更旧时保留本地值；
  *   宿主在 ready 握手递增 viewEpoch，视图收到新代次帧即重置确认空间
  *   （webview 重建后宿主旧的大 formRevision 不会误确认新视图的输入）；
+ * - 筛选面板文本输入做短防抖后发送 setHistoryFilter(id, value)，select/
+ *   date 变化立即提交；组合输入期间不发送中间值；
  * - 输入事件同步值与输入序号，宿主随即回推整段渲染（加入按钮、字数等
  *   派生展示随输入更新）；输入法组合期间的渲染暂存到组合结束再应用，
  *   会话切换帧清空组合态（旧控件的 compositionend 不再冒泡到根）；
  * - 快捷动作不抢占输入法组合（compositionstart..end）；
+ * - toast 是纯提示：pointer-events:none 且位于页脚之前，不拦截页脚按钮；
  * - 事件守卫与 DOM 禁用一致：disabled 控件不产生意图。
  */
 
@@ -46,6 +51,17 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
   /** 视图已发送、宿主尚未在 render 中确认的输入（防旧序号回退）。 */
   const pendingInputs = new Map<string, PendingInput>();
   const toastTimers: number[] = [];
+  /**
+   * 滚动位置快照：按 data-scroll-key 统一管理 P5 树、P6/P7 左右 pane、
+   * 历史表格与现有 .list（不保留第二套列表滚动恢复）。键在同一会话内
+   * 跨整段重绘保持；切换目标时清空，避免旧目标的滚动落到新目标。
+   */
+  const scrollPositions = new Map<string, { top: number; left: number }>();
+  /** 筛选字段输入短防抖：键 = 字段 ID；值变化最终发送稳定 id/value。 */
+  const filterTimers = new Map<string, number>();
+  /** 防抖期间待发送的字段值：整段重绘后与宿主值不一致则丢弃（宿主权威）。 */
+  const pendingFilters = new Map<string, string>();
+  const FILTER_DEBOUNCE_MS = 200;
 
   const send = (message: unknown): void => {
     if (!disposed) {
@@ -83,6 +99,14 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
       // 会发出恒定值；勾选态单通道由 change 事件派生（见 onChange）。
       return;
     }
+    // 折叠筛选文本字段：短防抖后发送 setHistoryFilter（组合期间不发中间值）。
+    const filterFieldId = target.dataset.filterFieldId;
+    if (filterFieldId !== undefined) {
+      if (target.dataset.intent === 'setHistoryFilter' && !target.hasAttribute('disabled') && !isComposing) {
+        scheduleFilterValue(filterFieldId, 'value' in target ? String(target.value) : '');
+      }
+      return;
+    }
     const fieldId = target.dataset.fieldId;
     if (!fieldId || target.hasAttribute('disabled')) {
       return;
@@ -104,6 +128,57 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
     });
   };
 
+  /**
+   * 折叠筛选字段（P6）：文本输入做短防抖，select/date 变化立即提交。
+   * 视图只发送稳定字段 ID 与值，不解释筛选业务条件；输入法组合期间不
+   * 发送中间值（compositionend 后按最终值调度）。
+   */
+  const cancelFilterTimer = (fieldId: string): void => {
+    const timer = filterTimers.get(fieldId);
+    if (timer !== undefined) {
+      doc.defaultView?.clearTimeout(timer);
+      filterTimers.delete(fieldId);
+    }
+  };
+
+  const flushFilterValue = (fieldId: string, value: string): void => {
+    cancelFilterTimer(fieldId);
+    pendingFilters.delete(fieldId);
+    sendIntent({ kind: 'setHistoryFilter', id: fieldId, value });
+  };
+
+  const scheduleFilterValue = (fieldId: string, value: string): void => {
+    cancelFilterTimer(fieldId);
+    pendingFilters.set(fieldId, value);
+    const timer = doc.defaultView?.setTimeout(() => {
+      filterTimers.delete(fieldId);
+      if (pendingFilters.get(fieldId) !== value) {
+        return;
+      }
+      pendingFilters.delete(fieldId);
+      sendIntent({ kind: 'setHistoryFilter', id: fieldId, value });
+    }, FILTER_DEBOUNCE_MS);
+    if (timer !== undefined) {
+      filterTimers.set(fieldId, timer);
+    }
+  };
+
+  /**
+   * 面板级筛选动作（如清空筛选）是宿主权威操作：取消该面板所有待发
+   * 防抖，避免迟到输入把刚清空的筛选又改回去。
+   */
+  const cancelFilterPanelDebounces = (panelId: string): void => {
+    for (const fieldId of [...pendingFilters.keys()]) {
+      const selector =
+        `[data-filter-field-id="${cssEscape(fieldId)}"]` +
+        `[data-filter-panel-id="${cssEscape(panelId)}"]`;
+      if (root.querySelector(selector)) {
+        cancelFilterTimer(fieldId);
+        pendingFilters.delete(fieldId);
+      }
+    }
+  };
+
   /** 输入法组合态：compositionstart 置位、compositionend 复位；组合期间不触发快捷动作。 */
   let isComposing = false;
   /** 组合期间暂存的最新同会话渲染（宿主输入即回推后，组合中不整段替换 DOM）。 */
@@ -122,9 +197,60 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
       case 'toggleRow':
       case 'toggleGroup':
       case 'toggleTree':
+      case 'toggleHistoryRevision':
       case 'setFilter':
+      case 'setHistoryFilter':
       case 'syncInput':
         // 复选框/下拉/表格筛选的值变化由 change 事件负责；click 只做禁用守卫。
+        return;
+      case 'selectBrowserNode':
+      case 'toggleBrowserNode':
+      case 'retryBrowserNode':
+      case 'refreshBrowserNode':
+      case 'loadMoreBrowserNode':
+      case 'copyBrowserNodeUrl':
+      case 'openRemoteNode':
+      case 'openHistoryFromBrowser':
+        // P5 节点动作只带稳定节点 ID；宿主映射目标与请求代次。
+        sendIntent({ kind: intent, nodeId: holder.dataset.nodeId ?? '' });
+        return;
+      case 'selectHistoryRevision':
+        // P6 行选中只更新详情，不改变勾选集合。
+        sendIntent({ kind: 'selectHistoryRevision', id: holder.dataset.rowId ?? '' });
+        return;
+      case 'setConflictTab':
+        // P7 分组 tab 只传 tab ID（协议字段 tab），冲突分组语义由宿主解释。
+        sendIntent({ kind: 'setConflictTab', tab: holder.dataset.tabId ?? '' });
+        return;
+      case 'refreshHistoryUpper':
+        // 枚举参数只转发稳定值（head/base-fallback）；非法值由协议层拒绝。
+        sendIntent({ kind: 'refreshHistoryUpper', mode: holder.dataset.mode ?? '' });
+        return;
+      case 'chooseConflictVariant':
+        sendIntent({ kind: 'chooseConflictVariant', value: holder.dataset.value ?? '' });
+        return;
+      case 'rescanConflicts':
+        sendIntent({ kind: 'rescanConflicts', scope: holder.dataset.scope ?? '' });
+        return;
+      case 'openConflictVersion':
+        sendIntent({ kind: 'openConflictVersion', role: holder.dataset.role ?? '' });
+        return;
+      case 'selectConflict':
+      case 'selectCompareCandidate':
+        sendIntent({
+          kind: intent as 'selectConflict' | 'selectCompareCandidate',
+          id: holder.dataset.rowId ?? holder.dataset.itemId ?? '',
+        });
+        return;
+      case 'copyConflictPath':
+        sendIntent({ kind: 'copyConflictPath', id: holder.dataset.rowId ?? holder.dataset.itemId ?? '' });
+        return;
+      case 'copyHistoryText':
+        sendIntent({
+          kind: 'copyHistoryText',
+          copyKind: holder.dataset.copyKind ?? '',
+          id: holder.dataset.rowId ?? holder.dataset.itemId ?? '',
+        });
         return;
       case 'openDiff':
       case 'openFile':
@@ -204,6 +330,10 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
     if (!holder || holder.hasAttribute('disabled') || (holder instanceof HTMLInputElement && holder.disabled)) {
       return;
     }
+    // 面板级筛选动作（清空筛选等）优先取消该面板的待发防抖输入。
+    if (holder.dataset.filterPanel !== undefined) {
+      cancelFilterPanelDebounces(holder.dataset.filterPanel);
+    }
     forwardClickIntent(holder);
   };
 
@@ -233,6 +363,21 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
         sendIntent({ kind: 'toggleTree', nodeId: target.dataset.nodeId ?? '', selected: target.checked });
         return;
       }
+      if (intent === 'toggleHistoryRevision') {
+        // 协议契约为 toggleHistoryRevision(id)：宿主按 id 切换，视图不回传
+        // selected（勾选态以宿主渲染为准，避免两份真相）。
+        sendIntent({ kind: 'toggleHistoryRevision', id: target.dataset.rowId ?? '' });
+        return;
+      }
+    }
+    // 折叠筛选的 select/date 变化：清除同字段防抖并立即提交最终值。
+    if (intent === 'setHistoryFilter') {
+      const filterFieldId = target.dataset.filterFieldId;
+      if (filterFieldId !== undefined) {
+        const value = 'value' in target ? String(target.value) : '';
+        flushFilterValue(filterFieldId, value);
+      }
+      return;
     }
     // 表格文本筛选（无 data-field-id，不进输入同步通道）与下拉筛选同走
     // setFilter：值变化即发送，宿主重算切片后整帧重推。
@@ -277,10 +422,36 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
     focusKey: string | null;
     selectionStart: number | null;
     selectionEnd: number | null;
-    listScroll: number;
   }
 
+  /**
+   * 重绘前记录所有 data-scroll-key 容器的滚动位置（P5 树、P6/P7 左右
+   * pane、历史表格与现有 .list 统一走这一条通道，不保留第二套列表滚动）。
+   */
+  const captureScrollPositions = (): void => {
+    for (const element of root.querySelectorAll<HTMLElement>('[data-scroll-key]')) {
+      const key = element.dataset.scrollKey;
+      if (!key) {
+        continue;
+      }
+      scrollPositions.set(key, { top: element.scrollTop, left: element.scrollLeft });
+    }
+  };
+
+  const restoreScrollPositions = (): void => {
+    for (const element of root.querySelectorAll<HTMLElement>('[data-scroll-key]')) {
+      const key = element.dataset.scrollKey;
+      const point = key ? scrollPositions.get(key) : undefined;
+      if (!key || !point) {
+        continue;
+      }
+      element.scrollTop = point.top;
+      element.scrollLeft = point.left;
+    }
+  };
+
   const captureState = (): FocusSnapshot => {
+    captureScrollPositions();
     const active = doc.activeElement instanceof HTMLElement ? doc.activeElement : null;
     const editing =
       active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement ? active : null;
@@ -288,15 +459,11 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
       focusKey: active?.dataset.focus ?? null,
       selectionStart: editing ? editing.selectionStart : null,
       selectionEnd: editing ? editing.selectionEnd : null,
-      listScroll: root.querySelector<HTMLElement>('.list')?.scrollTop ?? 0,
     };
   };
 
   const restoreState = (snapshot: FocusSnapshot): void => {
-    const list = root.querySelector<HTMLElement>('.list');
-    if (list) {
-      list.scrollTop = snapshot.listScroll;
-    }
+    restoreScrollPositions();
     if (!snapshot.focusKey) {
       return;
     }
@@ -320,9 +487,37 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
     }
   };
 
-  const applyRender = (html: string, formRevision: number): void => {
+  const applyRender = (html: string, formRevision: number, sessionChanged = false): void => {
     const snapshot = captureState();
+    if (sessionChanged) {
+      // 目标切换：捕获只是为了新旧 DOM 对齐，旧目标的滚动记忆必须丢弃。
+      scrollPositions.clear();
+    }
     root.innerHTML = html;
+    // 视图更新的输入不回退：宿主 formRevision 落后于本地未确认输入时，
+    // 保留本地值并重新对齐光标。
+    for (const field of pendingInputs.keys()) {
+      const pending = pendingInputs.get(field);
+      if (!pending || formRevision >= pending.inputRevision) {
+        pendingInputs.delete(field);
+        continue;
+      }
+      const control = root.querySelector<HTMLElement>(`[data-field-id="${cssEscape(field)}"]`);
+      if (control instanceof HTMLInputElement && control.type === 'checkbox') {
+        // 勾选字段的待确认值是 'true'|'false' 派生串：恢复到 checked 态。
+        control.checked = pending.value === 'true';
+      } else if (control instanceof HTMLInputElement || control instanceof HTMLTextAreaElement) {
+        control.value = pending.value;
+      }
+    }
+    // 防抖窗口内的筛选文本同样以本地值为准，避免宿主较早回显覆盖用户输入；
+    // 面板级清空动作会先取消 pendingFilters，不再回填。
+    for (const [fieldId, value] of pendingFilters) {
+      const control = root.querySelector<HTMLElement>(`[data-filter-field-id="${cssEscape(fieldId)}"]`);
+      if (control instanceof HTMLInputElement || control instanceof HTMLSelectElement) {
+        control.value = value;
+      }
+    }
     // 视图更新的输入不回退：宿主 formRevision 落后于本地未确认输入时，
     // 保留本地值并重新对齐光标。
     for (const field of pendingInputs.keys()) {
@@ -370,7 +565,15 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
     host.className = `toast ${level === 'error' ? 'error' : 'info'}`;
     host.setAttribute('role', 'status');
     host.textContent = message;
-    root.prepend(host);
+    // 纯提示不拦截鼠标：pointer-events:none 让页脚主按钮等下层控件立即可点；
+    // 元素放在页脚之前的文档流里，提示出现在页脚上方且不遮挡按钮命中区。
+    host.style.pointerEvents = 'none';
+    const footer = root.querySelector<HTMLElement>('.footer');
+    if (footer?.parentElement) {
+      footer.parentElement.insertBefore(host, footer);
+    } else {
+      root.prepend(host);
+    }
     const timer = doc.defaultView?.setTimeout(() => {
       host.remove();
     }, 4000);
@@ -388,8 +591,13 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
       const nextSessionId = String(message.sessionId ?? '');
       const sessionChanged = nextSessionId !== currentSessionId;
       if (sessionChanged) {
-        // 目标切换：上一会话的折叠状态不带入新目标。
+        // 目标切换：上一会话的折叠状态与待发筛选值不带入新目标
+        // （滚动记忆在 applyRender 捕获旧 DOM 后清空）。
         foldedNavKeys.clear();
+        for (const timer of filterTimers.values()) {
+          doc.defaultView?.clearTimeout(timer);
+        }
+        filterTimers.clear();
         // 旧输入控件已随 DOM 替换，其 compositionend 不会再冒泡到根节点：
         // 清除组合态并丢弃旧会话暂存帧，新目标后续渲染照常上屏。
         isComposing = false;
@@ -414,7 +622,7 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
         pendingComposingRender = String(message.html ?? '');
         return;
       }
-      applyRender(String(message.html ?? ''), lastFormRevision);
+      applyRender(String(message.html ?? ''), lastFormRevision, sessionChanged);
       return;
     }
     if (message.type === 'toast') {
@@ -452,6 +660,10 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
       for (const timer of toastTimers) {
         doc.defaultView?.clearTimeout(timer);
       }
+      for (const timer of filterTimers.values()) {
+        doc.defaultView?.clearTimeout(timer);
+      }
+      filterTimers.clear();
     },
   };
 }

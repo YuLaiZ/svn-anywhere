@@ -255,9 +255,9 @@ function sessionScopeBaseline(): CheckoutResultScope {
     return session.binding.resultScope;
   }
   if (session) {
-    return { entryKey: session.entry.entryKey, mode: session.mode };
+    return { scopeKind: 'checkout', entryKey: session.entry.entryKey, mode: session.mode };
   }
-  return { entryKey: '', mode: 'checkout' };
+  return { scopeKind: 'checkout', entryKey: '', mode: 'checkout' };
 }
 
 /**
@@ -645,7 +645,7 @@ async function recoverSession(sessionId: string, entry: CheckoutOpenEntry, entry
   // 跨入口打开都回到任务当前状态；跨入口打开的会话绑定任务的 resultScope，
   // 页头/写限制/动作对象不以本次打开入口混判）。
   const task = getActiveTask('checkout');
-  let baseline: CheckoutResultScope = { entryKey, mode: entry.mode };
+  let baseline: CheckoutResultScope = { scopeKind: 'checkout', entryKey, mode: entry.mode };
   if (task) {
     const scope = task.resultScope as CheckoutResultScope;
     // 页头目标优先取记录 targetPath（begin 已落盘后可用），准备窗口回退锁键
@@ -709,7 +709,7 @@ async function recoverSession(sessionId: string, entry: CheckoutOpenEntry, entry
         ...state,
         mode: 'import',
         entry: { ...state.entry, mode: 'import' },
-        binding: { resultScope: { entryKey, mode: 'import' }, targetPath: page.path },
+        binding: { resultScope: { scopeKind: 'checkout', entryKey, mode: 'import' }, targetPath: page.path },
       };
       importVerifySnapshotFailed = false;
       session = state;
@@ -724,7 +724,7 @@ async function recoverSession(sessionId: string, entry: CheckoutOpenEntry, entry
       ...state,
       mode: 'checkout',
       entry: { ...state.entry, mode: 'checkout' },
-      binding: { resultScope: { entryKey, mode: 'checkout' }, targetPath: record.targetPath },
+      binding: { resultScope: { scopeKind: 'checkout', entryKey, mode: 'checkout' }, targetPath: record.targetPath },
     };
     session = state;
     pushRender();
@@ -1189,7 +1189,7 @@ async function handleStartCheckout(sessionId: string): Promise<void> {
     pushRender();
     return;
   }
-  const scope: CheckoutResultScope = { entryKey: s.entry.entryKey, mode: 'checkout' };
+  const scope: CheckoutResultScope = { scopeKind: 'checkout', entryKey: s.entry.entryKey, mode: 'checkout' };
   bumpResultEpoch('checkout');
   clearDraft(scope.entryKey, scope.mode);
   const formSnapshot = toDraft(s);
@@ -1833,7 +1833,7 @@ async function handleStartImport(sessionId: string): Promise<void> {
   const nameMode = s.form.nameMode;
   const parentUrl = parentUrlOf(url);
   const parentIdentity = s.review.parentIdentity;
-  const scope: CheckoutResultScope = { entryKey: s.entry.entryKey, mode: 'import' };
+  const scope: CheckoutResultScope = { scopeKind: 'checkout', entryKey: s.entry.entryKey, mode: 'import' };
   const basisSnapshot = s.review.snapshot;
   const basisDigest = basisSnapshot ? snapshotDigest(basisSnapshot) : null;
 

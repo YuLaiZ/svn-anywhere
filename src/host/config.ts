@@ -5,6 +5,7 @@
 import * as vscode from 'vscode';
 import type { CheckoutDepth } from '../core/checkout';
 import { DEFAULT_ENCODING_FALLBACK, DEFAULT_OUTPUT_ENCODING } from '../core/encoding';
+import { DEFAULT_HISTORY_PAGE_SIZE, normalizeHistoryPageSize } from '../core/history';
 import { DEFAULT_TIMEOUT_MS } from '../core/svnCli';
 
 export function getConfiguration(): vscode.WorkspaceConfiguration {
@@ -57,6 +58,15 @@ export function readCheckoutDefaultDepth(): CheckoutDepth {
   return typeof raw === 'string' && CHECKOUT_DEPTHS.includes(raw as CheckoutDepth)
     ? (raw as CheckoutDepth)
     : 'infinity';
+}
+
+/**
+ * 历史面板每批加载条数（P6）：只接受 20/50/100，类型非法或越界值回退
+ * 默认 50（与 core/history 的 normalizeHistoryPageSize 同一口径）。
+ */
+export function readHistoryPageSize(): number {
+  const raw: unknown = getConfiguration().get('historyPageSize', DEFAULT_HISTORY_PAGE_SIZE);
+  return normalizeHistoryPageSize(raw);
 }
 
 /** svn 输出解码设置：主编码与回退链（编码 label 不区分大小写）。 */

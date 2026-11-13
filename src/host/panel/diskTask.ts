@@ -220,7 +220,7 @@ export function startDiskScan(input: StartDiskScanInput): StartedDiskScan {
     taskId: randomOperationId(),
     panelKind: 'disk',
     phase: 'scanning',
-    resultScope: { wcRoot: input.wcRoot },
+    resultScope: { scopeKind: 'disk', wcRoot: input.wcRoot },
     lockKey: input.wcRoot,
     subPath: input.subPath,
     initiatorSessionId: input.initiatorSessionId,
@@ -253,7 +253,7 @@ async function runScanTaskFlow(task: DiskScanTask, input: StartDiskScanInput, sv
   // 结算顺序（§2.1）：先写结果缓存（executor 一律写入）、再按出口⑩终结
   // 保留中的 vacuum 未决记录、最后移除任务对象（同一结算段内完成——重开
   // 绑定会话经任务移除通知重跑三段时缓存已就绪）。
-  writeSessionResult('disk', { wcRoot: input.wcRoot }, scanOutcomeCache(outcome, input.scanEpoch), 'executor');
+  writeSessionResult('disk', { scopeKind: 'disk', wcRoot: input.wcRoot }, scanOutcomeCache(outcome, input.scanEpoch), 'executor');
   if (outcome.kind !== 'scanCanceled') {
     // 重新检测完成（ready/partial/scanError）即终结记录（§2.2 vacuum 行：
     // unknown 与 failed-unconfirmed 都终结；scanCanceled 未完成检测、记录保留）。
@@ -412,7 +412,7 @@ export function startVacuumTask(input: StartVacuumTaskInput): StartedVacuumTask 
     taskId: randomOperationId(),
     panelKind: 'disk',
     phase: 'connecting',
-    resultScope: { wcRoot: input.wcRoot },
+    resultScope: { scopeKind: 'disk', wcRoot: input.wcRoot },
     lockKey: input.wcRoot,
     subPath: input.baseState.subPath,
     initiatorSessionId: input.initiatorSessionId,

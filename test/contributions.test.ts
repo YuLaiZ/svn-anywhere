@@ -6,12 +6,16 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { DEFAULT_HISTORY_PAGE_SIZE, HISTORY_PAGE_SIZES } from '../src/core/history';
 import { strings } from '../src/host/i18n';
 
 interface Manifest {
   contributes: {
     commands: Array<{ command: string; title: string; category?: string }>;
     submenus?: Array<{ id: string; label: string }>;
+    configuration?: {
+      properties: Record<string, { type?: string; enum?: unknown[]; default?: unknown; description?: string }>;
+    };
   };
 }
 
@@ -41,6 +45,28 @@ describe('贡献点与 i18n 命令标签一致性', () => {
     expect(pkg.contributes.submenus).toEqual([{ id: 'svnAnywhere.submenu', label: 'SVN Anywhere' }]);
     for (const c of pkg.contributes.commands) {
       expect(c.category, `${c.command} 的 category 不是 SVN Anywhere`).toBe('SVN Anywhere');
+    }
+  });
+});
+
+describe('配置贡献点（M4 新增 historyPageSize）', () => {
+  const properties = pkg.contributes.configuration?.properties ?? {};
+
+  it('historyPageSize 已登记且类型为 number', () => {
+    const prop = properties['svnAnywhere.historyPageSize'];
+    expect(prop).toBeDefined();
+    expect(prop?.type).toBe('number');
+  });
+
+  it('historyPageSize 的可选值与默认值与 core/history 常量一致', () => {
+    const prop = properties['svnAnywhere.historyPageSize'];
+    expect(prop?.enum).toEqual([...HISTORY_PAGE_SIZES]);
+    expect(prop?.default).toBe(DEFAULT_HISTORY_PAGE_SIZE);
+  });
+
+  it('所有配置项都带非空 description（设置页可读）', () => {
+    for (const [key, prop] of Object.entries(properties)) {
+      expect(prop.description, `${key} 缺少 description`).toBeTruthy();
     }
   });
 });

@@ -209,6 +209,27 @@ export interface TableRowSpec {
   id: string;
   cells: Record<string, string>;
   actions?: ActionSpec[];
+  /** 行勾选态（仅在 TableSpec.selection 存在时渲染复选框）。 */
+  selected?: boolean;
+  /** 不可勾选的行（如 revision 节点不存在/无权限）；原因给 title 与 aria-label。 */
+  disabled?: boolean;
+  disabledReason?: string;
+  /** 勾选框的可访问名称（宿主 i18n；缺省回退行 ID，不伪造业务语义）。 */
+  selectionLabel?: string;
+}
+
+/**
+ * 表格选择契约（P6 revision 勾选）：
+ * - 'revision' 允许最多两项（硬上限 2，第三个选择由宿主提示）；
+ * - 'single' 只允许一项，选新行自动清旧行。
+ * 纯函数 applyTableSelection 是勾选上限的最后一道防线，视图与宿主共用。
+ */
+export interface TableSelectionSpec {
+  mode: 'revision' | 'single';
+  /** 最大可选数：revision 模式缺省 2 且不超过 2；single 模式固定 1。 */
+  maxSelected?: number;
+  /** 勾选列头的可访问名称（宿主 i18n；缺省只渲染空表头）。 */
+  ariaLabel?: string;
 }
 
 /**
@@ -222,9 +243,30 @@ export interface TableSpec {
   /** 当前排序（渲染指示用；切片在宿主侧完成）。 */
   sort: { key: string; direction: 'asc' | 'desc' };
   filters?: TableFilterSpec[];
-  /** 分页：page 从 1 起；total 为筛选后总数、pageCount 为筛选后总页数。 */
-  pagination: { page: number; pageSize: number; total: number; pageCount: number };
+  /**
+   * 分页：page 从 1 起；total 为筛选后总数、pageCount 为筛选后总页数。
+   * mode='append'（P6 历史累计展示）固定 page=1/pageCount=1，rows 为当前
+   * 已展示前缀，total=visibleMatched，pageSize=max(1, displayedCount)；
+   * renderer 不渲染上一页/下一页，只渲染外部“加载更多”动作，历史列表
+   * 不因翻页覆盖已展示记录。缺省 'page' 保持既有表格行为。
+   */
+  pagination: {
+    page: number;
+    pageSize: number;
+    total: number;
+    pageCount: number;
+    mode?: 'page' | 'append';
+  };
   rows: TableRowSpec[];
+  /** 勾选契约（P6 revision 勾选）；缺省不渲染勾选列。 */
+  selection?: TableSelectionSpec;
+  /**
+   * 行点击选中/查看详情的意图名（缺省 selectHistoryRevision：P6 历史行
+   * 只更新详情）。比较候选表等复用同一表格时可覆盖为对应冻结动作。
+   */
+  rowSelectIntent?: string;
+  /** append 模式的“加载更多”外部动作（意图只带稳定 ID，宿主自行切片）。 */
+  loadMoreAction?: ActionSpec;
   /** 无任何条目时的空态。 */
   empty: { title: string; detail?: string };
   /** 有条目但筛选后无匹配的空态。 */
@@ -302,32 +344,13 @@ export function sliceTableRows<R extends TableRowSpec>(
   page: number,
   pageSize: number,
 ): TableSlice<R> {
-  const active = (filters ?? []).filter((filter) =>
-    filter.kind === 'select' ? filter.value !== 'all' : filter.value !== '',
-  );
-  const matched = items.filter(({ row }) =>
-    active.every((filter) => {
-      const cell = row.cells[filter.cellKey] ?? '';
-      return filter.kind === 'select'
-        ? cell === filter.value
-        : cell.toLowerCase().includes(filter.value.toLowerCase());
-    }),
-  );
-  const column = columns.find((candidate) => candidate.key === sort.key);
-  const direction = sort.direction === 'desc' ? -1 : 1;
-  const sorted = matched
-    .map((item, index) => ({ item, index }))
-    .sort((left, right) => {
-      const compared = compareByColumn(left.item, right.item, sort.key, column?.sortType);
-      return compared !== 0 ? compared * direction : left.index - right.index;
-    })
-    .map(({ item }) => item);
+  const sorted = filteredSortedRows(items, columns, sort, filters);
   const safePageSize = pageSize > 0 ? pageSize : 1;
   const pageCount = Math.max(1, Math.ceil(sorted.length / safePageSize));
   const safePage = Math.min(Math.max(1, Math.floor(page)), pageCount);
   const start = (safePage - 1) * safePageSize;
   return {
-    rows: sorted.slice(start, start + safePageSize).map(({ row }) => row),
+    rows: sorted.slice(start, start + safePageSize),
     total: sorted.length,
     pageCount,
     page: safePage,
@@ -354,6 +377,291 @@ function compareByColumn(
 function toNumber(value: string | number | undefined): number {
   const parsed = typeof value === 'number' ? value : Number(value);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/** 筛选与排序后的完整行序列（append 切片与宿主计数共用的纯逻辑）。 */
+function filteredSortedRows<R extends TableRowSpec>(
+  items: readonly SortableTableRow<R>[],
+  columns: readonly TableColumnSpec[],
+  sort: { key: string; direction: 'asc' | 'desc' },
+  filters: readonly TableFilterSpec[] | undefined,
+): R[] {
+  const active = (filters ?? []).filter((filter) =>
+    filter.kind === 'select' ? filter.value !== 'all' : filter.value !== '',
+  );
+  const matched = items.filter(({ row }) =>
+    active.every((filter) => {
+      const cell = row.cells[filter.cellKey] ?? '';
+      return filter.kind === 'select'
+        ? cell === filter.value
+        : cell.toLowerCase().includes(filter.value.toLowerCase());
+    }),
+  );
+  const column = columns.find((candidate) => candidate.key === sort.key);
+  const direction = sort.direction === 'desc' ? -1 : 1;
+  return matched
+    .map((item, index) => ({ item, index }))
+    .sort((left, right) => {
+      const compared = compareByColumn(left.item, right.item, sort.key, column?.sortType);
+      return compared !== 0 ? compared * direction : left.index - right.index;
+    })
+    .map(({ item }) => item.row);
+}
+
+/**
+ * append 模式切片（P6 历史累计展示）：rows 恒为当前已展示前缀
+ * （displayedCount 条），total 为筛选后总数；page/pageCount 固定 1，
+ * pageSize=max(1, displayedCount)。历史列表不能退化成翻页覆盖。
+ */
+export function appendTableRows<R extends TableRowSpec>(
+  items: readonly SortableTableRow<R>[],
+  columns: readonly TableColumnSpec[],
+  sort: { key: string; direction: 'asc' | 'desc' },
+  filters: readonly TableFilterSpec[] | undefined,
+  displayedCount: number,
+): TableSlice<R> {
+  const sorted = filteredSortedRows(items, columns, sort, filters);
+  const shown = Number.isFinite(displayedCount) ? Math.max(0, Math.floor(displayedCount)) : 0;
+  return {
+    rows: sorted.slice(0, shown),
+    total: sorted.length,
+    pageCount: 1,
+    page: 1,
+  };
+}
+
+/**
+ * append 模式的 TableSpec.pagination 构造：固定 page=1/pageCount=1，
+ * pageSize=max(1, displayedCount)，模式标记 append（renderer 据此不渲染
+ * 上一页/下一页，只渲染外部“加载更多”）。
+ */
+export function appendPagination(total: number, displayedCount: number): TableSpec['pagination'] {
+  return {
+    page: 1,
+    pageCount: 1,
+    total,
+    pageSize: Math.max(1, Math.floor(displayedCount)),
+    mode: 'append',
+  };
+}
+
+/** 表格选择上限：revision 模式硬上限 2；single 固定 1。 */
+export function tableSelectionLimit(selection: TableSelectionSpec): number {
+  if (selection.mode === 'single') {
+    return 1;
+  }
+  const declared = selection.maxSelected ?? 2;
+  return Math.max(1, Math.min(2, Math.floor(declared)));
+}
+
+export interface TableSelectionResult {
+  table: TableSpec;
+  /** 状态是否变化（未变化返回原 TableSpec 引用，便于 reducer 保持幂等）。 */
+  changed: boolean;
+  /** 是否因超过选择上限被拒绝（宿主据此提示，不改勾选与详情）。 */
+  limitReached: boolean;
+}
+
+/**
+ * 表格行勾选（纯函数，视图事件与宿主共用同一上限规则）：
+ * - single 模式选中新行自动取消旧行；
+ * - revision 模式最多两项，第三个选择返回 limitReached 且状态不变；
+ * - 未知行、disabled 行与重复状态不改变状态。
+ */
+export function applyTableSelection(table: TableSpec, rowId: string, selected: boolean): TableSelectionResult {
+  const selection = table.selection;
+  if (!selection) {
+    return { table, changed: false, limitReached: false };
+  }
+  const row = table.rows.find((candidate) => candidate.id === rowId);
+  if (!row || row.disabled) {
+    return { table, changed: false, limitReached: false };
+  }
+  if ((row.selected ?? false) === selected) {
+    return { table, changed: false, limitReached: false };
+  }
+  if (selected) {
+    // single 模式是替换语义：即使已有一项也允许选新行（旧行自动取消）。
+    if (selection.mode === 'single') {
+      return {
+        table: {
+          ...table,
+          rows: table.rows.map((candidate) =>
+            candidate.id === rowId
+              ? { ...candidate, selected: true }
+              : candidate.selected
+                ? { ...candidate, selected: false }
+                : candidate,
+          ),
+        },
+        changed: true,
+        limitReached: false,
+      };
+    }
+    const limit = tableSelectionLimit(selection);
+    const selectedCount = table.rows.filter((candidate) => candidate.selected && !candidate.disabled).length;
+    if (selectedCount >= limit) {
+      return { table, changed: false, limitReached: true };
+    }
+  }
+  return {
+    table: {
+      ...table,
+      rows: table.rows.map((candidate) =>
+        candidate.id === rowId ? { ...candidate, selected } : candidate,
+      ),
+    },
+    changed: true,
+    limitReached: false,
+  };
+}
+
+/** 当前勾选的表格行 ID（按行序），宿主据此构建比较对。 */
+export function selectedTableRowIds(table: TableSpec): string[] {
+  return table.rows.filter((row) => row.selected).map((row) => row.id);
+}
+
+/* ------------------------- M4 通用面板组件契约 ------------------------- */
+
+/**
+ * P5 懒加载树节点：只承载当前层已加载节点（宿主每次最多发送 40 项），
+ * 展开、选中、重试分别是独立意图；展开不等于选中，选中才更新详情。
+ */
+export interface LazyTreeRowSpec {
+  /** 稳定节点 ID（宿主派生，不含凭据；视图回传时不带路径）。 */
+  id: string;
+  /** 条目展示名（原始名称，不 trim）。 */
+  label: string;
+  kind: 'dir' | 'file' | 'symlink' | 'unknown';
+  /** 层级（0 起，仅影响缩进）。 */
+  depth: number;
+  phase: 'idle' | 'loading' | 'ready' | 'error';
+  /** 已加载子项数（目录 ready；不得用首批数量冒充总数）。 */
+  loaded?: number;
+  /** 精确直属总数（目录 ready；与 loaded 分开显示）。 */
+  total?: number;
+  /** 两段式元数据补全状态（大目录：名称首屏 + 元数据按需/后台补全）。 */
+  metadata?: 'complete' | 'pending' | 'filling' | 'cancelled';
+  /** 元数据补全进度（filling 时；completed / total）。 */
+  metadataProgress?: { completed: number; total: number };
+  expanded?: boolean;
+  selected?: boolean;
+  /** 节点状态文案（宿主 i18n：加载中/读取失败/已读取 40 / 总计 1,284）。 */
+  statusText?: string;
+  /** 展开按钮可访问名称（宿主 i18n；缺省不设置 aria-label）。 */
+  expandLabel?: string;
+  /** 选择按钮可访问名称（宿主 i18n；缺省用展示名）。 */
+  selectLabel?: string;
+  /** 节点行内动作（重试/刷新/复制 URL 等，意图只带稳定 ID）。 */
+  actions?: ActionSpec[];
+  /** 已加载子节点（仅展开层的切片，不递归未读取内容）。 */
+  children?: LazyTreeRowSpec[];
+}
+
+/** P5 当前层懒加载树（无复选框选择树：行 DOM/转义/滚动复用既有实现）。 */
+export interface LazyTreeSpec {
+  id: string;
+  /** 树容器可访问名称（宿主 i18n）。 */
+  ariaLabel?: string;
+  rows: LazyTreeRowSpec[];
+  /** 无节点空态。 */
+  empty: { title: string; detail?: string };
+  /** “加载更多”动作（宿主切片，每次最多 40 项；意图只带稳定 ID）。 */
+  loadMoreAction?: ActionSpec;
+  /** 根目录首读进行中（不确定进度条）。 */
+  busy?: boolean;
+}
+
+/**
+ * 主从布局：只负责左右/上下（窄容器）布局，不承载业务语义；
+ * 主区内容来自 lazyTree/table/list，详情内容由 DetailSpec 生成。
+ * P5/P6 用 master-detail（左主右窄详情），P7 用 balanced（左右对半）。
+ */
+export interface MasterDetailSpec {
+  layout: 'master-detail' | 'balanced';
+  /** 主区标题（宿主 i18n）。 */
+  masterLabel?: string;
+  /** 详情区标题（宿主 i18n）。 */
+  detailLabel?: string;
+  /** 主区滚动保持键（data-scroll-key；缺省 'master'）。 */
+  masterScrollKey?: string;
+  /** 详情区滚动保持键（data-scroll-key；缺省 'detail'）。 */
+  detailScrollKey?: string;
+}
+
+export interface DetailKeyValueSpec {
+  label: string;
+  value: string;
+  /** 值按等宽字体展示（URL、路径、revision 原值）。 */
+  mono?: boolean;
+}
+
+/** 详情段：键值段、文本段、预格式段、动作；动态值全部预转义。 */
+export type DetailSectionSpec =
+  | { kind: 'kv'; heading?: string; entries: DetailKeyValueSpec[] }
+  | { kind: 'text'; heading?: string; paragraphs: string[] }
+  | { kind: 'pre'; heading?: string; text: string }
+  | { kind: 'actions'; actions: ActionSpec[] };
+
+/** 节点、revision、冲突详情（宿主生成全部文案；视图只排版与转义）。 */
+export interface DetailSpec {
+  title?: string;
+  subtitle?: string;
+  sections: DetailSectionSpec[];
+}
+
+export interface FilterPanelFieldSpec {
+  id: string;
+  kind: 'text' | 'date' | 'select';
+  label: string;
+  value: string;
+  /** kind='select' 必填。 */
+  options?: Array<{ value: string; label: string }>;
+  placeholder?: string;
+  /** 字段级错误（如日期起止反序）：显示错误但保留用户输入。 */
+  error?: string;
+  disabled?: boolean;
+}
+
+/**
+ * 折叠筛选面板（P6）：文本/日期/select 字段与清空动作；字段值变化即
+ * 提交（`setHistoryFilter(id, value)`），Webview 不解释业务条件。
+ * 折叠用原生 details/summary，展开状态是视图瞬时状态。
+ */
+export interface FilterPanelSpec {
+  id: string;
+  /** 折叠区标题（宿主 i18n）。 */
+  title?: string;
+  /** 初始折叠（缺省展开）。 */
+  collapsed?: boolean;
+  fields: FilterPanelFieldSpec[];
+  /** 清空动作（宿主提供标签，视图不发业务判断）。 */
+  clearAction?: ActionSpec;
+}
+
+/** 分组 tab（P7 文件/属性/树）：仅表达计数与当前 tab，不承载冲突语义。 */
+export interface TabsSpec {
+  id: string;
+  /** tab 容器可访问名称（宿主 i18n）。 */
+  ariaLabel?: string;
+  tabs: Array<{ id: string; label: string; count?: number; disabled?: boolean; disabledReason?: string }>;
+  /** 当前 tab ID。 */
+  current: string;
+  /** 切换意图（冻结动作名由宿主给出；意图只带 tab ID，缺省 setConflictTab）。 */
+  intent?: string;
+}
+
+/**
+ * 长任务进度（P6/P7）：标题、明细、可关闭；写入在途仅保留关闭/日志等
+ * 放行动作（动作集由宿主按放行表传入）。ratio 缺省为不确定进度动画。
+ */
+export interface ProgressState {
+  title: string;
+  detail?: string;
+  /** 确定进度 0..1；缺省不确定进度。 */
+  ratio?: number;
+  /** 放行动作（关闭/查看日志等）。 */
+  actions?: ActionSpec[];
 }
 
 /** 宿主 → 视图的渲染状态。 */
@@ -387,6 +695,18 @@ export interface PanelState {
   ignoreEditor?: IgnoreEditorSpec;
   /** 表格（与大文件/导入核对文件列表并列的展示组件；宿主已切片）。 */
   table?: TableSpec;
+  /** P5 当前层懒加载树（与主从布局配合；不递归发送未读取内容）。 */
+  lazyTree?: LazyTreeSpec;
+  /** 主从布局（P5/P6 左主右详情、P7 对半）；缺省不改变既有面板结构。 */
+  layout?: MasterDetailSpec;
+  /** 主从布局的详情内容（节点/revision/冲突详情）。 */
+  detail?: DetailSpec;
+  /** 折叠筛选面板（P6 关键词/作者/日期/路径；变化立即提交）。 */
+  filterPanel?: FilterPanelSpec;
+  /** 分组 tab（P7 文件/属性/树；仅计数与当前 tab）。 */
+  tabs?: TabsSpec;
+  /** 长任务进度（P6/P7；与 busy 进度条分开，带标题/明细/放行动作）。 */
+  progress?: ProgressState;
   /**
    * 数值卡组（P4 空间概览与清理前后对比卡）：宿主完成格式化后填入，
    * 清理前后对比用同一组件、不另设 before-after 组件；M2 面板不引用。
@@ -416,6 +736,7 @@ export type PanelEvent =
   | { type: 'intent:toggleRow'; rowId: string; selected: boolean }
   | { type: 'intent:toggleGroup'; groupId: string; selected: boolean }
   | { type: 'intent:toggleTree'; nodeId: string; selected: boolean }
+  | { type: 'intent:toggleTableSelection'; rowId: string; selected: boolean }
   | { type: 'intent:setView'; view: 'tree' | 'list' }
   | { type: 'intent:selectVisible' }
   | { type: 'intent:clearSelection' }
@@ -491,6 +812,18 @@ export function reduce(state: PanelState, event: PanelEvent): PanelState {
       );
       const nextList = { ...list, rows: nextRows };
       return { ...state, list: { ...nextList, selection: countSelection(nextList) } };
+    }
+    case 'intent:toggleTableSelection': {
+      // P6 revision 勾选：最多两项；第三个选择被拒绝（宿主据此提示）。
+      if (state.busy || state.writeLocked) {
+        return state;
+      }
+      const table = state.table;
+      if (!table) {
+        return state;
+      }
+      const result = applyTableSelection(table, event.rowId, event.selected);
+      return result.changed ? { ...state, table: result.table } : state;
     }
     case 'intent:setView': {
       const list = rejectWhenLocked(state);

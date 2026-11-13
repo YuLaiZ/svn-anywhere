@@ -16,6 +16,10 @@
  *   （residue-pending 与终态记录不产生 busy、记录保留供恢复查询）、
  *   进程内运行登记（hasRunning 专用，模块级单例）、续检正门 beginResume
  *   与 markPhase 持有者防线、终态收口路径与首载陈旧化分诊。
+ * - M4 增量：kind history-update/resolve（P6 更新到指定 revision、P7
+ *   单项/批量 resolve），固定意图经 BeginOperationParams 一次写入，重启
+ *   分诊 prepared/running → unknown，不进入 M1 的 failed-unconfirmed
+ *   安全重跑分支。
  */
 import { join } from 'node:path';
 
@@ -33,9 +37,10 @@ export type OperationPhase =
   | 'done';
 
 /**
- * 操作类别（M3）：恢复分诊与限制矩阵的维度。
+ * 操作类别（M4）：恢复分诊与限制矩阵的维度。
  * checkout = 检出/续检；import = 导入；vacuum = 磁盘清理（P4）；
- * commit/ignore = M2 提交面板/忽略面板；update/cleanup/daily = M1 日常命令。
+ * commit/ignore = M2 提交面板/忽略面板；update/cleanup/daily = M1 日常命令；
+ * history-update = P6 更新到指定 revision（M4）；resolve = P7 冲突解决（M4）。
  * 旧记录无 kind 字段，读取时按 commit 兜底（kindOf）。
  */
 export type OperationKind =
@@ -46,7 +51,9 @@ export type OperationKind =
   | 'ignore'
   | 'update'
   | 'cleanup'
-  | 'daily';
+  | 'daily'
+  | 'history-update'
+  | 'resolve';
 
 /** P2 单属性提交的属性载荷：原始/待提交属性的存在与值（值按行原样保留）。 */
 export interface PropertyRecord {
@@ -83,6 +90,48 @@ export interface ImportIntent {
   fileRefs: string;
 }
 
+/**
+ * P6 更新到指定 revision 的固定意图（OperationRecord.historyUpdateIntent
+ * 的类型，M4 技术方案 §4.6）：随 begin 一次写入，此后 markPhase 不能改
+ * 目标、revision 或任何策略字段。只保存恢复/回读所需的身份与 revision，
+ * 不含凭据、文件内容或属性值。
+ */
+export interface HistoryUpdateIntent {
+  /** 规范化工作副本根（lockKey 同值）。 */
+  wcRoot: string;
+  /** 更新目标相对路径（相对 wcRoot，原样保留，不 trim）。 */
+  targetRelPath: string;
+  targetKind: 'file' | 'dir';
+  /** 目标节点完整 URL（编码形态）；更新与回读以本字段为身份基准。 */
+  targetUrl: string;
+  /** 请求更新到的 revision（确认时已解析为固定数字，不取执行时 HEAD）。 */
+  requestedRevision: number;
+  /** 更新开始前已确认的节点 revision（命令结束前保留，不提前改写）。 */
+  preRevision: number;
+}
+
+/**
+ * P7 冲突解决的固定意图（OperationRecord.resolveIntent 的类型，M4 技术
+ * 方案 §5.6）：单项 resolve、单项 resolve 后的回扫与批量父任务共用；
+ * 只保存工作副本根、规范化相对路径、冲突类型/指纹、用户策略与可选
+ * batchId——不保存属性原值、文件内容或凭据。
+ */
+export interface ResolveIntent {
+  /** 扫描/互斥范围根（规范化工作副本根）。 */
+  scopeRoot: string;
+  targets: Array<{
+    /** 冲突路径（相对 scopeRoot 的规范化 POSIX 路径）。 */
+    relPath: string;
+    conflictKinds: Array<'text' | 'property' | 'tree'>;
+    /** 发起时读取的路径冲突指纹（回扫比对用；不含凭据）。 */
+    fingerprint: string;
+    /** 用户选择的 SVN --accept 策略或 working（不是属性值/文件内容）。 */
+    strategy: string;
+  }>;
+  /** 批量父任务 ID（批内项共用；单项 resolve 不写）。 */
+  batchId?: string;
+}
+
 /** 清理确认时快照（vacuum 专用，随 begin 一次写入）。 */
 export interface PristineBefore {
   cacheCount: number;
@@ -91,7 +140,7 @@ export interface PristineBefore {
   missingCount: number | null;
 }
 
-/** 持久化的操作记录。不含密码/凭据。M3 新增字段一律可选（旧记录没有）。 */
+/** 持久化的操作记录。不含密码/凭据。M3/M4 新增字段一律可选（旧记录没有）。 */
 export interface OperationRecord {
   operationId: string;
   /** 规范化工作副本根（realpath 解析符号链接）；M3 记录按 wcRoot=lockKey 约定写入。 */
@@ -134,6 +183,12 @@ export interface OperationRecord {
   relativeUrl?: string;
   /** 仅 import：导入意图（含目标 URL、快照摘要与文件引用）。 */
   importIntent?: ImportIntent;
+  /* ---------------- M4 固定字段（同经 BeginOperationParams 一次写入；
+   * markPhase 白名单不含这些字段，旧记录没有时按原 kind 分诊逻辑处理） ---------------- */
+  /** 仅 history-update：更新到指定 revision 的固定意图。 */
+  historyUpdateIntent?: HistoryUpdateIntent;
+  /** 仅 resolve：冲突解决的固定意图（单项与批量父任务共用）。 */
+  resolveIntent?: ResolveIntent;
   /** 仅 vacuum：清理绑定的扫描代次。 */
   scanEpoch?: number;
   /** 仅 vacuum：确认时的 pristine 快照。 */
@@ -179,6 +234,9 @@ const WRITE_RESTRICTED_PHASES: Readonly<Record<OperationKind, ReadonlySet<Operat
   checkout: new Set(['prepared', 'running']),
   import: new Set(['prepared', 'running', 'unknown']),
   vacuum: new Set(['prepared', 'running', 'unknown']),
+  // M4 写 kind：写命令前 begin、结果未决时 unknown 冻结（技术方案 §5.6）。
+  'history-update': new Set(['prepared', 'running', 'unknown']),
+  resolve: new Set(['prepared', 'running', 'unknown']),
   // M1 命令成功/失败都 finally finish、无未知态相位：恒空。
   update: new Set(),
   cleanup: new Set(),
@@ -192,6 +250,8 @@ const RUNNING_PHASES: Readonly<Record<OperationKind, ReadonlySet<OperationPhase>
   checkout: new Set(['prepared', 'running']),
   import: new Set(['prepared', 'running']),
   vacuum: new Set(['prepared', 'running']),
+  'history-update': new Set(['prepared', 'running']),
+  resolve: new Set(['prepared', 'running']),
   update: new Set(['prepared']),
   cleanup: new Set(['prepared']),
   daily: new Set(['prepared']),
@@ -208,6 +268,8 @@ const BUSY_PHASES: Readonly<Record<OperationKind, ReadonlySet<OperationPhase>>> 
   checkout: new Set(['prepared', 'running']),
   import: new Set(['prepared', 'running', 'unknown']),
   vacuum: new Set(['prepared', 'running', 'unknown']),
+  'history-update': new Set(['prepared', 'running', 'unknown']),
+  resolve: new Set(['prepared', 'running', 'unknown']),
   update: new Set(['prepared']),
   cleanup: new Set(['prepared']),
   daily: new Set(['prepared']),
@@ -225,6 +287,11 @@ const PATCHABLE_FIELDS: Readonly<Record<OperationKind, ReadonlySet<string>>> = {
   // import 追加 outcome/resolvedRevision（成功路径证据检查与 unknown 核实的结论落盘）。
   import: new Set(['knownRevisions', 'tempWcPath', 'baseRevision', 'committedPaths', 'outcome', 'resolvedRevision']),
   vacuum: new Set(['knownRevisions', 'tempWcPath', 'baseRevision', 'committedPaths']),
+  // history-update：只允许回读写回节点 BASE 与确认 revision；固定意图（目标/
+  // 请求 revision/更新前 revision）无补写通道（技术方案 §5.6）。
+  'history-update': new Set(['baseRevision', 'resolvedRevision']),
+  // resolve：固定意图只读，不放宽 patch——无任何可变字段。
+  resolve: new Set(),
 };
 
 /** 该记录是否限制同一互斥键上的新写操作（按 kind×phase 矩阵判定）。 */
@@ -292,6 +359,11 @@ export interface BeginOperationParams {
   importIntent?: ImportIntent;
   scanEpoch?: number;
   pristineBefore?: PristineBefore;
+  /* ---------------- M4 接口增量：固定意图同经 begin 一次写入，此后不可变。 ---------------- */
+  /** 仅 history-update：更新到指定 revision 的固定意图。 */
+  historyUpdateIntent?: HistoryUpdateIntent;
+  /** 仅 resolve：冲突解决的固定意图（单项与批量父任务共用）。 */
+  resolveIntent?: ResolveIntent;
 }
 
 /**
@@ -368,9 +440,11 @@ export class OperationRegistry {
    * - commit/ignore（含无 kind 兜底）的 prepared/saving/committing →
    *   unknown 落盘（命令可能已发出，不以相位猜测「未发出」；不直接移除）；
    * - checkout 的 prepared/running → residue-pending；
-   * - import/vacuum 的 prepared/running → unknown。
+   * - import/vacuum 的 prepared/running → unknown；
+   * - M4 history-update/resolve 的 prepared/running → unknown（写命令可能
+   *   已发出，不按 M1 的安全重跑分支移除；由面板回扫收口）。
    * residue-pending 与 done/failed-unconfirmed 不进 active（记录仍留
-   * records/globalState 供恢复查询）；M3 kind 的终态残留（kill 落在
+   * records/globalState 供恢复查询）；M3/M4 kind 的终态残留（kill 落在
    * markPhase 终态与 finish 之间）顺带 finish 清理——M2 kind 的终态记录
    * 维持源码现状（跳过但保留在 globalState）。
    */
@@ -385,8 +459,14 @@ export class OperationRegistry {
       const kind = kindOf(record);
       const key = lockKeyOf(record);
       if (record.phase === 'done' || record.phase === 'failed-unconfirmed') {
-        if (kind === 'checkout' || kind === 'import' || kind === 'vacuum') {
-          // M3 终态收口的残留清理（幂等）：终态记录不保留在 globalState。
+        if (
+          kind === 'checkout' ||
+          kind === 'import' ||
+          kind === 'vacuum' ||
+          kind === 'history-update' ||
+          kind === 'resolve'
+        ) {
+          // M3/M4 终态收口的残留清理（幂等）：终态记录不保留在 globalState。
           await this.store.remove(record.operationId);
         }
         continue;
@@ -467,6 +547,8 @@ export class OperationRegistry {
       importIntent: params.importIntent,
       scanEpoch: params.scanEpoch,
       pristineBefore: params.pristineBefore,
+      historyUpdateIntent: params.historyUpdateIntent,
+      resolveIntent: params.resolveIntent,
     };
     await this.store?.save(record);
     this.records.set(record.operationId, record);

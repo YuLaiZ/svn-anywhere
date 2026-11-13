@@ -448,7 +448,7 @@ export function startCheckoutTask(input: StartCheckoutTaskInput): StartedCheckou
   const lockKey = input.directMode
     ? input.directDir
     : checkoutLockKey(input.parentDir, input.dirName);
-  const resultScope: CheckoutResultScope = { entryKey: input.entryKey, mode: 'checkout' };
+  const resultScope: CheckoutResultScope = { scopeKind: 'checkout', entryKey: input.entryKey, mode: 'checkout' };
   // ① 任务对象（connecting）注册 taskRegistry；ID 预生成（begin 沿用）。
   const taskId = randomOperationId();
   const task = createCheckoutTask(
@@ -666,7 +666,7 @@ export async function resumeCheckoutTask(input: ResumeCheckoutTaskInput): Promis
 
   // ② 新任务对象（ID 沿用记录 operationId；connecting 覆盖 beginResume
   // 成功后、写命令发出前的准备段，记录侧此刻已是 running）。
-  const resultScope: CheckoutResultScope = { entryKey: input.entryKey, mode: 'checkout' };
+  const resultScope: CheckoutResultScope = { scopeKind: 'checkout', entryKey: input.entryKey, mode: 'checkout' };
   const task = createCheckoutTask(
     input.operationId, input.lockKey, resultScope, input.initiatorSessionId,
     input.formSnapshot, input.callbacks ?? {},

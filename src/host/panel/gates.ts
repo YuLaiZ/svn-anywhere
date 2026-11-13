@@ -16,6 +16,8 @@
  * 谓词由面板注册时注入实现，宿主守卫在每次意图送达时求值，DOM 禁用
  * 在每次渲染前求值同一谓词：两侧同表同源，不出现「可点被拒」。
  */
+import { getOperationRegistry, kindOf, type OperationKind } from '../../core/operations';
+import { hasActiveTask, type PanelKind } from '../taskRegistry';
 
 /** 一条放行规则：动作名 + 可选条件谓词（求值为 false 时按不放行处理）。 */
 export interface GateRule {
@@ -189,4 +191,197 @@ export function createP4Gates(predicates: P4GatePredicates): PanelGates {
       ...tableReadonlyRules,
     ],
   };
+}
+
+/* ---------------- M4：P5/P6/P7 放行表 ----------------
+ *
+ * M4 不另建门禁机制：三张表与 M1-M3 共用本模块的 PanelGates/gatePermits
+ * 判定，busy/writeLocked 也由同一套既有注册表折算——面板自身的活动任务
+ * （TaskRegistry 槽）给出 busy，OperationRegistry 的 lockKey 写限制给出
+ * writeLocked（history-update/resolve 与 M1-M3 写操作同用 wcRoot 锁键，
+ * 见 resolvePanelOccupancy）。因此这里只声明各面板的动作放行集，不读写
+ * 锁状态本身。
+ */
+
+/** 面板占用态：busy 时等待（命令在途），否则 writeLocked 按放行表判定。 */
+export interface PanelOccupancy {
+  busy: boolean;
+  writeLocked: boolean;
+  /** writeLocked 命中记录的类别（禁用原因按 kind 分列文案；无则 null）。 */
+  heldKind: OperationKind | null;
+}
+
+/**
+ * P6/P7 的占用态派生：与 M1-M3 共享同一写锁注册表，不新建 M4 写锁。
+ * - busy：面板类别存在活动任务（P6 history-update/rescan、P7 扫描/
+ *   resolve/批量），或共享 OperationRegistry 在 lockKey 上有命令在途
+ *   （其他面板正在写同一副本时，M4 面板同样等待）；
+ * - writeLocked：共享 OperationRegistry 在 lockKey 上有写限制记录
+ *   （prepared/running/unknown 与协调态等，含 M1-M3 与 M4 记录）。
+ * lockKey=null（远端目标无本地副本）时只看任务槽与真实 SVN 状态。
+ * P5 只读面板没有任务槽与副本写锁，一般不调用本函数。
+ */
+export function resolvePanelOccupancy(panelKind: PanelKind, lockKey: string | null): PanelOccupancy {
+  const registry = getOperationRegistry();
+  const busy = hasActiveTask(panelKind) || (lockKey !== null && registry.hasRunning(lockKey));
+  if (busy) {
+    return { busy: true, writeLocked: false, heldKind: null };
+  }
+  const held = lockKey === null ? undefined : registry.writeRestriction(lockKey);
+  return { busy: false, writeLocked: held !== undefined, heldKind: held ? kindOf(held) : null };
+}
+
+/* ---------------- P5 仓库浏览器放行表 ---------------- */
+
+/**
+ * P5 只读意图全集（冻结动作对账表）：展开/选中/刷新/重试/加载更多、
+ * 复制 URL、只读打开远端内容、转交 P6 历史。P5 在 M4 不发写命令，
+ * 全部意图都是读请求。
+ */
+const P5_READONLY_INTENTS: readonly GateRule[] = [
+  { action: 'toggleBrowserNode' },
+  { action: 'selectBrowserNode' },
+  { action: 'retryBrowserNode' },
+  { action: 'refreshBrowserNode' },
+  { action: 'loadMoreBrowserNode' },
+  { action: 'copyBrowserNodeUrl' },
+  { action: 'openRemoteNode' },
+  { action: 'openHistoryFromBrowser' },
+  { action: 'viewTaskLog' },
+  { action: 'closePanel' },
+];
+
+/**
+ * P5 放行表：读请求一般不受 busy/writeLocked 阻止（技术方案 §7）。
+ * busy 只可能来自元数据补全任务或等待态，writeLocked 来自与其他面板
+ * 共享的写操作锁——两者都不改变「浏览只读」的事实，因此两行放行全部
+ * P5 意图；P5 没有写入口需要拒绝。
+ */
+export function createP5Gates(): PanelGates {
+  return { busy: P5_READONLY_INTENTS, writeLocked: P5_READONLY_INTENTS };
+}
+
+/* ---------------- P6 历史面板放行表 ---------------- */
+
+/**
+ * P6 只读查看意图：选中/勾选/筛选/比较/复制/查看/导出/追溯与日志关闭。
+ * 更新任务在途或写锁未决时仍允许查看已有分析；这些动作不推进会话
+ * 网络读取、不写工作副本，不会与更新任务结果页交错。
+ */
+const P6_READONLY_INTENTS: readonly GateRule[] = [
+  { action: 'selectHistoryRevision' },
+  { action: 'toggleHistoryRevision' },
+  { action: 'setHistoryFilter' },
+  { action: 'clearHistoryFilters' },
+  { action: 'compareHistoryRevisions' },
+  { action: 'selectCompareCandidate' },
+  { action: 'openHistoryDiff' },
+  { action: 'comparePreviousVisible' },
+  { action: 'compareBase' },
+  { action: 'blameHistoryRevision' },
+  { action: 'copyHistoryText' },
+  { action: 'viewHistoryRevision' },
+  { action: 'exportHistoryVersion' },
+  { action: 'viewTaskLog' },
+  { action: 'closePanel' },
+];
+
+/** P6 会话重读与写意图：占用态必须等待。 */
+const P6_BLOCKED_IN_OCCUPANCY: readonly GateRule[] = [
+  // 推进会话网络读取：与更新任务结果页/会话交错。
+  { action: 'loadMoreHistory' },
+  // 清会话重读与刷新上限：HLS-6 要求 reset 与 refresh 同组禁用。
+  { action: 'resetHistorySession' },
+  { action: 'refreshHistoryUpper' },
+  // 写工作副本与检出交接：写入在途禁止重复写入与切换目标。
+  { action: 'updateToHistoryRevision' },
+  { action: 'checkoutHistoryDirectory' },
+];
+
+/**
+ * P6 放行表：busy（history-update 在途）与 writeLocked（写锁未决）
+ * 均「禁止刷新、重复写入与切换目标，可关闭面板查看已有数据」——
+ * 放行只读查看集，拒绝会话重读/刷新/写/检出交接集。未知结果时
+ * 的重新扫描入口由阶段 3 的控制器在业务层提供，不混入本表。
+ */
+export function createP6Gates(): PanelGates {
+  return {
+    busy: [...P6_READONLY_INTENTS],
+    writeLocked: [...P6_READONLY_INTENTS],
+  };
+}
+
+/** P6 占用态下必须等待的动作名（供面板模型构建禁用原因与测试对账）。 */
+export function p6BlockedInOccupancyActions(): string[] {
+  return P6_BLOCKED_IN_OCCUPANCY.map((rule) => rule.action);
+}
+
+/* ---------------- P7 冲突面板放行表 ---------------- */
+
+/**
+ * P7 只读查看意图：选择/tab/检查器/终端/原生差异与合并入口/打开版本/
+ * 复制路径/批量结果/远端来源补查认证/日志关闭。扫描或写入在途时仍可
+ * 查看已有分析，不改变冲突快照与写入状态。
+ */
+const P7_READONLY_INTENTS: readonly GateRule[] = [
+  { action: 'selectConflict' },
+  { action: 'setConflictTab' },
+  { action: 'showConflictBatchResults' },
+  { action: 'inspectConflict' },
+  { action: 'openWorkCopyTerminal' },
+  { action: 'openConflictDiff' },
+  { action: 'openConflictEditor' },
+  { action: 'openConflictVersion' },
+  { action: 'copyConflictPath' },
+  { action: 'authenticateConflictSource' },
+  { action: 'viewTaskLog' },
+  { action: 'closePanel' },
+];
+
+/**
+ * P7 会话状态意图：只在宿主内存改面板状态（策略选择、推迟），
+ * 不发 SVN 写命令，占用态放行。
+ */
+const P7_SESSION_STATE_INTENTS: readonly GateRule[] = [
+  { action: 'chooseConflictVariant' },
+  { action: 'postponeConflict' },
+];
+
+/** P7 写与批量意图：占用态必须等待（禁止重复写入与批量处理）。 */
+const P7_WRITE_INTENTS: readonly GateRule[] = [
+  { action: 'applyConflictResolution' },
+  { action: 'prepareTreeConflict' },
+  { action: 'planConflictBatch' },
+  { action: 'startConflictBatch' },
+];
+
+/** P7 扫描意图：busy 时拒绝（重复扫描）；写锁（unknown）时放行作为回扫入口。 */
+const P7_SCAN_INTENTS: readonly GateRule[] = [
+  { action: 'rescanConflicts' },
+  { action: 'scanWholeWorkCopy' },
+];
+
+/**
+ * P7 放行表：
+ * - busy（扫描/resolve/批量在途）：放行只读查看与会话状态动作、
+ *   日志与关闭——写入在途禁止刷新、重复写入与批量处理；扫描在途
+ *   拒绝重复扫描。
+ * - writeLocked（operation record 未决、含结果未知）：放行重新扫描
+ *   与整副本扫描——「结果未知只开放核实/重新扫描/查看日志」，回扫
+ *   是解除未知的唯一读路径；写与批量仍拒绝。
+ */
+export function createP7Gates(): PanelGates {
+  return {
+    busy: [...P7_READONLY_INTENTS, ...P7_SESSION_STATE_INTENTS],
+    writeLocked: [
+      ...P7_READONLY_INTENTS,
+      ...P7_SESSION_STATE_INTENTS,
+      ...P7_SCAN_INTENTS,
+    ],
+  };
+}
+
+/** P7 busy 态下必须等待的动作名（写/批量/重复扫描；供模型与测试对账）。 */
+export function p7BlockedWhileBusyActions(): string[] {
+  return [...P7_WRITE_INTENTS, ...P7_SCAN_INTENTS].map((rule) => rule.action);
 }

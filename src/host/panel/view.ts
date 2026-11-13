@@ -22,10 +22,16 @@ import {
   visibleRows,
   type ActionSpec,
   type BannerSpec,
+  type DetailSectionSpec,
+  type FilterPanelSpec,
   type FilterSpec,
+  type LazyTreeRowSpec,
   type ListSpec,
+  type MasterDetailSpec,
   type PanelState,
+  type ProgressState,
   type RowSpec,
+  type TableSpec,
 } from './state';
 
 /** 文本与属性上下文共用的转义（属性值统一用双引号包裹）。 */
@@ -57,20 +63,33 @@ export function render(state: PanelState): string {
     renderBanners(state.banners),
     renderMetrics(state),
     renderSpaceBar(state),
+    renderTabs(state),
+    renderFilterPanel(state),
+    renderProgress(state),
   ];
   if (state.form) {
     parts.push(renderForm(state, locked));
   }
-  if (state.table) {
-    parts.push(renderTable(state));
-  }
-  if (state.list) {
-    parts.push(renderFilterBar(state, locked));
-    parts.push(renderSelectionBar(state, locked));
-    parts.push(renderList(state, locked));
-  }
-  if (state.ignoreEditor) {
-    parts.push(renderIgnoreEditor(state.ignoreEditor));
+  if (state.layout) {
+    parts.push(renderMasterDetail(state, locked));
+    if (state.ignoreEditor) {
+      parts.push(renderIgnoreEditor(state.ignoreEditor));
+    }
+  } else {
+    if (state.lazyTree) {
+      parts.push(renderLazyTree(state));
+    }
+    if (state.table) {
+      parts.push(renderTable(state));
+    }
+    if (state.list) {
+      parts.push(renderFilterBar(state, locked));
+      parts.push(renderSelectionBar(state, locked));
+      parts.push(renderList(state, locked));
+    }
+    if (state.ignoreEditor) {
+      parts.push(renderIgnoreEditor(state.ignoreEditor));
+    }
   }
   parts.push(renderFooter(state, locked));
   if (busy) {
@@ -263,6 +282,295 @@ function renderSpaceBar(state: PanelState): string {
 }
 
 /**
+ * 分组 tab（P7 文件/属性/树）：只表达计数与当前 tab；切换意图只带 tab ID，
+ * 宿主映射冲突分组语义。占用态按放行视图禁用。
+ */
+function renderTabs(state: PanelState): string {
+  const tabs = state.tabs;
+  if (!tabs || tabs.tabs.length === 0) {
+    return '';
+  }
+  const intent = tabs.intent ?? 'setConflictTab';
+  const gated = actionGated(state, intent);
+  const buttons = tabs.tabs
+    .map((tab) => {
+      const current = tab.id === tabs.current;
+      const count = tab.count !== undefined ? ` <span class="tab-count">${tab.count}</span>` : '';
+      const disabled = tab.disabled || gated ? ' disabled' : '';
+      const title = tab.disabledReason ?? tab.label;
+      return (
+        `<button type="button" class="tab${current ? ' current' : ''}" role="tab" aria-selected="${current}"` +
+        ` data-intent="${escapeHtml(intent)}" data-tab-id="${escapeHtml(tab.id)}" data-focus="tab-${escapeHtml(tab.id)}"` +
+        ` title="${escapeHtml(title)}" aria-label="${escapeHtml(title)}"${disabled}>${escapeHtml(tab.label)}${count}</button>`
+      );
+    })
+    .join('');
+  const aria = tabs.ariaLabel ? ` aria-label="${escapeHtml(tabs.ariaLabel)}"` : '';
+  return `<div class="tabs" role="tablist"${aria}>${buttons}</div>`;
+}
+
+/**
+ * 折叠筛选面板（P6）：文本/日期/select 字段与清空动作。字段值变化经
+ * `setHistoryFilter(id, value)` 立即提交（输入短防抖由视图侧承担）；
+ * 字段错误只显示、不改写用户输入。折叠用原生 details/summary。
+ */
+function renderFilterPanel(state: PanelState): string {
+  const panel: FilterPanelSpec | undefined = state.filterPanel;
+  if (!panel || (panel.fields.length === 0 && !panel.clearAction)) {
+    return '';
+  }
+  const gated = actionGated(state, 'setHistoryFilter');
+  const fields = panel.fields.map((field) => {
+    const disabled = field.disabled || gated ? ' disabled' : '';
+    const common =
+      `data-intent="setHistoryFilter" data-filter-field-id="${escapeHtml(field.id)}"` +
+      ` data-filter-panel-id="${escapeHtml(panel.id)}"` +
+      ` data-focus="filter-field-${escapeHtml(field.id)}"` +
+      ` aria-label="${escapeHtml(field.label)}"${disabled}`;
+    let control: string;
+    if (field.kind === 'select') {
+      const options = (field.options ?? [])
+        .map((option) =>
+          `<option value="${escapeHtml(option.value)}"${option.value === field.value ? ' selected' : ''}>${escapeHtml(option.label)}</option>`,
+        )
+        .join('');
+      control = `<select ${common}>${options}</select>`;
+    } else {
+      const placeholder = field.placeholder ? ` placeholder="${escapeHtml(field.placeholder)}"` : '';
+      control = `<input type="${field.kind === 'date' ? 'date' : 'text'}" value="${escapeHtml(field.value)}"${placeholder} ${common}>`;
+    }
+    const error = field.error ? `<p class="field-error">${escapeHtml(field.error)}</p>` : '';
+    return `<label class="filter-field ${escapeHtml(field.kind)}"><span>${escapeHtml(field.label)}</span>${control}</label>${error}`;
+  }).join('');
+  const clear = panel.clearAction
+    ? `<div class="filter-panel-actions">${renderActionButton(panel.clearAction, {
+        intent: panel.clearAction.id,
+        argName: 'data-filter-panel',
+        argValue: panel.id,
+        extraId: '',
+        gated: actionGated(state, panel.clearAction.id),
+      })}</div>`
+    : '';
+  return (
+    `<details class="filter-panel" data-filter-panel-id="${escapeHtml(panel.id)}"${panel.collapsed ? '' : ' open'}>` +
+    `<summary>${escapeHtml(panel.title ?? '')}</summary>` +
+    `<div class="filter-panel-body">${fields}${clear}</div>` +
+    `</details>`
+  );
+}
+
+/**
+ * 长任务进度（P6/P7）：标题、明细与放行动作；ratio 缺省为不确定进度。
+ * 与 busy 底部进度条分开：写入在途时动作集由宿主放行表决定（同源禁用）。
+ */
+function renderProgress(state: PanelState): string {
+  const progress: ProgressState | undefined = state.progress;
+  if (!progress) {
+    return '';
+  }
+  const ratio =
+    typeof progress.ratio === 'number' && Number.isFinite(progress.ratio)
+      ? Math.min(1, Math.max(0, progress.ratio))
+      : null;
+  const bar = ratio === null
+    ? `<div class="progress" aria-hidden="true"><i></i></div>`
+    : `<div class="progress" aria-hidden="true" data-determinate="1"><i style="width:${(ratio * 100).toFixed(1)}%"></i></div>`;
+  const detail = progress.detail ? `<p class="muted">${escapeHtml(progress.detail)}</p>` : '';
+  const actions = (progress.actions ?? [])
+    .map((action) =>
+      renderActionButton(action, {
+        intent: action.id,
+        argName: 'data-progress-action',
+        argValue: action.id,
+        extraId: '',
+        gated: actionGated(state, action.id),
+      }),
+    )
+    .join('');
+  return (
+    `<section class="task-progress" role="status" aria-live="polite" aria-label="${escapeHtml(progress.title)}">` +
+    `<div class="task-progress-head"><strong>${escapeHtml(progress.title)}</strong><div class="acts">${actions}</div></div>` +
+    bar +
+    detail +
+    `</section>`
+  );
+}
+
+/** 主从布局：主区（树/表格/列表）与详情区各自独立滚动，滚动键稳定。 */
+function renderMasterDetail(state: PanelState, locked: boolean): string {
+  const layout: MasterDetailSpec = state.layout!;
+  const master = renderMasterContent(state, locked);
+  const detail = state.detail ? renderDetail(state) : '';
+  const masterHead = layout.masterLabel
+    ? `<div class="pane-head"><strong>${escapeHtml(layout.masterLabel)}</strong></div>`
+    : '';
+  const detailHead = layout.detailLabel
+    ? `<div class="pane-head"><strong>${escapeHtml(layout.detailLabel)}</strong></div>`
+    : '';
+  const masterAria = layout.masterLabel ? ` aria-label="${escapeHtml(layout.masterLabel)}"` : '';
+  const detailAria = layout.detailLabel ? ` aria-label="${escapeHtml(layout.detailLabel)}"` : '';
+  return (
+    `<div class="split-layout layout-${layout.layout === 'balanced' ? 'balanced' : 'master-detail'}">` +
+    `<section class="pane pane-master"${masterAria}>${masterHead}` +
+    `<div class="pane-scroll" data-scroll-key="${escapeHtml(layout.masterScrollKey ?? 'master')}">${master}</div></section>` +
+    `<section class="pane pane-detail"${detailAria}>${detailHead}` +
+    `<div class="pane-scroll" data-scroll-key="${escapeHtml(layout.detailScrollKey ?? 'detail')}">${detail}</div></section>` +
+    `</div>`
+  );
+}
+
+/** 主区内容优先级：懒加载树 > 表格 > 列表；面板每帧只应声明一种主组件。 */
+function renderMasterContent(state: PanelState, locked: boolean): string {
+  if (state.lazyTree) {
+    return renderLazyTree(state);
+  }
+  if (state.table) {
+    return renderTable(state);
+  }
+  if (state.list) {
+    return renderFilterBar(state, locked) + renderSelectionBar(state, locked) + renderList(state, locked);
+  }
+  return '';
+}
+
+/** 详情：标题/副标题 + 键值、文本、预格式、动作段；全部动态值预转义。 */
+function renderDetail(state: PanelState): string {
+  const detail = state.detail;
+  if (!detail) {
+    return '';
+  }
+  const title = detail.title ? `<div class="detail-title">${escapeHtml(detail.title)}</div>` : '';
+  const subtitle = detail.subtitle
+    ? `<div class="detail-subtitle">${escapeHtml(detail.subtitle)}</div>`
+    : '';
+  const sections = detail.sections.map((section) => renderDetailSection(section, state)).join('');
+  return `<div class="pane-detail">${title}${subtitle}${sections}</div>`;
+}
+
+function renderDetailSection(section: DetailSectionSpec, state: PanelState): string {
+  if (section.kind === 'actions') {
+    const actions = section.actions
+      .map((action) =>
+        renderActionButton(action, {
+          intent: action.id,
+          argName: 'data-detail-action',
+          argValue: action.id,
+          extraId: '',
+          gated: actionGated(state, action.id),
+        }),
+      )
+      .join('');
+    return `<div class="detail-section"><div class="inline-actions">${actions}</div></div>`;
+  }
+  const heading = section.heading ? `<h2>${escapeHtml(section.heading)}</h2>` : '';
+  if (section.kind === 'kv') {
+    const entries = section.entries
+      .map((entry) =>
+        `<dt>${escapeHtml(entry.label)}</dt><dd${entry.mono ? ' class="mono"' : ''}>${escapeHtml(entry.value)}</dd>`,
+      )
+      .join('');
+    return `<div class="detail-section">${heading}<dl class="kv">${entries}</dl></div>`;
+  }
+  if (section.kind === 'pre') {
+    return `<div class="detail-section">${heading}<pre>${escapeHtml(section.text)}</pre></div>`;
+  }
+  const paragraphs = section.paragraphs.map((text) => `<p>${escapeHtml(text)}</p>`).join('');
+  return `<div class="detail-section">${heading}${paragraphs}</div>`;
+}
+
+/**
+ * P5 当前层懒加载树：节点行只承载已加载切片；展开/选择/重试是独立意图，
+ * 展开不改变选中。行 DOM 复用既有转义与动作按钮，滚动由 pane 的
+ * data-scroll-key 统一保持。
+ */
+function renderLazyTree(state: PanelState): string {
+  const tree = state.lazyTree;
+  if (!tree) {
+    return '';
+  }
+  const rows = tree.rows.map((row) => renderLazyNode(state, row)).join('');
+  const empty = tree.rows.length === 0
+    ? `<div class="empty"><h3>${escapeHtml(tree.empty.title)}</h3>${tree.empty.detail ? `<p class="muted">${escapeHtml(tree.empty.detail)}</p>` : ''}</div>`
+    : '';
+  const loadMore = tree.loadMoreAction
+    ? `<div class="tree-load-more">${renderActionButton(tree.loadMoreAction, {
+        intent: tree.loadMoreAction.id,
+        argName: 'data-tree-id',
+        argValue: tree.id,
+        extraId: '',
+        gated: actionGated(state, tree.loadMoreAction.id),
+      })}</div>`
+    : '';
+  const busy = tree.busy ? `<div class="progress" role="status" aria-hidden="true"><i></i></div>` : '';
+  const aria = tree.ariaLabel ? ` aria-label="${escapeHtml(tree.ariaLabel)}"` : '';
+  return `<div class="lazy-tree" role="tree" data-tree-id="${escapeHtml(tree.id)}"${aria}>${rows}${empty}${loadMore}${busy}</div>`;
+}
+
+function renderLazyNode(state: PanelState, row: LazyTreeRowSpec): string {
+  const id = escapeHtml(row.id);
+  const isDir = row.kind === 'dir';
+  const expanded = isDir && row.expanded === true;
+  const selected = row.selected === true;
+  const classes = [
+    'tree-node',
+    `kind-${row.kind}`,
+    `phase-${row.phase}`,
+    expanded ? 'expanded' : '',
+    selected ? 'selected' : '',
+  ].filter(Boolean).join(' ');
+  const ariaExpanded = isDir ? ` aria-expanded="${expanded}"` : '';
+  const indent = ` style="padding-left:${12 + row.depth * 16}px"`;
+  const toggleLabel = row.expandLabel ? ` aria-label="${escapeHtml(row.expandLabel)}"` : '';
+  const toggleGated = actionGated(state, 'toggleBrowserNode') || row.phase === 'loading';
+  const toggle = isDir
+    ? `<button type="button" class="node-toggle" data-intent="toggleBrowserNode" data-node-id="${id}" data-focus="node-toggle-${id}"${toggleLabel}${ariaExpanded}${toggleGated ? ' disabled' : ''}>${expanded ? '▾' : '▸'}</button>`
+    : `<span class="node-spacer" aria-hidden="true"></span>`;
+  const selectLabel = row.selectLabel ? ` aria-label="${escapeHtml(row.selectLabel)}"` : '';
+  const label = `<button type="button" class="node-label" data-intent="selectBrowserNode" data-node-id="${id}" data-focus="node-select-${id}"${selectLabel}${actionGated(state, 'selectBrowserNode') ? ' disabled' : ''}>${escapeHtml(row.label)}</button>`;
+  const status = row.statusText
+    ? `<span class="node-status muted">${escapeHtml(row.statusText)}</span>`
+    : '';
+  const metadata = renderLazyMetadata(row);
+  const actions = (row.actions ?? [])
+    .map((action) =>
+      renderActionButton(action, {
+        intent: action.id,
+        argName: 'data-node-id',
+        argValue: row.id,
+        extraId: '',
+        gated: actionGated(state, action.id),
+      }),
+    )
+    .join('');
+  const acts = actions ? `<div class="acts">${actions}</div>` : '';
+  const children = expanded && row.children && row.children.length > 0
+    ? `<div class="tree-node-children" role="group">${row.children.map((child) => renderLazyNode(state, child)).join('')}</div>`
+    : '';
+  return (
+    `<div class="${classes}" role="treeitem" aria-level="${row.depth + 1}" aria-selected="${selected}" data-node-id="${id}"${indent}>` +
+    `<div class="tree-node-row">${toggle}${label}${status}${metadata}${acts}</div>${children}</div>`
+  );
+}
+
+/** 两段式加载的元数据占位/进度：只显示计数，不把首批数量当总数。 */
+function renderLazyMetadata(row: LazyTreeRowSpec): string {
+  if (row.metadata === 'pending' || row.metadata === 'cancelled') {
+    return `<span class="node-pending muted" aria-hidden="true">…</span>`;
+  }
+  if (row.metadata === 'filling' && row.metadataProgress) {
+    const ratio = row.metadataProgress.total > 0
+      ? Math.min(1, Math.max(0, row.metadataProgress.completed / row.metadataProgress.total))
+      : 0;
+    return (
+      `<span class="node-metadata-progress" title="${row.metadataProgress.completed} / ${row.metadataProgress.total}">` +
+      `<span class="node-progress-bar"><i style="width:${(ratio * 100).toFixed(1)}%"></i></span>` +
+      `<span class="num">${row.metadataProgress.completed} / ${row.metadataProgress.total}</span></span>`
+    );
+  }
+  return '';
+}
+
+/**
  * P2 规则编辑区：规则列表（.rules/.rule-row，含行内移除）与待加入输入
  * （.add-area：输入 + 加入 + 用当前项名）分开；DOM 结构沿用原型基线。
  */
@@ -380,9 +688,21 @@ function renderTable(state: PanelState): string {
       ? (table.filterEmpty ?? { title: strings.panel.filterEmptyTitle })
       : table.empty;
     const emptyNote = table.note ? `<p class="muted table-note">${escapeHtml(table.note)}</p>` : '';
+    // append 模式下空态仍要保留“加载更多”：历史可能只是本页无匹配，
+    // 后续原始批次尚未扫描（P6 noMatch 不允许丢失继续加载入口）。
+    const emptyLoadMore = pagination.mode === 'append' && table.loadMoreAction
+      ? `<div class="table-load-more">${renderActionButton(table.loadMoreAction, {
+          intent: table.loadMoreAction.id,
+          argName: 'data-table-id',
+          argValue: table.id,
+          extraId: '',
+          gated: actionGated(state, table.loadMoreAction.id),
+        })}</div>`
+      : '';
     return `<section class="table-block" data-table-id="${escapeHtml(table.id)}">${filterBar}` +
-      `<div class="empty"><h3>${escapeHtml(empty.title)}</h3>${empty.detail ? `<p class="muted">${escapeHtml(empty.detail)}</p>` : ''}</div>${emptyNote}</section>`;
+      `<div class="empty"><h3>${escapeHtml(empty.title)}</h3>${empty.detail ? `<p class="muted">${escapeHtml(empty.detail)}</p>` : ''}</div>${emptyLoadMore}${emptyNote}</section>`;
   }
+  const selectionEnabled = table.selection !== undefined;
   const headCells = columns.map((column) => {
     const align = column.align ? ` align-${column.align}` : '';
     if (!column.sortable) {
@@ -400,12 +720,18 @@ function renderTable(state: PanelState): string {
       `<button type="button" class="th-sort${isCurrent ? ' active' : ''}" data-intent="setSort" data-sort-key="${escapeHtml(column.key)}" data-sort-direction="${nextDirection}" data-focus="table-sort-${escapeHtml(column.key)}" aria-label="${escapeHtml(ariaLabel)}"${lockedDisabled(actionGated(state, 'setSort'))}>` +
       `${escapeHtml(column.label)}${indicator}</button></th>`;
   }).join('');
+  const allHeadCells = selectionEnabled
+    ? `<th class="col select" scope="col"${table.selection?.ariaLabel ? ` aria-label="${escapeHtml(table.selection.ariaLabel)}"` : ''}></th>${headCells}`
+    : headCells;
   const bodyRows = table.rows.map((row) => {
     const cells = columns.map((column) => {
       const align = column.align ? ` align-${column.align}` : '';
       const text = row.cells[column.key] ?? '';
       return `<td class="col${align}">${escapeHtml(text)}</td>`;
     }).join('');
+    const selectionCell = selectionEnabled
+      ? renderTableSelectionCell(state, row)
+      : '';
     const actions = (row.actions ?? []).map((action) =>
       renderActionButton(action, {
         intent: action.id,
@@ -415,21 +741,50 @@ function renderTable(state: PanelState): string {
         gated: actionGated(state, action.id),
       }),
     ).join('');
-    return `<tr data-row-id="${escapeHtml(row.id)}">${cells}${actions ? `<td class="col acts">${actions}</td>` : ''}</tr>`;
+    const rowClass = row.selected ? ' class="selected"' : '';
+    const rowSelectIntent = table.rowSelectIntent ?? 'selectHistoryRevision';
+    const selectIntent = actionGated(state, rowSelectIntent)
+      ? ''
+      : ` data-intent="${escapeHtml(rowSelectIntent)}" data-focus="table-row-${escapeHtml(row.id)}"`;
+    return `<tr data-row-id="${escapeHtml(row.id)}"${rowClass}${selectIntent}>${selectionCell}${cells}${actions ? `<td class="col acts">${actions}</td>` : ''}</tr>`;
   }).join('');
+  const append = pagination.mode === 'append';
   const hasPrev = pagination.page > 1;
   const hasNext = pagination.page < pagination.pageCount;
-  const pager = pagination.pageCount > 1
+  // append 模式不渲染上一页/下一页：历史只能追加展示，不能翻页覆盖。
+  const pager = !append && pagination.pageCount > 1
     ? `<div class="table-pager">` +
       `<button type="button" class="link" data-intent="setPage" data-page="${pagination.page - 1}" data-focus="table-page-prev"${!hasPrev || actionGated(state, 'setPage') ? ' disabled' : ''}>${escapeHtml(strings.panel.pagerPrev)}</button>` +
       `<span class="summary">${escapeHtml(format(strings.panel.pagerSummary, { page: String(pagination.page), pageCount: String(pagination.pageCount), total: String(pagination.total) }))}</span>` +
       `<button type="button" class="link" data-intent="setPage" data-page="${pagination.page + 1}" data-focus="table-page-next"${!hasNext || actionGated(state, 'setPage') ? ' disabled' : ''}>${escapeHtml(strings.panel.pagerNext)}</button>` +
       `</div>`
     : '';
+  const loadMore = append && table.loadMoreAction
+    ? `<div class="table-load-more">${renderActionButton(table.loadMoreAction, {
+        intent: table.loadMoreAction.id,
+        argName: 'data-table-id',
+        argValue: table.id,
+        extraId: '',
+        gated: actionGated(state, table.loadMoreAction.id),
+      })}</div>`
+    : '';
   const note = table.note ? `<p class="muted table-note">${escapeHtml(table.note)}</p>` : '';
   return `<section class="table-block" data-table-id="${escapeHtml(table.id)}">${filterBar}` +
-    `<div class="table-scroll"><table class="data-table">` +
-    `<thead><tr>${headCells}</tr></thead><tbody>${bodyRows}</tbody></table></div>${pager}${note}</section>`;
+    `<div class="table-scroll" data-scroll-key="table-${escapeHtml(table.id)}"><table class="data-table">` +
+    `<thead><tr>${allHeadCells}</tr></thead><tbody>${bodyRows}</tbody></table></div>${pager}${loadMore}${note}</section>`;
+}
+
+/** 表格行勾选单元格：maxSelected 上限由宿主与应用层共同保证，这里只渲染状态。 */
+function renderTableSelectionCell(state: PanelState, row: TableSpec['rows'][number]): string {
+  const label = row.selectionLabel ?? row.id;
+  const title = row.disabledReason ?? label;
+  const disabled = row.disabled || actionGated(state, 'toggleHistoryRevision');
+  return (
+    `<td class="col select"><input type="checkbox" data-intent="toggleHistoryRevision"` +
+    ` data-row-id="${escapeHtml(row.id)}" data-focus="table-select-${escapeHtml(row.id)}"` +
+    ` aria-label="${escapeHtml(label)}" title="${escapeHtml(title)}"` +
+    `${row.selected ? ' checked' : ''}${disabled ? ' disabled' : ''}></td>`
+  );
 }
 
 function renderFilterBar(state: PanelState, locked: boolean): string {
@@ -527,7 +882,7 @@ function renderList(state: PanelState, locked: boolean): string {
     .map((group) => renderGroup(list, group.id, group.label, locked))
     .filter((chunk) => chunk !== '')
     .join('');
-  return `<div class="list" data-focus="list" role="list">${body}</div>`;
+  return `<div class="list" data-focus="list" data-scroll-key="list" role="list">${body}</div>`;
 }
 
 /** 渲染一个分组：组头（派生半选态）+ 组内行（树形嵌套或平铺）。 */

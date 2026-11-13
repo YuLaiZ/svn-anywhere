@@ -5,15 +5,21 @@
 import { describe, expect, it } from 'vitest';
 import { commitFixture, ignoreFixture } from '../src/host/panel/fixture';
 import {
+  appendPagination,
+  appendTableRows,
+  applyTableSelection,
   countSelection,
   findRow,
   reduce,
+  selectedTableRowIds,
   sliceTableRows,
+  tableSelectionLimit,
   visibleRows,
   type PanelState,
   type RowSpec,
   type SortableTableRow,
   type TableColumnSpec,
+  type TableSpec,
 } from '../src/host/panel/state';
 
 function row(id: string, patch: Partial<RowSpec> = {}): RowSpec {
@@ -363,5 +369,124 @@ describe('sliceTableRows：宿主侧排序/筛选/分页切片', () => {
     ];
     const slice = sliceTableRows(fallback, columns, { key: 'size', direction: 'desc' }, undefined, 1, 50);
     expect(slice.rows.map((row) => row.id)).toEqual(['f1', 'f2']);
+  });
+});
+
+describe('appendTableRows：P6 历史累计展示切片', () => {
+  const columns: TableColumnSpec[] = [{ key: 'revision', label: 'Revision', sortable: true }];
+
+  function items(ids: string[]): SortableTableRow[] {
+    return ids.map((id) => ({ row: { id, cells: { revision: id } } }));
+  }
+
+  it('rows 为当前已展示前缀，total 为筛选后总数，page/pageCount 固定 1', () => {
+    const slice = appendTableRows(items(['r9', 'r8', 'r7', 'r6']), columns, { key: 'revision', direction: 'desc' }, undefined, 2);
+    expect(slice).toMatchObject({ total: 4, page: 1, pageCount: 1 });
+    expect(slice.rows.map((row) => row.id)).toEqual(['r9', 'r8']);
+  });
+
+  it('displayedCount 超过总数时只展示全部；为 0 时不展示任何行但保留总数', () => {
+    const all = appendTableRows(items(['r9', 'r8']), columns, { key: 'revision', direction: 'desc' }, undefined, 99);
+    expect(all.rows.map((row) => row.id)).toEqual(['r9', 'r8']);
+    expect(all.total).toBe(2);
+    const none = appendTableRows(items(['r9', 'r8']), columns, { key: 'revision', direction: 'desc' }, undefined, 0);
+    expect(none.rows).toHaveLength(0);
+    expect(none.total).toBe(2);
+  });
+
+  it('筛选先于展示前缀：total 是筛选后匹配数，排序仍由宿主列定义决定', () => {
+    const mixed: SortableTableRow[] = [
+      { row: { id: 'r9', cells: { revision: '9', message: 'fix' } } },
+      { row: { id: 'r8', cells: { revision: '8', message: 'feat' } } },
+      { row: { id: 'r7', cells: { revision: '7', message: 'fix' } } },
+    ];
+    const slice = appendTableRows(
+      mixed,
+      [...columns, { key: 'message', label: '说明' }],
+      { key: 'revision', direction: 'desc' },
+      [{ id: 'message', kind: 'text', cellKey: 'message', value: 'FIX' }],
+      1,
+    );
+    expect(slice.total).toBe(2);
+    expect(slice.rows.map((row) => row.id)).toEqual(['r9']);
+  });
+
+  it('appendPagination 固定单页并把 displayedCount 收敛为 pageSize', () => {
+    expect(appendPagination(120, 50)).toEqual({ page: 1, pageCount: 1, total: 120, pageSize: 50, mode: 'append' });
+    expect(appendPagination(0, 0)).toMatchObject({ pageSize: 1, page: 1, pageCount: 1 });
+  });
+});
+
+describe('applyTableSelection：P6 revision 勾选最多两项', () => {
+  function table(selected: string[], patch: Partial<TableSpec> = {}): TableSpec {
+    return {
+      id: 'history',
+      columns: [{ key: 'revision', label: 'Revision' }],
+      sort: { key: 'revision', direction: 'desc' },
+      pagination: { page: 1, pageSize: 50, total: 3, pageCount: 1, mode: 'append' },
+      rows: [
+        { id: 'r9', cells: { revision: '9' }, selected: selected.includes('r9') },
+        { id: 'r8', cells: { revision: '8' }, selected: selected.includes('r8') },
+        { id: 'r7', cells: { revision: '7' }, selected: selected.includes('r7') },
+        { id: 'r6', cells: { revision: '6' }, disabled: true, disabledReason: '节点在该 revision 不存在' },
+      ],
+      selection: { mode: 'revision', maxSelected: 2 },
+      empty: { title: '无历史' },
+      ...patch,
+    };
+  }
+
+  it('revision 模式允许两项；第三个选择返回 limitReached 且状态不变', () => {
+    const two = applyTableSelection(table(['r9']), 'r8', true);
+    expect(two.changed).toBe(true);
+    expect(selectedTableRowIds(two.table)).toEqual(['r9', 'r8']);
+    const third = applyTableSelection(two.table, 'r7', true);
+    expect(third.changed).toBe(false);
+    expect(third.limitReached).toBe(true);
+    expect(third.table).toBe(two.table);
+    expect(selectedTableRowIds(third.table)).toEqual(['r9', 'r8']);
+  });
+
+  it('取消一项后可继续选择；重复状态幂等返回原引用', () => {
+    const deselect = applyTableSelection(table(['r9', 'r8']), 'r9', false);
+    expect(selectedTableRowIds(deselect.table)).toEqual(['r8']);
+    const add = applyTableSelection(deselect.table, 'r7', true);
+    expect(selectedTableRowIds(add.table)).toEqual(['r8', 'r7']);
+    const same = applyTableSelection(add.table, 'r7', true);
+    expect(same.changed).toBe(false);
+    expect(same.table).toBe(add.table);
+  });
+
+  it('single 模式选新行自动清旧行；maxSelected 硬上限不超过 2', () => {
+    const single = table([], { selection: { mode: 'single' } });
+    const first = applyTableSelection(single, 'r9', true);
+    const second = applyTableSelection(first.table, 'r8', true);
+    expect(selectedTableRowIds(second.table)).toEqual(['r8']);
+    expect(tableSelectionLimit({ mode: 'revision', maxSelected: 9 })).toBe(2);
+    expect(tableSelectionLimit({ mode: 'revision' })).toBe(2);
+    expect(tableSelectionLimit({ mode: 'single', maxSelected: 2 })).toBe(1);
+  });
+
+  it('disabled/未知行拒绝；无 selection 契约时表格不参与勾选', () => {
+    const current = table(['r9']);
+    expect(applyTableSelection(current, 'r6', true)).toMatchObject({ changed: false, limitReached: false });
+    expect(applyTableSelection(current, 'zzz', true).changed).toBe(false);
+    const noSelection = table([], { selection: undefined });
+    expect(applyTableSelection(noSelection, 'r9', true).changed).toBe(false);
+  });
+
+  it('reducer 事件在 busy/writeLocked 期间拒绝勾选', () => {
+    const state = baseState({ table: table(['r9']), busy: true });
+    expect(reduce(state, { type: 'intent:toggleTableSelection', rowId: 'r8', selected: true })).toBe(state);
+    const locked = baseState({ table: table(['r9']), writeLocked: true });
+    expect(reduce(locked, { type: 'intent:toggleTableSelection', rowId: 'r8', selected: true })).toBe(locked);
+  });
+
+  it('reducer 正常勾选写回表格；超过两项时保持原状态', () => {
+    const state = baseState({ table: table(['r9', 'r8']) });
+    const third = reduce(state, { type: 'intent:toggleTableSelection', rowId: 'r7', selected: true });
+    expect(third).toBe(state);
+    const deselect = reduce(state, { type: 'intent:toggleTableSelection', rowId: 'r9', selected: false });
+    expect(selectedTableRowIds(deselect.table!)).toEqual(['r8']);
   });
 });

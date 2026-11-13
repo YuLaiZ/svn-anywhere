@@ -1,6 +1,10 @@
 /**
  * 面板宿主测试（mock vscode）：HTML 骨架（CSP/nonce/asWebviewUri）、
  * 消息校验与会话代次、请求去重、忙碌拒绝、复用 reveal、dispose 清理。
+ *
+ * M4 增补：读请求代次（beginReadRequest/isReadRequestCurrent 的会话
+ * 归属与过期规则）、写锁时切换目标拒绝（blockSwitchWhenWriteLocked，
+ * M1-M3 既有行为不变）、P5/P6/P7 门禁经宿主守卫与 DOM 注入生效。
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -104,8 +108,8 @@ vi.mock('vscode', () => ({
 }));
 
 import { createPanel, panelHtmlTemplate, resetPanelRegistry } from '../src/host/panel/host';
-import { createP3Gates, createP4Gates } from '../src/host/panel/gates';
-import type { PanelState, TableSpec } from '../src/host/panel/state';
+import { createP3Gates, createP4Gates, createP5Gates, createP6Gates, createP7Gates } from '../src/host/panel/gates';
+import type { LazyTreeSpec, ListSpec, PanelState, TableSpec } from '../src/host/panel/state';
 
 const context = {
   extensionUri: { toString: () => 'file:///ext' } as never,
@@ -674,5 +678,288 @@ describe('panelHtmlTemplate', () => {
     expect(html).toContain('img-src wv-src: data:');
     expect(html).toContain("style-src wv-src: 'unsafe-inline'");
     expect(html).not.toMatch(/connect-src|http:/);
+  });
+});
+
+/* ---------------- M4：读请求代次（技术方案 §2.3） ---------------- */
+
+describe('读请求代次：targetKey + requestSeq + viewEpoch', () => {
+  it('beginReadRequest 递增代次并携带会话/目标/视图代次；新请求使旧票据过期', () => {
+    const handle = createPanel('t1', { title: 'T' }, { onIntent: () => {} }, context);
+    const first = handle.beginReadRequest('target-a');
+    expect(first.sessionId).toBe(handle.sessionId);
+    expect(first.targetKey).toBe('target-a');
+    expect(first.requestSeq).toBe(1);
+    expect(first.viewEpoch).toBe(0);
+    expect(handle.isReadRequestCurrent(first)).toBe(true);
+
+    const second = handle.beginReadRequest('target-a');
+    expect(second.requestSeq).toBe(2);
+    expect(handle.isReadRequestCurrent(first)).toBe(false);
+    expect(handle.isReadRequestCurrent(second)).toBe(true);
+    handle.dispose();
+  });
+
+  it('切换目标后旧会话票据全部过期，新会话读代次从 1 重开', () => {
+    const handle = createPanel('t1', { title: 'T' }, { onIntent: () => {} }, context);
+    handle.update(state({ sessionId: handle.sessionId }));
+    const ticket = handle.beginReadRequest('target-a');
+    const nextSessionId = handle.switchSession();
+    expect(nextSessionId).toBeTypeOf('string');
+    expect(nextSessionId).not.toBe(ticket.sessionId);
+    // 旧目标迟到回包：票据属于旧会话，不得上屏（控制器只写旧目标缓存）。
+    expect(handle.isReadRequestCurrent(ticket)).toBe(false);
+
+    const next = handle.beginReadRequest('target-b');
+    expect(next.sessionId).toBe(nextSessionId);
+    expect(next.requestSeq).toBe(1);
+    expect(next.viewEpoch).toBe(0);
+    expect(handle.isReadRequestCurrent(next)).toBe(true);
+    handle.dispose();
+  });
+
+  it('视图重建（ready）不使票据过期：viewEpoch 记录发起代次供控制器比对', async () => {
+    const handle = createPanel('t1', { title: 'T' }, { onIntent: () => {} }, context);
+    handle.update(state({ sessionId: handle.sessionId }));
+    const ticket = handle.beginReadRequest('target-a');
+    expect(ticket.viewEpoch).toBe(0);
+    await panelsCreated[0].receive({ type: 'ready', protocolVersion: 1 });
+    // 宿主状态仍有效（重推即可上屏），票据只按会话与读代次判定。
+    expect(handle.isReadRequestCurrent(ticket)).toBe(true);
+    // 新发起的读请求携带重建后的视图代次。
+    expect(handle.beginReadRequest('target-a').viewEpoch).toBe(1);
+    handle.dispose();
+  });
+
+  it('面板销毁后票据过期（迟到回包不写已销毁面板）', () => {
+    const handle = createPanel('t1', { title: 'T' }, { onIntent: () => {} }, context);
+    const ticket = handle.beginReadRequest('target-a');
+    handle.dispose();
+    expect(handle.isReadRequestCurrent(ticket)).toBe(false);
+  });
+
+  it('读请求代次与视图意图的请求去重互不干扰（同名 requestId 空间独立）', async () => {
+    const intents: unknown[] = [];
+    const handle = createPanel('t1', { title: 'T' }, { onIntent: (intent) => { intents.push(intent); } }, context);
+    handle.update(state({ sessionId: handle.sessionId }));
+    const ticket = handle.beginReadRequest('target-a');
+    await panelsCreated[0].receive({
+      type: 'intent', protocolVersion: 1, sessionId: handle.sessionId, requestId: 'r1',
+      intent: { kind: 'refresh' },
+    });
+    expect(intents).toHaveLength(1);
+    expect(handle.isReadRequestCurrent(ticket)).toBe(true);
+    handle.dispose();
+  });
+});
+
+/* ---------------- M4：写锁时切换目标拒绝 ---------------- */
+
+describe('切换目标：M4 写锁拒绝（M1-M3 既有行为不变）', () => {
+  it('blockSwitchWhenWriteLocked：writeLocked 时拒绝切换，busy 仍优先拒绝', () => {
+    const handle = createPanel(
+      't1',
+      { title: 'T', blockSwitchWhenWriteLocked: true },
+      { onIntent: () => {} },
+      context,
+    );
+    handle.update(state({ sessionId: handle.sessionId, writeLocked: true }));
+    expect(handle.switchSession()).toBeUndefined();
+    handle.update(state({ sessionId: handle.sessionId, busy: true, writeLocked: true }));
+    expect(handle.switchSession()).toBeUndefined();
+    handle.update(state({ sessionId: handle.sessionId, busy: false, writeLocked: false }));
+    expect(handle.switchSession()).toBeTypeOf('string');
+    handle.dispose();
+  });
+
+  it('未携带该选项的 M1-M3 面板：writeLocked 不阻止切换目标（既有行为不变）', () => {
+    const handle = createPanel('t1', { title: 'T' }, { onIntent: () => {} }, context);
+    handle.update(state({ sessionId: handle.sessionId, writeLocked: true }));
+    expect(handle.switchSession()).toBeTypeOf('string');
+    handle.dispose();
+  });
+});
+
+/* ---------------- M4：P5/P6/P7 门禁经宿主守卫与 DOM 注入 ---------------- */
+
+describe('M4 门禁注册（P5/P6/P7 表走同一宿主守卫）', () => {
+  interface M4Harness {
+    handle: ReturnType<typeof createPanel>;
+    panel: FakePanel;
+    intents: unknown[];
+    receive(intent: Record<string, unknown>): Promise<void>;
+    patch(patch: Partial<PanelState>): void;
+  }
+
+  /** M4 意图引用的稳定 ID 必须存在于当前状态：门禁测试提供最小树/行夹具。 */
+  const P5_TREE: LazyTreeSpec = {
+    id: 'p5-tree',
+    rows: [{ id: 'n1', label: 'n1', kind: 'dir', depth: 0, phase: 'ready' }],
+    empty: { title: '空目录' },
+  };
+  const P6_TABLE: TableSpec = {
+    id: 'history',
+    columns: [{ key: 'revision', label: 'revision' }],
+    sort: { key: 'revision', direction: 'desc' },
+    pagination: { page: 1, pageSize: 50, total: 1, pageCount: 1 },
+    rows: [{ id: 'r10', cells: { revision: '10' } }],
+    empty: { title: '没有历史记录' },
+  };
+  const P7_LIST: ListSpec = {
+    id: 'conflicts',
+    columns: [{ key: 'path', label: '路径' }],
+    rows: [{ id: 'c1', cells: { path: 'a.txt' } }],
+    selection: { total: 0, visible: 0, hidden: 0 },
+    empty: { title: '没有冲突' },
+  };
+
+  function makeM4Panel(
+    panelId: string,
+    gates: Parameters<typeof createPanel>[1]['gates'],
+    options: Partial<Parameters<typeof createPanel>[1]> = {},
+  ): M4Harness {
+    const intents: unknown[] = [];
+    const handle = createPanel(
+      panelId,
+      { title: panelId, gates, ...options },
+      { onIntent: (intent) => { intents.push(intent); } },
+      context,
+    );
+    const panel = panelsCreated.at(-1) as FakePanel;
+    const harness: M4Harness = {
+      handle,
+      panel,
+      intents,
+      receive: (intent) =>
+        Promise.resolve(panel.receive({
+          type: 'intent', protocolVersion: 1, sessionId: handle.sessionId,
+          requestId: `r-${Math.random().toString(36).slice(2)}`,
+          intent,
+        })),
+      patch: (patch) => {
+        panel.posted.length = 0;
+        handle.update(state({ sessionId: handle.sessionId, ...patch }));
+      },
+    };
+    handle.update(state({ sessionId: handle.sessionId }));
+    panel.posted.length = 0;
+    return harness;
+  }
+
+  it('P5 表：busy 时浏览器读意图照常转发（读请求不受阻止）', async () => {
+    const h = makeM4Panel('p5', createP5Gates());
+    h.patch({ busy: true, lazyTree: P5_TREE });
+    await h.receive({ kind: 'toggleBrowserNode', nodeId: 'n1' });
+    await h.receive({ kind: 'selectBrowserNode', nodeId: 'n1' });
+    await h.receive({ kind: 'openHistoryFromBrowser', nodeId: 'n1' });
+    expect(h.intents).toHaveLength(3);
+    expect(toastMessages(h.panel.posted)).toHaveLength(0);
+    h.handle.dispose();
+  });
+
+  it('P5 表：writeLocked 时复制 URL 与只读打开放行，非 P5 动作拒绝并 toast', async () => {
+    const h = makeM4Panel('p5', createP5Gates());
+    h.patch({ writeLocked: true, lazyTree: P5_TREE });
+    await h.receive({ kind: 'copyBrowserNodeUrl', nodeId: 'n1' });
+    await h.receive({ kind: 'openRemoteNode', nodeId: 'n1' });
+    expect(h.intents).toHaveLength(2);
+    await h.receive({ kind: 'syncInput', fieldId: 'x', value: 'y', inputRevision: 1 });
+    expect(h.intents).toHaveLength(2);
+    expect(toastMessages(h.panel.posted)[0]?.message).toContain('忽略重复请求');
+    h.handle.dispose();
+  });
+
+  it('P5 稳定节点 ID 校验：引用不存在节点被静默丢弃', async () => {
+    const h = makeM4Panel('p5', createP5Gates());
+    h.patch({ lazyTree: P5_TREE });
+    await h.receive({ kind: 'selectBrowserNode', nodeId: 'missing' });
+    expect(h.intents).toHaveLength(0);
+    await h.receive({ kind: 'selectBrowserNode', nodeId: 'n1' });
+    expect(h.intents).toHaveLength(1);
+    h.handle.dispose();
+  });
+
+  it('P6 表：busy 时拒绝刷新历史上限与更新写入，放行选中查看', async () => {
+    const h = makeM4Panel('p6', createP6Gates());
+    h.patch({ busy: true, table: P6_TABLE });
+    await h.receive({ kind: 'selectHistoryRevision', id: 'r10' });
+    await h.receive({ kind: 'setHistoryFilter', id: 'author', value: 'alice' });
+    expect(h.intents).toHaveLength(2);
+    await h.receive({ kind: 'refreshHistoryUpper', mode: 'head' });
+    await h.receive({ kind: 'resetHistorySession' });
+    await h.receive({ kind: 'updateToHistoryRevision' });
+    await h.receive({ kind: 'loadMoreHistory' });
+    expect(h.intents).toHaveLength(2);
+    expect(toastMessages(h.panel.posted).length).toBeGreaterThan(0);
+    h.handle.dispose();
+  });
+
+  it('P6 表：writeLocked 时同样拒绝 reset/refresh（reset 与 refresh 同组禁用）', async () => {
+    const h = makeM4Panel('p6', createP6Gates());
+    h.patch({ writeLocked: true, table: P6_TABLE });
+    await h.receive({ kind: 'resetHistorySession' });
+    await h.receive({ kind: 'refreshHistoryUpper', mode: 'base-fallback' });
+    expect(h.intents).toHaveLength(0);
+    await h.receive({ kind: 'compareHistoryRevisions' });
+    await h.receive({ kind: 'viewTaskLog' });
+    expect(h.intents).toHaveLength(2);
+    h.handle.dispose();
+  });
+
+  it('P7 表：writeLocked 放行重新扫描（unknown 回扫入口）、拒绝应用解决', async () => {
+    const h = makeM4Panel('p7', createP7Gates());
+    h.patch({ writeLocked: true, list: P7_LIST });
+    await h.receive({ kind: 'rescanConflicts', scope: 'task' });
+    await h.receive({ kind: 'scanWholeWorkCopy' });
+    await h.receive({ kind: 'selectConflict', id: 'c1' });
+    expect(h.intents).toHaveLength(3);
+    await h.receive({ kind: 'applyConflictResolution' });
+    await h.receive({ kind: 'startConflictBatch' });
+    expect(h.intents).toHaveLength(3);
+    h.handle.dispose();
+  });
+
+  it('P7 表：busy 时重复扫描与批量被拒，日志/关闭与查看放行', async () => {
+    const h = makeM4Panel('p7', createP7Gates());
+    h.patch({ busy: true });
+    await h.receive({ kind: 'rescanConflicts', scope: 'whole' });
+    await h.receive({ kind: 'startConflictBatch' });
+    await h.receive({ kind: 'postponeConflict' });
+    await h.receive({ kind: 'viewTaskLog' });
+    await h.receive({ kind: 'closePanel' });
+    expect(h.intents).toHaveLength(3);
+    h.handle.dispose();
+  });
+
+  it('DOM 注入同源：P7 写锁帧的可交互集含重新扫描、不含应用解决', () => {
+    const h = makeM4Panel('p7', createP7Gates());
+    h.patch({
+      writeLocked: true,
+      headerActions: [
+        { id: 'rescanConflicts', label: '重新扫描' },
+        { id: 'applyConflictResolution', label: '应用解决' },
+      ],
+    });
+    const html = String((renderMessage(h.panel.posted) as { html?: string })?.html ?? '');
+    // 与宿主守卫同表：放行的重新扫描按钮可点，未放行的写入按钮禁用。
+    expect(html).not.toMatch(/data-intent="rescanConflicts"[^>]*disabled/);
+    expect(html).toMatch(/data-intent="applyConflictResolution"[^>]*disabled/);
+    h.handle.dispose();
+  });
+
+  it('bannerAction 在 M4 表的命名空间：P7 写锁下横幅回扫按钮放行', async () => {
+    const h = makeM4Panel('p7', createP7Gates());
+    h.patch({
+      writeLocked: true,
+      banners: [{
+        id: 'unknown',
+        level: 'warn',
+        title: '结果未知',
+        actions: [{ id: 'rescanConflicts', label: '重新扫描' }],
+      }],
+    });
+    await h.receive({ kind: 'bannerAction', bannerId: 'unknown', actionId: 'rescanConflicts' });
+    expect(h.intents).toHaveLength(1);
+    h.handle.dispose();
   });
 });

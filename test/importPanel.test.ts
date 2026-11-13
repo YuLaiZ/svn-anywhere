@@ -1133,7 +1133,7 @@ describe('P3 导入面板 flow', () => {
     await sleep(40);
     expect(lastHtml(panel)).toContain('核实确认已提交');
     // 结论成功页写缓存时携带 targetUrl（handoff 的模型外数据源）。
-    const cached = readSessionResult('checkout', { entryKey: src, mode: 'import' });
+    const cached = readSessionResult('checkout', { scopeKind: 'checkout', entryKey: src, mode: 'import' });
     const cachedPage = cached?.page as { kind?: string; revision?: number; targetUrl?: string };
     expect(cachedPage.kind).toBe('success');
     expect(cachedPage.revision).toBe(7);
@@ -1180,7 +1180,7 @@ describe('P3 导入面板 flow', () => {
     expect(html).toContain('data-intent="retryImport"');
     // 核实结论页写缓存（关闭重开恢复结论页）——字段矩阵：kind/evidence/
     // detail（锚点文案）/formSnapshot（retryImport 两层回填数据源）/targetUrl。
-    const cached = readSessionResult('checkout', { entryKey: src, mode: 'import' });
+    const cached = readSessionResult('checkout', { scopeKind: 'checkout', entryKey: src, mode: 'import' });
     const cachedPage = cached?.page as {
       kind?: string;
       evidence?: string;
@@ -1212,7 +1212,7 @@ describe('P3 导入面板 flow', () => {
     expect(html).toContain(strings.checkoutPanel.importResultTitles.unknown);
     expect(html).toContain('data-intent="abandonUnknownImport"');
     // 快照不完整形态的缓存页：kind=unknown ∧ snapshotIncomplete=true（放弃出口的判定载体）。
-    const cachedIncomplete = readSessionResult('checkout', { entryKey: src2, mode: 'import' });
+    const cachedIncomplete = readSessionResult('checkout', { scopeKind: 'checkout', entryKey: src2, mode: 'import' });
     const incompletePage = cachedIncomplete?.page as { kind?: string; snapshotIncomplete?: boolean };
     expect(incompletePage.kind).toBe('unknown');
     expect(incompletePage.snapshotIncomplete).toBe(true);
@@ -1263,7 +1263,7 @@ describe('P3 导入面板 flow', () => {
     // 迟到结论被守卫丢弃：页面保持 unknown、缓存仍是发起时的 unknown 镜像
     // （结论页未写入）、记录不动。
     expect(lastHtml(panel)).toContain(strings.checkoutPanel.importResultTitles.unknown);
-    const cached = readSessionResult('checkout', { entryKey: src, mode: 'import' });
+    const cached = readSessionResult('checkout', { scopeKind: 'checkout', entryKey: src, mode: 'import' });
     expect((cached?.page as { kind?: string })?.kind).toBe('unknown');
     expect([...store.records.values()].some((record) => record.phase === 'unknown')).toBe(true);
     expect(getResultEpoch('checkout')).toBe(epochBefore + 1);
@@ -1277,7 +1277,7 @@ describe('P3 导入面板 flow', () => {
     const { setImportSnapshotDir } = await import('../src/host/panel/importTask');
     setImportSnapshotDir(snapshotDir);
     // merged 页经缓存恢复（executor 直落 merged 页的缓存形态：revision+detail 齐备）。
-    writeSessionResult('checkout', { entryKey: src, mode: 'import' }, {
+    writeSessionResult('checkout', { scopeKind: 'checkout', entryKey: src, mode: 'import' }, {
       mode: 'import',
       kind: 'merged',
       revision: 9,
@@ -1310,7 +1310,7 @@ describe('P3 导入面板 flow', () => {
     expect(html).toContain('data-intent="acknowledgeMerged"');
     expect(html).not.toContain(strings.checkoutPanel.importVerifySnapshotFailedTitle);
     // 写缓存的结论页同携 revision/detail（关闭重开经②段缓存恢复的数据源）。
-    const cached = readSessionResult('checkout', { entryKey: src, mode: 'import' });
+    const cached = readSessionResult('checkout', { scopeKind: 'checkout', entryKey: src, mode: 'import' });
     const cachedPage = cached?.page as { kind?: string; revision?: number; detail?: string };
     expect(cachedPage.kind).toBe('merged');
     expect(cachedPage.revision).toBe(9);
@@ -1357,7 +1357,7 @@ describe('P3 导入面板 flow', () => {
     expect(html).not.toContain('data-intent="abandonUnknownImport"');
     // 缓存页字段矩阵：resolution/formSnapshot（两层回填数据源）/targetUrl；
     // 非快照不完整形态不置 snapshotIncomplete。
-    const cached = readSessionResult('checkout', { entryKey: src, mode: 'import' });
+    const cached = readSessionResult('checkout', { scopeKind: 'checkout', entryKey: src, mode: 'import' });
     const cachedPage = cached?.page as {
       kind?: string;
       resolution?: string;
@@ -1385,7 +1385,7 @@ describe('P3 导入面板 flow', () => {
     const snapshotDir = await presetUnknownRecord(src, TARGET_URL, true, true);
     const { setImportSnapshotDir } = await import('../src/host/panel/importTask');
     setImportSnapshotDir(snapshotDir);
-    writeSessionResult('checkout', { entryKey: src, mode: 'import' }, {
+    writeSessionResult('checkout', { scopeKind: 'checkout', entryKey: src, mode: 'import' }, {
       mode: 'import',
       kind: 'merged',
       revision: 9,
@@ -1408,7 +1408,7 @@ describe('P3 导入面板 flow', () => {
     expect(html).not.toContain('data-intent="acknowledgeMerged"');
     expect(html).toContain('data-intent="newTask"');
     // settled 页写缓存（关闭重开恢复 settled 形态）。
-    const cached = readSessionResult('checkout', { entryKey: src, mode: 'import' });
+    const cached = readSessionResult('checkout', { scopeKind: 'checkout', entryKey: src, mode: 'import' });
     expect((cached?.page as { settled?: boolean }).settled).toBe(true);
     setImportSnapshotDir(undefined);
   });
@@ -1419,7 +1419,7 @@ describe('P3 导入面板 flow', () => {
     const { setImportSnapshotDir } = await import('../src/host/panel/importTask');
     setImportSnapshotDir(snapshotDir);
     // merged 页经缓存恢复（记录 unknown ∧ outcome=merged）。
-    writeSessionResult('checkout', { entryKey: src, mode: 'import' }, {
+    writeSessionResult('checkout', { scopeKind: 'checkout', entryKey: src, mode: 'import' }, {
       mode: 'import',
       kind: 'merged',
       revision: 9,
@@ -1471,13 +1471,13 @@ describe('P3 导入面板 flow', () => {
     send(second, { kind: 'acknowledgeMerged' });
     await sleep(40);
     expect(store.records.size).toBe(0);
-    const settled = readSessionResult('checkout', { entryKey: src, mode: 'import' });
+    const settled = readSessionResult('checkout', { scopeKind: 'checkout', entryKey: src, mode: 'import' });
     expect((settled?.page as { settled?: boolean }).settled).toBe(true);
     // 旧控制器的迟到核实结论（committed）返回：settled 页与缓存不被顶回、
     // 记录不被二次收口（已随 acknowledge 删除——迟到收口经执行器校验跳过）。
     releaseVerify();
     await sleep(60);
-    const after = readSessionResult('checkout', { entryKey: src, mode: 'import' });
+    const after = readSessionResult('checkout', { scopeKind: 'checkout', entryKey: src, mode: 'import' });
     const page = after?.page as { kind?: string; settled?: boolean };
     expect(page.kind).toBe('merged');
     expect(page.settled).toBe(true);
@@ -1494,7 +1494,7 @@ describe('P3 导入面板 flow', () => {
   it('retryImport：会话 form 非空优先 form；重启形态按结果页 formSnapshot 回填', async () => {
     // 会话内形态：发起失败页后会话 form 仍在 → retry 保留会话值。
     const src = realpathSync(makeSourceDir('retry-session'));
-    writeSessionResult('checkout', { entryKey: src, mode: 'import' }, {
+    writeSessionResult('checkout', { scopeKind: 'checkout', entryKey: src, mode: 'import' }, {
       mode: 'import',
       kind: 'failed',
       path: src,
@@ -1511,13 +1511,13 @@ describe('P3 导入面板 flow', () => {
     expect(html).toContain(strings.checkoutPanel.stepForm);
     expect(html).toContain(TARGET_URL);
     // 缓存清除 + 代次递增 + 草稿写回（当前入口键）。
-    expect(readSessionResult('checkout', { entryKey: src, mode: 'import' })).toBeUndefined();
+    expect(readSessionResult('checkout', { scopeKind: 'checkout', entryKey: src, mode: 'import' })).toBeUndefined();
     expect(readDraft(src, 'import')?.url).toBe(TARGET_URL);
 
     // 重启形态：缓存带 formSnapshot、会话 form 为空（新建会话）→ 按快照回填。
     panel.dispose();
     const src2 = realpathSync(makeSourceDir('retry-restart'));
-    writeSessionResult('checkout', { entryKey: src2, mode: 'import' }, {
+    writeSessionResult('checkout', { scopeKind: 'checkout', entryKey: src2, mode: 'import' }, {
       mode: 'import',
       kind: 'failed',
       path: src2,
@@ -1539,7 +1539,7 @@ describe('P3 导入面板 flow', () => {
 
   it('handoffToCheckout：切模式保留 URL/revMode=number/revision，草稿写「源目录+checkout」键，重开回填', async () => {
     const src = realpathSync(makeSourceDir('handoff'));
-    writeSessionResult('checkout', { entryKey: src, mode: 'import' }, {
+    writeSessionResult('checkout', { scopeKind: 'checkout', entryKey: src, mode: 'import' }, {
       mode: 'import',
       kind: 'success',
       revision: 12,
@@ -1578,7 +1578,7 @@ describe('P3 导入面板 flow', () => {
 
   it('revealSourceDir 与 clearUrlHistory：Finder 打开源目录、清空共用历史', async () => {
     const src = realpathSync(makeSourceDir('actions'));
-    writeSessionResult('checkout', { entryKey: src, mode: 'import' }, {
+    writeSessionResult('checkout', { scopeKind: 'checkout', entryKey: src, mode: 'import' }, {
       mode: 'import',
       kind: 'success',
       revision: 5,

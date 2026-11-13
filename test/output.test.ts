@@ -74,16 +74,25 @@ describe('输出频道生命周期（宿主侧）', () => {
     logLine('状态行', 'status');
     logLine('更新行', 'update');
     logLine('提交行', 'commit');
+    logLine('浏览行', 'browse');
+    logLine('历史行', 'history');
+    logLine('冲突行', 'conflict');
     logLine('其它行', 'other');
     expect(vscodeMock.channels.map((ch) => ch.title)).toEqual([
       'SVN Anywhere · 状态',
       'SVN Anywhere · 更新',
       'SVN Anywhere · 提交',
+      'SVN Anywhere · 仓库浏览',
+      'SVN Anywhere · 历史',
+      'SVN Anywhere · 冲突',
       'SVN Anywhere',
     ]);
     expect(channelByTitle('SVN Anywhere · 状态')?.lines).toEqual(['状态行']);
     expect(channelByTitle('SVN Anywhere · 更新')?.lines).toEqual(['更新行']);
     expect(channelByTitle('SVN Anywhere · 提交')?.lines).toEqual(['提交行']);
+    expect(channelByTitle('SVN Anywhere · 仓库浏览')?.lines).toEqual(['浏览行']);
+    expect(channelByTitle('SVN Anywhere · 历史')?.lines).toEqual(['历史行']);
+    expect(channelByTitle('SVN Anywhere · 冲突')?.lines).toEqual(['冲突行']);
     expect(channelByTitle('SVN Anywhere')?.lines).toEqual(['其它行']);
   });
 

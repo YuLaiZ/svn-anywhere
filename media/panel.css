@@ -816,3 +816,228 @@ button.th-sort.active { color: var(--vscode-textLink-foreground, var(--vscode-fo
 .seg-3 { background: var(--vscode-charts-purple, #b180d7); }
 .seg-4 { background: var(--vscode-charts-yellow, #cca700); }
 .seg-5 { background: var(--vscode-charts-red, #f14c4c); }
+
+/* ------------------------------ M4 通用面板组件（P5/P6/P7） ------------------------------ */
+
+/* 主从布局：左主区（树/表格/列表）右详情区，各自独立滚动；
+ * master-detail = 62/38（P5/P6），balanced = 50/50（P7）；
+ * 窄容器（≤400px）上下堆叠，页面不横向溢出。 */
+.split-layout {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  gap: 0;
+  overflow: hidden;
+}
+
+.split-layout > .pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.layout-master-detail > .pane-master { flex: 1 1 62%; border-right: 1px solid var(--vscode-panel-border); }
+.layout-master-detail > .pane-detail { flex: 1 1 38%; }
+.layout-balanced > .pane-master { flex: 1 1 50%; border-right: 1px solid var(--vscode-panel-border); }
+.layout-balanced > .pane-detail { flex: 1 1 50%; }
+
+.pane-head {
+  flex: none;
+  padding: 8px 12px 4px;
+  font-size: 12px;
+  color: var(--vscode-descriptionForeground);
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+.pane-scroll { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+
+@media (max-width: 400px) {
+  .split-layout { flex-direction: column; }
+  .layout-master-detail > .pane-master,
+  .layout-balanced > .pane-master {
+    flex: 1 1 50%;
+    border-right: none;
+    border-bottom: 1px solid var(--vscode-panel-border);
+  }
+  .layout-master-detail > .pane-detail,
+  .layout-balanced > .pane-detail { flex: 1 1 50%; }
+}
+
+/* 详情段：标题/副标题 + 键值、文本、预格式与动作段。 */
+.detail-title { padding: 8px 12px 0; font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+.detail-subtitle { padding: 2px 12px 0; font-size: 11px; color: var(--vscode-descriptionForeground); overflow-wrap: anywhere; }
+.detail-section { padding: 8px 12px 0; font-size: 12px; }
+.detail-section:last-child { padding-bottom: 10px; }
+.detail-section h2 { margin: 4px 0; font-size: 12px; font-weight: 600; color: var(--vscode-descriptionForeground); }
+.detail-section p { margin: 4px 0; overflow-wrap: anywhere; }
+.detail-section pre { margin: 4px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 10px; margin: 4px 0; }
+.kv dt { color: var(--vscode-descriptionForeground); }
+.kv dd { margin: 0; overflow-wrap: anywhere; }
+.kv dd.mono { font-family: var(--vscode-editor-font-family, monospace); }
+.inline-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.inline-actions button { font-size: 12px; padding: 2px 8px; }
+
+/* 懒加载树（P5）：展开/选择分离；两段式元数据占位与补全进度。 */
+.lazy-tree { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 4px 0; }
+.tree-node { min-width: 0; }
+.tree-node-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  padding: 2px 8px 2px 0;
+  font-size: 12px;
+}
+.tree-node-row:hover { background: var(--vscode-list-hoverBackground); }
+.tree-node.selected > .tree-node-row {
+  background: var(--vscode-list-inactiveSelectionBackground, var(--vscode-list-hoverBackground));
+  color: var(--vscode-list-inactiveSelectionForeground, inherit);
+}
+.node-toggle {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid transparent;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 10px;
+  line-height: 16px;
+}
+.node-toggle:disabled { opacity: 0.5; cursor: default; }
+.node-spacer { flex: none; width: 18px; }
+.node-label {
+  flex: 0 1 auto;
+  min-width: 0;
+  border: 1px solid transparent;
+  background: transparent;
+  color: inherit;
+  font-size: 12px;
+  padding: 1px 3px;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+.node-label:hover:not([disabled]) { text-decoration: underline; }
+.node-label:disabled { cursor: default; }
+.tree-node.phase-loading > .tree-node-row { opacity: 0.75; }
+.node-status { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.node-pending { flex: none; font-size: 11px; }
+.node-metadata-progress {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+}
+.node-progress-bar {
+  display: inline-block;
+  width: 56px;
+  height: 5px;
+  border-radius: 3px;
+  background: var(--vscode-input-background, rgba(127, 127, 127, 0.2));
+  overflow: hidden;
+}
+.node-progress-bar > i {
+  display: block;
+  height: 100%;
+  background: var(--vscode-progressBar-background, var(--vscode-focusBorder));
+}
+.tree-node-children { min-width: 0; }
+.tree-load-more { padding: 6px 12px; }
+
+/* 分组 tab（P7）：只承载计数与当前项。 */
+.tabs {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 6px 16px 0;
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+.tab {
+  border: 1px solid transparent;
+  border-bottom: none;
+  background: transparent;
+  color: var(--vscode-descriptionForeground);
+  font-size: 12px;
+  padding: 4px 10px;
+  cursor: pointer;
+  border-radius: 3px 3px 0 0;
+}
+.tab:hover:not([disabled]) { color: var(--vscode-foreground); }
+.tab.current {
+  color: var(--vscode-foreground);
+  border-color: var(--vscode-panel-border);
+  background: var(--vscode-sideBar-background);
+}
+.tab:disabled { opacity: 0.5; cursor: default; }
+.tab-count {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 0 5px;
+  border-radius: 8px;
+  background: var(--vscode-badge-background, rgba(127, 127, 127, 0.25));
+  color: var(--vscode-badge-foreground, inherit);
+  font-size: 10px;
+}
+
+/* 折叠筛选面板（P6 关键词/作者/日期/路径；变化立即提交）。 */
+.filter-panel { flex: none; margin: 6px 16px 0; border: 1px solid var(--vscode-panel-border); border-radius: 4px; }
+.filter-panel > summary { cursor: pointer; padding: 6px 10px; font-size: 12px; color: var(--vscode-descriptionForeground); }
+.filter-panel-body { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 10px 8px; align-items: flex-end; }
+.filter-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 120px;
+  flex: 1 1 140px;
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+}
+.filter-field input,
+.filter-field select {
+  font-family: var(--vscode-font-family);
+  font-size: 12px;
+  padding: 3px 6px;
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+  border-radius: 2px;
+}
+.field-error { flex-basis: 100%; margin: 0; font-size: 11px; color: var(--vscode-errorForeground); }
+.filter-panel-actions { flex-basis: 100%; display: flex; gap: 6px; }
+.filter-panel-actions button { font-size: 12px; padding: 2px 10px; }
+
+/* 长任务进度（P6/P7）：标题、明细与放行动作；与 busy 底部进度条分开。 */
+.task-progress {
+  flex: none;
+  margin: 8px 16px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-sideBar-background);
+}
+.task-progress-head { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.task-progress-head .acts { margin-left: auto; display: flex; gap: 6px; }
+.task-progress-head .acts button { font-size: 12px; padding: 2px 8px; }
+.task-progress p { margin: 4px 0 0; font-size: 11px; overflow-wrap: anywhere; }
+
+/* 表格“加载更多”（P6 append 模式；空态与有行时都保留入口）。 */
+.table-load-more { flex: none; padding: 6px 16px; }
+.table-load-more button { font-size: 12px; padding: 2px 10px; }
+
+/* 表格勾选列与选中行（P6 revision 选择；上限 2 由宿主兜底）。 */
+.data-table tr.selected { background: var(--vscode-list-inactiveSelectionBackground, rgba(127, 127, 127, 0.12)); }
+.data-table .col.select { width: 28px; text-align: center; }
+.data-table .col.select input { margin: 0; }
+
+/* toast 不拦截页脚/按钮点击（app.ts 亦内联设置，CSS 兜底）。 */
+.toast { pointer-events: none; }

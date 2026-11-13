@@ -8,16 +8,56 @@
  *   路径一律由宿主从当前状态映射取得，视图不能传任意路径执行；
  * - TypeScript 类型不替代消息校验：parseViewMessage 对每条入站消息做
  *   结构、类型与动作白名单的运行时检查，非法消息被拒绝并给出原因。
+ * - M4 起新增 P5/P6/P7 意图（技术方案 §6 冻结动作对账表），意图仍只携带
+ *   稳定 nodeId/行/ revision ID 或枚举值，不接收宿主路径；枚举参数在解析
+ *   层按白名单拒绝（例如 refreshHistoryUpper.mode 只允许 head/base-fallback）。
  */
 import { format, strings } from '../i18n';
 
 export const PROTOCOL_VERSION = 1;
+
+/* --------------------------------------------------------------------------------
+ * M4 意图枚举取值（技术方案 §6：需要参数时只传稳定 ID 或枚举值）。
+ * 导出供宿主控制器、放行表与测试共用，不在各面板重复定义。
+ * -------------------------------------------------------------------------------- */
+
+/** refreshHistoryUpper.mode 的合法值：协议层只接受这两种（其余在解析层拒绝）。 */
+export const REFRESH_HISTORY_UPPER_MODES = ['head', 'base-fallback'] as const;
+export type RefreshHistoryUpperMode = (typeof REFRESH_HISTORY_UPPER_MODES)[number];
+
+/** P6 复制内容的类别：提交说明、revision、变更路径、节点 URL、当前目标路径。 */
+export const HISTORY_COPY_KINDS = ['revision', 'message', 'changedPath', 'nodeUrl', 'targetPath'] as const;
+export type HistoryCopyKind = (typeof HISTORY_COPY_KINDS)[number];
+
+/** P7 冲突列表顶级 tab：文件、属性、树三类 + 全部。 */
+export const CONFLICT_TABS = ['all', 'text', 'property', 'tree'] as const;
+export type ConflictTab = (typeof CONFLICT_TABS)[number];
+
+/** P7 svn resolve --accept 变体（postpone 是面板动作，不是 accept 值）。 */
+export const CONFLICT_VARIANTS = [
+  'mine-full',
+  'theirs-full',
+  'working',
+  'base',
+  'mine-conflict',
+  'theirs-conflict',
+] as const;
+export type ConflictVariant = (typeof CONFLICT_VARIANTS)[number];
+
+/** P7 扫描范围：本次更新任务范围 / 整个工作副本。 */
+export const CONFLICT_RESCAN_SCOPES = ['task', 'whole'] as const;
+export type ConflictRescanScope = (typeof CONFLICT_RESCAN_SCOPES)[number];
+
+/** P7 打开冲突版本的角色：本地工作内容 / 冲突基线 / 传入内容。 */
+export const CONFLICT_VERSION_ROLES = ['local', 'base', 'incoming'] as const;
+export type ConflictVersionRole = (typeof CONFLICT_VERSION_ROLES)[number];
 
 /**
  * 视图可发起的意图（已知动作的联合类型）。阶段 1 起覆盖 P1 提交面板，
  * 阶段 2 起覆盖 P2 忽略规则编辑器；后续阶段扩展 P3 检出/导入与 P4 磁盘
  * 治理的动作全集——类型与白名单先行登记（处理器由各面板落地时实现），
  * 意图里仍只允许条目 ID / 序号等稳定标识，路径一律由宿主映射。
+ * M4 追加 P5 仓库浏览器、P6 历史与比较、P7 冲突处理动作。
  */
 export type Intent =
   | { kind: 'refresh' }
@@ -87,6 +127,53 @@ export type Intent =
   | { kind: 'confirmVacuum' }
   | { kind: 'revealFileInOS'; rowId: string }
   | { kind: 'showScopeHelp' }
+  /* ---------------- M4：P5 仓库浏览器（仅稳定 nodeId） ---------------- */
+  | { kind: 'toggleBrowserNode'; nodeId: string }
+  | { kind: 'selectBrowserNode'; nodeId: string }
+  | { kind: 'retryBrowserNode'; nodeId: string }
+  | { kind: 'refreshBrowserNode'; nodeId: string }
+  | { kind: 'loadMoreBrowserNode'; nodeId: string }
+  | { kind: 'copyBrowserNodeUrl'; nodeId: string }
+  | { kind: 'openRemoteNode'; nodeId: string }
+  | { kind: 'openHistoryFromBrowser'; nodeId: string }
+  /* ---------------- M4：P6 历史与比较 ---------------- */
+  | { kind: 'selectHistoryRevision'; id: string }
+  | { kind: 'toggleHistoryRevision'; id: string }
+  | { kind: 'loadMoreHistory' }
+  | { kind: 'setHistoryFilter'; id: string; value: string }
+  | { kind: 'clearHistoryFilters' }
+  | { kind: 'resetHistorySession' }
+  | { kind: 'refreshHistoryUpper'; mode: RefreshHistoryUpperMode }
+  | { kind: 'compareHistoryRevisions' }
+  | { kind: 'selectCompareCandidate'; id: string }
+  | { kind: 'openHistoryDiff' }
+  | { kind: 'comparePreviousVisible' }
+  | { kind: 'compareBase' }
+  | { kind: 'viewHistoryRevision' }
+  | { kind: 'exportHistoryVersion' }
+  | { kind: 'copyHistoryText'; copyKind: HistoryCopyKind; id: string }
+  | { kind: 'blameHistoryRevision' }
+  | { kind: 'updateToHistoryRevision' }
+  | { kind: 'checkoutHistoryDirectory' }
+  /* ---------------- M4：P7 冲突处理 ---------------- */
+  | { kind: 'selectConflict'; id: string }
+  | { kind: 'setConflictTab'; tab: ConflictTab }
+  | { kind: 'chooseConflictVariant'; value: ConflictVariant }
+  | { kind: 'applyConflictResolution' }
+  | { kind: 'postponeConflict' }
+  | { kind: 'prepareTreeConflict' }
+  | { kind: 'rescanConflicts'; scope: ConflictRescanScope }
+  | { kind: 'planConflictBatch' }
+  | { kind: 'startConflictBatch' }
+  | { kind: 'showConflictBatchResults' }
+  | { kind: 'scanWholeWorkCopy' }
+  | { kind: 'inspectConflict' }
+  | { kind: 'openWorkCopyTerminal' }
+  | { kind: 'openConflictDiff' }
+  | { kind: 'openConflictEditor' }
+  | { kind: 'openConflictVersion'; role: ConflictVersionRole }
+  | { kind: 'copyConflictPath'; id: string }
+  | { kind: 'authenticateConflictSource' }
   /* ---------------- 表格配套（通用） ---------------- */
   | { kind: 'setSort'; key: string; direction: 'asc' | 'desc' }
   | { kind: 'setPage'; page: number };
@@ -131,8 +218,65 @@ export interface IntentMessage {
 
 export type ViewToHostMessage = ReadyMessage | IntentMessage;
 
+/**
+ * M4 冻结动作对账表（技术方案 §6）登记的 P5/P6/P7 全部意图 kind。
+ * 独立导出供运行时白名单、放行表与单测交叉校验；新增动作必须同时进
+ * 这里、Intent 联合与 parseIntent 分支，避免只登记一处。
+ */
+export const M4_INTENT_KINDS = [
+  // P5 仓库浏览器
+  'toggleBrowserNode',
+  'selectBrowserNode',
+  'retryBrowserNode',
+  'refreshBrowserNode',
+  'loadMoreBrowserNode',
+  'copyBrowserNodeUrl',
+  'openRemoteNode',
+  'openHistoryFromBrowser',
+  // P6 历史与比较
+  'selectHistoryRevision',
+  'toggleHistoryRevision',
+  'loadMoreHistory',
+  'setHistoryFilter',
+  'clearHistoryFilters',
+  'resetHistorySession',
+  'refreshHistoryUpper',
+  'compareHistoryRevisions',
+  'selectCompareCandidate',
+  'openHistoryDiff',
+  'comparePreviousVisible',
+  'compareBase',
+  'viewHistoryRevision',
+  'exportHistoryVersion',
+  'copyHistoryText',
+  'blameHistoryRevision',
+  'updateToHistoryRevision',
+  'checkoutHistoryDirectory',
+  // P7 冲突处理
+  'selectConflict',
+  'setConflictTab',
+  'chooseConflictVariant',
+  'applyConflictResolution',
+  'postponeConflict',
+  'prepareTreeConflict',
+  'rescanConflicts',
+  'planConflictBatch',
+  'startConflictBatch',
+  'showConflictBatchResults',
+  'scanWholeWorkCopy',
+  'inspectConflict',
+  'openWorkCopyTerminal',
+  'openConflictDiff',
+  'openConflictEditor',
+  'openConflictVersion',
+  'copyConflictPath',
+  'authenticateConflictSource',
+] as const;
+
+export type M4IntentKind = (typeof M4_INTENT_KINDS)[number];
+
 /** 意图动作白名单：新增动作必须同时登记在这里与 intent 校验分支。 */
-const INTENT_KINDS = new Set([
+const INTENT_KINDS = new Set<string>([
   'refresh', 'openDiff', 'openFile', 'dismissBanner', 'bannerAction',
   'setFilter', 'clearFilters', 'toggleRow', 'syncInput',
   'toggleGroup', 'toggleTree', 'setView', 'selectVisible', 'clearSelection',
@@ -148,6 +292,7 @@ const INTENT_KINDS = new Set([
   'handoffToCheckout', 'newTask',
   'startScan', 'cancelScan', 'rescan', 'confirmVacuum', 'revealFileInOS', 'showScopeHelp',
   'setSort', 'setPage',
+  ...M4_INTENT_KINDS,
 ]);
 
 /** 提交面板视图切换的合法取值。 */
@@ -185,6 +330,36 @@ function readFiniteNumber(source: Record<string, unknown>, key: string, label: s
   return typeof value === 'number' && Number.isFinite(value)
     ? { ok: true, value }
     : { ok: false, message: format(strings.panel.validation.numberField, { label: `${label}.${key}` }) };
+}
+
+/**
+ * M4 新增枚举校验的 i18n key（`panel.validation.invalidEnum`）默认文案。
+ * i18n 文件落地该键后自动优先取 i18n；未落地前用本默认值（同 i18n_keys），
+ * 保证定向单测可运行。登记见本模块交付的 i18n_keys。
+ */
+const INVALID_ENUM_DEFAULT = '{label} 的取值非法：允许 {allowed}，收到 {value}';
+const validationStrings: Record<string, string | undefined> = strings.panel.validation;
+const INVALID_ENUM_TEMPLATE = validationStrings.invalidEnum ?? INVALID_ENUM_DEFAULT;
+
+/** 枚举字段校验：值必须是允许集合内的字符串（白名单外的值直接拒绝）。 */
+function readEnum<T extends string>(
+  source: Record<string, unknown>,
+  key: string,
+  allowed: readonly T[],
+  label: string,
+): FieldResult<T> {
+  const value = source[key];
+  if (typeof value === 'string' && (allowed as readonly string[]).includes(value)) {
+    return { ok: true, value: value as T };
+  }
+  return {
+    ok: false,
+    message: format(INVALID_ENUM_TEMPLATE, {
+      label: `${label}.${key}`,
+      allowed: allowed.join(' | '),
+      value: String(value),
+    }),
+  };
 }
 
 /** 校验 intent 载荷：动作白名单 + 字段类型（不校验条目存在性，那属于宿主侧能力校验）。 */
@@ -245,7 +420,33 @@ function parseIntent(raw: unknown): { ok: true; intent: Intent } | { ok: false; 
     case 'cancelScan':
     case 'rescan':
     case 'confirmVacuum':
-    case 'showScopeHelp': {
+    case 'showScopeHelp':
+    // M4：P6 无参动作。
+    case 'loadMoreHistory':
+    case 'clearHistoryFilters':
+    case 'resetHistorySession':
+    case 'compareHistoryRevisions':
+    case 'openHistoryDiff':
+    case 'comparePreviousVisible':
+    case 'compareBase':
+    case 'viewHistoryRevision':
+    case 'exportHistoryVersion':
+    case 'blameHistoryRevision':
+    case 'updateToHistoryRevision':
+    case 'checkoutHistoryDirectory':
+    // M4：P7 无参动作。
+    case 'applyConflictResolution':
+    case 'postponeConflict':
+    case 'prepareTreeConflict':
+    case 'planConflictBatch':
+    case 'startConflictBatch':
+    case 'showConflictBatchResults':
+    case 'scanWholeWorkCopy':
+    case 'inspectConflict':
+    case 'openWorkCopyTerminal':
+    case 'openConflictDiff':
+    case 'openConflictEditor':
+    case 'authenticateConflictSource': {
       // 无参意图：case 标签联合到判别联合的直接构造在类型层不可表达
       // （宽 kind 无法匹配单一成员），此处集中一次断言；带载荷意图各有
       // 独立校验分支，白名单与单测双重覆盖此列表。
@@ -383,6 +584,109 @@ function parseIntent(raw: unknown): { ok: true; intent: Intent } | { ok: false; 
             },
           }
         : { ok: false, reason: inputRevision.message };
+    }
+    /* ---------------- M4：P5 仓库浏览器（仅稳定 nodeId，不接受路径） ---------------- */
+    case 'toggleBrowserNode':
+    case 'selectBrowserNode':
+    case 'retryBrowserNode':
+    case 'refreshBrowserNode':
+    case 'loadMoreBrowserNode':
+    case 'copyBrowserNodeUrl':
+    case 'openRemoteNode':
+    case 'openHistoryFromBrowser': {
+      const nodeId = readString(raw, 'nodeId', label);
+      return nodeId.ok
+        ? {
+            ok: true,
+            intent: {
+              kind: kind as
+                | 'toggleBrowserNode'
+                | 'selectBrowserNode'
+                | 'retryBrowserNode'
+                | 'refreshBrowserNode'
+                | 'loadMoreBrowserNode'
+                | 'copyBrowserNodeUrl'
+                | 'openRemoteNode'
+                | 'openHistoryFromBrowser',
+              nodeId: nodeId.value,
+            },
+          }
+        : { ok: false, reason: nodeId.message };
+    }
+    /* ---------------- M4：P6 历史与比较 ---------------- */
+    case 'selectHistoryRevision':
+    case 'toggleHistoryRevision':
+    case 'selectCompareCandidate': {
+      const id = readString(raw, 'id', label);
+      return id.ok
+        ? {
+            ok: true,
+            intent: {
+              kind: kind as 'selectHistoryRevision' | 'toggleHistoryRevision' | 'selectCompareCandidate',
+              id: id.value,
+            },
+          }
+        : { ok: false, reason: id.message };
+    }
+    case 'setHistoryFilter': {
+      const id = readString(raw, 'id', label);
+      if (!id.ok) {
+        return { ok: false, reason: id.message };
+      }
+      const value = readString(raw, 'value', label);
+      return value.ok
+        ? { ok: true, intent: { kind, id: id.value, value: value.value } }
+        : { ok: false, reason: value.message };
+    }
+    case 'refreshHistoryUpper': {
+      // 协议层只接受 head/base-fallback：unresolved/live-head 等会话来源或
+      // 其他任意值一律在解析层拒绝，宿主不会收到非法 mode。
+      const mode = readEnum(raw, 'mode', REFRESH_HISTORY_UPPER_MODES, label);
+      return mode.ok
+        ? { ok: true, intent: { kind, mode: mode.value } }
+        : { ok: false, reason: mode.message };
+    }
+    case 'copyHistoryText': {
+      const copyKind = readEnum(raw, 'copyKind', HISTORY_COPY_KINDS, label);
+      if (!copyKind.ok) {
+        return { ok: false, reason: copyKind.message };
+      }
+      const id = readString(raw, 'id', label);
+      return id.ok
+        ? { ok: true, intent: { kind, copyKind: copyKind.value, id: id.value } }
+        : { ok: false, reason: id.message };
+    }
+    /* ---------------- M4：P7 冲突处理 ---------------- */
+    case 'selectConflict':
+    case 'copyConflictPath': {
+      const id = readString(raw, 'id', label);
+      return id.ok
+        ? { ok: true, intent: { kind: kind as 'selectConflict' | 'copyConflictPath', id: id.value } }
+        : { ok: false, reason: id.message };
+    }
+    case 'setConflictTab': {
+      const tab = readEnum(raw, 'tab', CONFLICT_TABS, label);
+      return tab.ok
+        ? { ok: true, intent: { kind, tab: tab.value } }
+        : { ok: false, reason: tab.message };
+    }
+    case 'chooseConflictVariant': {
+      const value = readEnum(raw, 'value', CONFLICT_VARIANTS, label);
+      return value.ok
+        ? { ok: true, intent: { kind, value: value.value } }
+        : { ok: false, reason: value.message };
+    }
+    case 'rescanConflicts': {
+      const scope = readEnum(raw, 'scope', CONFLICT_RESCAN_SCOPES, label);
+      return scope.ok
+        ? { ok: true, intent: { kind, scope: scope.value } }
+        : { ok: false, reason: scope.message };
+    }
+    case 'openConflictVersion': {
+      const role = readEnum(raw, 'role', CONFLICT_VERSION_ROLES, label);
+      return role.ok
+        ? { ok: true, intent: { kind, role: role.value } }
+        : { ok: false, reason: role.message };
     }
   }
   // kind 已在 INTENT_KINDS 白名单过滤，这里不可达；保留兜底防御未来新增遗漏。

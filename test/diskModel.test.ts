@@ -700,7 +700,7 @@ describe('运行中任务绑定与占用重算', () => {
   it('绑定扫描任务：页头 wcRoot/subPath 取任务固定参数（不显示本次打开的另一子目录）', () => {
     const bound = bindRunningTask(state(), { kind: 'scan', wcRoot: '/a', subPath: '/a/x' });
     expect(bound.phase).toBe('scanning');
-    expect(bound.binding).toEqual({ resultScope: { wcRoot: '/a' }, subPath: '/a/x' });
+    expect(bound.binding).toEqual({ resultScope: { scopeKind: 'disk', wcRoot: '/a' }, subPath: '/a/x' });
     expect(bound.recovered).toBe('task');
     const page = buildDiskPanelState(bound);
     expect(page.targetLabel).toContain('/a/x');

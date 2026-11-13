@@ -31,6 +31,7 @@ import {
   type VerifyReport,
 } from '../../core/checkout';
 import type { ImportSnapshot } from '../../core/importDir';
+import type { CheckoutResultScope } from '../taskRegistry';
 import {
   buildImportTargetUrl,
   enumerationToSnapshot,
@@ -200,7 +201,7 @@ export type P3ResultPage =
 
 /** 运行中任务绑定：目标作用域与页头路径按任务呈现，不以本次打开入口推导（§4.1 五段第①段）。 */
 export interface CheckoutBinding {
-  resultScope: { entryKey: string; mode: P3Mode };
+  resultScope: CheckoutResultScope;
   /** 任务/记录的目标路径（页头与结果页展示基准）。 */
   targetPath: string;
 }
@@ -1133,7 +1134,7 @@ export function setRecheckOutcome(state: CheckoutPanelState, result: ImportReche
 /** 发起导入（startImport 的模型侧转移）：进入 running 步并建立任务绑定（同 beginTask 转移表）。 */
 export function beginImportTask(
   state: CheckoutPanelState,
-  task: { opId: string; targetPath: string; resultScope?: { entryKey: string; mode: P3Mode } },
+  task: { opId: string; targetPath: string; resultScope?: CheckoutResultScope },
 ): CheckoutPanelState {
   return beginTask(state, task);
 }
@@ -1317,14 +1318,14 @@ export function clearReviewError(state: CheckoutPanelState): CheckoutPanelState 
  */
 export function beginTask(
   state: CheckoutPanelState,
-  task: { opId: string; targetPath: string; resultScope?: { entryKey: string; mode: P3Mode } },
+  task: { opId: string; targetPath: string; resultScope?: CheckoutResultScope },
 ): CheckoutPanelState {
   return {
     ...state,
     step: 'running',
     task: { phase: 'connecting', currentFile: null, count: 0, opId: task.opId },
     binding: {
-      resultScope: task.resultScope ?? { entryKey: state.entry.entryKey, mode: state.mode },
+      resultScope: task.resultScope ?? { scopeKind: 'checkout', entryKey: state.entry.entryKey, mode: state.mode },
       targetPath: task.targetPath,
     },
     result: null,

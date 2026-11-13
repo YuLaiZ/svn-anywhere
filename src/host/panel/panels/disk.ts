@@ -134,7 +134,7 @@ function sessionScopeBaseline(): DiskResultScope {
   if (session?.binding) {
     return session.binding.resultScope;
   }
-  return { wcRoot: currentEntry?.wcRoot ?? session?.wcRoot ?? '' };
+  return { scopeKind: 'disk', wcRoot: currentEntry?.wcRoot ?? session?.wcRoot ?? '' };
 }
 
 /** 结果页/会话关联的互斥键（writeLocked 判定的查询键）：P4 恒为副本根。 */
@@ -353,7 +353,7 @@ function recoverDiskSession(sessionId: string): void {
 
   // ② 会话结果缓存（缓存项携带 wcRoot：与基准不一致即丢弃并继续后续段；
   // 命中恢复结果页并把 subPath 刷新为本次打开路径、tableView 不随缓存恢复）。
-  const cached = readSessionResult('disk', { wcRoot: entry.wcRoot }) as SessionResultEntry | undefined;
+  const cached = readSessionResult('disk', { scopeKind: 'disk', wcRoot: entry.wcRoot }) as SessionResultEntry | undefined;
   if (cached) {
     session = fromDiskCache(base, cached.page as DiskPanelCache, entry.subPath);
     resetTableView();
@@ -649,7 +649,7 @@ async function handleConfirmVacuum(sessionId: string): Promise<void> {
               : setChangedFromReadFailure(baseState, detailText);
           const page = toDiskCache(changed);
           if (page) {
-            writeSessionResult('disk', { wcRoot }, page, 'controller');
+            writeSessionResult('disk', { scopeKind: 'disk', wcRoot }, page, 'controller');
           }
           applyIfLive(sessionId, () => changed);
         }
@@ -736,5 +736,5 @@ export function diskSessionSnapshot(): DiskPanelState | undefined {
 
 /** 测试与自动化辅助：读取 P4 会话结果缓存（mock-host 断言「后台终态写缓存」用）。 */
 export function readDiskCachedResult(wcRoot: string): SessionResultEntry | undefined {
-  return readSessionResult('disk', { wcRoot });
+  return readSessionResult('disk', { scopeKind: 'disk', wcRoot });
 }

@@ -137,7 +137,7 @@ export const __checkoutTaskApi = {
   verifyCheckoutOnly,
   /** 读取检出面板的会话结果缓存（自动化断言「后台终态写缓存」用）。 */
   readCachedResult: (entryKey: string) =>
-    readSessionResult('checkout', { entryKey, mode: 'checkout' }),
+    readSessionResult('checkout', { scopeKind: 'checkout', entryKey, mode: 'checkout' }),
 };
 
 /**
@@ -153,7 +153,7 @@ export const __importTaskApi = {
   abandonUnknownImportTask,
   /** 读取导入面板（P3 共用面板类别）的会话结果缓存（自动化断言用）。 */
   readCachedResult: (entryKey: string) =>
-    readSessionResult('checkout', { entryKey, mode: 'import' }),
+    readSessionResult('checkout', { scopeKind: 'checkout', entryKey, mode: 'import' }),
 };
 
 /**
@@ -169,7 +169,7 @@ export const __diskTaskApi = {
   /** 面板控制器打开入口（mock-host 经面板意图驱动「扫描→确认清理→复测」全链用）。 */
   openDiskPanel,
   /** 读取磁盘治理面板的会话结果缓存（自动化断言「后台终态写缓存」用）。 */
-  readCachedResult: (wcRoot: string) => readSessionResult('disk', { wcRoot }),
+  readCachedResult: (wcRoot: string) => readSessionResult('disk', { scopeKind: 'disk', wcRoot }),
   /** 重启模拟：读取并一次性消费「扫描进行中」标记（自动化断言用）。 */
   consumeScanMarker,
 };

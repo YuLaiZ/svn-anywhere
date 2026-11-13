@@ -14,12 +14,13 @@
  *   不计数）、尾行 `Committed revision N.`；目录与文件同为条目行。
  */
 import { execSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { run } from '../src/core/svnCli';
+import { Utf8StreamDecoder, run, runStream, runToFile, urlWithPeg } from '../src/core/svnCli';
 import { decodeBuffer } from '../src/core/encoding';
+import { OUTPUT_TOO_LARGE, INSUFFICIENT_DISK } from '../src/core/errors';
 import { createSvnLab, writeFile } from './helpers';
 
 let hasSvn = false;
@@ -304,6 +305,304 @@ describe('onStdoutChunk（真实 svn 行形态，svnadmin + file://）', () => {
       }
       expect(textLines[textLines.length - 1]).toBe('Checked out revision 1.');
       expect(buffer.flush()).toBeNull();
+    } finally {
+      lab.cleanup();
+    }
+  });
+});
+
+describe('runStream（不累计 stdout 的流式原语）', () => {
+  it('stdout 逐块回调且不累计整段：结果 stdout 恒为空串，回调拼接与真实输出一致', async () => {
+    const chunks: Buffer[] = [];
+    const result = await runStream('sh', ['-c', "printf 'aaa'; sleep 0.2; printf 'bbb'"], {
+      onStdoutChunk: (chunk) => {
+        chunks.push(chunk);
+      },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe('');
+    expect(Buffer.concat(chunks).toString('utf8')).toBe('aaabbb');
+    // 至少两块（分段输出 + sleep 确保块在运行中到达）。
+    expect(chunks.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('回调在进程结束前逐块触发（非结束后一次性）', async () => {
+    const chunkAt: number[] = [];
+    let settled = false;
+    const finished = runStream('sh', ['-c', "printf 'one'; sleep 0.3; printf 'two'"], {
+      onStdoutChunk: () => {
+        chunkAt.push(settled ? -1 : Date.now());
+      },
+    }).then((result) => {
+      settled = true;
+      return result;
+    });
+    await finished;
+    expect(chunkAt.length).toBeGreaterThanOrEqual(2);
+    // 所有回调都在结算前触发（未命中 -1）。
+    expect(chunkAt.every((at) => at > 0)).toBe(true);
+  });
+
+  it('回调抛错即终止子进程并以该错误 reject（预算超限/写盘失败等主动中止入口）', async () => {
+    const boom = new Error('budget exceeded');
+    const startedAt = Date.now();
+    await expect(
+      runStream('sh', ['-c', "printf 'x'; sleep 5"], {
+        onStdoutChunk: () => {
+          throw boom;
+        },
+      }),
+    ).rejects.toBe(boom);
+    // SIGTERM 组杀通常立即生效；极端时序下（进程组未就绪命中 SIGKILL
+    // 兜底）耗时为 3 秒宽限期。上界只排除「等待命令自然结束」的 5 秒。
+    expect(Date.now() - startedAt).toBeLessThan(4500);
+  });
+
+  it('超时与取消语义与 run 一致', async () => {
+    await expect(
+      runStream('sleep', ['5'], { timeoutMs: 200, onStdoutChunk: () => {} }),
+    ).rejects.toMatchObject({ name: 'SvnError', code: 'TIMEOUT' });
+
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 100);
+    await expect(
+      runStream('sleep', ['5'], { signal: controller.signal, onStdoutChunk: () => {} }),
+    ).rejects.toMatchObject({ name: 'SvnError', code: 'CANCELLED' });
+  });
+
+  it('Utf8StreamDecoder 跨分块解码中文：分块边界落在多字节字符中间也不产生 U+FFFD', async () => {
+    // 「中」UTF-8 为 E4 B8 AD：第一块只发首字节，100ms 后补齐剩余两字节，
+    // 用真实管道复现「逐块 toString 产生替换符」的场景（阶段 0 实测）。
+    const script = `${JSON.stringify(process.execPath)} -e "process.stdout.write(Buffer.from([0xe4]));setTimeout(()=>process.stdout.write(Buffer.from([0xb8,0xad])),100)"`;
+    const decoder = new Utf8StreamDecoder();
+    let decoded = '';
+    const naiveChunks: string[] = [];
+    await runStream('sh', ['-c', script], {
+      onStdoutChunk: (chunk) => {
+        decoded += decoder.write(chunk);
+        naiveChunks.push(chunk.toString('utf8'));
+      },
+    });
+    decoded += decoder.end();
+    expect(decoded).toBe('中');
+    // 对照：逐块 toString 拼接会把边界上的多字节字符解码成替换符。
+    expect(naiveChunks.join('')).toContain('�');
+  });
+
+  it.runIf(hasSvn && hasSvnadmin)('真实 svn list --xml 流式喂入 SAX 解析入口（跨 chunk 解码）', async () => {
+    const lab = createSvnLab('svn-anywhere-runstream-list-');
+    try {
+      const src = join(lab.root, 'src');
+      writeFile(src, '中文 文件.txt', 'x\n');
+      writeFile(src, 'at@name.txt', 'y\n');
+      const imported = await run('svn', ['import', '-m', 'init', src, `${lab.repoUrl}/trunk`]);
+      expect(imported.exitCode).toBe(0);
+
+      // 整段对照（run 保持既有整段文本行为）。
+      const full = await run('svn', [
+        'list', '--xml', '--non-interactive', '--depth', 'immediates', '-r', 'HEAD',
+        '--', urlWithPeg(`${lab.repoUrl}/trunk`),
+      ]);
+      expect(full.exitCode).toBe(0);
+      expect(full.stdout).toContain('<lists>');
+
+      // 流式：同命令经 runStream 逐块解码，拼接结果必须与整段完全一致。
+      const decoder = new Utf8StreamDecoder();
+      let streamed = '';
+      const streamResult = await runStream('svn', [
+        'list', '--xml', '--non-interactive', '--depth', 'immediates', '-r', 'HEAD',
+        '--', urlWithPeg(`${lab.repoUrl}/trunk`),
+      ], {
+        onStdoutChunk: (chunk) => {
+          streamed += decoder.write(chunk);
+        },
+      });
+      streamed += decoder.end();
+      expect(streamResult.stdout).toBe('');
+      expect(streamResult.exitCode).toBe(0);
+      expect(streamed).toBe(full.stdout);
+      // 中文与含 @ 的名称在 XML 中原样（UTF-8）出现，且无替换符。
+      expect(streamed).toContain('中文 文件.txt');
+      expect(streamed).not.toContain('�');
+    } finally {
+      lab.cleanup();
+    }
+  });
+
+  it.runIf(hasSvn && hasSvnadmin)('退出码非零仍作为业务结果返回（供 assertSuccess 分流）', async () => {
+    const lab = createSvnLab('svn-anywhere-runstream-missing-');
+    try {
+      const decoder = new Utf8StreamDecoder();
+      let streamed = '';
+      const result = await runStream('svn', [
+        'list', '--xml', '--non-interactive', '--depth', 'immediates', '-r', 'HEAD',
+        '--', urlWithPeg(`${lab.repoUrl}/no-such-path`),
+      ], {
+        onStdoutChunk: (chunk) => {
+          streamed += decoder.write(chunk);
+        },
+      });
+      streamed += decoder.end();
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain('E200009');
+    } finally {
+      lab.cleanup();
+    }
+  });
+});
+
+describe('runToFile（直接写目标临时文件的流式原语）', () => {
+  it('成功：.part 原子改名为目标文件，字节计数准确，无残留', async () => {
+    const dir = makeTempDir('svn-anywhere-runtofile-ok-');
+    try {
+      const target = join(dir, 'out.bin');
+      const progress: number[] = [];
+      const result = await runToFile('sh', ['-c', "printf 'hello world'"], {
+        targetPath: target,
+        onProgress: (bytes) => progress.push(bytes),
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.filePath).toBe(target);
+      expect(result.stdout).toBe('');
+      expect(result.bytesWritten).toBe(11);
+      expect(readFileSync(target, 'utf8')).toBe('hello world');
+      expect(readdirSync(dir)).toEqual(['out.bin']);
+      expect(progress[progress.length - 1]).toBe(11);
+    } finally {
+      cleanupDir(dir);
+    }
+  });
+
+  it('超过 maxBytes：OUTPUT_TOO_LARGE，进程终止且目标/半文件都不存在', async () => {
+    const dir = makeTempDir('svn-anywhere-runtofile-limit-');
+    try {
+      const target = join(dir, 'out.bin');
+      await expect(
+        runToFile('sh', ['-c', "printf '0123456789'; sleep 5"], {
+          targetPath: target,
+          maxBytes: 5,
+        }),
+      ).rejects.toMatchObject({ name: 'SvnError', code: OUTPUT_TOO_LARGE });
+      expect(existsSync(target)).toBe(false);
+      expect(readdirSync(dir)).toEqual([]);
+    } finally {
+      cleanupDir(dir);
+    }
+  });
+
+  it('expectedBytes 超过 maxBytes：不启动 svn（OUTPUT_TOO_LARGE）', async () => {
+    const dir = makeTempDir('svn-anywhere-runtofile-budget-');
+    try {
+      const target = join(dir, 'out.bin');
+      const marker = join(dir, 'marker');
+      await expect(
+        runToFile('sh', ['-c', `touch ${JSON.stringify(marker)}`], {
+          targetPath: target,
+          expectedBytes: 10,
+          maxBytes: 5,
+        }),
+      ).rejects.toMatchObject({ name: 'SvnError', code: OUTPUT_TOO_LARGE });
+      // 预检失败不启动命令：命令副作用不存在。
+      expect(existsSync(marker)).toBe(false);
+      expect(readdirSync(dir)).toEqual([]);
+    } finally {
+      cleanupDir(dir);
+    }
+  });
+
+  it('磁盘余量预检失败：INSUFFICIENT_DISK，不启动 svn', async () => {
+    const dir = makeTempDir('svn-anywhere-runtofile-disk-');
+    try {
+      const target = join(dir, 'out.bin');
+      const marker = join(dir, 'marker');
+      // 预期 1 PiB + 64 MiB 余量必然超过任何测试机可用空间；预算上限放宽
+      // 到 2 PiB，使该用例只命中磁盘预检分支而不是字节上限分支。
+      await expect(
+        runToFile('sh', ['-c', `touch ${JSON.stringify(marker)}`], {
+          targetPath: target,
+          expectedBytes: 1024 ** 5,
+          maxBytes: 2 * 1024 ** 5,
+        }),
+      ).rejects.toMatchObject({ name: 'SvnError', code: INSUFFICIENT_DISK });
+      expect(existsSync(marker)).toBe(false);
+      expect(readdirSync(dir)).toEqual([]);
+    } finally {
+      cleanupDir(dir);
+    }
+  });
+
+  it('退出码非零：删除半文件并以业务结果返回（.part 不残留）', async () => {
+    const dir = makeTempDir('svn-anywhere-runtofile-exit-');
+    try {
+      const target = join(dir, 'out.bin');
+      const result = await runToFile('sh', ['-c', "printf 'partial'; exit 3"], {
+        targetPath: target,
+      });
+      expect(result.exitCode).toBe(3);
+      expect(result.filePath).toBeUndefined();
+      expect(result.bytesWritten).toBe(7);
+      expect(existsSync(target)).toBe(false);
+      expect(readdirSync(dir)).toEqual([]);
+    } finally {
+      cleanupDir(dir);
+    }
+  });
+
+  it('超时与取消：沿用 TIMEOUT/CANCELLED 错误码并删除半文件', async () => {
+    const dir = makeTempDir('svn-anywhere-runtofile-cancel-');
+    try {
+      const target = join(dir, 'out.bin');
+      await expect(
+        runToFile('sleep', ['5'], { targetPath: target, timeoutMs: 200 }),
+      ).rejects.toMatchObject({ name: 'SvnError', code: 'TIMEOUT' });
+      expect(readdirSync(dir)).toEqual([]);
+
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 100);
+      await expect(
+        runToFile('sleep', ['5'], { targetPath: target, signal: controller.signal }),
+      ).rejects.toMatchObject({ name: 'SvnError', code: 'CANCELLED' });
+      expect(readdirSync(dir)).toEqual([]);
+    } finally {
+      cleanupDir(dir);
+    }
+  });
+
+  it('目标目录不存在：抛 SvnError（FILE_CREATE_ERROR/ENOENT），不误报成功', async () => {
+    const dir = makeTempDir('svn-anywhere-runtofile-nodir-');
+    try {
+      const target = join(dir, 'no-such-subdir', 'out.bin');
+      await expect(
+        runToFile('sh', ['-c', "printf 'x'"], { targetPath: target }),
+      ).rejects.toMatchObject({ name: 'SvnError' });
+    } finally {
+      cleanupDir(dir);
+    }
+  });
+
+  it.runIf(hasSvn && hasSvnadmin)('真实 svn cat：仓库原始字节写入临时文件并与源内容一致', async () => {
+    const lab = createSvnLab('svn-anywhere-runtofile-cat-');
+    try {
+      const src = join(lab.root, 'src');
+      const content = 'line1\n中文内容\nline3\n';
+      writeFile(src, '文档 目录/文件.txt', content);
+      const imported = await run('svn', ['import', '-m', 'init', src, `${lab.repoUrl}/trunk`]);
+      expect(imported.exitCode).toBe(0);
+
+      const dir = makeTempDir('svn-anywhere-runtofile-cat-out-');
+      try {
+        const target = join(dir, 'cat.bin');
+        const result = await runToFile('svn', [
+          'cat', '-r', 'HEAD', '--non-interactive',
+          '--', urlWithPeg(`${lab.repoUrl}/trunk/文档 目录/文件.txt`),
+        ], { targetPath: target });
+        expect(result.exitCode).toBe(0);
+        expect(result.filePath).toBe(target);
+        expect(result.bytesWritten).toBe(Buffer.byteLength(content, 'utf8'));
+        expect(readFileSync(target, 'utf8')).toBe(content);
+      } finally {
+        cleanupDir(dir);
+      }
     } finally {
       lab.cleanup();
     }

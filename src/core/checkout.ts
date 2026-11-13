@@ -302,7 +302,23 @@ export interface CheckRemoteOptions extends RunOptions {
 /** URL 不存在时 svn 在 stderr 先给 W170000 警告再给 E200009 错误。 */
 const URL_NOT_FOUND_CODES = new Set(['E200009', 'E160013']);
 const REVISION_NOT_FOUND_CODES = new Set(['E160006', 'E160005', 'E195012']);
-const CONNECTION_CODES = new Set(['E175002', 'E170013', 'E175013', 'E180001', 'E000104', 'E670003']);
+/**
+ * 检出侧的连接失败码集合：沿用 M3 既有行为（E175013 在 RemoteCheckFailure
+ * 枚举里仍归 connection）并补齐阶段 0 实测的超时（E175012）与连接中断
+ * （E120108）、无法连接（E000061）。M4 新模块使用 core/errors 的
+ * NETWORK_ERROR_CODES 与 classifyAuthFailure 做更细的 auth/permission 分类。
+ */
+const CONNECTION_CODES = new Set([
+  'E175002',
+  'E170013',
+  'E175013',
+  'E180001',
+  'E000104',
+  'E670003',
+  'E175012',
+  'E120108',
+  'E000061',
+]);
 
 function classifyRemoteError(err: unknown): { ok: false; failure: RemoteCheckFailure; message: string } {
   if (err instanceof SvnError) {

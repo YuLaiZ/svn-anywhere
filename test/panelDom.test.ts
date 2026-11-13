@@ -540,6 +540,314 @@ describe('checkbox 表单字段：单通道输入同步', () => {
   });
 });
 
+describe('M4 多滚动容器与 toast 命中', () => {
+  function treeState(patch: Partial<PanelState> = {}): PanelState {
+    return stateOf({
+      list: undefined,
+      form: undefined,
+      layout: {
+        layout: 'master-detail',
+        masterLabel: '远端目录',
+        detailLabel: '节点详情',
+        masterScrollKey: 'browser-tree',
+        detailScrollKey: 'browser-detail',
+      },
+      lazyTree: {
+        id: 'browser',
+        rows: [
+          {
+            id: 'trunk',
+            label: 'trunk',
+            kind: 'dir',
+            depth: 0,
+            phase: 'ready',
+            loaded: 40,
+            total: 1284,
+            expanded: true,
+            children: [
+              { id: 'trunk/docs', label: 'docs', kind: 'dir', depth: 1, phase: 'ready', loaded: 2, total: 2 },
+            ],
+          },
+        ],
+        empty: { title: '空目录' },
+        loadMoreAction: { id: 'loadMoreBrowserNode', label: '加载更多', payload: { 'node-id': 'trunk' } },
+      },
+      detail: {
+        title: 'trunk',
+        sections: [{ kind: 'kv', entries: [{ label: '节点 URL', value: 'https://example.com/trunk' }] }],
+      },
+      ...patch,
+    });
+  }
+
+  it('按 data-scroll-key 保存多个 pane 的滚动位置（纵向与横向）', () => {
+    const { app } = setup(treeState());
+    const master = document.querySelector<HTMLElement>('[data-scroll-key="browser-tree"]')!;
+    const detail = document.querySelector<HTMLElement>('[data-scroll-key="browser-detail"]')!;
+    master.scrollTop = 25;
+    master.scrollLeft = 4;
+    detail.scrollTop = 60;
+
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's1', revision: 2, formRevision: 0,
+      html: render(treeState()),
+    });
+    const restoredMaster = document.querySelector<HTMLElement>('[data-scroll-key="browser-tree"]')!;
+    const restoredDetail = document.querySelector<HTMLElement>('[data-scroll-key="browser-detail"]')!;
+    expect(restoredMaster.scrollTop).toBe(25);
+    expect(restoredMaster.scrollLeft).toBe(4);
+    expect(restoredDetail.scrollTop).toBe(60);
+    app.dispose();
+  });
+
+  it('表格滚动与既有 .list 共用同一条 data-scroll-key 通道', () => {
+    const { app } = setup({
+      list: undefined,
+      form: undefined,
+      table: {
+        id: 'history',
+        columns: [{ key: 'revision', label: 'Revision' }],
+        sort: { key: 'revision', direction: 'desc' },
+        pagination: { page: 1, pageSize: 50, total: 1, pageCount: 1, mode: 'append' },
+        rows: [{ id: 'r9', cells: { revision: 'r9' } }],
+        empty: { title: '无历史' },
+      },
+    });
+    const tableScroll = document.querySelector<HTMLElement>('[data-scroll-key="table-history"]')!;
+    tableScroll.scrollTop = 33;
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's1', revision: 2, formRevision: 0,
+      html: render({
+        sessionId: 's1', title: '面板', targetLabel: 'wc', revision: 2, formRevision: 0, busy: false, banners: [],
+        table: {
+          id: 'history',
+          columns: [{ key: 'revision', label: 'Revision' }],
+          sort: { key: 'revision', direction: 'desc' },
+          pagination: { page: 1, pageSize: 50, total: 1, pageCount: 1, mode: 'append' },
+          rows: [{ id: 'r9', cells: { revision: 'r9' } }],
+          empty: { title: '无历史' },
+        },
+      }),
+    });
+    expect(document.querySelector<HTMLElement>('[data-scroll-key="table-history"]')!.scrollTop).toBe(33);
+    app.dispose();
+  });
+
+  it('切换目标会话时清空滚动记忆，避免旧目标位置落到新目标', () => {
+    const { app } = setup(treeState());
+    const master = document.querySelector<HTMLElement>('[data-scroll-key="browser-tree"]')!;
+    master.scrollTop = 25;
+    // 同会话重绘：保留。
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's1', revision: 2, formRevision: 0,
+      html: render(treeState()),
+    });
+    expect(document.querySelector<HTMLElement>('[data-scroll-key="browser-tree"]')!.scrollTop).toBe(25);
+    // 目标切换：清空后新帧从 0 开始。
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's2', revision: 1, formRevision: 0,
+      html: render(treeState({ sessionId: 's2' })),
+    });
+    expect(document.querySelector<HTMLElement>('[data-scroll-key="browser-tree"]')!.scrollTop).toBe(0);
+    app.dispose();
+  });
+
+  it('toast 不拦截页脚点击：pointer-events:none 且位于页脚之前', () => {
+    const { app, sent } = setup();
+    app.handleHostMessage({ type: 'toast', protocolVersion: 1, sessionId: 's1', level: 'info', message: '已复制' });
+    const toast = document.querySelector<HTMLElement>('.toast')!;
+    expect(toast.style.pointerEvents).toBe('none');
+    const footer = document.querySelector<HTMLElement>('.footer')!;
+    expect(toast.nextElementSibling).toBe(footer);
+    // 提示存在时页脚主按钮仍可点击并产生意图。
+    document.querySelector<HTMLButtonElement>('[data-intent="refresh"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'refresh' });
+    app.dispose();
+  });
+});
+
+describe('M4 通用组件事件转发', () => {
+  function treeSetup() {
+    const state = stateOf({
+      list: undefined,
+      form: undefined,
+      layout: { layout: 'master-detail', masterLabel: '远端目录', detailLabel: '节点详情' },
+      lazyTree: {
+        id: 'browser',
+        rows: [{
+          id: 'trunk/docs',
+          label: 'docs',
+          kind: 'dir',
+          depth: 0,
+          phase: 'ready',
+          loaded: 0,
+          total: 0,
+          expanded: false,
+          actions: [{ id: 'retryBrowserNode', label: '重试' }],
+        }],
+        empty: { title: '空目录' },
+      },
+      detail: { title: 'trunk', sections: [] },
+    });
+    document.body.innerHTML = '<div id="app"></div>';
+    const { api, sent } = makeApi();
+    const app = mountPanel(document, api);
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's1', revision: 1, formRevision: 0,
+      html: render(state),
+    });
+    return { app, sent };
+  }
+
+  it('懒加载树展开/选择/重试发送独立意图（只带节点 ID）', () => {
+    const { app, sent } = treeSetup();
+    document.querySelector<HTMLButtonElement>('.node-toggle')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'toggleBrowserNode', nodeId: 'trunk/docs' });
+    document.querySelector<HTMLButtonElement>('.node-label')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'selectBrowserNode', nodeId: 'trunk/docs' });
+    document.querySelector<HTMLButtonElement>('[data-intent="retryBrowserNode"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'retryBrowserNode', nodeId: 'trunk/docs' });
+    app.dispose();
+  });
+
+  function historySetup() {
+    const state = stateOf({
+      list: undefined,
+      form: undefined,
+      table: {
+        id: 'history',
+        columns: [{ key: 'revision', label: 'Revision' }],
+        sort: { key: 'revision', direction: 'desc' },
+        pagination: { page: 1, pageSize: 2, total: 2, pageCount: 1, mode: 'append' },
+        selection: { mode: 'revision', maxSelected: 2 },
+        rows: [
+          { id: 'r9', cells: { revision: 'r9' } },
+          { id: 'r8', cells: { revision: 'r8' } },
+        ],
+        loadMoreAction: { id: 'loadMoreHistory', label: '加载更多' },
+        empty: { title: '无历史' },
+      },
+      filterPanel: {
+        id: 'historyFilters',
+        title: '筛选',
+        fields: [
+          { id: 'keyword', kind: 'text', label: '关键词', value: '' },
+          { id: 'author', kind: 'select', label: '作者', value: 'all', options: [
+            { value: 'all', label: '全部' },
+            { value: 'alice', label: 'alice' },
+          ] },
+        ],
+        clearAction: { id: 'clearHistoryFilters', label: '清空筛选' },
+      },
+      tabs: { id: 'conflicts', current: 'text', tabs: [{ id: 'all', label: '全部', count: 2 }, { id: 'text', label: '文件', count: 2 }] },
+    });
+    document.body.innerHTML = '<div id="app"></div>';
+    const { api, sent } = makeApi();
+    const app = mountPanel(document, api);
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's1', revision: 1, formRevision: 0,
+      html: render(state),
+    });
+    return { app, sent, state };
+  }
+
+  it('表格勾选与行选中分别发送 toggleHistoryRevision / selectHistoryRevision', () => {
+    const { app, sent } = historySetup();
+    const box = document.querySelector<HTMLInputElement>('input[data-intent="toggleHistoryRevision"][data-row-id="r9"]')!;
+    box.checked = true;
+    box.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'toggleHistoryRevision', id: 'r9' });
+    document.querySelector<HTMLTableRowElement>('tr[data-row-id="r8"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'selectHistoryRevision', id: 'r8' });
+    document.querySelector<HTMLButtonElement>('[data-intent="loadMoreHistory"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'loadMoreHistory' });
+    app.dispose();
+  });
+
+  it('筛选 select 变化立即发送；文本输入短防抖后发送最终值', () => {
+    vi.useFakeTimers();
+    const { app, sent } = historySetup();
+    const select = document.querySelector<HTMLSelectElement>('[data-filter-field-id="author"]')!;
+    select.value = 'alice';
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'setHistoryFilter', id: 'author', value: 'alice' });
+
+    const input = document.querySelector<HTMLInputElement>('[data-filter-field-id="keyword"]')!;
+    input.value = 'fix';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.value = 'fix message';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'setHistoryFilter', id: 'author', value: 'alice' });
+    vi.advanceTimersByTime(210);
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'setHistoryFilter', id: 'keyword', value: 'fix message' });
+    vi.useRealTimers();
+    app.dispose();
+  });
+
+  it('防抖窗口内宿主回显不覆盖本地筛选值；清空筛选取消待发输入', () => {
+    vi.useFakeTimers();
+    const { app, sent, state } = historySetup();
+    const input = document.querySelector<HTMLInputElement>('[data-filter-field-id="keyword"]')!;
+    input.value = 'fix';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    // 宿主较早回显（字段值仍为空）：本地输入不被覆盖，防抖继续。
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's1', revision: 2, formRevision: 0,
+      html: render(state),
+    });
+    expect(document.querySelector<HTMLInputElement>('[data-filter-field-id="keyword"]')!.value).toBe('fix');
+    vi.advanceTimersByTime(210);
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'setHistoryFilter', id: 'keyword', value: 'fix' });
+
+    // 再次输入后立即清空筛选：清空是宿主权威操作，待发输入被取消。
+    const next = document.querySelector<HTMLInputElement>('[data-filter-field-id="keyword"]')!;
+    next.value = 'later';
+    next.dispatchEvent(new Event('input', { bubbles: true }));
+    document.querySelector<HTMLButtonElement>('[data-intent="clearHistoryFilters"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'clearHistoryFilters' });
+    vi.advanceTimersByTime(500);
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'clearHistoryFilters' });
+    vi.useRealTimers();
+    app.dispose();
+  });
+
+  it('tab 点击发送 setConflictTab（只带 tab ID）', () => {
+    const { app, sent } = historySetup();
+    document.querySelector<HTMLButtonElement>('[data-intent="setConflictTab"][data-tab-id="text"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'setConflictTab', tab: 'text' });
+    app.dispose();
+  });
+
+  it('参数化动作按 data-* 载荷转发枚举稳定值（refreshHistoryUpper/chooseConflictVariant）', () => {
+    document.body.innerHTML = '<div id="app"></div>';
+    const { api, sent } = makeApi();
+    const app = mountPanel(document, api);
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's1', revision: 1, formRevision: 0,
+      html: render(stateOf({
+        list: undefined,
+        form: undefined,
+        layout: { layout: 'master-detail' },
+        detail: {
+          title: 'r9',
+          sections: [{
+            kind: 'actions',
+            actions: [
+              { id: 'refreshHistoryUpper', label: '刷新', payload: { mode: 'head' } },
+              { id: 'chooseConflictVariant', label: '保留本地', payload: { value: 'mine-full' } },
+            ],
+          }],
+        },
+      })),
+    });
+    document.querySelector<HTMLButtonElement>('[data-intent="refreshHistoryUpper"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'refreshHistoryUpper', mode: 'head' });
+    document.querySelector<HTMLButtonElement>('[data-intent="chooseConflictVariant"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'chooseConflictVariant', value: 'mine-full' });
+    app.dispose();
+  });
+});
+
 describe('表格交互：排序/翻页/行内定位/文本筛选转发', () => {
   function tableSetup(patch: Partial<PanelState> = {}) {
     return setup({
