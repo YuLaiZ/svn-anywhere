@@ -4,7 +4,9 @@
 
 ## 现状
 
-2026-10-27 立项。首个版本 M1（右键工作流）八个阶段已全部实施：M1 验收 1–7 与多行提交说明专项于 2026-10-29 在本地 `file://` 环境复验通过（修复 `7436d15`/`a79774c` 后），验收 8（认证失败补录）于 2026-10-30 在本地 Docker 多版本 SVN 服务器矩阵上通过——**M1 验收全部通过**，遗留仅体验项（见需求包阶段进度）；自动验证扩充至 163 项单元测试与 mock-host 18 场景。首个可用版本发布时更新本节。
+2026-10-27 立项。首个版本 M1（右键工作流）八个阶段已全部实施：M1 验收 1–7 与多行提交说明专项于 2026-10-29 在本地 `file://` 环境复验通过（修复 `7436d15`/`a79774c` 后），验收 8（认证失败补录）于 2026-10-30 在本地 Docker 多版本 SVN 服务器矩阵上通过——**M1 验收全部通过**，遗留仅体验项（见需求包阶段进度）。M1 验收时点自动验证为 163 项单元测试与 mock-host 18 场景；0.6.0 门槛已扩至 79 个测试文件 / 2041 项（双 locale 一致）与 mock-host 66 个场景。
+
+当前开发版本 **0.6.0** 是 M4（历史与比较）阶段 1–4 的批次版本：已具备 P5 仓库浏览器（远端目录浏览、只读文件预览与导出）、P6 只读历史与版本比较（文件/目录历史、筛选与分批加载、复制跟随、快照比较进入原生差异编辑器）、以及针对本地工作文件的快速差异（`svnAnywhere.toggleQuickDiff`）与行内追溯（`svnAnywhere.toggleInlineBlame`）。0.6.0 **不代表 M4 完成**：P7 冲突处理、更新与回扫等写操作在 0.7.0 批次，M4 正式验收与文档收口在后续阶段；此处结论以需求包阶段证据为准，首个正式发布时更新本节。
 
 ## 为什么
 
@@ -28,7 +30,7 @@ macOS 上没有 TortoiseSVN。现存的 VS Code SVN 扩展各自只覆盖一部�
 
 首个版本 M1 聚焦一条右键工作流：在资源管理器右键任意路径，即可更新、提交（含空说明开关、`missing` 转删除、提交前远端检查）、改仓库地址、编辑忽略规则。不注册常驻视图，不监听文件变化。
 
-之后按需扩展：检出、副本总览、提交历史、磁盘占用统计等。
+当前 0.6.0 已在此之上实现检出、导入本地目录、磁盘治理，以及 M4 的只读链路：P5 仓库浏览器（`svnAnywhere.browseRepository`）、P6 历史与比较（`svnAnywhere.showHistory`）、编辑器右键的快速差异与行内追溯。后续按 0.7.0 批次扩展：P7 冲突处理、历史面板更新与回扫、批量操作等，完成 M4 正式验收。
 
 ## 开发
 
@@ -62,4 +64,10 @@ node scripts/extension-host-test.mjs --extension . --tests <验收测试入口> 
 
 mock 宿主（`scripts/mock-host.cjs`）的 `fakeVscode` 同步实现了上述装饰与保存事件语义，`test/mockHost.test.ts` 锁定其行为；`pnpm run mock-host` 仍负责真实命令链路的端到端场景。
 
-打包与本地安装流程在首个可用版本时补充（`vsce package` 产出 vsix，本地分发，不上架 Marketplace）。
+打包与本地安装（`@vscode/vsce` 为 devDependency，产出 vsix 本地分发，不上架 Marketplace）：
+
+```bash
+pnpm run build
+pnpm exec vsce package              # 产出 svn-anywhere-<版本>.vsix
+code --install-extension svn-anywhere-0.6.0.vsix --extensions-dir <隔离目录> --force
+```

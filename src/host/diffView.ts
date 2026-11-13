@@ -568,6 +568,21 @@ export function disposeSnapshotDiffView(): void {
   snapshotProvider = undefined;
 }
 
+/**
+ * 扩展停用时的差异视图兜底清理：在 disposeSnapshotDiffView 基础上，
+ * 释放文档关闭监听并删除尚未被关闭事件回收的差异临时目录（差异编辑器
+ * 随宿主关闭时 close 事件不再到达扩展）。
+ */
+export function disposeDiffView(): void {
+  disposeSnapshotDiffView();
+  for (const tempDir of new Set(tempRefs.values())) {
+    removeDiffTempDir(tempDir);
+  }
+  tempRefs.clear();
+  closeSubscription?.dispose();
+  closeSubscription = undefined;
+}
+
 // ---------------------------------------------------------------------------
 // P6 单文件导出：原生保存对话框 + 覆盖确认
 // ---------------------------------------------------------------------------

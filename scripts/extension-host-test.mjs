@@ -167,7 +167,7 @@ function printUsage() {
   - 每次运行使用隔离的 user-data/extensions 目录，不修改本机 VS Code 配置。
 
 阶段 4 复用示例（先 pnpm run build）：
-  node scripts/extension-host-test.mjs --extension . --tests test/ext-host/quickDiff.cjs
+  node scripts/extension-host-test.mjs --extension . --tests test/ext-host/editor-smoke.cjs
 `);
 }
 

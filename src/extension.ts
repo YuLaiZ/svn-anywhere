@@ -8,6 +8,7 @@ import { escapePeg, findWorkingCopy } from './core/workspace';
 import { readSvnPath, readTimeoutMs } from './host/config';
 import { registerAllCommands } from './host/commands';
 import { registerBrowseRepositoryCommand, setBrowsePanelOpener, setHistoryHandoffHandler } from './host/commands/browse';
+import { registerEditorCommands } from './host/commands/editor';
 import { openBrowsePanel, setBrowsePanelContext } from './host/panel/panels/browse';
 import { openHistoryTarget, registerShowHistoryCommand, setHistoryPanelOpener } from './host/commands/history';
 import { openHistoryPanel, setHistoryPanelContext } from './host/panel/panels/history';
@@ -31,11 +32,26 @@ import {
 } from './host/panel/diskTask';
 import { openDiskPanel } from './host/panel/panels/disk';
 import { disposeRemoteContent, initializeRemoteContent } from './host/readonlyContent';
+import { disposeDiffView } from './host/diffView';
+import { disableInlineBlame, isInlineBlameEnabled } from './host/inlineBlame';
+import { disableQuickDiff, isQuickDiffEnabled } from './host/quickDiff';
 import { readSessionResult } from './host/sessionResults';
 import { format, strings } from './host/i18n';
 import { decodingRunOptions, disposeOutputChannel, getOutputChannel, logCommand, logLine, resetOutputState } from './host/output';
 
-export async function activate(context: vscode.ExtensionContext): Promise<void> {
+/**
+ * 扩展公开 API（activate 返回值；真实 Extension Host 的自动化冒烟经
+ * `vscode.extensions.getExtension('yulaiz.svn-anywhere').exports` 读取）。
+ * 装饰本身无法经 vscode 公开 API 回读，用开关状态证明命令链路已在真实
+ * 编辑器中执行（enabled 只在目标判定与 diff/blame 成功、setDecorations
+ * 调用后成立）。
+ */
+export interface SvnAnywhereExtensionApi {
+  isQuickDiffEnabled(): boolean;
+  isInlineBlameEnabled(): boolean;
+}
+
+export async function activate(context: vscode.ExtensionContext): Promise<SvnAnywhereExtensionApi> {
   resetOutputState();
   context.subscriptions.push({ dispose: disposeOutputChannel });
   getOutputChannel();
@@ -58,11 +74,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // registerAllCommands 分开管理，二次激活由各自的句柄数组保证幂等。
   registerBrowseRepositoryCommand(context);
   registerShowHistoryCommand(context);
+  // M4 阶段 4：编辑器集成命令（命令数 19→21）——快速差异与行内追溯由
+  // 各自模块的状态机维护装饰，入口只取当前活动文本编辑器。
+  registerEditorCommands(context);
   probeSvn().catch((err: unknown) => {
     logLine(format(strings.activation.probeFailed, {
       message: err instanceof Error ? err.message : String(err),
     }));
   });
+  return { isQuickDiffEnabled, isInlineBlameEnabled };
 }
 
 function errorMessage(err: unknown): string {
@@ -142,6 +162,11 @@ async function probeWorkspace(svnPath: string): Promise<void> {
 
 export function deactivate(): void {
   killAllActive();
+  // 编辑器装饰与快照只读 provider 的内存内容随停用释放（关闭释放模式的
+  // 停用兜底；P5 远端内容的临时资源由 disposeRemoteContent 清理）。
+  disableQuickDiff();
+  disableInlineBlame();
+  disposeDiffView();
   disposeRemoteContent();
   disposeOutputChannel();
 }

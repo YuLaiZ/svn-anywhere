@@ -46,6 +46,10 @@ export const strings = {
     browseRepository: '浏览仓库',
     /** 查看历史（P6）：打开只读历史面板（本地节点、活动编辑器或命令面板）。 */
     showHistory: '查看历史',
+    /** 快速差异（F107）：开关当前活动文本文件的 BASE 行级装饰。 */
+    toggleQuickDiff: '切换快速差异',
+    /** 行内追溯（F108）：开关当前活动文本文件的逐行 revision/author 装饰。 */
+    toggleInlineBlame: '切换行内追溯',
   },
   target: {
     resolved: '[定位] {command}：目标 {target}，副本根 {wcRoot}',
@@ -1328,6 +1332,38 @@ export const strings = {
     notFound: '目标在该 revision 不存在。',
     directory: '目录不支持 blame。',
     tooLarge: 'blame 输出超过上限，未展示结果。',
+  },
+  /** M4 编辑器集成（F107 快速差异 / F108 行内追溯）：命令提示与行装饰文本。 */
+  editor: {
+    featureQuickDiff: '快速差异',
+    featureInlineBlame: '行内追溯',
+    noActiveEditor: '请先在编辑器中打开一个文本文件。',
+    rejectedNotFile: '仅支持本地文件：当前文档不是文件系统路径。',
+    rejectedNotWorkingCopy: '当前文件不在任何 SVN 工作副本内，无法显示{feature}。',
+    rejectedUnversioned: '当前文件未纳入版本控制，无法显示{feature}。',
+    rejectedMissing: '当前文件在本地不存在或已标记删除，无法显示{feature}。',
+    rejectedDirectory: '目录不支持{feature}。',
+    rejectedBinary: '二进制文件不显示{feature}。',
+    reasonNotFile: '非本地文件',
+    reasonNotWorkingCopy: '不在工作副本内',
+    reasonUnversioned: '未纳入版本控制',
+    reasonMissing: '本地不存在或已删除',
+    reasonDeleted: '已标记删除',
+    reasonDirectory: '目录',
+    reasonBinary: '二进制文件',
+    reasonTooLarge: '超过大小上限',
+    reasonUnknown: '读取失败',
+    quickDiffEnabled: '快速差异已开启：{path}（{count} 处行级变更）。',
+    quickDiffDeleted: '已删除 {count} 行',
+    quickDiffRefreshStopped: '快速差异已停止刷新：{path}（{reason}）。',
+    inlineBlameEnabled: '行内追溯已开启：{path}（{count} 行归属）。',
+    inlineBlameLine: 'r{revision} · {author}',
+    inlineBlameLineNoAuthor: 'r{revision}',
+    inlineBlameUncommitted: '未提交/未归属',
+    inlineBlameTooLarge: '文件超过 16 MiB，行内追溯已禁用。',
+    inlineBlameManualRefresh: '文件较大，保存后不会自动刷新行内追溯。',
+    inlineBlameRefreshNow: '立即刷新',
+    inlineBlameRefreshStopped: '行内追溯已停止刷新：{path}（{reason}）。',
   },
 } as const;
 

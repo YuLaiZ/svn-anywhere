@@ -2,7 +2,7 @@
   "name": "svn-anywhere",
   "displayName": "SVN Anywhere",
   "description": "在 VS Code 里管理任意布局的 SVN 工作副本",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "publisher": "yulaiz",
   "private": true,
   "engines": {
@@ -27,6 +27,8 @@
     "onCommand:svnAnywhere.showRemoteInfo",
     "onCommand:svnAnywhere.browseRepository",
     "onCommand:svnAnywhere.showHistory",
+    "onCommand:svnAnywhere.toggleQuickDiff",
+    "onCommand:svnAnywhere.toggleInlineBlame",
     "onCommand:svnAnywhere.checkout",
     "onCommand:svnAnywhere.importLocal",
     "onCommand:svnAnywhere.diskUsage"
@@ -120,6 +122,16 @@
         "category": "SVN Anywhere"
       },
       {
+        "command": "svnAnywhere.toggleQuickDiff",
+        "title": "切换快速差异",
+        "category": "SVN Anywhere"
+      },
+      {
+        "command": "svnAnywhere.toggleInlineBlame",
+        "title": "切换行内追溯",
+        "category": "SVN Anywhere"
+      },
+      {
         "command": "svnAnywhere.checkout",
         "title": "检出",
         "category": "SVN Anywhere"
@@ -148,6 +160,16 @@
           "command": "svnAnywhere.showHistory",
           "when": "resourceScheme == file",
           "group": "navigation@100"
+        },
+        {
+          "command": "svnAnywhere.toggleQuickDiff",
+          "when": "resourceScheme == file",
+          "group": "navigation@101"
+        },
+        {
+          "command": "svnAnywhere.toggleInlineBlame",
+          "when": "resourceScheme == file",
+          "group": "navigation@102"
         }
       ],
       "svnAnywhere.submenu": [
@@ -276,6 +298,12 @@
         },
         {
           "command": "svnAnywhere.showHistory"
+        },
+        {
+          "command": "svnAnywhere.toggleQuickDiff"
+        },
+        {
+          "command": "svnAnywhere.toggleInlineBlame"
         },
         {
           "command": "svnAnywhere.checkout"

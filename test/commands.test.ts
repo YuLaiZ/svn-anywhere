@@ -95,6 +95,10 @@ import {
   registerBrowseRepositoryCommand,
 } from '../src/host/commands/browse';
 import {
+  disposeEditorCommandsForTest,
+  registerEditorCommands,
+} from '../src/host/commands/editor';
+import {
   disposeShowHistoryCommandForTest,
   registerShowHistoryCommand,
 } from '../src/host/commands/history';
@@ -129,6 +133,7 @@ beforeEach(() => {
   resetOutputState();
   disposeBrowseRepositoryCommandForTest();
   disposeShowHistoryCommandForTest();
+  disposeEditorCommandsForTest();
   vscodeMock.channels.length = 0;
   vscodeMock.information.length = 0;
   vscodeMock.warning.length = 0;
@@ -343,19 +348,22 @@ describe('registerAllCommands 二次激活', () => {
     // M4 阶段 2：命令数 17→18——browseRepository 由 extension.activate 在
     // registerAllCommands 之后经独立句柄接线（同一注册序列在本用例中复现）。
     // M4 阶段 3：命令数 18→19——showHistory 与 browseRepository 同模式。
+    // M4 阶段 4：命令数 19→21——toggleQuickDiff/toggleInlineBlame 同模式。
     const firstContext = { subscriptions: [], globalState } as unknown as vscode.ExtensionContext;
     await registerAllCommands(firstContext);
     registerBrowseRepositoryCommand(firstContext);
     registerShowHistoryCommand(firstContext);
-    expect(vscodeMock.registered).toHaveLength(19);
+    registerEditorCommands(firstContext);
+    expect(vscodeMock.registered).toHaveLength(21);
     const firstHandles = vscodeMock.registered.map((r) => r.disposable);
 
     const secondContext = { subscriptions: [], globalState } as unknown as vscode.ExtensionContext;
     await expect(registerAllCommands(secondContext)).resolves.toBeUndefined();
     registerBrowseRepositoryCommand(secondContext);
     registerShowHistoryCommand(secondContext);
+    registerEditorCommands(secondContext);
     expect(firstHandles.every((d) => d.disposed)).toBe(true);
-    expect(vscodeMock.registered).toHaveLength(38);
-    expect(vscodeMock.activeCommandIds.size).toBe(19);
+    expect(vscodeMock.registered).toHaveLength(42);
+    expect(vscodeMock.activeCommandIds.size).toBe(21);
   });
 });

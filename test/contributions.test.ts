@@ -82,8 +82,33 @@ describe('P6 历史入口贡献点（M4 阶段 3）', () => {
     expect(editor.some((item) => item.command === 'svnAnywhere.showHistory')).toBe(true);
   });
 
-  it('命令总数保持 19（17 个核心命令 + browseRepository + showHistory）', () => {
-    expect(pkg.contributes.commands).toHaveLength(19);
+  it('命令总数保持 21（17 个核心命令 + browseRepository + showHistory + toggleQuickDiff + toggleInlineBlame）', () => {
+    expect(pkg.contributes.commands).toHaveLength(21);
+  });
+});
+
+describe('编辑器集成入口贡献点（M4 阶段 4）', () => {
+  for (const [key, title] of [
+    ['toggleQuickDiff', strings.command.toggleQuickDiff],
+    ['toggleInlineBlame', strings.command.toggleInlineBlame],
+  ] as const) {
+    it(`${key} 已登记命令、命令面板、编辑器右键与激活事件`, () => {
+      const command = pkg.contributes.commands.find((c) => c.command === `svnAnywhere.${key}`);
+      expect(command).toBeDefined();
+      expect(command?.title).toBe(title);
+      expect(pkg.activationEvents).toContain(`onCommand:svnAnywhere.${key}`);
+      const palette = pkg.contributes.menus?.commandPalette ?? [];
+      expect(palette.some((item) => item.command === `svnAnywhere.${key}`)).toBe(true);
+      const editor = pkg.contributes.menus?.['editor/context'] ?? [];
+      expect(editor.some((item) => item.command === `svnAnywhere.${key}`)).toBe(true);
+    });
+  }
+
+  it('编辑器右键菜单保留查看历史并包含两个装饰开关', () => {
+    const editor = pkg.contributes.menus?.['editor/context'] ?? [];
+    expect(editor.some((item) => item.command === 'svnAnywhere.showHistory')).toBe(true);
+    expect(editor.some((item) => item.command === 'svnAnywhere.toggleQuickDiff')).toBe(true);
+    expect(editor.some((item) => item.command === 'svnAnywhere.toggleInlineBlame')).toBe(true);
   });
 });
 
