@@ -309,18 +309,23 @@ describe('commandRevert（还原）', () => {
 
 describe('commandMove（移动）', () => {
   it('输入目标后执行 svn move：登记 A/D 且提交后保留历史', async () => {
-    vscodeMock.inputResult = join(wc, 'renamed.txt');
-    await commandMove(makeUri(join(wc, 'mod.txt')));
-    expect(existsSync(join(wc, 'renamed.txt'))).toBe(true);
-    expect(existsSync(join(wc, 'mod.txt'))).toBe(false);
-    const status = svnCli(['status']);
-    expect(status).toMatch(/^D\s+mod\.txt/m);
-    expect(status).toMatch(/^A\s+\+\s+renamed\.txt/m);
-    execFileSync('svn', ['commit', '-q', '-m', 'rename mod'], { cwd: wc });
-    expect(svnCli(['log', '--verbose', '-r', 'HEAD'])).toContain('(from /mod.txt:');
-    // 基线恢复：把改名提交撤销不了，改为重建基线（move 回原名）。
-    execFileSync('svn', ['move', '-q', 'renamed.txt', 'mod.txt'], { cwd: wc });
-    execFileSync('svn', ['commit', '-q', '-m', 'restore mod name'], { cwd: wc });
+    try {
+      vscodeMock.inputResult = join(wc, 'renamed.txt');
+      await commandMove(makeUri(join(wc, 'mod.txt')));
+      expect(existsSync(join(wc, 'renamed.txt'))).toBe(true);
+      expect(existsSync(join(wc, 'mod.txt'))).toBe(false);
+      const status = svnCli(['status']);
+      expect(status).toMatch(/^D\s+mod\.txt/m);
+      expect(status).toMatch(/^A\s+\+\s+renamed\.txt/m);
+      execFileSync('svn', ['commit', '-q', '-m', 'rename mod'], { cwd: wc });
+      expect(svnCli(['log', '--verbose', '-r', 'HEAD'])).toContain('(from /mod.txt:');
+    } finally {
+      // 断言失败也必须恢复下一用例依赖的 mod.txt 基线。
+      if (existsSync(join(wc, 'renamed.txt')) && !existsSync(join(wc, 'mod.txt'))) {
+        execFileSync('svn', ['move', '-q', 'renamed.txt', 'mod.txt'], { cwd: wc });
+        execFileSync('svn', ['commit', '-q', '-m', 'restore mod name'], { cwd: wc });
+      }
+    }
   });
 
   it('源被文件系统移动（missing）：提示改用 svn move，不执行任何操作', async () => {

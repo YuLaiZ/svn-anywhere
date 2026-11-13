@@ -6,6 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { svnEnv } from '../src/core/svnCli';
 
 export interface SvnLab {
   root: string;
@@ -28,7 +29,7 @@ export function createSvnLab(prefix: string): SvnLab {
     root,
     repoUrl,
     svn(args, cwd) {
-      return execFileSync('svn', args, { cwd, encoding: 'utf8' });
+      return execFileSync('svn', args, { cwd, encoding: 'utf8', env: svnEnv() });
     },
     checkout(name) {
       const path = join(root, name);
@@ -52,6 +53,10 @@ export function writeFile(wc: string, relative: string, content: string, add = f
   if (add) {
     // --parents 自动补建未版本控制的中间目录；目标含 @ 时仍须 peg 转义。
     const escaped = relative.includes('@') ? `${relative}@` : relative;
-    execFileSync('svn', ['add', '-q', '--parents', escaped], { cwd: wc, encoding: 'utf8' });
+    execFileSync('svn', ['add', '-q', '--parents', escaped], {
+      cwd: wc,
+      encoding: 'utf8',
+      env: svnEnv(),
+    });
   }
 }
