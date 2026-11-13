@@ -66,6 +66,27 @@ describe('P5 仓库浏览器入口贡献点（M4 阶段 2）', () => {
   });
 });
 
+describe('P6 历史入口贡献点（M4 阶段 3）', () => {
+  it('showHistory 已登记命令、1_info 菜单、命令面板、活动编辑器与激活事件', () => {
+    const command = pkg.contributes.commands.find((c) => c.command === 'svnAnywhere.showHistory');
+    expect(command).toBeDefined();
+    expect(command?.title).toBe(strings.command.showHistory);
+    expect(pkg.activationEvents).toContain('onCommand:svnAnywhere.showHistory');
+    const submenu = pkg.contributes.menus?.['svnAnywhere.submenu'] ?? [];
+    const menuItem = submenu.find((item) => item.command === 'svnAnywhere.showHistory');
+    expect(menuItem, '查看历史应挂在 SVN 子菜单 1_info 组').toBeDefined();
+    expect(menuItem?.group?.startsWith('1_info')).toBe(true);
+    const palette = pkg.contributes.menus?.commandPalette ?? [];
+    expect(palette.some((item) => item.command === 'svnAnywhere.showHistory')).toBe(true);
+    const editor = pkg.contributes.menus?.['editor/context'] ?? [];
+    expect(editor.some((item) => item.command === 'svnAnywhere.showHistory')).toBe(true);
+  });
+
+  it('命令总数保持 19（17 个核心命令 + browseRepository + showHistory）', () => {
+    expect(pkg.contributes.commands).toHaveLength(19);
+  });
+});
+
 describe('配置贡献点（M4 新增 historyPageSize）', () => {
   const properties = pkg.contributes.configuration?.properties ?? {};
 

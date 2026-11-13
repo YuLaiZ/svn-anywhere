@@ -647,11 +647,12 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
       return;
     }
     if (message.type === 'append') {
-      // P5 加载更多增量：宿主只发新增切片（每次 ≤40 个节点）的已渲染
-      // 片段，视图按 `treeId:nodeId` 定位到目标节点的 .tree-node-children
-      // 容器后追加，不重建整棵树、不打断滚动位置、焦点与输入法。目标
-      // 切换后的旧 append 与更旧 revision 的迟到帧一律丢弃；容器不存在
-      // （树已重绘为另一目标/形状或节点已折叠）也丢弃。
+      // 增量追加：宿主只发新增切片（P5 每次 ≤40 个节点、P6 每次
+      // ≤historyPageSize 行）的已渲染片段，视图按 `data-append-key` 定位
+      // 目标容器后追加，不重建整棵树/整张表、不打断滚动位置、焦点与输入法。
+      // 容器只有两族：P5 节点子行容器（.tree-node-children）与 P6 历史
+      // 表格 tbody；目标切换后的旧 append 与更旧 revision 的迟到帧一律
+      // 丢弃；容器不存在（已重绘为另一目标/形状）也丢弃。
       const messageSessionId = String(message.sessionId ?? '');
       if (currentSessionId === '' || messageSessionId !== currentSessionId) {
         return;
@@ -668,10 +669,10 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
       if (!target || !html) {
         return;
       }
-      // 只追加到节点的子行容器；不能回退到树顶层 .tree-rows，否则新增
-      // 行会成为根行的兄弟而不是它的子行。
+      // 只追加到节点的子行容器或历史表格 tbody；不能回退到树顶层
+      // .tree-rows，也不能把行追加到表格之外的任意容器。
       const container = root.querySelector<HTMLElement>(
-        `.tree-node-children[data-append-key="${cssEscape(target)}"]`,
+        `.tree-node-children[data-append-key="${cssEscape(target)}"], tbody[data-append-key="${cssEscape(target)}"]`,
       );
       if (!container) {
         return;

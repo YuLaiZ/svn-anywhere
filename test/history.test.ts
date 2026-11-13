@@ -1474,7 +1474,7 @@ describe('resolveHistoryNodeAtRevision', () => {
     });
     expect(resolution).toEqual({
       status: 'present',
-      repositoryPath: '/trunk/target.txt',
+      repositoryPath: 'trunk/target.txt',
       url: 'https://svn.example.com/repo/trunk/target.txt',
       revision: 7,
     });
@@ -1518,7 +1518,7 @@ describe('resolveHistoryNodeAtRevision', () => {
     });
     expect(resolution).toMatchObject({
       status: 'present',
-      repositoryPath: '/trunk/src.txt',
+      repositoryPath: 'trunk/src.txt',
       revision: 2,
     });
     expect(vi.mocked(run).mock.calls[1][1][4]).toBe('https://svn.example.com/repo/trunk/src.txt@2');
@@ -1561,7 +1561,7 @@ describe('resolveHistoryNodeAtRevision', () => {
     });
     expect(resolution).toMatchObject({
       status: 'present',
-      repositoryPath: '/A/x.txt',
+      repositoryPath: 'A/x.txt',
       revision: 2,
     });
     expect(vi.mocked(run).mock.calls.map((call) => call[1][4])).toEqual([
@@ -1637,7 +1637,7 @@ describe('resolveHistoryNodeAtRevision', () => {
     });
     expect(resolution).toMatchObject({
       status: 'present',
-      repositoryPath: '/trunk/target.txt',
+      repositoryPath: 'trunk/target.txt',
       revision: 3,
     });
   });

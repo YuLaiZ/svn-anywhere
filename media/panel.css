@@ -887,6 +887,53 @@ button.th-sort.active { color: var(--vscode-textLink-foreground, var(--vscode-fo
 .inline-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .inline-actions button { font-size: 12px; padding: 2px 8px; }
 
+/* P6 详情变更路径：动作徽标 + 路径原值 + 类型 + 复制来源；路径可任意
+ * 换行（294px 窄面板不横向溢出），行内动作按稳定路径项 ID 转发。 */
+.changed-paths { list-style: none; margin: 4px 0; padding: 0; display: flex; flex-direction: column; gap: 5px; }
+.path-item { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 6px; min-width: 0; }
+.path-action {
+  flex: none;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 10px;
+  line-height: 14px;
+  padding: 0 4px;
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  color: var(--vscode-descriptionForeground);
+}
+.path-action.act-A { color: var(--vscode-gitDecoration-addedResourceForeground, var(--vscode-foreground)); }
+.path-action.act-D { color: var(--vscode-gitDecoration-deletedResourceForeground, var(--vscode-foreground)); }
+.path-action.act-M { color: var(--vscode-gitDecoration-modifiedResourceForeground, var(--vscode-foreground)); }
+.path-action.act-R { color: var(--vscode-gitDecoration-renamedResourceForeground, var(--vscode-foreground)); }
+.path-value { min-width: 0; overflow-wrap: anywhere; word-break: break-all; }
+.path-kind { flex: none; font-size: 10px; color: var(--vscode-descriptionForeground); }
+.path-item .acts { margin-left: auto; display: flex; gap: 4px; }
+.path-item .acts button { font-size: 11px; padding: 1px 6px; }
+.path-copyfrom {
+  flex-basis: 100%;
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+.path-note { flex-basis: 100%; font-size: 11px; overflow-wrap: anywhere; }
+/* “查看全部变更路径”折叠（视图瞬时状态，不发意图）。 */
+.detail-paths-more { margin: 4px 0 0; }
+.detail-paths-more > summary {
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--vscode-textLink-foreground, var(--vscode-focusBorder));
+  overflow-wrap: anywhere;
+}
+.detail-paths-more > summary:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+
+/* P6 复制窗口：目标路径 ← 复制来源路径@revision，逐层复制边界。 */
+.copy-window { display: flex; flex-direction: column; gap: 6px; margin: 4px 0; }
+.copy-window-item { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 6px; min-width: 0; font-size: 11px; }
+.copy-window-arrow { flex: none; color: var(--vscode-descriptionForeground); }
+.copy-window-path { min-width: 0; overflow-wrap: anywhere; word-break: break-all; }
+.copy-window-meta { flex-basis: 100%; color: var(--vscode-descriptionForeground); overflow-wrap: anywhere; }
+
 /* 懒加载树（P5）：展开/选择分离；两段式元数据占位与补全进度。
  * 树在主从 pane 内滚动（pane-scroll），树自身只在独立使用（无 layout）时
  * 承担滚动；行内 URL/路径可任意换行，294px 窄面板不横向溢出。 */
@@ -1120,9 +1167,12 @@ button.th-sort.active { color: var(--vscode-textLink-foreground, var(--vscode-fo
 .task-progress-head .acts button { font-size: 12px; padding: 2px 8px; }
 .task-progress p { margin: 4px 0 0; font-size: 11px; overflow-wrap: anywhere; }
 
-/* 表格“加载更多”（P6 append 模式；空态与有行时都保留入口）。 */
-.table-load-more { flex: none; padding: 6px 16px; }
-.table-load-more button { font-size: 12px; padding: 2px 10px; }
+/* 表格“加载更多”（P6 append 模式；空态与有行时都保留入口）：
+ * 按钮旁显示本次/累计计数；窄面板可换行，计数文本可任意换行。 */
+.table-load-more { flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; padding: 6px 16px; }
+.table-load-more button { flex: none; font-size: 12px; padding: 2px 10px; }
+.table-load-more-info { display: flex; flex-wrap: wrap; gap: 2px 12px; min-width: 0; font-size: 11px; color: var(--vscode-descriptionForeground); }
+.table-load-more-info > span { min-width: 0; overflow-wrap: anywhere; }
 
 /* 表格勾选列与选中行（P6 revision 选择；上限 2 由宿主兜底）。 */
 .data-table tr.selected { background: var(--vscode-list-inactiveSelectionBackground, rgba(127, 127, 127, 0.12)); }
@@ -1131,3 +1181,12 @@ button.th-sort.active { color: var(--vscode-textLink-foreground, var(--vscode-fo
 
 /* toast 不拦截页脚/按钮点击（app.ts 亦内联设置，CSS 兜底）。 */
 .toast { pointer-events: none; }
+
+/* P6 历史窄面板补充（294/400px）：这些控件的基样式定义于上方，媒体
+ * 覆盖必须位于其后才能生效；表格横向滚动仍只发生在 .table-scroll 内，
+ * 页面本身不横向溢出。 */
+@media (max-width: 400px) {
+  .table-load-more { padding: 6px 12px; }
+  .path-item .acts { margin-left: 0; }
+  .detail-section { padding-left: 10px; padding-right: 10px; }
+}

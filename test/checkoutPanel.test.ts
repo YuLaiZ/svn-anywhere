@@ -40,6 +40,7 @@ import { setDraftStorage, type CheckoutFormDraft } from '../src/host/panel/draft
 import { strings } from '../src/host/i18n';
 import {
   openCheckoutPanel,
+  openCheckoutPanelFromHistory,
   resetCheckoutPanelController,
   setCheckoutPanelContext,
   canResumeCheckoutTarget,
@@ -1759,5 +1760,49 @@ describe('P3 检出面板 flow', () => {
     expect(reopenedHtml).toContain(strings.checkoutPanel.stepForm);
     expect(reopenedHtml).toContain(REPO_URL);
     expect(reopenedHtml).not.toContain('data-intent="cancelTask"');
+  });
+});
+
+/* --------------------------- P6 历史 → P3 交接 --------------------------- */
+
+describe('P6 历史 → P3 检出交接（openCheckoutPanelFromHistory）', () => {
+  it('目录交接预填实际 URL 与数字 revision：停留在表单步，不自动连接或检出', async () => {
+    const result = await openCheckoutPanelFromHistory({
+      sourceUrl: REPO_URL,
+      pinnedRevision: 7,
+      nodeKind: 'dir',
+    });
+    expect(result).toEqual({ ok: true });
+    await sleep(0);
+    const panel = lastPanel();
+    const html = lastHtml(panel);
+    expect(html).toContain(strings.checkoutPanel.stepForm);
+    expect(html).toContain(REPO_URL);
+    // 预填的目录名（URL 末段 trunk）与数字 revision 进入表单。
+    expect(html).toContain('data-field-id="rev"');
+    expect(html).toContain('value="7"');
+    expect(html).toContain('value="trunk"');
+    // 交接不绕过连接检查与确认：没有任何 svn 命令被自动发起。
+    expect(runCalls).toHaveLength(0);
+  });
+
+  it('文件目标直接拒绝，不创建面板', async () => {
+    const result = await openCheckoutPanelFromHistory({
+      sourceUrl: REPO_URL,
+      pinnedRevision: 5,
+      nodeKind: 'file',
+    });
+    expect(result.ok).toBe(false);
+    expect(vscodeMock.panels).toHaveLength(0);
+  });
+
+  it('非法 revision 与非法 URL 拒绝', async () => {
+    expect((await openCheckoutPanelFromHistory({
+      sourceUrl: REPO_URL, pinnedRevision: 0, nodeKind: 'dir',
+    })).ok).toBe(false);
+    expect((await openCheckoutPanelFromHistory({
+      sourceUrl: 'http://example.com/svn/trunk?x=1', pinnedRevision: 1, nodeKind: 'dir',
+    })).ok).toBe(false);
+    expect(vscodeMock.panels).toHaveLength(0);
   });
 });

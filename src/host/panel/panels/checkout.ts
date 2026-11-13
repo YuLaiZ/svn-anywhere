@@ -114,6 +114,7 @@ import {
   useUrlName,
   URL_HISTORY_LIMIT,
   type CheckoutFormFieldId,
+  type CheckoutHistoryPrefill,
   type CheckoutPanelEntry,
   type CheckoutPanelState,
   type CheckoutTaskPhase,
@@ -121,6 +122,11 @@ import {
   type P3Mode,
   type P3ResultPage,
 } from '../checkoutModel';
+import {
+  checkoutHandoffEntryKey,
+  snapshotText,
+  validateCheckoutHistoryHandoff,
+} from '../snapshotModel';
 import {
   cancelCheckoutTask,
   recheckCheckoutTarget,
@@ -198,6 +204,8 @@ export interface CheckoutOpenEntry {
   /** 检出：打开入口的父目录；导入：源目录。 */
   parentDir?: string;
   sourceDir?: string;
+  /** P6 历史交接预填（仅 checkout 模式；P3 仍重新校验 URL 与执行连接检查）。 */
+  prefill?: CheckoutHistoryPrefill;
 }
 
 let panelContext: PanelContext | undefined;
@@ -507,6 +515,37 @@ export async function openCheckoutPanel(entry: CheckoutOpenEntry): Promise<void>
   await recoverSession(handle.sessionId, entry, entryKey);
 }
 
+/**
+ * P6→P3 交接入口（技术方案 §4.5）：把「检出此版本」的历史目录目标交给
+ * 检出向导。
+ * - 宿主入口直接拒绝文件目标、非目录、非法 revision 与空/非法 URL；
+ * - 只预填已解析的实际目录 URL 与数字 revision；P3 仍重新执行 URL 校验、
+ *   连接检查、空目标检查与确认，不直接执行 checkout，也不绕过任何写前检查；
+ * - 面板未接线（未激活/测试替身）时返回明确原因，不静默吞动作。
+ */
+export async function openCheckoutPanelFromHistory(handoff: {
+  sourceUrl: string;
+  pinnedRevision: number;
+  nodeKind: 'file' | 'dir';
+}): Promise<{ ok: true } | { ok: false; message: string }> {
+  const checked = validateCheckoutHistoryHandoff(handoff);
+  if (!checked.ok) {
+    return { ok: false, message: checked.message };
+  }
+  if (!panelContext) {
+    return { ok: false, message: snapshotText('handoffPanelNotReady') };
+  }
+  await openCheckoutPanel({
+    entryKey: checkoutHandoffEntryKey(checked.handoff),
+    mode: 'checkout',
+    prefill: {
+      url: checked.handoff.sourceUrl,
+      revision: checked.handoff.pinnedRevision,
+    },
+  });
+  return { ok: true };
+}
+
 /** webview 重建握手：视图输入序号从零重启，宿主确认序号归零并重推。 */
 function onViewReady(): void {
   formRevision = 0;
@@ -639,6 +678,7 @@ async function recoverSession(sessionId: string, entry: CheckoutOpenEntry, entry
     sourceDir: entry.sourceDir,
     defaultDepth: readCheckoutDefaultDepth(),
     history: loadUrlHistory(),
+    ...(entry.prefill !== undefined ? { prefill: entry.prefill } : {}),
   };
 
   // ① 运行中任务（taskRegistry 按面板类别单槽：任务存在即绑定——同入口与

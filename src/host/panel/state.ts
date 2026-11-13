@@ -233,6 +233,23 @@ export interface TableSelectionSpec {
 }
 
 /**
+ * append 模式“加载更多”页脚的计数信息（P6 历史）：
+ * - summary / sessionSummary 是宿主经 i18n 格式化的成品文本（已显示前缀、
+ *   会话累计扫描/命中），视图只排版不重算业务计数；
+ * - thisLoad 是本轮网络统计（rawFetchedInLoad / scannedThisLoad.size）：
+ *   两个字段都为 0 时视图隐藏“本轮”行——pending-only 展示不得沿用上一次
+ *   网络动作的值，也不显示全 0 的空行。
+ */
+export interface TableLoadMoreInfo {
+  /** 当前展示前缀摘要（宿主 i18n，如「已显示 50 / 共 120 条」）。 */
+  summary?: string;
+  /** 会话累计摘要（宿主 i18n，如「会话已扫描 1,000 条 revision」）。 */
+  sessionSummary?: string;
+  /** 本轮网络统计；缺省或全 0 时隐藏“本轮”行。 */
+  thisLoad?: { rawFetched: number; uniqueScanned: number };
+}
+
+/**
  * 表格组件：与 list（树/勾选语义）并列的展示组件——排序/筛选/分页
  * 的语义都在表格上。宿主持有全量数据并完成排序/筛选/分页切片
  * （sliceTableRows），视图只收当前页行：消息体积与总行数无关。
@@ -267,10 +284,18 @@ export interface TableSpec {
   rowSelectIntent?: string;
   /** append 模式的“加载更多”外部动作（意图只带稳定 ID，宿主自行切片）。 */
   loadMoreAction?: ActionSpec;
+  /** append 模式加载更多旁的本次/累计计数（缺省只渲染按钮）。 */
+  loadMoreInfo?: TableLoadMoreInfo;
   /** 无任何条目时的空态。 */
   empty: { title: string; detail?: string };
   /** 有条目但筛选后无匹配的空态。 */
   filterEmpty?: { title: string; detail?: string };
+  /**
+   * 无行时选择哪个空态：缺省按 TableSpec.filters 是否活跃推导（既有表格）。
+   * P6 历史筛选在宿主侧完成、不使用 TableSpec.filters，由会话分类
+   * （empty/noMatch）显式指定，保证两种空态不互相冒充。
+   */
+  emptyMode?: 'empty' | 'filterEmpty';
   /** 表格下方标注（如「部分结果」）。 */
   note?: string;
 }
@@ -612,17 +637,78 @@ export interface DetailKeyValueSpec {
   mono?: boolean;
 }
 
-/** 详情段：键值段、文本段、预格式段、动作；动态值全部预转义。 */
+/**
+ * 详情中的一条变更路径（P6 历史）：路径 + SVN 动作/节点类型 + 复制来源。
+ * - action/kind 是 SVN 原词（A/M/D/R、file/dir），视图不翻译、不推断语义；
+ * - copyfrom 是复制来源（copyfrom-path/rev）；label 为宿主 i18n 的成品
+ *   前缀（如「复制自」），缺省只显示 `path@revision`；
+ * - id 是稳定路径项 ID：行内动作（复制路径等）只回传它，视图不在意图里
+ *   携带路径；无 id 时不渲染该行动作。
+ */
+export interface DetailPathChangeSpec {
+  id?: string;
+  path: string;
+  action?: string;
+  kind?: string;
+  copyfrom?: { path: string; revision?: string; label?: string };
+  /** 附加说明（宿主 i18n，如「当前节点复制点」）。 */
+  note?: string;
+  /** 行内动作（意图只带稳定 ID；由宿主映射到路径）。 */
+  actions?: ActionSpec[];
+}
+
+/**
+ * 详情中的一条复制窗口记录（P6 历史）：目标路径 ← 复制来源路径@revision。
+ * 用于展示目标身份的复制边界（含嵌套复制的每一层）；所有字段是展示值，
+ * boundaryRevision 标明复制发生的 revision。
+ */
+export interface DetailCopyWindowSpec {
+  targetPath: string;
+  sourcePath: string;
+  sourceRevision?: string;
+  boundaryRevision?: string;
+  /** 附加说明（宿主 i18n，如「复制点之前的历史停在来源节点」）。 */
+  note?: string;
+}
+
+/** 详情段：键值段、文本段、预格式段、动作、变更路径与复制窗口；动态值全部预转义。 */
 export type DetailSectionSpec =
   | { kind: 'kv'; heading?: string; entries: DetailKeyValueSpec[] }
   | { kind: 'text'; heading?: string; paragraphs: string[] }
   | { kind: 'pre'; heading?: string; text: string }
-  | { kind: 'actions'; actions: ActionSpec[] };
+  | { kind: 'actions'; actions: ActionSpec[] }
+  | {
+    kind: 'paths';
+    heading?: string;
+    paths: DetailPathChangeSpec[];
+    /** 无路径时的说明（宿主 i18n；缺省不渲染任何内容）。 */
+    emptyText?: string;
+    /**
+     * 折叠阈值：paths 数量超过该值时，前 collapseAfter 条直接展示，其余
+     * 收进「查看全部变更路径」details（summary 文案由 moreLabel 提供）。
+     * 缺省或 moreLabel 缺省时全部直接展示。
+     */
+    collapseAfter?: number;
+    moreLabel?: string;
+  }
+  | {
+    kind: 'copyWindow';
+    heading?: string;
+    items: DetailCopyWindowSpec[];
+    emptyText?: string;
+  };
 
 /** 节点、revision、冲突详情（宿主生成全部文案；视图只排版与转义）。 */
 export interface DetailSpec {
   title?: string;
   subtitle?: string;
+  /**
+   * 当前详情对应的稳定行 ID（P6 revision 行 ID）。详情层动作按钮（如
+   * copyHistoryText 复制 revision/提交说明）据此绑定 data-row-id：视图
+   * 不在意图里携带路径或 revision 原值，宿主按 ID 映射目标。缺省时
+   * 动作按无参意图转发（既有 P5 详情行为不变）。
+   */
+  id?: string;
   sections: DetailSectionSpec[];
 }
 

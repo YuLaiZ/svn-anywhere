@@ -28,12 +28,15 @@ vi.mock('../src/core/remoteStatus', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/core/remoteStatus')>();
   return { ...actual, runRemoteStatus: vi.fn() };
 });
-vi.mock('../src/core/svnCli', () => ({
-  run: vi.fn(),
-  runOrThrow: vi.fn(),
-  DEFAULT_TIMEOUT_MS: 120_000,
-  killAllActive: vi.fn(),
-}));
+vi.mock('../src/core/svnCli', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/core/svnCli')>();
+  return {
+    ...actual,
+    run: vi.fn(),
+    runOrThrow: vi.fn(),
+    killAllActive: vi.fn(),
+  };
+});
 
 interface FakePanel {
   viewType: string;

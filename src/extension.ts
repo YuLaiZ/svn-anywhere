@@ -7,8 +7,10 @@ import { SvnError, tailText } from './core/errors';
 import { escapePeg, findWorkingCopy } from './core/workspace';
 import { readSvnPath, readTimeoutMs } from './host/config';
 import { registerAllCommands } from './host/commands';
-import { registerBrowseRepositoryCommand, setBrowsePanelOpener } from './host/commands/browse';
+import { registerBrowseRepositoryCommand, setBrowsePanelOpener, setHistoryHandoffHandler } from './host/commands/browse';
 import { openBrowsePanel, setBrowsePanelContext } from './host/panel/panels/browse';
+import { openHistoryTarget, registerShowHistoryCommand, setHistoryPanelOpener } from './host/commands/history';
+import { openHistoryPanel, setHistoryPanelContext } from './host/panel/panels/history';
 import {
   cancelCheckoutTask,
   resumeCheckoutTask,
@@ -41,15 +43,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // TextDocumentContentProvider、文档关闭释放监听，并后台回收过期临时资源。
   initializeRemoteContent(context);
   // P5 面板上下文与命令层打开器注入：browseRepository 命令解析出的目标
-  // 交给面板控制器；P6 历史交接（阶段 3 注册 showHistory 后接 setHistoryHandoffHandler）。
+  // 交给面板控制器；P6 历史交接经 setHistoryHandoffHandler 接到 P6 打开器。
   setBrowsePanelContext(context);
   setBrowsePanelOpener(openBrowsePanel);
+  // P6 历史面板（M4 阶段 3）：showHistory 命令的本地目标与 P5 节点交接
+  // 共用同一面板控制器；交接载荷只含节点身份与快照 revision。
+  setHistoryPanelContext(context);
+  setHistoryPanelOpener(openHistoryPanel);
+  setHistoryHandoffHandler((payload) => openHistoryTarget({ source: 'handoff', payload }));
   // await 注册（含操作记录首载折算与孤儿快照清理）：activate 返回后命令
   // 可用即意味着注册表已折算完成（M3 §2.2 首载时序）。
   await registerAllCommands(context);
-  // M4 入口命令接线（命令数 17→18）：浏览仓库入口与 registerAllCommands
-  // 分开管理，二次激活由各自的句柄数组保证幂等。
+  // M4 入口命令接线（命令数 18→19）：浏览仓库与查看历史入口与
+  // registerAllCommands 分开管理，二次激活由各自的句柄数组保证幂等。
   registerBrowseRepositoryCommand(context);
+  registerShowHistoryCommand(context);
   probeSvn().catch((err: unknown) => {
     logLine(format(strings.activation.probeFailed, {
       message: err instanceof Error ? err.message : String(err),

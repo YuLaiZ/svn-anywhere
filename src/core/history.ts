@@ -180,6 +180,11 @@ function normalizeRepoPath(path: string): string {
   return p === '' ? '/' : p;
 }
 
+/** 内部规范化路径（带前导 /）转对外契约：无前导斜杠，根为 ''。 */
+function toHistoryRelativePath(normalized: string): string {
+  return normalized === '/' ? '' : normalized.slice(1);
+}
+
 /** 仓库相对目录/文件 URL：rootUrl + 逐段 encodeURIComponent（rootUrl 原样）。 */
 export function urlForRepositoryPath(rootUrl: string, repositoryPath: string): string {
   const base = rootUrl.endsWith('/') ? rootUrl.slice(0, -1) : rootUrl;
@@ -1337,7 +1342,11 @@ export function findRevisionPathMapping(
   return { kind: 'unknown' };
 }
 
-/** 实际节点解析结果：present(url) / absent(deleted) / notFoundAtRevision。 */
+/**
+ * 实际节点解析结果：present(url) / absent(deleted) / notFoundAtRevision。
+ * present.repositoryPath 与 HistoryTarget.relativePath 同契约：仓库相对
+ * POSIX 路径，无前导斜杠（'' 表示仓库根），中文/空格/@ 为未编码原文。
+ */
 export type HistoryNodeResolution =
   | { status: 'present'; repositoryPath: string; url: string; revision: number }
   | { status: 'absent'; deletedRevision?: number }
@@ -1437,7 +1446,7 @@ export async function resolveHistoryNodeAtRevision(
     if (result.exitCode === 0) {
       return {
         status: 'present',
-        repositoryPath: path,
+        repositoryPath: toHistoryRelativePath(path),
         url: parseInfoUrl(result.stdout) ?? url,
         revision,
       };
@@ -1461,7 +1470,7 @@ export async function resolveHistoryNodeAtRevision(
     }
     if (mapping.kind === 'same-revision') {
       // §4.3 步骤 4：复制在该 revision 本身发生时使用新路径。
-      return { status: 'present', repositoryPath: path, url, revision };
+      return { status: 'present', repositoryPath: toHistoryRelativePath(path), url, revision };
     }
     if (mapping.kind === 'deleted') {
       return { status: 'absent', deletedRevision: mapping.revision };

@@ -22,6 +22,8 @@ import {
   visibleRows,
   type ActionSpec,
   type BannerSpec,
+  type DetailCopyWindowSpec,
+  type DetailPathChangeSpec,
   type DetailSectionSpec,
   type FilterPanelSpec,
   type FilterSpec,
@@ -31,6 +33,7 @@ import {
   type PanelState,
   type ProgressState,
   type RowSpec,
+  type TableRowSpec,
   type TableSpec,
 } from './state';
 
@@ -446,22 +449,34 @@ function renderDetail(state: PanelState): string {
   const subtitle = detail.subtitle
     ? `<div class="detail-subtitle">${escapeHtml(detail.subtitle)}</div>`
     : '';
-  const sections = detail.sections.map((section) => renderDetailSection(section, state)).join('');
+  const sections = detail.sections
+    .map((section) => renderDetailSection(section, state, detail.id))
+    .join('');
   return `<div class="pane-detail">${title}${subtitle}${sections}</div>`;
 }
 
-function renderDetailSection(section: DetailSectionSpec, state: PanelState): string {
+function renderDetailSection(
+  section: DetailSectionSpec,
+  state: PanelState,
+  detailId: string | undefined,
+): string {
   if (section.kind === 'actions') {
     const actions = section.actions
-      .map((action) =>
-        renderActionButton(action, {
+      .map((action) => {
+        // 详情层动作优先绑定稳定行 ID（copyHistoryText 等需要 ID 的意图）；
+        // 动作 payload 已自带 row-id 时以 payload 为准，避免重复属性。
+        const bindRowId = detailId !== undefined && action.payload?.['row-id'] === undefined
+          ? detailId
+          : undefined;
+        return renderActionButton(action, {
           intent: action.id,
-          argName: 'data-detail-action',
-          argValue: action.id,
+          // 无 detail.id 的既有面板保持 data-detail-action 无参转发。
+          argName: bindRowId !== undefined ? 'data-row-id' : 'data-detail-action',
+          argValue: bindRowId ?? action.id,
           extraId: '',
           gated: actionGated(state, action.id),
-        }),
-      )
+        });
+      })
       .join('');
     return `<div class="detail-section"><div class="inline-actions">${actions}</div></div>`;
   }
@@ -477,8 +492,113 @@ function renderDetailSection(section: DetailSectionSpec, state: PanelState): str
   if (section.kind === 'pre') {
     return `<div class="detail-section">${heading}<pre>${escapeHtml(section.text)}</pre></div>`;
   }
+  if (section.kind === 'paths') {
+    const body = renderChangedPaths(
+      section.paths,
+      section.emptyText,
+      section.collapseAfter,
+      section.moreLabel,
+      state,
+    );
+    return `<div class="detail-section">${heading}${body}</div>`;
+  }
+  if (section.kind === 'copyWindow') {
+    const body = renderCopyWindow(section.items, section.emptyText);
+    return `<div class="detail-section">${heading}${body}</div>`;
+  }
   const paragraphs = section.paragraphs.map((text) => `<p>${escapeHtml(text)}</p>`).join('');
   return `<div class="detail-section">${heading}${paragraphs}</div>`;
+}
+
+/**
+ * 详情变更路径列表（P6 历史）：每项显示 SVN 动作原词、路径原值（含复制
+ * 来源 copyfrom-path/rev）与宿主附加说明；行内动作只绑定稳定路径项 ID，
+ * 视图不在意图里携带路径。超过 collapseAfter 且提供 moreLabel 时，其余
+ * 路径收进「查看全部变更路径」details——折叠是视图瞬时状态，不发意图。
+ * moreLabel 可含 `{count}` 占位符（由视图填入被收起条数）；不含时在
+ * 文案后附加（N）。
+ */
+function renderChangedPaths(
+  paths: DetailPathChangeSpec[],
+  emptyText: string | undefined,
+  collapseAfter: number | undefined,
+  moreLabel: string | undefined,
+  state: PanelState,
+): string {
+  if (paths.length === 0) {
+    return emptyText ? `<p class="muted">${escapeHtml(emptyText)}</p>` : '';
+  }
+  const threshold = typeof collapseAfter === 'number' && Number.isFinite(collapseAfter)
+    ? Math.max(0, Math.floor(collapseAfter))
+    : paths.length;
+  const fold = moreLabel !== undefined && paths.length > threshold;
+  const direct = fold ? paths.slice(0, threshold) : paths;
+  const rest = fold ? paths.slice(threshold) : [];
+  const list = (items: DetailPathChangeSpec[]): string =>
+    `<ul class="changed-paths">${items.map((item) => renderChangedPath(item, state)).join('')}</ul>`;
+  const summaryText = moreLabel !== undefined && rest.length > 0
+    ? (moreLabel.includes('{count}')
+        ? format(moreLabel, { count: String(rest.length) })
+        : `${moreLabel}（${rest.length}）`)
+    : '';
+  const more = rest.length > 0
+    ? `<details class="detail-paths-more"><summary>${escapeHtml(summaryText)}</summary>${list(rest)}</details>`
+    : '';
+  const directHtml = direct.length > 0 ? list(direct) : '';
+  return `${directHtml}${more}`;
+}
+
+function renderChangedPath(item: DetailPathChangeSpec, state: PanelState): string {
+  const actionChip = item.action
+    ? `<span class="path-action act-${escapeHtml(item.action)}">${escapeHtml(item.action)}</span>`
+    : '';
+  const path = `<span class="path-value mono" title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</span>`;
+  const kind = item.kind ? `<span class="path-kind">${escapeHtml(item.kind)}</span>` : '';
+  const copyfrom = item.copyfrom
+    ? `<span class="path-copyfrom">${item.copyfrom.label ? `${escapeHtml(item.copyfrom.label)} ` : ''}` +
+      `<span class="mono">${escapeHtml(item.copyfrom.path)}</span>` +
+      `${item.copyfrom.revision !== undefined ? `<span class="mono">@r${escapeHtml(item.copyfrom.revision)}</span>` : ''}</span>`
+    : '';
+  const note = item.note ? `<span class="path-note muted">${escapeHtml(item.note)}</span>` : '';
+  const pathId = item.id;
+  const actions = pathId !== undefined && (item.actions?.length ?? 0) > 0
+    ? `<span class="acts">${item.actions!.map((actionSpec) =>
+      renderActionButton(actionSpec, {
+        intent: actionSpec.id,
+        // payload 已自带 row-id 时以 payload 为准，避免重复 data-row-id 属性。
+        argName: actionSpec.payload?.['row-id'] === undefined ? 'data-row-id' : 'data-detail-action',
+        argValue: pathId,
+        extraId: '',
+        gated: actionGated(state, actionSpec.id),
+      })).join('')}</span>`
+    : '';
+  const itemId = pathId !== undefined ? ` data-path-id="${escapeHtml(pathId)}"` : '';
+  return `<li class="path-item"${itemId}>${actionChip}${path}${kind}${actions}${copyfrom}${note}</li>`;
+}
+
+/**
+ * 详情复制窗口（P6 历史）：目标路径 ← 复制来源路径@revision，逐层展示
+ * 复制边界（嵌套复制按宿主给出的顺序排列）；boundaryRevision 标明复制
+ * 发生的 revision。箭头是装饰符号，全部动态值转义。
+ */
+function renderCopyWindow(items: DetailCopyWindowSpec[], emptyText: string | undefined): string {
+  if (items.length === 0) {
+    return emptyText ? `<p class="muted">${escapeHtml(emptyText)}</p>` : '';
+  }
+  const rows = items.map((item) => {
+    const target = `<span class="copy-window-path mono" title="${escapeHtml(item.targetPath)}">${escapeHtml(item.targetPath)}</span>`;
+    const source = `<span class="copy-window-path mono" title="${escapeHtml(item.sourcePath)}">${escapeHtml(item.sourcePath)}</span>` +
+      (item.sourceRevision !== undefined ? `<span class="mono">@r${escapeHtml(item.sourceRevision)}</span>` : '');
+    const boundary = item.boundaryRevision !== undefined
+      ? `<span class="copy-window-meta">r${escapeHtml(item.boundaryRevision)}</span>`
+      : '';
+    const note = item.note ? `<span class="copy-window-meta">${escapeHtml(item.note)}</span>` : '';
+    return (
+      `<div class="copy-window-item">${target}` +
+      `<span class="copy-window-arrow" aria-hidden="true">←</span>${source}${boundary}${note}</div>`
+    );
+  }).join('');
+  return `<div class="copy-window">${rows}</div>`;
 }
 
 /**
@@ -843,25 +963,19 @@ function renderTable(state: PanelState): string {
           `<select data-intent="setFilter" data-filter-id="${escapeHtml(filter.id)}" data-focus="table-filter-${escapeHtml(filter.id)}"${lockedDisabled(actionGated(state, 'setFilter'))}>${options}</select></label>`;
       }).join('')}</div>`
     : '';
+  const loadMore = renderTableLoadMore(state, table);
   if (table.rows.length === 0) {
-    const filterActive = filters.some((filter) => (filter.kind === 'select' ? filter.value !== 'all' : filter.value !== ''));
+    const filterActive = table.emptyMode !== undefined
+      ? table.emptyMode === 'filterEmpty'
+      : filters.some((filter) => (filter.kind === 'select' ? filter.value !== 'all' : filter.value !== ''));
     const empty = filterActive
       ? (table.filterEmpty ?? { title: strings.panel.filterEmptyTitle })
       : table.empty;
     const emptyNote = table.note ? `<p class="muted table-note">${escapeHtml(table.note)}</p>` : '';
     // append 模式下空态仍要保留“加载更多”：历史可能只是本页无匹配，
     // 后续原始批次尚未扫描（P6 noMatch 不允许丢失继续加载入口）。
-    const emptyLoadMore = pagination.mode === 'append' && table.loadMoreAction
-      ? `<div class="table-load-more">${renderActionButton(table.loadMoreAction, {
-          intent: table.loadMoreAction.id,
-          argName: 'data-table-id',
-          argValue: table.id,
-          extraId: '',
-          gated: actionGated(state, table.loadMoreAction.id),
-        })}</div>`
-      : '';
     return `<section class="table-block" data-table-id="${escapeHtml(table.id)}">${filterBar}` +
-      `<div class="empty"><h3>${escapeHtml(empty.title)}</h3>${empty.detail ? `<p class="muted">${escapeHtml(empty.detail)}</p>` : ''}</div>${emptyLoadMore}${emptyNote}</section>`;
+      `<div class="empty"><h3>${escapeHtml(empty.title)}</h3>${empty.detail ? `<p class="muted">${escapeHtml(empty.detail)}</p>` : ''}</div>${loadMore}${emptyNote}</section>`;
   }
   const selectionEnabled = table.selection !== undefined;
   const headCells = columns.map((column) => {
@@ -884,31 +998,7 @@ function renderTable(state: PanelState): string {
   const allHeadCells = selectionEnabled
     ? `<th class="col select" scope="col"${table.selection?.ariaLabel ? ` aria-label="${escapeHtml(table.selection.ariaLabel)}"` : ''}></th>${headCells}`
     : headCells;
-  const bodyRows = table.rows.map((row) => {
-    const cells = columns.map((column) => {
-      const align = column.align ? ` align-${column.align}` : '';
-      const text = row.cells[column.key] ?? '';
-      return `<td class="col${align}">${escapeHtml(text)}</td>`;
-    }).join('');
-    const selectionCell = selectionEnabled
-      ? renderTableSelectionCell(state, row)
-      : '';
-    const actions = (row.actions ?? []).map((action) =>
-      renderActionButton(action, {
-        intent: action.id,
-        argName: 'data-row-id',
-        argValue: row.id,
-        extraId: '',
-        gated: actionGated(state, action.id),
-      }),
-    ).join('');
-    const rowClass = row.selected ? ' class="selected"' : '';
-    const rowSelectIntent = table.rowSelectIntent ?? 'selectHistoryRevision';
-    const selectIntent = actionGated(state, rowSelectIntent)
-      ? ''
-      : ` data-intent="${escapeHtml(rowSelectIntent)}" data-focus="table-row-${escapeHtml(row.id)}"`;
-    return `<tr data-row-id="${escapeHtml(row.id)}"${rowClass}${selectIntent}>${selectionCell}${cells}${actions ? `<td class="col acts">${actions}</td>` : ''}</tr>`;
-  }).join('');
+  const bodyRows = renderTableRows(state, table, table.rows);
   const append = pagination.mode === 'append';
   const hasPrev = pagination.page > 1;
   const hasNext = pagination.page < pagination.pageCount;
@@ -920,23 +1010,110 @@ function renderTable(state: PanelState): string {
       `<button type="button" class="link" data-intent="setPage" data-page="${pagination.page + 1}" data-focus="table-page-next"${!hasNext || actionGated(state, 'setPage') ? ' disabled' : ''}>${escapeHtml(strings.panel.pagerNext)}</button>` +
       `</div>`
     : '';
-  const loadMore = append && table.loadMoreAction
-    ? `<div class="table-load-more">${renderActionButton(table.loadMoreAction, {
-        intent: table.loadMoreAction.id,
-        argName: 'data-table-id',
-        argValue: table.id,
-        extraId: '',
-        gated: actionGated(state, table.loadMoreAction.id),
-      })}</div>`
-    : '';
   const note = table.note ? `<p class="muted table-note">${escapeHtml(table.note)}</p>` : '';
+  // append 模式的 tbody 是增量追加目标：宿主经 append 消息按 table.id 定位，
+  // 每次只追加 ≤historyPageSize 行，不重建表格、不丢滚动位置。
+  const bodyKey = append ? ` data-append-key="${escapeHtml(table.id)}"` : '';
   return `<section class="table-block" data-table-id="${escapeHtml(table.id)}">${filterBar}` +
     `<div class="table-scroll" data-scroll-key="table-${escapeHtml(table.id)}"><table class="data-table">` +
-    `<thead><tr>${allHeadCells}</tr></thead><tbody>${bodyRows}</tbody></table></div>${pager}${loadMore}${note}</section>`;
+    `<thead><tr>${allHeadCells}</tr></thead><tbody${bodyKey}>${bodyRows}</tbody></table></div>${pager}${loadMore}${note}</section>`;
+}
+
+/** 表格渲染只读取占用态与放行视图（append 片段与整表共用）。 */
+export type TableRenderState = Pick<PanelState, 'busy' | 'writeLocked' | 'gate'>;
+
+/**
+ * 渲染表格行集合（整表 body 与 append 增量片段共用）：行点击只更新详情、
+ * 勾选列只在 selection 存在时渲染；行内动作与行选中意图只带稳定行 ID。
+ */
+function renderTableRows(state: TableRenderState, table: TableSpec, rows: TableRowSpec[]): string {
+  const selectionEnabled = table.selection !== undefined;
+  return rows.map((row) => {
+    const cells = table.columns.map((column) => {
+      const align = column.align ? ` align-${column.align}` : '';
+      const text = row.cells[column.key] ?? '';
+      return `<td class="col${align}">${escapeHtml(text)}</td>`;
+    }).join('');
+    const selectionCell = selectionEnabled ? renderTableSelectionCell(state, row) : '';
+    const actions = (row.actions ?? []).map((action) =>
+      renderActionButton(action, {
+        intent: action.id,
+        argName: 'data-row-id',
+        argValue: row.id,
+        extraId: '',
+        gated: actionGated(state, action.id),
+      }),
+    ).join('');
+    const rowClass = row.selected ? ' class="selected"' : '';
+    const ariaSelected = selectionEnabled ? ` aria-selected="${row.selected ? 'true' : 'false'}"` : '';
+    const rowSelectIntent = table.rowSelectIntent ?? 'selectHistoryRevision';
+    const selectIntent = actionGated(state, rowSelectIntent)
+      ? ''
+      : ` data-intent="${escapeHtml(rowSelectIntent)}" data-focus="table-row-${escapeHtml(row.id)}"`;
+    return `<tr data-row-id="${escapeHtml(row.id)}"${rowClass}${ariaSelected}${selectIntent}>${selectionCell}${cells}${actions ? `<td class="col acts">${actions}</td>` : ''}</tr>`;
+  }).join('');
+}
+
+/**
+ * 渲染 P6 历史表格的追加行片段（宿主 append 增量消息的 html 载荷）：
+ * 调用方按宿主切片契约每次最多传 historyPageSize 行，视图不再二次截断；
+ * 片段只含 `<tr>`，不含 table/tbody/加载更多（它们由整段 render 维护）。
+ */
+export function renderTableRowSlice(
+  state: TableRenderState,
+  table: TableSpec,
+  rows: TableRowSpec[],
+): string {
+  return renderTableRows(state, table, rows);
+}
+
+/**
+ * append 模式“加载更多”页脚：按钮 + 本次/累计计数。
+ * - summary / sessionSummary 是宿主 i18n 成品文本；summary 缺省时回退为
+ *   「已展示 N 条 · 当前筛选可见 M 条」（N=当前展示前缀行数，
+ *   M=TableSpec.pagination.total，即 visibleMatched），保证页脚始终显示
+ *   累计计数而不依赖宿主额外字段；
+ * - thisLoad 的原始回包数与本轮唯一 revision 数均为 0 时隐藏“本轮”行
+ *   （pending-only 展示不得沿用上一次网络动作的值）；非 0 时用与宿主
+ *   相同的 historyPanel 模板格式化。
+ */
+function renderTableLoadMore(state: TableRenderState, table: TableSpec): string {
+  if (table.pagination.mode !== 'append' || !table.loadMoreAction) {
+    return '';
+  }
+  const info = table.loadMoreInfo;
+  const summary = info?.summary
+    ? `<span class="load-more-summary">${escapeHtml(info.summary)}</span>`
+    : `<span class="load-more-summary">` +
+      `${escapeHtml(format(strings.historyPanel.displayedSummary, { displayed: String(table.rows.length) }))} · ` +
+      `${escapeHtml(format(strings.historyPanel.visibleSummary, { visible: String(table.pagination.total) }))}</span>`;
+  const session = info?.sessionSummary
+    ? `<span class="load-more-session">${escapeHtml(info.sessionSummary)}</span>`
+    : '';
+  const thisLoad = info?.thisLoad;
+  const showThisLoad = thisLoad !== undefined && (thisLoad.rawFetched > 0 || thisLoad.uniqueScanned > 0);
+  const thisLoadHtml = showThisLoad
+    ? `<span class="load-more-this-load">` +
+      `${escapeHtml(format(strings.historyPanel.scannedThisLoad, { count: String(thisLoad.rawFetched) }))} · ` +
+      `${escapeHtml(format(strings.historyPanel.uniqueRevisionsThisLoad, { count: String(thisLoad.uniqueScanned) }))}</span>`
+    : '';
+  const infoHtml = summary || session || thisLoadHtml
+    ? `<span class="table-load-more-info">${summary}${session}${thisLoadHtml}</span>`
+    : '';
+  return `<div class="table-load-more">${renderActionButton(table.loadMoreAction, {
+    intent: table.loadMoreAction.id,
+    argName: 'data-table-id',
+    argValue: table.id,
+    extraId: '',
+    gated: actionGated(state, table.loadMoreAction.id),
+  })}${infoHtml}</div>`;
 }
 
 /** 表格行勾选单元格：maxSelected 上限由宿主与应用层共同保证，这里只渲染状态。 */
-function renderTableSelectionCell(state: PanelState, row: TableSpec['rows'][number]): string {
+function renderTableSelectionCell(
+  state: Pick<PanelState, 'busy' | 'writeLocked' | 'gate'>,
+  row: TableSpec['rows'][number],
+): string {
   const label = row.selectionLabel ?? row.id;
   const title = row.disabledReason ?? label;
   const disabled = row.disabled || actionGated(state, 'toggleHistoryRevision');

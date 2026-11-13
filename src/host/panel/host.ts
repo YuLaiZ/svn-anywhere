@@ -128,12 +128,13 @@ export interface PanelHandle {
   /** 更新状态并渲染推送；目标切换/销毁后的迟到结果被丢弃。 */
   update(next: PanelState, forSessionId?: string): void;
   /**
-   * 追加 P5 懒加载树的新增节点片段（每次 ≤40 个节点）：只发已渲染的
-   * 行 HTML，视图按 `data-append-key`（`treeId:nodeId`，节点的 children
-   * 容器）追加、不重建整棵树；revision 与 render 共用同一会话单调序列。
-   * snapshot 是本会话包含新增行后的完整状态快照，只更新宿主内部的意图
-   * 校验/视图重建重推依据，不触发整帧渲染。尚无整段渲染（树容器不存在）
-   * 或参数为空时静默丢弃，调用方随后用整帧 render 兜底。
+   * 追加增量展示行片段（P5 懒加载树每次 ≤40 个节点；P6 历史表格每次
+   * ≤historyPageSize 行）：只发已渲染的行 HTML，视图按 `data-append-key`
+   *（P5 为 `treeId:nodeId` 的节点 children 容器；P6 为表格 tbody 的
+   * table.id）追加、不重建整棵树/整张表；revision 与 render 共用同一会话
+   * 单调序列。snapshot 是本会话包含新增行后的完整状态快照，只更新宿主
+   * 内部的意图校验/视图重建重推依据，不触发整帧渲染。尚无整段渲染
+   *（容器不存在）或参数为空时静默丢弃，调用方随后用整帧 render 兜底。
    */
   appendTreeNodes(target: string, html: string, snapshot: PanelState): void;
   /** 推送瞬时提示。 */

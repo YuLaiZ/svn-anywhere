@@ -6,8 +6,8 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { mountPanel, type WebviewApi } from '../src/host/panel/webview/app';
-import { render } from '../src/host/panel/view';
-import type { PanelState, RowSpec } from '../src/host/panel/state';
+import { render, renderTableRowSlice } from '../src/host/panel/view';
+import type { PanelState, RowSpec, TableSpec } from '../src/host/panel/state';
 
 function makeApi(): { api: WebviewApi; sent: unknown[] } {
   const sent: unknown[] = [];
@@ -633,6 +633,85 @@ describe('M4 多滚动容器与 toast 命中', () => {
     app.dispose();
   });
 
+  function appendTable(rows: TableSpec['rows'] = [
+    { id: 'r9', cells: { revision: 'r9' } },
+    { id: 'r8', cells: { revision: 'r8' } },
+  ]): TableSpec {
+    return {
+      id: 'history',
+      columns: [{ key: 'revision', label: 'Revision' }],
+      sort: { key: 'revision', direction: 'desc' },
+      pagination: { page: 1, pageSize: 2, total: rows.length, pageCount: 1, mode: 'append' },
+      selection: { mode: 'revision', maxSelected: 2 },
+      rows,
+      loadMoreAction: { id: 'loadMoreHistory', label: '加载更多' },
+      empty: { title: '无历史' },
+    };
+  }
+
+  it('append 消息向历史表格 tbody 追加行片段：不重建表格、保持滚动与既有行', () => {
+    const table = appendTable();
+    const { app, sent, st } = setup({ list: undefined, form: undefined, table });
+    const tbody = document.querySelector('tbody[data-append-key="history"]')!;
+    const firstRow = document.querySelector('tr[data-row-id="r9"]')!;
+    const scroll = document.querySelector<HTMLElement>('[data-scroll-key="table-history"]')!;
+    scroll.scrollTop = 22;
+    const slice = renderTableRowSlice(st, table, [
+      { id: 'r7', cells: { revision: 'r7' }, selectionLabel: '勾选 revision r7' },
+      { id: 'r6', cells: { revision: 'r6' }, selectionLabel: '勾选 revision r6' },
+    ]);
+    app.handleHostMessage({
+      type: 'append', protocolVersion: 1, sessionId: 's1', revision: 2, target: 'history', html: slice,
+    });
+    // 追加落入同一 tbody，既有行仍是同一 DOM 引用（append 不是整段重绘）。
+    expect(document.querySelector('tbody[data-append-key="history"]')).toBe(tbody);
+    expect(document.querySelectorAll('tbody[data-append-key="history"] tr').length).toBe(4);
+    expect(document.querySelector('tr[data-row-id="r9"]')).toBe(firstRow);
+    expect(scroll.scrollTop).toBe(22);
+    // 追加行立即参与事件委托：勾选发送 toggleHistoryRevision。
+    const box = document.querySelector<HTMLInputElement>('input[data-intent="toggleHistoryRevision"][data-row-id="r7"]')!;
+    box.checked = true;
+    box.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'toggleHistoryRevision', id: 'r7' });
+    app.dispose();
+  });
+
+  it('表格 append 只认当前会话与可追加容器：旧帧、旧会话与非 append 表格丢弃', () => {
+    const table = appendTable();
+    const { app, st } = setup({ list: undefined, form: undefined, table });
+    const slice = renderTableRowSlice(st, table, [{ id: 'r7', cells: { revision: 'r7' } }]);
+    // 旧 revision 迟到帧丢弃。
+    app.handleHostMessage({
+      type: 'append', protocolVersion: 1, sessionId: 's1', revision: 0, target: 'history', html: slice,
+    });
+    expect(document.querySelector('tr[data-row-id="r7"]')).toBeNull();
+    // 目标切换后旧会话 append 丢弃。
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's2', revision: 1, formRevision: 0,
+      html: render({
+        sessionId: 's2', title: '面板', targetLabel: 'wc', revision: 1, formRevision: 0, busy: false, banners: [],
+        table,
+      }),
+    });
+    app.handleHostMessage({
+      type: 'append', protocolVersion: 1, sessionId: 's1', revision: 9, target: 'history', html: slice,
+    });
+    expect(document.querySelector('tr[data-row-id="r7"]')).toBeNull();
+    // 非 append 表格（page 模式）没有 data-append-key 容器：追加静默丢弃。
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's2', revision: 2, formRevision: 0,
+      html: render({
+        sessionId: 's2', title: '面板', targetLabel: 'wc', revision: 2, formRevision: 0, busy: false, banners: [],
+        table: { ...table, pagination: { page: 1, pageSize: 50, total: 2, pageCount: 1 } },
+      }),
+    });
+    app.handleHostMessage({
+      type: 'append', protocolVersion: 1, sessionId: 's2', revision: 3, target: 'history', html: slice,
+    });
+    expect(document.querySelector('tr[data-row-id="r7"]')).toBeNull();
+    app.dispose();
+  });
+
   it('切换目标会话时清空滚动记忆，避免旧目标位置落到新目标', () => {
     const { app } = setup(treeState());
     const master = document.querySelector<HTMLElement>('[data-scroll-key="browser-tree"]')!;
@@ -954,6 +1033,99 @@ describe('M4 通用组件事件转发', () => {
     expect(lastIntent(sent)?.intent).toEqual({ kind: 'refreshHistoryUpper', mode: 'head' });
     document.querySelector<HTMLButtonElement>('[data-intent="chooseConflictVariant"]')?.click();
     expect(lastIntent(sent)?.intent).toEqual({ kind: 'chooseConflictVariant', value: 'mine-full' });
+    app.dispose();
+  });
+
+  it('变更路径行内动作只转发稳定路径项 ID（copyHistoryText + copyKind）', () => {
+    const { app, sent } = setup({
+      list: undefined,
+      form: undefined,
+      layout: { layout: 'master-detail' },
+      detail: {
+        title: 'r1280',
+        sections: [{
+          kind: 'paths',
+          heading: '变更路径',
+          paths: [{
+            id: 'r1280:0',
+            path: 'trunk/src/app.ts',
+            action: 'M',
+            actions: [{
+              id: 'copyHistoryText',
+              label: '复制路径',
+              payload: { 'copy-kind': 'changedPath' },
+            }],
+          }],
+        }],
+      },
+    });
+    document.querySelector<HTMLButtonElement>('[data-intent="copyHistoryText"][data-row-id="r1280:0"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({
+      kind: 'copyHistoryText',
+      copyKind: 'changedPath',
+      id: 'r1280:0',
+    });
+    app.dispose();
+  });
+
+  it('详情层动作绑定 detail.id：copyHistoryText 发送稳定行 ID', () => {
+    const { app, sent } = setup({
+      list: undefined,
+      form: undefined,
+      layout: { layout: 'master-detail' },
+      detail: {
+        id: 'r1280',
+        title: 'r1280',
+        sections: [{
+          kind: 'actions',
+          actions: [{ id: 'copyHistoryText', label: '复制 revision', payload: { 'copy-kind': 'revision' } }],
+        }],
+      },
+    });
+    document.querySelector<HTMLButtonElement>('[data-intent="copyHistoryText"][data-row-id="r1280"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({
+      kind: 'copyHistoryText',
+      copyKind: 'revision',
+      id: 'r1280',
+    });
+    app.dispose();
+  });
+
+  it('筛选面板的跟随复制与每批数量 select 变化立即发送稳定 id/value', () => {
+    const { app, sent } = setup({
+      list: undefined,
+      form: undefined,
+      filterPanel: {
+        id: 'historyFilters',
+        title: '筛选',
+        fields: [
+          {
+            id: 'follow',
+            kind: 'select',
+            label: '历史范围',
+            value: 'follow',
+            options: [{ value: 'follow', label: '跟随复制历史' }, { value: 'stop', label: '停在复制点' }],
+          },
+          {
+            id: 'pageSize',
+            kind: 'select',
+            label: '每批数量',
+            value: '50',
+            options: [{ value: '20', label: '20' }, { value: '50', label: '50' }, { value: '100', label: '100' }],
+          },
+        ],
+        clearAction: { id: 'clearHistoryFilters', label: '清空筛选' },
+      },
+    });
+    const follow = document.querySelector<HTMLSelectElement>('[data-filter-field-id="follow"]')!;
+    follow.value = 'stop';
+    follow.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'setHistoryFilter', id: 'follow', value: 'stop' });
+    const pageSize = document.querySelector<HTMLSelectElement>('[data-filter-field-id="pageSize"]')!;
+    pageSize.value = '100';
+    pageSize.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'setHistoryFilter', id: 'pageSize', value: '100' });
+    // select 变化立即提交，不等文本防抖窗口。
     app.dispose();
   });
 });

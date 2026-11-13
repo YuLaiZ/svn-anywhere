@@ -94,6 +94,10 @@ import {
   disposeBrowseRepositoryCommandForTest,
   registerBrowseRepositoryCommand,
 } from '../src/host/commands/browse';
+import {
+  disposeShowHistoryCommandForTest,
+  registerShowHistoryCommand,
+} from '../src/host/commands/history';
 import { resolveBatchTargetGroups, resolveWorkingCopyTarget } from '../src/host/commands/target';
 import { strings } from '../src/host/i18n';
 
@@ -124,6 +128,7 @@ beforeEach(() => {
   disposeOutputChannel();
   resetOutputState();
   disposeBrowseRepositoryCommandForTest();
+  disposeShowHistoryCommandForTest();
   vscodeMock.channels.length = 0;
   vscodeMock.information.length = 0;
   vscodeMock.warning.length = 0;
@@ -337,17 +342,20 @@ describe('registerAllCommands 二次激活', () => {
     // 必须 await 后断言，同步断言会拿到未完成的注册计数。
     // M4 阶段 2：命令数 17→18——browseRepository 由 extension.activate 在
     // registerAllCommands 之后经独立句柄接线（同一注册序列在本用例中复现）。
+    // M4 阶段 3：命令数 18→19——showHistory 与 browseRepository 同模式。
     const firstContext = { subscriptions: [], globalState } as unknown as vscode.ExtensionContext;
     await registerAllCommands(firstContext);
     registerBrowseRepositoryCommand(firstContext);
-    expect(vscodeMock.registered).toHaveLength(18);
+    registerShowHistoryCommand(firstContext);
+    expect(vscodeMock.registered).toHaveLength(19);
     const firstHandles = vscodeMock.registered.map((r) => r.disposable);
 
     const secondContext = { subscriptions: [], globalState } as unknown as vscode.ExtensionContext;
     await expect(registerAllCommands(secondContext)).resolves.toBeUndefined();
     registerBrowseRepositoryCommand(secondContext);
+    registerShowHistoryCommand(secondContext);
     expect(firstHandles.every((d) => d.disposed)).toBe(true);
-    expect(vscodeMock.registered).toHaveLength(36);
-    expect(vscodeMock.activeCommandIds.size).toBe(18);
+    expect(vscodeMock.registered).toHaveLength(38);
+    expect(vscodeMock.activeCommandIds.size).toBe(19);
   });
 });

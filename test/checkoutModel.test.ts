@@ -923,3 +923,62 @@ describe('URL 历史与 closed 边界', () => {
     expect(s.recovered).toBeNull();
   });
 });
+
+/* --------------------------- P6 历史交接预填 --------------------------- */
+
+describe('P6→P3 交接预填（CheckoutPanelEntry.prefill）', () => {
+  it('URL 经 P3 校验链、revision 固定数字模式、auto 联动目录名；仍是 form/untested', () => {
+    const s = createCheckoutPanelState({
+      sessionId: 's1',
+      entryKey: 'history:http://example.com/svn/trunk/proj',
+      mode: 'checkout',
+      prefill: { url: 'http://example.com/svn/trunk/proj', revision: 1281 },
+    });
+    expect(s.step).toBe('form');
+    expect(s.conn.phase).toBe('untested');
+    expect(s.form.url).toBe('http://example.com/svn/trunk/proj');
+    expect(s.form.urlInput).toBe('http://example.com/svn/trunk/proj');
+    expect(s.form.urlError).toBeNull();
+    expect(s.form.revMode).toBe('number');
+    expect(s.form.rev).toBe('1281');
+    expect(s.form.revError).toBeNull();
+    // 自动命名按 URL 末段联动（nameMode='auto'，用户可改）。
+    expect(s.form.nameMode).toBe('auto');
+    expect(s.form.dirName).toBe('proj');
+    // 父目录由用户在 P3 中重新选择（交接不带本地目录）。
+    expect(s.form.parentDir).toBe('');
+    expect(s.form.finalPath).toBeNull();
+  });
+
+  it('非法预填 URL 保留显示草稿、form.url 置空并给 urlError；newTask 保留预填', () => {
+    const s = createCheckoutPanelState({
+      sessionId: 's1',
+      entryKey: 'history:bad',
+      mode: 'checkout',
+      prefill: { url: 'not a url', revision: 3 },
+    });
+    expect(s.form.url).toBe('');
+    expect(s.form.urlInput).toBe('not a url');
+    expect(s.form.urlError).toBeTruthy();
+    expect(s.form.revMode).toBe('number');
+    expect(s.form.rev).toBe('3');
+
+    const again = newTask(s);
+    expect(again.form.urlInput).toBe('not a url');
+    expect(again.form.rev).toBe('3');
+    expect(again.form.urlError).toBeTruthy();
+  });
+
+  it('导入模式忽略 prefill（交接只对 checkout）', () => {
+    const s = createCheckoutPanelState({
+      sessionId: 's1',
+      entryKey: 'src-dir',
+      mode: 'import',
+      sourceDir: '/src',
+      prefill: { url: 'http://example.com/svn/trunk/proj', revision: 9 },
+    });
+    expect(s.form.url).toBe('');
+    expect(s.form.rev).toBe('');
+    expect(s.form.revMode).toBe('head');
+  });
+});

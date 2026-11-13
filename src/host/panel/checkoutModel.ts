@@ -218,6 +218,18 @@ export function markRecovered(state: CheckoutPanelState, from: Exclude<CheckoutR
   return { ...state, recovered: from };
 }
 
+/**
+ * P6→P3 交接的预填值（技术方案 §4.5）：P6 只交已解析的实际目录 URL 与
+ * 明确数字 revision；P3 仍经 normalizeUrlInput 重新校验、固定数字模式，
+ * 连接检查/空目标检查/确认全部重新执行（交接不绕过任何写前检查）。
+ */
+export interface CheckoutHistoryPrefill {
+  /** 已由 P6 侧 normalizeCheckoutUrl 的目录 URL（P3 仍重新校验）。 */
+  url: string;
+  /** 已确认的数字 revision。 */
+  revision: number;
+}
+
 /** 面板打开入口（任务 resultScope 捕获与草稿键的基准；newTask 重建表单的初始值来源）。 */
 export interface CheckoutPanelEntry {
   sessionId: string;
@@ -231,6 +243,8 @@ export interface CheckoutPanelEntry {
   defaultDepth?: CheckoutDepth;
   /** URL 历史（宿主 globalState 载入后喂入；模型只读镜像）。 */
   history?: string[];
+  /** P6 历史交接预填（仅 checkout 模式使用；newTask 重建时保留）。 */
+  prefill?: CheckoutHistoryPrefill;
 }
 
 /** 入口快照（创建时归一为必填；newTask/switchMode 重建与页头兜底展示用）。 */
@@ -240,6 +254,8 @@ export interface CheckoutPanelEntrySnapshot {
   parentDir: string;
   sourceDir: string;
   defaultDepth: CheckoutDepth;
+  /** 历史交接预填（仅 checkout 模式；重开/新建任务重建表单时保留）。 */
+  prefill?: CheckoutHistoryPrefill;
 }
 
 /** P3 面板完整状态（检出与导入共用形状，§4.1）。 */
@@ -279,30 +295,32 @@ export function createCheckoutPanelState(entry: CheckoutPanelEntry): CheckoutPan
     parentDir: entry.parentDir ?? '',
     sourceDir: entry.sourceDir ?? '',
     defaultDepth,
+    ...(entry.prefill !== undefined ? { prefill: { ...entry.prefill } } : {}),
   };
+  const form = applyHistoryPrefill({
+    url: '',
+    urlInput: '',
+    nameMode: 'auto',
+    finalPath: null,
+    urlError: null,
+    parentDir: base.parentDir,
+    dirName: '',
+    directMode: false,
+    directDir: '',
+    revMode: 'head',
+    rev: '',
+    depth: defaultDepth,
+    nameError: null,
+    revError: null,
+    sourceDir: base.sourceDir,
+    message: '',
+  }, base.prefill, entry.mode);
   return {
     sessionId: entry.sessionId,
     entry: base,
     mode: entry.mode,
     step: 'form',
-    form: {
-      url: '',
-      urlInput: '',
-      nameMode: 'auto',
-      finalPath: null,
-      urlError: null,
-      parentDir: base.parentDir,
-      dirName: '',
-      directMode: false,
-      directDir: '',
-      revMode: 'head',
-      rev: '',
-      depth: defaultDepth,
-      nameError: null,
-      revError: null,
-      sourceDir: base.sourceDir,
-      message: '',
-    },
+    form,
     history: [...(entry.history ?? [])],
     conn: freshConn(),
     review: freshReview(),
@@ -313,6 +331,32 @@ export function createCheckoutPanelState(entry: CheckoutPanelEntry): CheckoutPan
     binding: null,
     recovered: null,
   };
+}
+
+/**
+ * 历史交接预填（P6→P3，技术方案 §4.5）：只在 checkout 模式生效；
+ * - URL 仍走 P3 校验链（非法值保留显示草稿、form.url 置空并给 urlError）；
+ * - revision 固定写入数字模式（validateRev 由 refreshDerived 重算）；
+ * - 自动命名按 URL 联动目录名（nameMode='auto'，用户可改）。
+ */
+function applyHistoryPrefill(
+  form: CheckoutFormState,
+  prefill: CheckoutHistoryPrefill | undefined,
+  mode: P3Mode,
+): CheckoutFormState {
+  if (prefill === undefined || mode !== 'checkout') {
+    return form;
+  }
+  const check = normalizeUrlInput(prefill.url);
+  const next: CheckoutFormState = {
+    ...form,
+    urlInput: check.ok ? check.url : prefill.url,
+    url: check.ok ? check.url : '',
+    urlError: check.ok ? null : check.message,
+    revMode: 'number',
+    rev: String(prefill.revision),
+  };
+  return refreshDerived(applyAutoNaming(next));
 }
 
 function freshConn(): CheckoutConnState {

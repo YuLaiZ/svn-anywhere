@@ -6,9 +6,17 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { commitFixture } from '../src/host/panel/fixture';
-import { render, renderLazyNodeSlice, type LazyTreeRowView } from '../src/host/panel/view';
-import type { FormFieldSpec, LazyTreeRowSpec, PanelState, RowSpec } from '../src/host/panel/state';
-import { strings } from '../src/host/i18n';
+import { render, renderLazyNodeSlice, renderTableRowSlice, type LazyTreeRowView } from '../src/host/panel/view';
+import type {
+  FormFieldSpec,
+  LazyTreeRowSpec,
+  PanelState,
+  RowSpec,
+  DetailSectionSpec,
+  TableRowSpec,
+  TableSpec,
+} from '../src/host/panel/state';
+import { strings, format } from '../src/host/i18n';
 
 function baseState(patch: Partial<PanelState> = {}): PanelState {
   return {
@@ -912,6 +920,519 @@ describe('render：P6 表格选择与 append 分页', () => {
     const html = render(historyState({}, { busy: true }));
     expect(html).toMatch(/data-intent="toggleHistoryRevision"[^>]*disabled/);
     expect(html).not.toContain('data-intent="selectHistoryRevision"');
+  });
+});
+
+describe('render：P6 历史表格（行、append 页脚与增量行片段）', () => {
+  function historyTable(patch: Partial<TableSpec> = {}): TableSpec {
+    return {
+      id: 'history',
+      columns: [
+        { key: 'revision', label: 'Revision', sortable: true },
+        { key: 'author', label: '作者' },
+        { key: 'date', label: '日期' },
+        { key: 'message', label: '提交说明' },
+        { key: 'paths', label: '变更路径数', align: 'right' },
+      ],
+      sort: { key: 'revision', direction: 'desc' },
+      pagination: { page: 1, pageSize: 2, total: 80, pageCount: 1, mode: 'append' },
+      selection: { mode: 'revision', maxSelected: 2, ariaLabel: '选择要比较的 revision' },
+      rows: [
+        {
+          id: 'r1280',
+          cells: {
+            revision: 'r1280',
+            author: '林舟',
+            date: '2026-11-13',
+            message: '修复 <面板> & 渲染',
+            paths: '3',
+          },
+          selected: true,
+          selectionLabel: '勾选 revision r1280',
+          actions: [{ id: 'viewHistoryRevision', label: '查看此版本' }],
+        },
+        {
+          id: 'r1279',
+          cells: {
+            revision: 'r1279',
+            author: '周宁',
+            date: '2026-11-12',
+            message: 'feat: 新增行',
+            paths: '1',
+          },
+          selectionLabel: '勾选 revision r1279',
+        },
+      ],
+      loadMoreAction: { id: 'loadMoreHistory', label: strings.panel.loadMoreHistory },
+      loadMoreInfo: {
+        summary: '已显示 50 / 共 80 条',
+        sessionSummary: '会话已扫描 1,000 条 revision · 目标历史 80 条',
+        thisLoad: { rawFetched: 500, uniqueScanned: 497 },
+      },
+      empty: { title: '没有历史记录' },
+      filterEmpty: { title: '没有匹配当前筛选的历史记录' },
+      ...patch,
+    };
+  }
+
+  it('行显示 revision/作者/日期/摘要/变更路径数五列，摘要转义', () => {
+    const html = render(baseState({ table: historyTable() }));
+    // 列头：勾选列 + 五个数据列（Revision 是可排序列，渲染为排序按钮）。
+    expect((html.match(/scope="col"/g) ?? []).length).toBe(6);
+    expect(html).toContain('data-sort-key="revision"');
+    for (const label of ['Revision', '作者', '日期', '提交说明', '变更路径数']) {
+      expect(html).toContain(label);
+    }
+    const row = html.slice(html.indexOf('<tr data-row-id="r1280"'), html.indexOf('<tr data-row-id="r1279"'));
+    expect(row).toContain('>r1280</td>');
+    expect(row).toContain('>林舟</td>');
+    expect(row).toContain('>2026-11-13</td>');
+    expect(row).toContain('修复 &lt;面板&gt; &amp; 渲染');
+    expect(row).toContain('align-right">3</td>');
+    expect(row).toMatch(/aria-selected="true"/);
+    expect(row).toContain('data-intent="viewHistoryRevision" data-row-id="r1280"');
+  });
+
+  it('append 模式 tbody 带 data-append-key（table.id）；page 模式不带', () => {
+    const append = render(baseState({ table: historyTable() }));
+    expect(append).toContain('<tbody data-append-key="history">');
+    const page = render(baseState({
+      table: historyTable({ pagination: { page: 1, pageSize: 50, total: 2, pageCount: 1 } }),
+    }));
+    expect(page).toContain('<tbody>');
+    expect(page).not.toContain('data-append-key="history"');
+  });
+
+  it('加载更多旁显示本次/累计计数（本轮原始回包数与唯一 revision 数）', () => {
+    const html = render(baseState({ table: historyTable() }));
+    const more = html.slice(html.indexOf('class="table-load-more"'));
+    expect(more).toContain('class="table-load-more-info"');
+    expect(more).toContain('已显示 50 / 共 80 条');
+    expect(more).toContain('会话已扫描 1,000 条 revision · 目标历史 80 条');
+    expect(more).toContain(format(strings.historyPanel.scannedThisLoad, { count: '500' }));
+    expect(more).toContain(format(strings.historyPanel.uniqueRevisionsThisLoad, { count: '497' }));
+    expect(more).toContain('data-intent="loadMoreHistory"');
+  });
+
+  it('宿主未提供 loadMoreInfo 时页脚回退显示已展示/可见累计计数', () => {
+    const html = render(baseState({ table: historyTable({ loadMoreInfo: undefined }) }));
+    const more = html.slice(html.indexOf('class="table-load-more"'));
+    expect(more).toContain(format(strings.historyPanel.displayedSummary, { displayed: '2' }));
+    expect(more).toContain(format(strings.historyPanel.visibleSummary, { visible: '80' }));
+    expect(more).not.toContain('class="load-more-this-load"');
+    expect(more).toContain('data-intent="loadMoreHistory"');
+  });
+
+  it('pending-only（本轮 0 字段）隐藏“本轮”行但保留累计计数', () => {
+    const html = render(baseState({
+      table: historyTable({
+        loadMoreInfo: {
+          summary: '已显示 80 / 共 80 条',
+          sessionSummary: '会话已扫描 500 条 revision · 目标历史 80 条',
+          thisLoad: { rawFetched: 0, uniqueScanned: 0 },
+        },
+      }),
+    }));
+    const more = html.slice(html.indexOf('class="table-load-more"'));
+    expect(more).toContain('已显示 80 / 共 80 条');
+    expect(more).toContain('会话已扫描 500 条 revision · 目标历史 80 条');
+    expect(more).not.toContain(format(strings.historyPanel.scannedThisLoad, { count: '0' }));
+    expect(more).not.toContain(format(strings.historyPanel.uniqueRevisionsThisLoad, { count: '0' }));
+    expect(more).not.toContain('class="load-more-this-load"');
+  });
+
+  it('无匹配（筛选活跃）空态仍显示加载更多与累计计数', () => {
+    const html = render(baseState({
+      table: historyTable({
+        rows: [],
+        filters: [{ id: 'keyword', kind: 'text', cellKey: 'message', value: 'zzz' }],
+      }),
+    }));
+    expect(html).toContain('没有匹配当前筛选的历史记录');
+    expect(html).toContain('data-intent="loadMoreHistory"');
+    expect(html).toContain('已显示 50 / 共 80 条');
+  });
+
+  it('P6 宿主用 emptyMode=filterEmpty 显式指定 noMatch（不依赖 TableSpec.filters）', () => {
+    const noMatch = render(baseState({
+      table: historyTable({ rows: [], emptyMode: 'filterEmpty' }),
+    }));
+    expect(noMatch).toContain('没有匹配当前筛选的历史记录');
+    expect(noMatch).not.toContain('没有历史记录');
+    expect(noMatch).toContain('data-intent="loadMoreHistory"');
+    const empty = render(baseState({
+      table: historyTable({ rows: [], emptyMode: 'empty' }),
+    }));
+    expect(empty).toContain('没有历史记录');
+    expect(empty).not.toContain('没有匹配当前筛选的历史记录');
+  });
+
+  it('renderTableRowSlice 只渲染行片段：不含 table/tbody/加载更多/列头', () => {
+    const table = historyTable();
+    const rows: TableRowSpec[] = Array.from({ length: 40 }, (_, index) => ({
+      id: `r${900 - index}`,
+      cells: { revision: `r${900 - index}`, author: 'a', date: '2026-11-01', message: 'm', paths: '1' },
+      selectionLabel: `勾选 revision r${900 - index}`,
+    }));
+    const slice = renderTableRowSlice(baseState(), table, rows);
+    expect((slice.match(/<tr /g) ?? []).length).toBe(40);
+    expect(slice).not.toContain('<table');
+    expect(slice).not.toContain('<thead');
+    expect(slice).not.toContain('<tbody');
+    expect(slice).not.toContain('<th ');
+    expect(slice).not.toContain('table-load-more');
+    expect(slice).toContain('data-intent="toggleHistoryRevision" data-row-id="r900"');
+  });
+});
+
+describe('render：P6 详情变更路径与复制窗口', () => {
+  function detailState(sections: DetailSectionSpec[]): PanelState {
+    return baseState({
+      layout: {
+        layout: 'master-detail',
+        masterLabel: '历史记录',
+        detailLabel: '版本详情',
+        masterScrollKey: 'history-table',
+        detailScrollKey: 'history-detail',
+      },
+      detail: {
+        title: 'r1280 · 修复复制展示',
+        subtitle: '林舟 · 2026-11-13 10:00',
+        sections,
+      },
+    });
+  }
+
+  it('变更路径列出 action/类型/copyfrom/说明，行内动作只带稳定路径项 ID', () => {
+    const html = render(detailState([
+      {
+        kind: 'paths',
+        heading: '变更路径',
+        paths: [
+          {
+            id: 'r1280:0',
+            path: 'trunk/src/app.ts',
+            action: 'M',
+            kind: 'file',
+            note: '当前目标',
+            actions: [{ id: 'copyHistoryText', label: '复制路径', payload: { 'copy-kind': 'changedPath' } }],
+          },
+          {
+            id: 'r1280:1',
+            path: 'trunk/docs/guide.md',
+            action: 'A',
+            copyfrom: { path: 'branches/base/docs/guide.md', revision: '3', label: '复制自' },
+          },
+        ],
+      },
+    ]));
+    expect(html).toContain('class="path-action act-M">M</span>');
+    expect(html).toContain('class="path-action act-A">A</span>');
+    // 表格与详情各自独立滚动：滚动键来自 MasterDetailSpec（宿主稳定命名）。
+    expect(html).toContain('data-scroll-key="history-table"');
+    expect(html).toContain('data-scroll-key="history-detail"');
+    expect(html).toContain('class="path-value mono" title="trunk/src/app.ts">trunk/src/app.ts</span>');
+    expect(html).toContain('class="path-kind">file</span>');
+    expect(html).toContain('class="path-note muted">当前目标</span>');
+    expect(html).toContain('data-path-id="r1280:0"');
+    expect(html).toContain(
+      'data-intent="copyHistoryText" data-row-id="r1280:0"',
+    );
+    expect(html).toContain('data-copy-kind="changedPath"');
+    // copyfrom 展示为「复制自 来源@rN」，来源路径不做二次拼接。
+    expect(html).toContain('class="path-copyfrom"');
+    expect(html).toContain('复制自 <span class="mono">branches/base/docs/guide.md</span>');
+    expect(html).toContain('<span class="mono">@r3</span>');
+  });
+
+  it('超过 collapseAfter 的路径收进“查看全部变更路径”details（视图瞬时折叠）', () => {
+    const html = render(detailState([
+      {
+        kind: 'paths',
+        heading: '变更路径',
+        collapseAfter: 2,
+        moreLabel: '查看全部变更路径（{count}）',
+        paths: ['a.ts', 'b.ts', 'c.ts', 'd.ts'].map((path, index) => ({
+          id: `p${index}`,
+          path,
+          action: 'M',
+        })),
+      },
+    ]));
+    const direct = html.slice(0, html.indexOf('class="detail-paths-more"'));
+    expect(direct).toContain('>a.ts<');
+    expect(direct).toContain('>b.ts<');
+    expect(direct).not.toContain('>c.ts<');
+    expect(html).toContain('<details class="detail-paths-more">');
+    expect(html).toContain('<summary>查看全部变更路径（2）</summary>');
+    const folded = html.slice(html.indexOf('class="detail-paths-more"'));
+    expect(folded).toContain('>c.ts<');
+    expect(folded).toContain('>d.ts<');
+  });
+
+  it('moreLabel 不含 {count} 时在文案后附加条数；无路径时渲染 emptyText', () => {
+    const html = render(detailState([
+      {
+        kind: 'paths',
+        collapseAfter: 1,
+        moreLabel: '查看全部变更路径',
+        paths: [{ id: 'p0', path: 'a.ts' }, { id: 'p1', path: 'b.ts' }, { id: 'p2', path: 'c.ts' }],
+      },
+    ]));
+    expect(html).toContain('<summary>查看全部变更路径（2）</summary>');
+    const empty = render(detailState([
+      { kind: 'paths', heading: '变更路径', paths: [], emptyText: '该提交没有可直接展示的变更路径。' },
+    ]));
+    expect(empty).toContain('class="muted">该提交没有可直接展示的变更路径。');
+    expect(empty).not.toContain('class="changed-paths"');
+  });
+
+  it('复制窗口逐层展示 目标 ← 来源@revision 与边界说明', () => {
+    const html = render(detailState([
+      {
+        kind: 'copyWindow',
+        heading: '复制来源',
+        items: [
+          {
+            targetPath: 'trunk/C',
+            sourcePath: 'trunk/B',
+            sourceRevision: '4',
+            boundaryRevision: '5',
+            note: '复制点之前的历史停在来源节点',
+          },
+          { targetPath: 'trunk/B', sourcePath: 'trunk/A', sourceRevision: '2', boundaryRevision: '3' },
+        ],
+      },
+    ]));
+    expect(html).toContain('class="copy-window"');
+    expect(html).toContain('class="copy-window-path mono" title="trunk/C">trunk/C</span>');
+    expect(html).toContain('<span class="copy-window-arrow" aria-hidden="true">←</span>');
+    expect(html).toContain('title="trunk/B">trunk/B</span><span class="mono">@r4</span>');
+    expect(html).toContain('class="copy-window-meta">r5</span>');
+    expect(html).toContain('class="copy-window-meta">复制点之前的历史停在来源节点</span>');
+    const empty = render(detailState([
+      { kind: 'copyWindow', heading: '复制来源', items: [], emptyText: '没有复制关系。' },
+    ]));
+    expect(empty).toContain('class="muted">没有复制关系。');
+  });
+
+  it('详情层动作在 detail.id 存在时绑定稳定行 ID（复制 revision/说明等）', () => {
+    const html = render(baseState({
+      layout: { layout: 'master-detail' },
+      detail: {
+        id: 'r1280',
+        title: 'r1280',
+        sections: [{
+          kind: 'actions',
+          actions: [
+            { id: 'copyHistoryText', label: '复制 revision', payload: { 'copy-kind': 'revision' } },
+            { id: 'compareBase', label: '工作内容与 BASE 比较' },
+          ],
+        }],
+      },
+    }));
+    expect(html).toContain('data-intent="copyHistoryText" data-row-id="r1280"');
+    expect(html).toContain('data-copy-kind="revision"');
+    expect(html).toContain('data-intent="compareBase" data-row-id="r1280"');
+    // 未提供 detail.id 的既有面板保持 data-detail-action 无参绑定。
+    const legacy = render(baseState({
+      layout: { layout: 'master-detail' },
+      detail: { title: '节点', sections: [{ kind: 'actions', actions: [{ id: 'copyBrowserNodeUrl', label: '复制 URL' }] }] },
+    }));
+    expect(legacy).toContain('data-intent="copyBrowserNodeUrl" data-detail-action="copyBrowserNodeUrl"');
+  });
+
+  it('路径与复制来源中的 HTML 特殊字符全部转义', () => {
+    const html = render(detailState([
+      {
+        kind: 'paths',
+        paths: [{
+          id: 'p0',
+          path: 'trunk/<img src=x onerror=alert(1)>.ts',
+          action: 'A',
+          copyfrom: { path: 'branches/"x"&y', revision: '2' },
+          note: '<script>note</script>',
+        }],
+      },
+      {
+        kind: 'copyWindow',
+        items: [{ targetPath: '<t>', sourcePath: '"s"&', note: '<b>' }],
+      },
+    ]));
+    expect(html).not.toContain('<img src=x');
+    expect(html).not.toContain('<script>note</script>');
+    expect(html).not.toContain('<b>');
+    expect(html).toContain('trunk/&lt;img src=x onerror=alert(1)&gt;.ts');
+    expect(html).toContain('branches/&quot;x&quot;&amp;y');
+    expect(html).toContain('&lt;script&gt;note&lt;/script&gt;');
+    expect(html).toContain('&lt;t&gt;');
+    expect(html).toContain('&quot;s&quot;&amp;');
+  });
+});
+
+describe('render：P6 筛选面板完整字段（跟随复制/每批数量）', () => {
+  function fullFilterState(): PanelState {
+    return baseState({
+      filterPanel: {
+        id: 'historyFilters',
+        title: '筛选',
+        fields: [
+          { id: 'keyword', kind: 'text', label: '关键词', value: '迁移', placeholder: '说明、作者或 rN' },
+          {
+            id: 'author',
+            kind: 'select',
+            label: '作者',
+            value: 'alice',
+            options: [{ value: 'all', label: '全部作者' }, { value: 'alice', label: 'alice' }],
+          },
+          { id: 'path', kind: 'text', label: '路径', value: 'src/' },
+          { id: 'from', kind: 'date', label: '起始日期', value: '2026-01-01' },
+          { id: 'to', kind: 'date', label: '截止日期', value: '2026-11-13' },
+          {
+            id: 'follow',
+            kind: 'select',
+            label: '历史范围',
+            value: 'follow',
+            options: [{ value: 'follow', label: '跟随复制历史' }, { value: 'stop', label: '停在复制点' }],
+          },
+          {
+            id: 'pageSize',
+            kind: 'select',
+            label: '每批数量',
+            value: '50',
+            options: [{ value: '20', label: '20' }, { value: '50', label: '50' }, { value: '100', label: '100' }],
+          },
+        ],
+        clearAction: { id: 'clearHistoryFilters', label: '清空筛选' },
+      },
+    });
+  }
+
+  it('关键词/作者/路径/起止日期/跟随复制/每批数量全部渲染，选中值回显', () => {
+    const html = render(fullFilterState());
+    expect(html).toContain('data-filter-field-id="keyword"');
+    expect(html).toContain('data-filter-field-id="author"');
+    expect(html).toContain('data-filter-field-id="path"');
+    expect(html).toContain('data-filter-field-id="from"');
+    expect(html).toContain('data-filter-field-id="to"');
+    expect(html).toContain('data-filter-field-id="follow"');
+    expect(html).toContain('data-filter-field-id="pageSize"');
+    expect(html).toContain('<option value="alice" selected>alice</option>');
+    expect(html).toContain('<option value="follow" selected>跟随复制历史</option>');
+    expect(html).toContain('<option value="50" selected>50</option>');
+    expect(html).toMatch(/<input type="text" value="迁移"/);
+    expect(html).toMatch(/<input type="date" value="2026-11-13"/);
+    expect(html).toContain('data-intent="clearHistoryFilters"');
+    // 筛选字段变化只提交 id/value（不携带网络请求或分页参数）。
+    expect(html).toContain('data-intent="setHistoryFilter" data-filter-field-id="follow"');
+    expect(html).toContain('data-intent="setHistoryFilter" data-filter-field-id="pageSize"');
+  });
+});
+
+describe('render：P6 状态提示（错误/权限/上限/HEAD）', () => {
+  it('错误与权限横幅 role=alert 并带重试/关闭动作（bannerAction 按稳定 ID）', () => {
+    const html = render(baseState({
+      banners: [
+        {
+          id: 'historyError',
+          level: 'error',
+          title: strings.historyPanel.loadFailedTitle,
+          detail: format(strings.historyPanel.loadFailedDetail, { message: 'svn: E175013: Access forbidden' }),
+          actions: [{ id: 'refresh', label: '重试' }],
+        },
+        {
+          id: 'historyPermission',
+          level: 'error',
+          title: '权限被拒绝',
+          detail: '当前账号没有读取该路径历史的权限。',
+          dismissable: false,
+        },
+      ],
+    }));
+    expect((html.match(/class="banner error" role="alert"/g) ?? []).length).toBe(2);
+    expect(html).toContain('svn: E175013: Access forbidden');
+    expect(html).toContain('data-intent="bannerAction" data-banner-id="historyError"');
+    expect(html).toContain('data-action-id="refresh"');
+    // dismissable:false 的权限横幅不渲染关闭按钮（判定性持久提示）：
+    // 该横幅既无 actions 也无 data-banner-id，避免可点被拒的关闭入口。
+    expect(html).toContain('当前账号没有读取该路径历史的权限。');
+    expect(html).not.toContain('data-banner-id="historyPermission"');
+  });
+
+  it('上限横幅同时列出 matched/scanned 两个 reason，并提供清理入口', () => {
+    const html = render(baseState({
+      banners: [{
+        id: 'historyLimit',
+        level: 'warn',
+        title: '历史会话达到上限',
+        detail: format(strings.historyPanel.limitBoth, {
+          matchedActual: '5,080',
+          matchedLimit: '5,000',
+          scannedActual: '100,010',
+          scannedLimit: '100,000',
+        }),
+        dismissable: false,
+        actions: [{
+          id: 'resetHistorySession',
+          label: '清除该目标历史会话并重新读取',
+          payload: {},
+        }],
+      }],
+    }));
+    expect(html).toContain('class="banner warn"');
+    expect(html).toContain('已加载命中 5,080/5,000');
+    expect(html).toContain('已扫描 revision 100,010/100,000');
+    expect(html).toContain('data-intent="bannerAction" data-banner-id="historyLimit"');
+    expect(html).toContain('data-action-id="resetHistorySession"');
+    expect(html).toContain('仅影响本次会话加载，不修改工作副本');
+  });
+
+  it('HEAD 不可用横幅提供“尝试按 BASE 上限查看”（refreshHistoryUpper mode=base-fallback）', () => {
+    const html = render(baseState({
+      banners: [{
+        id: 'historyHead',
+        level: 'warn',
+        title: format(strings.historyPanel.headUnavailable, { message: '服务器不可达' }),
+        dismissable: false,
+        actions: [{
+          id: 'refreshHistoryUpper',
+          label: strings.historyPanel.tryBaseUpper,
+          payload: { mode: 'base-fallback' },
+        }],
+      }],
+    }));
+    expect(html).toContain('HEAD 暂不可用：服务器不可达');
+    expect(html).toContain('data-intent="bannerAction" data-banner-id="historyHead"');
+    expect(html).toContain('data-action-id="refreshHistoryUpper"');
+    expect(html).toContain('data-mode="base-fallback"');
+    expect(html).toContain(strings.historyPanel.tryBaseUpper);
+  });
+});
+
+describe('render：P6 窄面板 CSS 契约', () => {
+  it('294/400 宽度下历史表格与详情不横向溢出（内部滚动 + 任意换行）', () => {
+    const css = readFileSync(join(process.cwd(), 'media/panel.css'), 'utf8');
+    // 400px 断点内主从布局上下堆叠；窄屏覆盖必须定义在基础规则之后才生效。
+    expect(css).toMatch(/@media \(max-width: 400px\) \{[\s\S]*\.split-layout \{ flex-direction: column; \}/);
+    expect(css).toMatch(/@media \(max-width: 400px\) \{[\s\S]*\.path-item \.acts \{ margin-left: 0; \}/);
+    const basePathActs = css.indexOf('.path-item .acts { margin-left: auto;');
+    const narrowPathActs = css.indexOf('.path-item .acts { margin-left: 0; }');
+    expect(basePathActs).toBeGreaterThan(-1);
+    expect(narrowPathActs).toBeGreaterThan(basePathActs);
+    const baseLoadMore = css.indexOf('.table-load-more { flex: none; display: flex; flex-wrap: wrap;');
+    const narrowLoadMore = css.indexOf('.table-load-more { padding: 6px 12px; }');
+    expect(narrowLoadMore).toBeGreaterThan(baseLoadMore);
+    // 加载更多页脚与计数可换行；计数文本任意换行。
+    expect(css).toContain('.table-load-more { flex: none; display: flex; flex-wrap: wrap;');
+    expect(css).toContain('.table-load-more-info { display: flex; flex-wrap: wrap;');
+    // 变更路径/复制窗口的路径值可收缩换行，详情在 pane-scroll 内滚动。
+    expect(css).toContain('.changed-paths { list-style: none; margin: 4px 0; padding: 0; display: flex; flex-direction: column; gap: 5px; }');
+    expect(css).toContain('.path-value { min-width: 0; overflow-wrap: anywhere; word-break: break-all; }');
+    expect(css).toContain('.copy-window-item { display: flex; flex-wrap: wrap;');
+    expect(css).toContain('.copy-window-path { min-width: 0; overflow-wrap: anywhere; word-break: break-all; }');
+    // 表格横向滚动只发生在容器内（.table-scroll），页面本身不横向溢出。
+    expect(css).toMatch(/\.table-scroll \{[^}]*overflow: auto;/);
+    expect(css).toMatch(/\.pane-scroll \{[^}]*overflow: auto;/);
   });
 });
 

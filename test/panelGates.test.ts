@@ -251,7 +251,8 @@ describe('P6 放行表（history-update 在途与写锁）', () => {
     'clearHistoryFilters', 'compareHistoryRevisions', 'selectCompareCandidate',
     'openHistoryDiff', 'comparePreviousVisible', 'compareBase',
     'blameHistoryRevision', 'copyHistoryText', 'viewHistoryRevision',
-    'exportHistoryVersion', 'viewTaskLog', 'closePanel',
+    'exportHistoryVersion', 'historyCompareClose', 'setFilter', 'setPage',
+    'setSort', 'viewTaskLog', 'closePanel',
   ];
 
   it('busy 与 writeLocked 放行只读查看（查看已有数据不被写入在途阻止）', () => {

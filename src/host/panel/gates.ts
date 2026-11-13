@@ -282,6 +282,12 @@ const P6_READONLY_INTENTS: readonly GateRule[] = [
   { action: 'copyHistoryText' },
   { action: 'viewHistoryRevision' },
   { action: 'exportHistoryVersion' },
+  // 比较结果区的会话状态动作：关闭比较只改面板状态，占用态仍可退出。
+  { action: 'historyCompareClose' },
+  // 比较候选表的通用控件（筛选/翻页/排序）：只重算宿主切片，不请求 SVN。
+  { action: 'setFilter' },
+  { action: 'setPage' },
+  { action: 'setSort' },
   { action: 'viewTaskLog' },
   { action: 'closePanel' },
 ];
