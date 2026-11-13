@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+<style>
+body { font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); color: var(--vscode-foreground); background: var(--vscode-editor-background); margin: 0; }
+#probe { padding: 8px; }
+.wrapper { width: 400px; border: 1px solid var(--vscode-panel-border); }
+.panel { container-type: inline-size; container-name: panel; background: var(--vscode-sideBar-background); color: var(--vscode-foreground); }
+.panel-header { display: flex; gap: 6px; padding: 8px; flex-wrap: wrap; }
+.layout { display: grid; grid-template-columns: 1fr; }
+.master { padding: 8px; border-right: 1px solid var(--vscode-panel-border); }
+.detail { padding: 8px; }
+@container panel (min-width: 320px) {
+  .layout { grid-template-columns: 160px minmax(0, 1fr); }
+  .detail { display: block; }
+}
+@container panel (max-width: 319.98px) {
+  .layout { grid-template-columns: 1fr; }
+  .detail { display: none; }
+}
+</style>
+</head>
+<body>
+<div id="probe">
+  <div class="wrapper" id="wrapper">
+    <div class="panel" id="panel">
+      <div class="panel-header"><span>历史</span><span>筛选</span><span>比较</span></div>
+      <div class="layout" id="layout">
+        <div class="master" id="master">master list</div>
+        <div class="detail" id="detail">detail pane</div>
+      </div>
+    </div>
+  </div>
+  <input id="ime" type="text" placeholder="ime probe">
+</div>
+<script>
+const vscodeApi = acquireVsCodeApi();
+const $ = (id) => document.getElementById(id);
+function measure() {
+  const out = {
+    phase: 'pending',
+    bodyClass: document.body.className,
+    bodyAttrs: [...document.body.attributes].map((a) => a.name + '=' + a.value),
+  };
+  const body = getComputedStyle(document.body);
+  out.background = body.backgroundColor;
+  out.foreground = body.color;
+  out.vars = {
+    editorBackground: body.getPropertyValue('--vscode-editor-background').trim(),
+    foreground: body.getPropertyValue('--vscode-foreground').trim(),
+    panelBorder: body.getPropertyValue('--vscode-panel-border').trim(),
+  };
+  out.supportsContainerType = CSS.supports('container-type: inline-size');
+  out.layouts = {};
+  for (const w of [294, 360, 400]) {
+    $('wrapper').style.width = w + 'px';
+    out.layouts['w' + w] = {
+      panelWidth: $('panel').getBoundingClientRect().width,
+      columns: getComputedStyle($('layout')).gridTemplateColumns,
+      detailDisplay: getComputedStyle($('detail')).display,
+    };
+  }
+  out.ua = navigator.userAgent;
+  return out;
+}
+async function clipboardProbe() {
+  const r = {};
+  try { await navigator.clipboard.writeText('m4-vscode-clipboard'); r.write = 'ok'; } catch (e) { r.write = String(e); }
+  try { r.read = await navigator.clipboard.readText(); } catch (e) { r.read = String(e); }
+  return r;
+}
+function imeProbe() {
+  const el = $('ime');
+  el.focus();
+  const events = [];
+  for (const t of ['compositionstart', 'compositionupdate', 'compositionend']) {
+    el.addEventListener(t, (e) => events.push(t + ':' + (e.data || '')));
+  }
+  el.dispatchEvent(new CompositionEvent('compositionstart', { data: 'n' }));
+  el.dispatchEvent(new CompositionEvent('compositionupdate', { data: 'ni' }));
+  el.value = 'ni';
+  el.dispatchEvent(new CompositionEvent('compositionend', { data: '你' }));
+  el.value = '你';
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  return { events, value: el.value };
+}
+async function run(phase) {
+  const m = measure();
+  m.phase = phase;
+  m.clipboard = await clipboardProbe();
+  m.ime = imeProbe();
+  m.hasVsCodeApi = typeof acquireVsCodeApi === 'function';
+  vscodeApi.postMessage(m);
+}
+window.addEventListener('load', () => setTimeout(() => { window.focus(); run('dark'); }, 800));
+window.addEventListener('message', (e) => {
+  if (!e.data) return;
+  if (e.data.cmd === 'measure-light') setTimeout(() => run('light'), 500);
+  if (e.data.cmd === 'measure-hc') setTimeout(() => run('hc'), 500);
+});
+</script>
+</body>
+</html>

@@ -4,8 +4,9 @@
  * 执行链路（添加/删除/还原/移动的命令封装与终端行为一致）。
  */
 import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import {
   buildAddArgs,
   buildDeleteArgs,
@@ -124,6 +125,22 @@ describe('真实 SVN 执行链路（本地 file:// 临时仓库）', () => {
 
   afterAll(() => {
     lab.cleanup();
+  });
+
+  afterEach(() => {
+    // 回到基线：撤销登记与本地修改，删除未版本控制残留。共享副本上的登记类
+    // 残留会被后续用例的全副本 svn commit 连带提交，导致断言失败连锁污染。
+    try {
+      execFileSync('svn', ['revert', '-q', '-R', '.'], { cwd: wc });
+      for (const rel of ['new.txt', 'deep', 'move.txt', 'moved.txt', 'far', 'fresh-u.txt']) {
+        const abs = join(wc, rel);
+        if (existsSync(abs)) {
+          execFileSync('sh', ['-c', `rm -rf ${JSON.stringify(abs)}`]);
+        }
+      }
+    } catch {
+      // 基线恢复失败不阻塞后续断言（下一条用例自行重置）。
+    }
   });
 
   it('buildAddArgs 真实登记未版本控制文件与目录（--parents 补上级）', async () => {

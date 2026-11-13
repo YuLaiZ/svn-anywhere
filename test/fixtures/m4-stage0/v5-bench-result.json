@@ -1,0 +1,206 @@
+{
+  "wc": "/tmp/m4-stage0-v5/perf-wc",
+  "at": "2026-11-13T06:34:15.424Z",
+  "node": "v26.13.0",
+  "results": {
+    "small-1mib.txt": {
+      "file": "small-1mib.txt",
+      "workBytes": 1048536,
+      "workLines": 16384,
+      "diff": {
+        "exitCode": 0,
+        "outputBytes": 264,
+        "hunkCount": 1,
+        "hunks": [
+          {
+            "file": "small-1mib.txt",
+            "oldStart": 8000,
+            "oldCount": 1,
+            "newStart": 8000,
+            "newCount": 1
+          }
+        ],
+        "samples": [
+          39.33,
+          78.29,
+          46.76,
+          29.22,
+          29.15
+        ],
+        "minMs": 29.15,
+        "medianMs": 39.33,
+        "maxMs": 78.29,
+        "parse": {
+          "samples": [
+            0.17,
+            0.05,
+            0.01,
+            0,
+            0
+          ],
+          "minMs": 0,
+          "medianMs": 0.01,
+          "maxMs": 0.17
+        }
+      },
+      "blame": {
+        "exitCode": 0,
+        "killed": false,
+        "xmlBytes": 2266271,
+        "targetPath": "small-1mib.txt",
+        "entryCount": 16384,
+        "entriesWithoutCommit": 1,
+        "samples": [
+          168.61,
+          183.94,
+          169.48
+        ],
+        "minMs": 168.61,
+        "medianMs": 169.48,
+        "maxMs": 183.94,
+        "parse": {
+          "samples": [
+            171.26,
+            142.7,
+            125.62
+          ],
+          "minMs": 125.62,
+          "medianMs": 142.7,
+          "maxMs": 171.26
+        }
+      }
+    },
+    "large-10mib.txt": {
+      "file": "large-10mib.txt",
+      "workBytes": 10485721,
+      "workLines": 163840,
+      "diff": {
+        "exitCode": 0,
+        "outputBytes": 270,
+        "hunkCount": 1,
+        "hunks": [
+          {
+            "file": "large-10mib.txt",
+            "oldStart": 80000,
+            "oldCount": 1,
+            "newStart": 80000,
+            "newCount": 1
+          }
+        ],
+        "samples": [
+          95.01,
+          94.42,
+          90.63,
+          87.4,
+          91.49
+        ],
+        "minMs": 87.4,
+        "medianMs": 91.49,
+        "maxMs": 95.01,
+        "parse": {
+          "samples": [
+            0.02,
+            0,
+            0,
+            0,
+            0
+          ],
+          "minMs": 0,
+          "medianMs": 0,
+          "maxMs": 0.02
+        }
+      },
+      "blame": {
+        "exitCode": 0,
+        "killed": false,
+        "xmlBytes": 22826497,
+        "targetPath": "large-10mib.txt",
+        "entryCount": 163840,
+        "entriesWithoutCommit": 1,
+        "samples": [
+          1086.05
+        ],
+        "minMs": 1086.05,
+        "medianMs": 1086.05,
+        "maxMs": 1086.05,
+        "parse": {
+          "samples": [
+            1226.23,
+            1212.49,
+            1207.93
+          ],
+          "minMs": 1207.93,
+          "medianMs": 1212.49,
+          "maxMs": 1226.23
+        }
+      }
+    },
+    "lines-10k.txt": {
+      "file": "lines-10k.txt",
+      "workBytes": 999923,
+      "workLines": 10000,
+      "diff": {
+        "exitCode": 0,
+        "outputBytes": 296,
+        "hunkCount": 1,
+        "hunks": [
+          {
+            "file": "lines-10k.txt",
+            "oldStart": 5000,
+            "oldCount": 1,
+            "newStart": 5000,
+            "newCount": 1
+          }
+        ],
+        "samples": [
+          27.83,
+          25.78,
+          31.43,
+          31.34,
+          31.6
+        ],
+        "minMs": 25.78,
+        "medianMs": 31.34,
+        "maxMs": 31.6,
+        "parse": {
+          "samples": [
+            0.02,
+            0,
+            0,
+            0,
+            0
+          ],
+          "minMs": 0,
+          "medianMs": 0,
+          "maxMs": 0.02
+        }
+      },
+      "blame": {
+        "exitCode": 0,
+        "killed": false,
+        "xmlBytes": 1378894,
+        "targetPath": "lines-10k.txt",
+        "entryCount": 10000,
+        "entriesWithoutCommit": 1,
+        "samples": [
+          114.82,
+          125.26,
+          336.36
+        ],
+        "minMs": 114.82,
+        "medianMs": 125.26,
+        "maxMs": 336.36,
+        "parse": {
+          "samples": [
+            103.96,
+            80.07,
+            77.99
+          ],
+          "minMs": 77.99,
+          "medianMs": 80.07,
+          "maxMs": 103.96
+        }
+      }
+    }
+  }
+}

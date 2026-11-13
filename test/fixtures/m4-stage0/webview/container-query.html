@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>M4 webview container-query probe</title>
+<style>
+/**
+ * 模拟 VS Code Webview：body 由宿主注入 vscode-light/vscode-dark/
+ * vscode-high-contrast 类与 --vscode-* 变量；这里用 VS Code 默认主题的
+ * 代表性取值做本地替身，仅供阶段 0 可行性验证，不进产品。
+ */
+:root {
+  --vscode-font-family: -apple-system, "Segoe UI", sans-serif;
+  --vscode-font-size: 13px;
+  --vscode-editor-background: #1e1e1e;
+  --vscode-foreground: #cccccc;
+  --vscode-descriptionForeground: #9d9d9d;
+  --vscode-panel-border: #3c3c3c;
+  --vscode-sideBar-background: #252526;
+  --vscode-list-activeSelectionBackground: #04395e;
+  --vscode-button-background: #0e639c;
+  --vscode-button-foreground: #ffffff;
+}
+body.vscode-light {
+  --vscode-editor-background: #ffffff;
+  --vscode-foreground: #333333;
+  --vscode-descriptionForeground: #717171;
+  --vscode-panel-border: #e5e5e5;
+  --vscode-sideBar-background: #f3f3f3;
+  --vscode-list-activeSelectionBackground: #0060c0;
+  --vscode-button-background: #005fb8;
+  --vscode-button-foreground: #ffffff;
+}
+body.vscode-high-contrast {
+  --vscode-editor-background: #000000;
+  --vscode-foreground: #ffffff;
+  --vscode-descriptionForeground: #ffffff;
+  --vscode-panel-border: #6fc3df;
+  --vscode-sideBar-background: #000000;
+  --vscode-list-activeSelectionBackground: #000000;
+  --vscode-button-background: #000000;
+  --vscode-button-foreground: #ffffff;
+}
+html, body { height: 100%; margin: 0; }
+body {
+  font-family: var(--vscode-font-family);
+  font-size: var(--vscode-font-size);
+  color: var(--vscode-foreground);
+  background: var(--vscode-editor-background);
+}
+#probe { padding: 8px; }
+.wrapper { width: 400px; border: 1px solid var(--vscode-panel-border); }
+.panel {
+  container-type: inline-size;
+  container-name: panel;
+  background: var(--vscode-sideBar-background);
+  color: var(--vscode-foreground);
+}
+.panel-header { display: flex; gap: 6px; padding: 8px; flex-wrap: wrap; }
+.layout { display: grid; grid-template-columns: 1fr; }
+.master { padding: 8px; border-right: 1px solid var(--vscode-panel-border); }
+.detail { padding: 8px; }
+@container panel (min-width: 320px) {
+  .layout { grid-template-columns: 160px minmax(0, 1fr); }
+  .detail { display: block; }
+}
+@container panel (max-width: 319.98px) {
+  .layout { grid-template-columns: 1fr; }
+  .detail { display: none; }
+}
+</style>
+</head>
+<body class="vscode-dark">
+<div id="probe">
+  <div class="wrapper" id="wrapper">
+    <div class="panel" id="panel">
+      <div class="panel-header"><span>历史</span><span>筛选</span><span>比较</span></div>
+      <div class="layout" id="layout">
+        <div class="master" id="master">master list</div>
+        <div class="detail" id="detail">detail pane</div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+window.__probe = {
+  setWidth(w) { document.getElementById('wrapper').style.width = w + 'px'; },
+  measure() {
+    const layout = document.getElementById('layout');
+    const detail = document.getElementById('detail');
+    const panel = document.getElementById('panel');
+    const body = getComputedStyle(document.body);
+    return {
+      width: document.getElementById('wrapper').getBoundingClientRect().width,
+      panelWidth: panel.getBoundingClientRect().width,
+      columns: getComputedStyle(layout).gridTemplateColumns,
+      detailDisplay: getComputedStyle(detail).display,
+      bodyClass: document.body.className,
+      background: body.backgroundColor,
+      foreground: body.color,
+      supportsContainerType: CSS.supports('container-type: inline-size'),
+      supportsContainerQuery: CSS.supports('container-name: panel'),
+    };
+  },
+  setTheme(cls) { document.body.className = cls; },
+  async clipboardRoundtrip() {
+    try {
+      await navigator.clipboard.writeText('m4-clipboard-probe');
+      const text = await navigator.clipboard.readText();
+      return { ok: text === 'm4-clipboard-probe', text };
+    } catch (e) {
+      return { ok: false, error: String(e) };
+    }
+  },
+};
+</script>
+</body>
+</html>

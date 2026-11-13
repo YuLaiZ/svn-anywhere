@@ -1,0 +1,8 @@
+{
+  "name": "m4-v5-poc",
+  "publisher": "m4-stage0",
+  "version": "0.0.1",
+  "engines": { "vscode": "^1.85.0" },
+  "main": "./extension.js",
+  "activationEvents": ["*"]
+}

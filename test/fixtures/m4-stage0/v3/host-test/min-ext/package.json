@@ -1,0 +1,10 @@
+{
+  "name": "m4-v3-host-poc",
+  "displayName": "M4 V3 host POC",
+  "version": "0.0.1",
+  "publisher": "m4-stage0",
+  "engines": { "vscode": "^1.85.0" },
+  "main": "./extension.js",
+  "activationEvents": ["*"],
+  "contributes": {}
+}
