@@ -76,6 +76,18 @@ import {
 import { escapePeg } from '../../core/workspace';
 import type { ConflictsResultScope } from '../taskRegistry';
 import {
+  batchApplicabilityOf,
+  batchUnsupportedText,
+  buildConflictBatchSpec,
+  CONFLICT_BATCH_STATE_VERSION,
+  conflictBatchText,
+  isConflictBatchPersistState,
+  type ConflictBatchApplicability,
+  type ConflictBatchPersistState,
+  type ConflictBatchPlan,
+  type ConflictBatchResult,
+} from './conflictBatchModel';
+import {
   putM4ScopeSession,
   readM4ScopeSession,
   type M4ScopePutResult,
@@ -116,8 +128,17 @@ export const CONFLICT_BROWSABLE_VERSION = 1;
 /** 内容探测窗口：前 8 KiB（与 core/remoteBrowse.BINARY_PROBE_BYTES 同口径）。 */
 export const CONFLICT_CONTENT_PROBE_BYTES = BINARY_PROBE_BYTES;
 
-/** 整文件批量策略：二进制不开放冲突块变体，文本也只开放整文件结果。 */
-export const CONFLICT_BATCH_WHOLE_VARIANTS: readonly SvnAcceptValue[] = ['mine-full', 'theirs-full'];
+/** 整文件批量策略常量与适用性判定在 conflictBatchModel（阶段 7）；
+ * 从这里 re-export 保持阶段 5 的导入路径兼容。 */
+export {
+  batchApplicabilityOf,
+  batchUnsupportedText,
+  CONFLICT_BATCH_WHOLE_VARIANTS,
+} from './conflictBatchModel';
+export type {
+  ConflictBatchApplicability,
+  ConflictBatchUnsupportedReason,
+} from './conflictBatchModel';
 
 /** 六种变体的展示顺序：常用整文件结果 → 文本高级变体 → 冲突基线。 */
 export const CONFLICT_VARIANT_ORDER: readonly SvnAcceptValue[] = [
@@ -755,21 +776,6 @@ export interface ConflictVariantView {
   disabledReason?: string;
 }
 
-/** 批量适用性（阶段 7 计划使用；阶段 5 模型只给出布尔与原因）。 */
-export type ConflictBatchUnsupportedReason =
-  | 'mixed-path'
-  | 'property'
-  | 'tree'
-  | 'auto-unsupported'
-  | 'unknown-content';
-
-export interface ConflictBatchApplicability {
-  applicable: boolean;
-  unsupportedReason?: ConflictBatchUnsupportedReason;
-  /** 可执行项的整文件策略（文本/二进制都只开放 mine-full/theirs-full）。 */
-  variants: readonly SvnAcceptValue[];
-}
-
 /** 动作矩阵：从 core/resolve 的动作集派生，面板不另写判断。 */
 export interface ConflictActionMatrix {
   kinds: ConflictKind[];
@@ -885,46 +891,6 @@ export function buildConflictActionMatrix(record: ConflictRecord): ConflictActio
     matrix.blockerText = resolveRejectText(blocker);
   }
   return matrix;
-}
-
-/** 批量适用性：混合路径/属性/树/保留属性/类型未知不进入自动批量。 */
-export function batchApplicabilityOf(record: ConflictRecord): ConflictBatchApplicability {
-  if (record.kinds.length > 1) {
-    return { applicable: false, unsupportedReason: 'mixed-path', variants: [] };
-  }
-  if (record.kinds.includes('property')) {
-    const autoUnsupported = record.propertyConflicts !== undefined
-      && record.propertyConflicts.length > 0
-      && record.propertyConflicts.every((property) => property.autoUnsupported);
-    return {
-      applicable: false,
-      unsupportedReason: autoUnsupported ? 'auto-unsupported' : 'property',
-      variants: [],
-    };
-  }
-  if (record.kinds.includes('tree')) {
-    return { applicable: false, unsupportedReason: 'tree', variants: [] };
-  }
-  if (record.contentKind === 'unknown') {
-    return { applicable: false, unsupportedReason: 'unknown-content', variants: [] };
-  }
-  return { applicable: true, variants: [...CONFLICT_BATCH_WHOLE_VARIANTS] };
-}
-
-/** 批量不适用原因文案（阶段 7 计划与详情共用）。 */
-export function batchUnsupportedText(reason: ConflictBatchUnsupportedReason): string {
-  switch (reason) {
-    case 'mixed-path':
-      return conflictText('batchUnsupportedMixed');
-    case 'property':
-      return conflictText('batchUnsupportedProperty');
-    case 'tree':
-      return conflictText('batchUnsupportedTree');
-    case 'auto-unsupported':
-      return conflictText('batchUnsupportedAuto');
-    case 'unknown-content':
-      return conflictText('batchUnsupportedUnknown');
-  }
 }
 
 /* ---------------------------------------------------------------------------
@@ -1432,6 +1398,8 @@ export interface ConflictBrowsableState {
   scope: ConflictScopeTarget;
   tab: ConflictTab;
   selectedKey?: string;
+  /** 批量计划/结果（阶段 7：关闭重开恢复；失败后旧计划作废只留结果）。 */
+  batch?: ConflictBatchPersistState;
 }
 
 /** serialize 输出：四个字段分别写入 m4SessionStore 的对应槽位。 */
@@ -1487,6 +1455,15 @@ export class ConflictModel {
   private propertySelections = new Map<string, Record<string, 'local' | 'base' | 'incoming'>>();
   /** 回扫未决/命令失败的 unknown 行（不得伪装成已解决）。 */
   private unknownRows = new Map<string, string | undefined>();
+  /**
+   * 批量计划与结果（阶段 7）：计划与结果各一份，mode 决定面板批量区
+   * 渲染计划页还是结果页。新扫描成功即作废旧计划（结果只作记录保留）。
+   */
+  private batchValue: {
+    plan?: ConflictBatchPlan;
+    result?: ConflictBatchResult;
+    mode: 'plan' | 'results';
+  } = { mode: 'plan' };
   /** 会话内已关闭的可关闭横幅（external 边界提示等一次性告知；重新扫描保持关闭）。 */
   private dismissedBanners = new Set<string>();
   private readonly now: () => number;
@@ -1569,6 +1546,9 @@ export class ConflictModel {
     this.variantSelections.clear();
     this.propertySelections.clear();
     this.unknownRows.clear();
+    // 新扫描成功后旧批量计划作废（旧结果只作为结果记录保留；失败后
+    // 未执行项不得按过期范围自动续跑，必须基于本次扫描重新生成计划）。
+    this.batchValue.plan = undefined;
     this.pruneSelection();
     return true;
   }
@@ -1609,6 +1589,7 @@ export class ConflictModel {
     this.variantSelections.clear();
     this.propertySelections.clear();
     this.unknownRows.clear();
+    this.batchValue = { mode: 'plan' };
     this.dismissedBanners.clear();
   }
 
@@ -1937,6 +1918,57 @@ export class ConflictModel {
     return this.unknownRows.has(key);
   }
 
+  /* ------------------------- 批量计划与结果 ------------------------- */
+
+  /** 本会话待核实行指纹（批量计划把它们列入不适用组，不执行）。 */
+  unknownKeys(): ReadonlySet<string> {
+    return new Set(this.unknownRows.keys());
+  }
+
+  /** 设置当前批量计划（生成计划/策略切换时由控制器调用）。 */
+  setBatchPlan(plan: ConflictBatchPlan): void {
+    this.batchValue.plan = plan;
+  }
+
+  batchPlan(): ConflictBatchPlan | undefined {
+    return this.batchValue.plan;
+  }
+
+  /** 更新批量执行结果（执行器每完成一项就写入同一对象并重推）。 */
+  setBatchResult(result: ConflictBatchResult): void {
+    this.batchValue.result = result;
+  }
+
+  batchResult(): ConflictBatchResult | undefined {
+    return this.batchValue.result;
+  }
+
+  /** 批量区视图：计划页或结果页（showConflictBatchResults 切换）。 */
+  setBatchMode(mode: 'plan' | 'results'): void {
+    this.batchValue.mode = mode;
+  }
+
+  batchMode(): 'plan' | 'results' {
+    return this.batchValue.mode;
+  }
+
+  /**
+   * 本会话逐项确认解决（批量执行器逐项回读确认后调用）：写入台账并立即
+   * 从当前扫描快照移除该指纹记录，列表按台账显示已解决（结果页与列表
+   * 一致）；下一次真实扫描再次报告同一路径 + 类型时以新扫描记录覆盖台账。
+   */
+  confirmResolvedLocally(entry: ResolvedLedgerEntry): void {
+    if (this.snapshotValue !== undefined) {
+      const remaining = this.snapshotValue.records.filter((record) => record.id !== entry.fingerprint);
+      if (remaining.length !== this.snapshotValue.records.length) {
+        this.snapshotValue.records = remaining;
+        this.snapshotValue.summary = summarizeConflicts(remaining);
+      }
+    }
+    this.recordResolved(entry);
+    this.unknownRows.delete(entry.fingerprint);
+  }
+
   detail(key?: string): DetailSpec | undefined {
     const row = key === undefined ? this.selectedRow() : this.rowByKey(key);
     if (!row) {
@@ -1967,6 +1999,20 @@ export class ConflictModel {
 
   /* ------------------------- 持久化 ------------------------- */
 
+  /** 批量计划/结果的序列化副本（防御持久化后任务继续修改同一对象）。 */
+  private batchPersistState(): ConflictBatchPersistState | undefined {
+    const { plan, result, mode } = this.batchValue;
+    if (plan === undefined && result === undefined) {
+      return undefined;
+    }
+    return {
+      version: CONFLICT_BATCH_STATE_VERSION,
+      mode,
+      ...(plan !== undefined ? { plan: cloneBatchPlan(plan) } : {}),
+      ...(result !== undefined ? { result: cloneBatchResult(result) } : {}),
+    };
+  }
+
   /** 持久化快照（m4SessionStore 四槽位；宿主重启后自然丢弃）。 */
   serialize(): ConflictModelSnapshot | undefined {
     const scope = this.scopeValue;
@@ -1978,6 +2024,9 @@ export class ConflictModel {
       scope: { ...scope },
       tab: this.tabValue,
       ...(this.selectedKeyValue !== undefined ? { selectedKey: this.selectedKeyValue } : {}),
+      ...(this.batchPersistState() !== undefined
+        ? { batch: this.batchPersistState() as ConflictBatchPersistState }
+        : {}),
     };
     return {
       browsable,
@@ -2022,6 +2071,19 @@ export class ConflictModel {
     if (browsable) {
       this.tabValue = browsable.tab;
       this.selectedKeyValue = browsable.selectedKey;
+      // 批量计划/结果随 browsable 恢复；形状不合法按 fresh 处理（真实 SVN
+      // 状态与 operation record 才是写入回扫的依据）。
+      if (isConflictBatchPersistState(browsable.batch)) {
+        this.batchValue = {
+          mode: browsable.batch.mode,
+          ...(browsable.batch.plan !== undefined
+            ? { plan: cloneBatchPlan(browsable.batch.plan) }
+            : {}),
+          ...(browsable.batch.result !== undefined
+            ? { result: cloneBatchResult(browsable.batch.result) }
+            : {}),
+        };
+      }
       restored = true;
     }
     if (snapshot) {
@@ -2090,6 +2152,10 @@ export class ConflictModel {
       state.gate = occupancy.gate;
     }
     state.conflictList = this.buildConflictList();
+    const batchSpec = this.buildConflictBatch();
+    if (batchSpec !== undefined) {
+      state.conflictBatch = batchSpec;
+    }
     const detail = this.detail();
     if (detail !== undefined) {
       state.detail = detail;
@@ -2106,8 +2172,17 @@ export class ConflictModel {
     return state;
   }
 
-  private targetLabelText(): string {
-    const scope = this.scopeValue;
+  /** 批量计划/结果区（阶段 7；无计划也无结果时不渲染）。 */
+  private buildConflictBatch(): ReturnType<typeof buildConflictBatchSpec> {
+    return buildConflictBatchSpec({
+      ...(this.batchValue.plan !== undefined ? { plan: this.batchValue.plan } : {}),
+      ...(this.batchValue.result !== undefined ? { result: this.batchValue.result } : {}),
+      mode: this.batchValue.mode,
+      remaining: this.summary().total,
+    });
+  }
+
+  private targetLabelText(): string {    const scope = this.scopeValue;
     if (!scope) {
       return conflictText('panelTitle');
     }
@@ -2290,7 +2365,11 @@ export class ConflictModel {
         payload: { scope: 'task' },
       },
       { id: 'scanWholeWorkCopy', label: conflictText('rescanWholeAction') },
+      { id: 'planConflictBatch', label: conflictBatchText('batchAction') },
     ];
+    if (this.batchValue.result !== undefined) {
+      secondary.push({ id: 'showConflictBatchResults', label: conflictBatchText('batchShowResults') });
+    }
     return {
       summary: parts.length === 0 ? conflictText('summaryNone') : parts.join(' · '),
       secondary,
@@ -2386,6 +2465,30 @@ function isPostponedEntry(value: unknown): value is PostponedConflictEntry {
   return typeof record.fingerprint === 'string'
     && typeof record.path === 'string'
     && Array.isArray(record.kinds);
+}
+
+/** 批量计划深拷贝（序列化/恢复共用；结构只含字符串/数字/数组）。 */
+function cloneBatchPlan(plan: ConflictBatchPlan): ConflictBatchPlan {
+  return {
+    ...plan,
+    scope: { ...plan.scope },
+    applicable: plan.applicable.map((item) => ({ ...item, kinds: [...item.kinds] })),
+    unsupported: plan.unsupported.map((item) => ({ ...item, kinds: [...item.kinds] })),
+    postponed: plan.postponed.map((item) => ({ ...item, kinds: [...item.kinds] })),
+  };
+}
+
+/** 批量结果深拷贝（序列化/恢复共用）。 */
+function cloneBatchResult(result: ConflictBatchResult): ConflictBatchResult {
+  return {
+    ...result,
+    scope: { ...result.scope },
+    items: result.items.map((item) => ({ ...item, kinds: [...item.kinds] })),
+    rescan: {
+      ...result.rescan,
+      ...(result.rescan.summary !== undefined ? { summary: { ...result.rescan.summary } } : {}),
+    },
+  };
 }
 
 function errorText(error: unknown): string {

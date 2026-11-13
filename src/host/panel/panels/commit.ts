@@ -46,7 +46,8 @@ import {
   summarizePaths,
   type WcTargetGroup,
 } from '../../commands/target';
-import { performUpdatePaths } from '../../commands/update';
+import { performUpdatePaths, updateConflictScope } from '../../commands/update';
+import { openConflictTarget } from '../../commands/conflicts';
 import { writeStatusReport } from '../../commands/statusReport';
 import { diffOutcomeNotice, openEntryDiff, type DiffTarget } from '../../diffView';
 import { createPanel, type PanelHandle } from '../host';
@@ -760,6 +761,16 @@ async function onIntent(intent: Intent, context: { sessionId: string; busy: bool
       }
       if (intent.kind === 'bannerAction' && intent.actionId === 'refresh') {
         await loadSession(context.sessionId, targetOf(session), { initial: false });
+        return;
+      }
+      if (intent.kind === 'bannerAction' && intent.actionId === 'openConflicts') {
+        // 常驻冲突横幅的 P7 入口：只打开冲突面板并把提交目标作为扫描
+        // 范围（P7 重新真实扫描），不自动 resolve、不解除提交阻止。
+        await openConflictTarget({
+          source: 'update',
+          wcRoot: session.wcRoot,
+          scopeRelPath: updateConflictScope(session.targetArgs),
+        });
         return;
       }
       pushRender();
@@ -1569,11 +1580,21 @@ async function remoteCheckBeforeCommitPanel(
   const unresolved =
     result.conflicts.length === 0 && Object.values(result.conflictSummary ?? {}).some((n) => (n ?? 0) > 0);
   if (result.conflicts.length > 0 || unresolved) {
-    void vscode.window.showInformationMessage(
-      format(strings.commitCheck.blockedByConflicts, {
-        paths: result.conflicts.length > 0 ? result.conflicts.join('、') : strings.commitCheck.conflictPathsFallback,
-      }),
-    );
+    const paths = result.conflicts.length > 0
+      ? result.conflicts.join('、')
+      : strings.commitCheck.conflictPathsFallback;
+    // 冲突仍是提交阻止条件：提示同时提供 P7 入口，只打开冲突面板并把本次
+    // 检查更新目标的范围交给它（P7 重新真实扫描），不自动 resolve、不自动
+    // 标记已解决。非模态提示不阻塞提交链路返回（面板随即回到 ready 并重读）。
+    const openConflicts = strings.commitCheck.openConflictsButton;
+    const scopeRelPath = updateConflictScope(session.targetArgs);
+    void vscode.window
+      .showWarningMessage(format(strings.commitCheck.blockedByConflicts, { paths }), openConflicts)
+      .then((choice) => {
+        if (choice === openConflicts) {
+          void openConflictTarget({ source: 'update', wcRoot: target.wcRoot, scopeRelPath });
+        }
+      });
     return 'conflict';
   }
   return choice === strings.commitCheck.updateAndContinue ? 'updated' : 'updateOnly';

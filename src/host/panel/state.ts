@@ -813,6 +813,76 @@ export interface ConfirmDialogSpec {
   cancelLabel?: string;
 }
 
+/* ---------------- P7 批量处理（计划/结果；阶段 7） ---------------- */
+
+/**
+ * 批量计划的一个分组（可执行/不适用/推迟）：宿主已按规范化路径分组并
+ * 完成文案；视图只渲染路径与说明，不判断冲突语义。
+ */
+export interface ConflictBatchGroupSpec {
+  id: 'applicable' | 'unsupported' | 'postponed';
+  title: string;
+  items: Array<{ path: string; note?: string }>;
+}
+
+/** 批量整文件策略选项（planConflictBatch + strategy 枚举；非 svn accept 原词）。 */
+export interface ConflictBatchStrategyOptionSpec {
+  value: string;
+  label: string;
+  selected: boolean;
+  disabled?: boolean;
+}
+
+/** 批量结果逐项状态：pending/running 只在执行中出现，未执行项显式标记。 */
+export type ConflictBatchResultItemState =
+  | 'resolved'
+  | 'failed'
+  | 'unknown'
+  | 'not-run'
+  | 'pending'
+  | 'running';
+
+export interface ConflictBatchResultItemSpec {
+  path: string;
+  state: ConflictBatchResultItemState;
+  /** 状态徽标文案（宿主 i18n）。 */
+  stateLabel: string;
+  /** 逐项结果说明（策略/失败原因/未知说明）。 */
+  detail?: string;
+}
+
+/** 批量结果页：摘要 chips、停止位置、最终范围回扫状态与逐项结果。 */
+export interface ConflictBatchResultsSpec {
+  title: string;
+  chips: Array<{ label: string; kind: 'ok' | 'warn' | 'error' }>;
+  /** 停止位置与原因（未全部完成时）。 */
+  stoppedNote?: string;
+  /** 最终范围回扫说明（已回扫 / 未核实）。 */
+  rescanNote?: string;
+  items: ConflictBatchResultItemSpec[];
+}
+
+/**
+ * P7 批量计划/结果区（阶段 7）：计划模式展示工作副本根/范围/策略、
+ * 可执行/不适用/推迟三组与开始动作；结果模式展示逐项结果、停止位置与
+ * 最终整范围回扫结论。动作只携带稳定意图名与枚举 payload。
+ */
+export interface ConflictBatchSpec {
+  id: string;
+  heading: string;
+  mode: 'plan' | 'results';
+  /** 计划概要（宿主已本地化；mono 用于路径/范围等原值）。 */
+  summary: Array<{ label: string; value: string; mono?: boolean }>;
+  strategyLabel: string;
+  strategies: ConflictBatchStrategyOptionSpec[];
+  groups: ConflictBatchGroupSpec[];
+  /** 整体禁写原因（wcLocked/共享写锁）：有值时开始动作禁用。 */
+  blockedReason?: string;
+  /** 计划/结果区动作（开始、查看结果、重新生成计划等）。 */
+  actions: ActionSpec[];
+  results?: ConflictBatchResultsSpec;
+}
+
 /** 冲突辅助文件：角色与路径来自当前冲突记录，视图不按后缀扫描/推断。 */
 export interface DetailArtifactSpec {
   /** 角色展示文案（宿主 i18n：冲突基线/本地工作内容/传入内容/属性拒绝文件）。 */
@@ -960,6 +1030,8 @@ export interface PanelState {
   detail?: DetailSpec;
   /** P7 冲突列表（与主从布局配合；宿主已完成 tab 过滤与排序）。 */
   conflictList?: ConflictListSpec;
+  /** P7 批量计划/结果区（阶段 7；宿主已分组与本地化）。 */
+  conflictBatch?: ConflictBatchSpec;
   /** P7 确认对话框（树冲突节点处理确认/二次确认；确认意图由宿主提供）。 */
   confirmDialog?: ConfirmDialogSpec;
   /** 折叠筛选面板（P6 关键词/作者/日期/路径；变化立即提交）。 */

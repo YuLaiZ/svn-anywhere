@@ -22,6 +22,7 @@ import {
   visibleRows,
   type ActionSpec,
   type BannerSpec,
+  type ConflictBatchResultsSpec,
   type ConflictListSpec,
   type ConflictPanelRowStatus,
   type ConflictRowSpec,
@@ -103,6 +104,9 @@ export function render(state: PanelState): string {
     if (state.ignoreEditor) {
       parts.push(renderIgnoreEditor(state.ignoreEditor));
     }
+  }
+  if (state.conflictBatch) {
+    parts.push(renderConflictBatch(state));
   }
   parts.push(renderFooter(state, locked));
   if (busy) {
@@ -681,6 +685,91 @@ function renderConflictList(state: PanelState): string {
   const rows = list.rows.map((row) => renderConflictRow(state, list, row, selectIntent)).join('');
   const aria = list.ariaLabel ? ` aria-label="${escapeHtml(list.ariaLabel)}"` : '';
   return `<div class="conflict-list" role="list" data-conflict-list-id="${escapeHtml(list.id)}"${aria}>${rows}</div>`;
+}
+
+/**
+ * P7 批量计划/结果区（ConflictBatchSpec，阶段 7）：计划概要、策略选择
+ * 按钮（planConflictBatch + strategy 枚举）、可执行/不适用/推迟三组与
+ * 动作；结果页展示摘要 chips、停止位置、最终整范围回扫说明与逐项结果。
+ * 视图只渲染宿主文案与稳定 payload，不判断冲突语义。
+ */
+function renderConflictBatch(state: PanelState): string {
+  const batch = state.conflictBatch;
+  if (!batch) {
+    return '';
+  }
+  const summary = batch.summary
+    .map((entry) =>
+      `<dt>${escapeHtml(entry.label)}</dt><dd${entry.mono ? ' class="mono"' : ''}>${escapeHtml(entry.value)}</dd>`)
+    .join('');
+  const strategies = batch.strategies.length === 0
+    ? ''
+    : `<div class="batch-strategy" role="group" aria-label="${escapeHtml(batch.strategyLabel)}">` +
+      `<span class="batch-label">${escapeHtml(batch.strategyLabel)}</span>` +
+      batch.strategies
+        .map((choice) => {
+          // 占用态按 P7 放行表禁用（planConflictBatch 属写集）：DOM 禁用
+          // 与宿主守卫同源，不出现可点被拒。
+          const disabled = choice.disabled === true || actionGated(state, 'planConflictBatch');
+          return `<button type="button" class="choice${choice.selected ? ' selected' : ''}" data-intent="planConflictBatch"` +
+            ` data-strategy="${escapeHtml(choice.value)}" data-focus="batch-strategy-${escapeHtml(choice.value)}"` +
+            ` aria-pressed="${choice.selected}"${disabled ? ' disabled' : ''}>${escapeHtml(choice.label)}</button>`;
+        })
+        .join('') +
+      `</div>`;
+  const groups = batch.groups
+    .map((group) => {
+      const items = group.items.length === 0
+        ? ''
+        : `<ul class="batch-items">${group.items
+            .map((item) =>
+              `<li><span class="mono batch-path">${escapeHtml(item.path)}</span>` +
+              `${item.note ? `<span class="muted batch-note">${escapeHtml(item.note)}</span>` : ''}</li>`)
+            .join('')}</ul>`;
+      return `<section class="batch-group batch-group-${escapeHtml(group.id)}">` +
+        `<h3>${escapeHtml(group.title)}</h3>${items}</section>`;
+    })
+    .join('');
+  const actions = batch.actions
+    .map((action) =>
+      renderActionButton(action, {
+        intent: action.id,
+        argName: '',
+        argValue: '',
+        extraId: '',
+        gated: actionGated(state, action.id),
+      }))
+    .join('');
+  const blocked = batch.blockedReason
+    ? `<p class="batch-blocked" role="note">${escapeHtml(batch.blockedReason)}</p>`
+    : '';
+  const results = batch.results ? renderConflictBatchResults(batch.results) : '';
+  return `<section class="conflict-batch" data-batch-id="${escapeHtml(batch.id)}" data-batch-mode="${escapeHtml(batch.mode)}">` +
+    `<h2>${escapeHtml(batch.heading)}</h2>` +
+    `<dl class="batch-summary">${summary}</dl>` +
+    `${strategies}${blocked}${groups}${results}` +
+    `${actions ? `<div class="batch-actions">${actions}</div>` : ''}` +
+    `</section>`;
+}
+
+/** 批量结果页：摘要 chips + 停止位置/回扫说明 + 逐项状态（宿主文案）。 */
+function renderConflictBatchResults(results: ConflictBatchResultsSpec): string {
+  const chips = results.chips
+    .map((chip) =>
+      `<span class="batch-chip batch-chip-${escapeHtml(chip.kind)}">${escapeHtml(chip.label)}</span>`)
+    .join('');
+  const items = results.items
+    .map((item) =>
+      `<li data-batch-item-state="${escapeHtml(item.state)}">` +
+      `<span class="mono batch-path">${escapeHtml(item.path)}</span>` +
+      `<span class="batch-state batch-state-${escapeHtml(item.state)}">${escapeHtml(item.stateLabel)}</span>` +
+      `${item.detail ? `<span class="muted batch-note">${escapeHtml(item.detail)}</span>` : ''}</li>`)
+    .join('');
+  return `<div class="batch-results" role="status">` +
+    `<div class="batch-chips">${chips}</div>` +
+    `${results.stoppedNote ? `<p class="batch-stopped" role="note">${escapeHtml(results.stoppedNote)}</p>` : ''}` +
+    `${results.rescanNote ? `<p class="muted batch-rescan">${escapeHtml(results.rescanNote)}</p>` : ''}` +
+    `<ul class="batch-result-items">${items}</ul></div>`;
 }
 
 function conflictStatusLabel(row: ConflictRowSpec): string {

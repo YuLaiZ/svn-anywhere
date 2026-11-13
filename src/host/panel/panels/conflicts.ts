@@ -27,7 +27,11 @@ import * as vscode from 'vscode';
 import { existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
-import type { ConflictRecord, ConflictSummary } from '../../../core/conflict';
+import {
+  readConflictRecord,
+  type ConflictRecord,
+  type ConflictSummary,
+} from '../../../core/conflict';
 import {
   isHistoryUpdateTaskContext,
   type HistoryUpdateTaskContext,
@@ -73,9 +77,22 @@ import {
   type ConflictPhase,
   type ConflictScopeTarget,
 } from '../conflictModel';
+import {
+  conflictBatchText,
+  createConflictBatchResult,
+  planConflictBatch,
+  settleConflictBatchResult,
+  summarizeConflictBatchResult,
+  type ConflictBatchPlan,
+  type ConflictBatchResult,
+} from '../conflictBatchModel';
 import { allowedActions, createP7Gates, resolvePanelOccupancy } from '../gates';
 import { createPanel, type PanelHandle } from '../host';
-import type { Intent } from '../protocol';
+import {
+  DEFAULT_CONFLICT_BATCH_STRATEGY,
+  type ConflictBatchStrategy,
+  type Intent,
+} from '../protocol';
 import type { ActionSpec, BannerSpec, DetailPropertyValueSpec, DetailSectionSpec, DetailSpec, PanelState } from '../state';
 
 const PANEL_ID = 'conflicts';
@@ -127,12 +144,15 @@ interface ConflictTaskCallbacks {
 }
 
 interface ConflictTaskExtra {
-  kind: 'scan' | 'resolve';
+  kind: 'scan' | 'resolve' | 'batch';
   scope: ConflictScopeTarget;
   /** 任务自带的模型实例：面板关闭后任务继续用它完成扫描/收口与持久化。 */
   model: ConflictModel;
   /** 扫描代次（scan 任务；resolve 任务不设）。 */
   epoch?: number;
+  /** 批量任务：冻结计划与逐项结果（批内项不创建嵌套任务）。 */
+  plan?: ConflictBatchPlan;
+  result?: ConflictBatchResult;
   callbacks: ConflictTaskCallbacks;
   /** 进度节流：最近一次推送时间。 */
   lastProgressAt?: number;
@@ -144,7 +164,7 @@ type ConflictTask = TaskObject<ConflictTaskExtra> & { extra: ConflictTaskExtra }
 /** 任务终态页（m4SessionStore.terminalPage）：先写页、再移除任务。 */
 interface ConflictTerminalPage {
   version: 1;
-  kind: 'scan' | 'resolve';
+  kind: 'scan' | 'resolve' | 'batch';
   at: number;
   outcome: string;
   message?: string;
@@ -385,7 +405,7 @@ function updateTaskContextBadges(): NonNullable<PanelState['headerBadges']> {
  * ------------------------------------------------------------------------- */
 
 function makeTask(
-  kind: 'scan' | 'resolve',
+  kind: 'scan' | 'resolve' | 'batch',
   scope: ConflictScopeTarget,
   owner: ConflictModel,
   phase: 'scanning' | 'connecting' | 'resolving',
@@ -510,33 +530,22 @@ async function runScanTask(task: ConflictTask): Promise<void> {
   const { model: owner, scope, epoch } = extra;
   const controller = new AbortController();
   scanAbort = controller;
-  const runOptions = conflictRunOptions(controller.signal);
-  const svnPath = readSvnPath();
   let outcome: 'scanned' | 'canceled' | 'failed' = 'failed';
   let failureMessage: string | undefined;
   try {
     const result = await scanConflictScope(
-      {
-        svnPath,
-        localRunOptions: runOptions,
-        classifyContent: createWorkingCopyContentClassifier(svnPath, scope.wcRoot, {
-          ...runOptions,
-          signal: controller.signal,
-        }),
-        authorizeRemote: createRemoteAuthorizer(credentialProvider()),
-        onProgress: (completed, total) => {
-          if (epoch === undefined) {
-            return;
-          }
-          owner.updateProgress(epoch, completed, total);
-          // 进度节流：≥100ms 或到达总数时才推送（阶段 0 实测 100ms 可更新）。
-          const now = Date.now();
-          if (completed >= total || now - (extra.lastProgressAt ?? 0) >= 100) {
-            extra.lastProgressAt = now;
-            extra.callbacks.render();
-          }
-        },
-      },
+      scanRuntimeFor(scope, controller.signal, (completed, total) => {
+        if (epoch === undefined) {
+          return;
+        }
+        owner.updateProgress(epoch, completed, total);
+        // 进度节流：≥100ms 或到达总数时才推送（阶段 0 实测 100ms 可更新）。
+        const now = Date.now();
+        if (completed >= total || now - (extra.lastProgressAt ?? 0) >= 100) {
+          extra.lastProgressAt = now;
+          extra.callbacks.render();
+        }
+      }),
       scope,
     );
     if (epoch !== undefined && owner.applyScan(epoch, result)) {
@@ -1014,6 +1023,390 @@ async function executeResolveTask(
 }
 
 /* ---------------------------------------------------------------------------
+ * 批量计划与执行
+ * ------------------------------------------------------------------------- */
+
+/** 构造一次范围扫描的运行时（面板扫描与批量最终回扫共用；认证单飞）。 */
+function scanRuntimeFor(
+  scope: ConflictScopeTarget,
+  signal?: AbortSignal,
+  onProgress?: (completed: number, total: number) => void,
+): Parameters<typeof scanConflictScope>[0] {
+  const svnPath = readSvnPath();
+  const runOptions = conflictRunOptions(signal);
+  return {
+    svnPath,
+    localRunOptions: runOptions,
+    classifyContent: createWorkingCopyContentClassifier(svnPath, scope.wcRoot, {
+      ...runOptions,
+      ...(signal !== undefined ? { signal } : {}),
+    }),
+    authorizeRemote: createRemoteAuthorizer(credentialProvider()),
+    ...(onProgress !== undefined ? { onProgress } : {}),
+  };
+}
+
+/** 批量进度持久化（关闭重开恢复：计划与逐项结果随 browsable 写入）。 */
+function persistBatchProgress(owner: ConflictModel, scope: ConflictScopeTarget): void {
+  persistConflictSession(owner, { current: conflictResultScopeOf(scope) });
+}
+
+/**
+ * 生成批量计划（planConflictBatch 意图）：纯读操作——只看模型当前列表、
+ * 待核实集合与最近一次真实扫描的 wcLocked 信号，不发起任何 SVN 命令。
+ * 共享写锁未决时计划照常生成但标记 writeBlocked，开始入口禁用。
+ */
+function planBatchFor(owner: ConflictModel, strategy: ConflictBatchStrategy): ConflictBatchPlan | undefined {
+  const scope = owner.scope();
+  if (scope === undefined) {
+    return undefined;
+  }
+  return planConflictBatch({
+    planId: randomOperationId(),
+    scope,
+    rows: owner.rows(),
+    unknownKeys: owner.unknownKeys(),
+    wcLocked: owner.wcLocked(),
+    writeLocked: getOperationRegistry().writeRestriction(scope.wcRoot) !== undefined,
+    strategy,
+  });
+}
+
+/** planConflictBatch 意图：生成/刷新计划并切到计划页（批量写前先看计划）。 */
+function handlePlanConflictBatch(strategy: ConflictBatchStrategy): void {
+  if (model === undefined) {
+    return;
+  }
+  if (hasActiveTask('conflicts')) {
+    toast('info', controlText('taskHeld'));
+    push();
+    return;
+  }
+  const plan = planBatchFor(model, strategy);
+  if (plan === undefined) {
+    return;
+  }
+  model.setBatchPlan(plan);
+  model.setBatchMode('plan');
+  pendingConfirm = undefined;
+  logLine(
+    `[batch] ${plan.planId} planned applicable=${plan.applicable.length}`
+      + ` unsupported=${plan.unsupported.length} postponed=${plan.postponed.length}`
+      + ` writeBlocked=${plan.writeBlocked}`,
+    'conflict',
+  );
+  push();
+}
+
+/**
+ * startConflictBatch 意图：校验计划仍可执行（未作废、未禁写、有可执行项、
+ * 无活动任务/共享写锁）后占用 conflicts 单任务槽并启动批量执行器。
+ * 批量从计划开始到最终回扫只注册一个父任务；批内项不创建嵌套任务。
+ */
+async function startConflictBatch(): Promise<void> {
+  const owner = model;
+  if (owner === undefined) {
+    return;
+  }
+  const scope = owner.scope();
+  if (scope === undefined) {
+    return;
+  }
+  const plan = owner.batchPlan();
+  if (plan === undefined) {
+    toast('info', conflictBatchText('batchNeedPlan'));
+    push();
+    return;
+  }
+  const previous = owner.batchResult();
+  if (previous !== undefined && previous.planInvalidated && previous.planId === plan.planId) {
+    // 失败后旧计划作废：旧剩余项不自动续跑，必须重新扫描生成新计划。
+    toast('info', conflictBatchText('batchPlanInvalidated'));
+    push();
+    return;
+  }
+  if (plan.writeBlocked) {
+    toast('info', plan.writeBlockedReason === 'write-locked'
+      ? conflictBatchText('batchBlockedWriteLocked')
+      : conflictBatchText('batchBlockedWcLocked'));
+    push();
+    return;
+  }
+  if (plan.applicable.length === 0) {
+    toast('info', conflictBatchText('batchNoApplicable'));
+    push();
+    return;
+  }
+  if (hasActiveTask('conflicts')) {
+    toast('info', controlText('taskHeld'));
+    push();
+    return;
+  }
+  const registry = getOperationRegistry();
+  if (registry.hasActive(scope.wcRoot)
+    || registry.hasRunning(scope.wcRoot)
+    || registry.writeRestriction(scope.wcRoot) !== undefined) {
+    toast('info', controlText('taskHeld'));
+    push();
+    return;
+  }
+  const task = makeTask('batch', scope, owner, 'resolving', plan.planId);
+  const claimed = claimTask(task);
+  if (!claimed.ok) {
+    toast('info', controlText('taskHeld'));
+    push();
+    return;
+  }
+  const result = createConflictBatchResult(plan);
+  owner.setBatchResult(result);
+  owner.setBatchMode('results');
+  task.extra.plan = plan;
+  task.extra.result = result;
+  logLine(
+    `[batch] ${plan.planId} started items=${plan.applicable.length} strategy=${plan.strategy}`,
+    'conflict',
+  );
+  toast('info', format(conflictBatchText('batchStarted'), {
+    count: String(plan.applicable.length),
+  }));
+  push();
+  task.extra.done = runBatchTask(task).catch((err: unknown) => {
+    logLine(`[batch] ${plan.planId} executor error: ${err instanceof Error ? err.message : String(err)}`, 'conflict');
+  });
+}
+
+/**
+ * 批量执行器（任务生命周期内，面板关闭后继续）：
+ * 1. 每项先重新读取冲突指纹；与计划不符即停止（不 begin、不写命令）；
+ * 2. 每项独立 operation record（kind=resolve，固定意图带 batchId），
+ *    批内项不调用 addTask 创建嵌套任务；
+ * 3. executeResolve 内部再重读一次指纹并执行 + status/info 联合回扫；
+ * 4. 第一项失败停止，当前项保持待核实，剩余项标记未执行；失败后旧计划
+ *    作废（planInvalidated），不得自动续跑；
+ * 5. 最终整范围回扫（真实 status/info）：列表、逐项结果与计数以同一次
+ *    回扫为准；回扫失败保留逐项已确认结果并明确「最终范围未核实」。
+ */
+async function runBatchTask(task: ConflictTask): Promise<void> {
+  const extra = task.extra;
+  const { model: owner, scope } = extra;
+  const plan = extra.plan;
+  const result = extra.result;
+  if (plan === undefined || result === undefined) {
+    settleTask(task.taskId, () => persistConflictSession(owner, { current: conflictResultScopeOf(scope) }));
+    return;
+  }
+  const registry = getOperationRegistry();
+  const runOptions = conflictRunOptions();
+  const svnPath = readSvnPath();
+  // 每项重读的 info 记录不带内容子类型（readConflictRecord 不做 MIME/NUL
+  // 探测）：复用扫描同口径分类器补 contentKind，二进制仍只接受整文件策略。
+  const classifyContent = createWorkingCopyContentClassifier(svnPath, scope.wcRoot, runOptions);
+  let stoppedIndex: number | undefined;
+  let stopReason: string | undefined;
+  let pageOutcome = 'unknown';
+  try {
+    for (let index = 0; index < plan.applicable.length; index += 1) {
+      const item = plan.applicable[index];
+      result.items[index].state = 'running';
+      owner.setBatchResult(result);
+      extra.callbacks.render();
+      persistBatchProgress(owner, scope);
+
+      // 1. 每项执行前重新读取该路径冲突指纹：与计划不符即停止。
+      let pre: Awaited<ReturnType<typeof readConflictRecord>>;
+      try {
+        pre = await readConflictRecord(svnPath, scope.wcRoot, item.path, runOptions);
+      } catch (err) {
+        pre = { error: err instanceof Error ? err.message : String(err) };
+      }
+      if (pre.error !== undefined) {
+        stoppedIndex = index;
+        stopReason = format(conflictBatchText('batchFingerprintReadFailed'), { message: pre.error });
+        result.items[index].state = 'failed';
+        result.items[index].detail = stopReason;
+        break;
+      }
+      if (pre.record === undefined || pre.record.id !== item.key) {
+        stoppedIndex = index;
+        stopReason = conflictBatchText('batchFingerprintChanged');
+        result.items[index].state = 'failed';
+        result.items[index].detail = stopReason;
+        break;
+      }
+      // 2. 每项独立 operation record：写命令发出前落盘固定意图（batchId 归组）。
+      const operationId = randomOperationId();
+      const begin = await registry.begin({
+        wcRoot: scope.wcRoot,
+        lockKey: scope.wcRoot,
+        kind: 'resolve',
+        operationId,
+        targetRelPath: item.path,
+        nodeKind: nodeKindOf(pre.record, scope.wcRoot),
+        resolveIntent: {
+          scopeRoot: scope.wcRoot,
+          targets: [{
+            relPath: item.path,
+            conflictKinds: [...item.kinds],
+            fingerprint: item.key,
+            strategy: item.strategy,
+          }],
+          batchId: plan.planId,
+        },
+      });
+      if (!begin.ok) {
+        stoppedIndex = index;
+        stopReason = conflictBatchText('batchBeginHeld');
+        result.items[index].state = 'failed';
+        result.items[index].detail = stopReason;
+        break;
+      }
+      result.items[index].operationId = operationId;
+      owner.setBatchResult(result);
+      logLine(
+        `[batch] ${plan.planId} item=${index + 1}/${plan.applicable.length}`
+          + ` path=${item.path} strategy=${item.strategy} op=${operationId}`,
+        'conflict',
+      );
+
+      let outcome: Awaited<ReturnType<typeof executeResolve>>;
+      try {
+        let contentKind = item.contentKind;
+        try {
+          contentKind = (await classifyContent(item.path)) ?? item.contentKind;
+        } catch {
+          contentKind = item.contentKind;
+        }
+        outcome = await executeResolve(svnPath, scope.wcRoot, {
+          record: pre.record,
+          selection: { kind: 'accept', value: item.strategy },
+          contentKind,
+        }, runOptions);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        await registry.markPhase(operationId, 'unknown');
+        stoppedIndex = index;
+        stopReason = message;
+        result.items[index].state = 'unknown';
+        result.items[index].detail = message;
+        logLine(`[batch] ${plan.planId} item=${index + 1} error: ${message}`, 'conflict');
+        break;
+      }
+      if (outcome.outcome === 'resolved') {
+        await registry.finalizeOperation(operationId, 'done');
+        owner.confirmResolvedLocally({
+          fingerprint: item.key,
+          path: item.path,
+          kinds: [...item.kinds],
+          strategy: item.strategy,
+          operationId,
+          resolvedAt: Date.now(),
+        });
+        result.items[index].state = 'resolved';
+        owner.setBatchResult(result);
+        extra.callbacks.render();
+        persistBatchProgress(owner, scope);
+        logLine(`[batch] ${plan.planId} item=${index + 1} resolved`, 'conflict');
+        continue;
+      }
+      if (outcome.outcome === 'rejected') {
+        // 写命令未发出（计划/指纹检查阶段拒绝）：安全收口，不留写锁。
+        const reasonText = outcome.reason !== undefined
+          ? resolveRejectText(outcome.reason)
+          : conflictBatchText('batchUnknownStop');
+        await registry.finalizeOperation(operationId, 'failed-unconfirmed');
+        stoppedIndex = index;
+        stopReason = reasonText;
+        result.items[index].state = 'failed';
+        result.items[index].detail = reasonText;
+        logLine(`[batch] ${plan.planId} item=${index + 1} rejected reason=${outcome.reason ?? 'unknown'}`, 'conflict');
+        break;
+      }
+      // unresolved/anomalous/unknown：结果未决，operation record 保持 unknown
+      // 相位（跨面板写锁），当前项待核实，绝不显示已解决。
+      const detail = outcome.verification?.detail ?? outcome.error;
+      const message = outcome.outcome === 'unresolved'
+        ? format(strings.resolvePanel.outcomeUnresolved, { detail: detail ?? '' })
+        : outcome.outcome === 'anomalous'
+          ? format(strings.resolvePanel.outcomeAnomalous, { detail: detail ?? '' })
+          : strings.resolvePanel.outcomeUnknown;
+      await registry.markPhase(operationId, 'unknown');
+      stoppedIndex = index;
+      stopReason = message;
+      result.items[index].state = 'unknown';
+      result.items[index].detail = message;
+      logLine(`[batch] ${plan.planId} item=${index + 1} outcome=${outcome.outcome}`, 'conflict');
+      break;
+    }
+    settleConflictBatchResult(
+      result,
+      stoppedIndex === undefined ? undefined : { index: stoppedIndex, reason: stopReason ?? '' },
+    );
+    owner.setBatchResult(result);
+    extra.callbacks.render();
+    persistBatchProgress(owner, scope);
+
+    // 5. 最终整范围回扫：回扫成功才以真实 status/info 更新列表与结果；
+    //    回扫失败保留逐项已确认结果并明确「最终范围未核实」。
+    const epoch = owner.beginScan();
+    try {
+      const rescan = await scanConflictScope(
+        scanRuntimeFor(scope, undefined, (completed, total) => {
+          owner.updateProgress(epoch, completed, total);
+          const now = Date.now();
+          if (completed >= total || now - (extra.lastProgressAt ?? 0) >= 100) {
+            extra.lastProgressAt = now;
+            extra.callbacks.render();
+          }
+        }),
+        scope,
+      );
+      if (owner.applyScan(epoch, rescan)) {
+        result.rescan = { outcome: 'scanned', summary: { ...owner.summary() } };
+        // 回扫成功后按真实扫描收口本批未决（unknown）记录：仍报告冲突的
+        // 释放写锁待用户重新选择；已清除的确认解决并写台账。
+        await reconcilePendingResolveRecords(scope, owner);
+      } else {
+        result.rescan = { outcome: 'failed', message: conflictBatchText('batchRescanStale') };
+      }
+    } catch (err) {
+      owner.cancelScan(epoch);
+      result.rescan = {
+        outcome: 'failed',
+        message: err instanceof Error ? err.message : String(err),
+      };
+    }
+    owner.setBatchResult(result);
+    pageOutcome = result.failed ? 'stopped' : 'completed';
+    const counts = summarizeConflictBatchResult(result);
+    logLine(
+      `[batch] ${plan.planId} settled failed=${result.failed} resolved=${counts.resolved}`
+        + ` failedItems=${counts.failed + counts.unknown} notRun=${counts.notRun}`
+        + ` rescan=${result.rescan.outcome}`,
+      'conflict',
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    logLine(`[batch] ${plan.planId} executor error: ${message}`, 'conflict');
+    settleConflictBatchResult(result, { index: 0, reason: message });
+    owner.setBatchResult(result);
+    pageOutcome = 'failed';
+  } finally {
+    settleTask(task.taskId, () => {
+      persistConflictSession(owner, { current: conflictResultScopeOf(scope) });
+      persistTaskTerminal(scope, {
+        version: 1,
+        kind: 'batch',
+        at: Date.now(),
+        outcome: pageOutcome,
+        ...(result.stopReason !== undefined ? { message: result.stopReason } : {}),
+        summary: owner.summary(),
+      });
+    });
+    extra.callbacks.render();
+  }
+}
+
+/* ---------------------------------------------------------------------------
  * 只读交互处理入口
  * ------------------------------------------------------------------------- */
 
@@ -1305,7 +1698,11 @@ function restoreNoticeFromTerminalPage(scope: ConflictScopeTarget): void {
   if (page !== undefined && typeof page === 'object' && page.version === 1) {
     if (page.message !== undefined) {
       resolveNotice = {
-        level: page.outcome === 'resolved' || page.outcome === 'scanned' ? 'info' : 'warn',
+        // 成功类终态（扫描成功/resolve 成功/批量完成）按 info 展示；
+        // 未知、失败与批量停止按 warn。
+        level: page.outcome === 'resolved' || page.outcome === 'scanned' || page.outcome === 'completed'
+          ? 'info'
+          : 'warn',
         message: page.message,
       };
     }
@@ -1478,11 +1875,20 @@ async function onIntent(intent: Intent, context: { sessionId: string; busy: bool
       await handleBannerAction(intent.bannerId, intent.actionId);
       return;
     }
-    case 'planConflictBatch':
-    case 'startConflictBatch':
+    case 'planConflictBatch': {
+      handlePlanConflictBatch(intent.strategy ?? DEFAULT_CONFLICT_BATCH_STRATEGY);
+      return;
+    }
+    case 'startConflictBatch': {
+      await startConflictBatch();
+      return;
+    }
     case 'showConflictBatchResults': {
-      // 批量属阶段 7：给出明确提示，不静默吞掉用户动作。
-      toast('info', controlText('actionNotReady'));
+      // 只读切换：结果存在时把批量区切到结果页；不存在时保持当前视图。
+      if (model.batchResult() !== undefined) {
+        model.setBatchMode('results');
+        push();
+      }
       return;
     }
     default: {
@@ -1619,10 +2025,27 @@ export function conflictsSessionSnapshot(): {
   pendingConfirm?: { key: string; kind: 'tree' | 'working' };
   busy: boolean;
   writeLocked: boolean;
-  taskKind?: 'scan' | 'resolve';
+  taskKind?: 'scan' | 'resolve' | 'batch';
   taskPhase?: string;
   resolveNotice?: string;
   pendingOperationId?: string;
+  batch?: {
+    planId?: string;
+    mode: 'plan' | 'results';
+    applicable: number;
+    unsupported: number;
+    postponed: number;
+    writeBlocked: boolean;
+    items: number;
+    resolved: number;
+    failed: number;
+    unknown: number;
+    notRun: number;
+    stoppedIndex?: number;
+    stopReason?: string;
+    planInvalidated: boolean;
+    rescan: 'pending' | 'scanned' | 'failed';
+  };
   updateTaskContext?: {
     requestedRevision: number;
     preRevision: number;
@@ -1638,6 +2061,9 @@ export function conflictsSessionSnapshot(): {
   const scope = owner?.scope();
   const selected = owner?.selectedKey();
   const pendingRecord = pendingResolveRecord();
+  const batchPlan = owner?.batchPlan();
+  const batchResult = owner?.batchResult();
+  const batchCounts = batchResult === undefined ? undefined : summarizeConflictBatchResult(batchResult);
   return {
     ...(scope !== undefined ? { scope } : {}),
     ...(owner !== undefined ? { phase: owner.phase() } : {}),
@@ -1658,6 +2084,27 @@ export function conflictsSessionSnapshot(): {
     ...(extra?.kind !== undefined ? { taskKind: extra.kind } : {}),
     ...(resolveNotice !== undefined ? { resolveNotice: resolveNotice.message } : {}),
     ...(pendingRecord !== undefined ? { pendingOperationId: pendingRecord.operationId } : {}),
+    ...(owner !== undefined && (batchPlan !== undefined || batchResult !== undefined)
+      ? {
+          batch: {
+            ...(batchPlan !== undefined ? { planId: batchPlan.planId } : {}),
+            mode: owner.batchMode(),
+            applicable: batchPlan?.applicable.length ?? 0,
+            unsupported: batchPlan?.unsupported.length ?? 0,
+            postponed: batchPlan?.postponed.length ?? 0,
+            writeBlocked: batchPlan?.writeBlocked ?? false,
+            items: batchResult?.items.length ?? 0,
+            resolved: batchCounts?.resolved ?? 0,
+            failed: batchCounts?.failed ?? 0,
+            unknown: batchCounts?.unknown ?? 0,
+            notRun: batchCounts?.notRun ?? 0,
+            ...(batchResult?.stoppedIndex !== undefined ? { stoppedIndex: batchResult.stoppedIndex } : {}),
+            ...(batchResult?.stopReason !== undefined ? { stopReason: batchResult.stopReason } : {}),
+            planInvalidated: batchResult?.planInvalidated ?? false,
+            rescan: batchResult?.rescan.outcome ?? 'pending',
+          },
+        }
+      : {}),
     ...(updateTaskContext !== undefined
       ? {
           updateTaskContext: {

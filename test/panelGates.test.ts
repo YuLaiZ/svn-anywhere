@@ -30,6 +30,7 @@ import {
   resetRunningOperationsForTest,
   runWithRunningKey,
   setOperationRegistryForTest,
+  type OperationKind,
 } from '../src/core/operations';
 import { M4_INTENT_KINDS } from '../src/host/panel/protocol';
 import { addTask, resetTaskRegistry, type PanelKind, type TaskObject } from '../src/host/taskRegistry';
@@ -498,6 +499,155 @@ describe('M4 占用态派生（与 M1-M3 共享写锁注册表）', () => {
     if (begin.ok) {
       await getOperationRegistry().finish(begin.operationId);
     }
+  });
+});
+
+describe('跨面板写锁共享（P1/P2/P3/P4/P6/P7 同一注册表 + wcRoot lockKey）', () => {
+  beforeEach(() => {
+    setOperationRegistryForTest(new OperationRegistry());
+    resetTaskRegistry();
+    resetRunningOperationsForTest();
+  });
+
+  /** 各写 kind 的「限制写但非在途」相位：unknown 是 M4/M3 共用的结果未决态。 */
+  const WRITE_LOCK_KINDS: ReadonlyArray<{ kind: OperationKind; label: string }> = [
+    { kind: 'commit', label: 'P1 提交' },
+    { kind: 'ignore', label: 'P2 忽略' },
+    { kind: 'import', label: 'P3 导入' },
+    { kind: 'vacuum', label: 'P4 磁盘治理' },
+    { kind: 'history-update', label: 'P6 更新到 revision' },
+    { kind: 'resolve', label: 'P7 冲突解决' },
+  ];
+
+  async function beginUnknown(kind: OperationKind, wcRoot = '/wc/root'): Promise<string> {
+    const begin = await getOperationRegistry().begin({
+      wcRoot,
+      targetRelPath: '.',
+      nodeKind: 'dir',
+      kind,
+    });
+    expect(begin.ok).toBe(true);
+    if (!begin.ok) {
+      throw new Error(`begin ${kind} failed`);
+    }
+    const moved = await getOperationRegistry().markPhase(begin.operationId, 'unknown');
+    expect(moved.ok).toBe(true);
+    return begin.operationId;
+  }
+
+  for (const { kind, label } of WRITE_LOCK_KINDS) {
+    it(`${label}（${kind}）未知记录：P6 冲突页与 P7 面板共享写锁并携带记录类别`, async () => {
+      const operationId = await beginUnknown(kind);
+      const expected = { busy: false, writeLocked: true, heldKind: kind };
+      // P6（历史/更新入口）与 P7（冲突范围）读取同一 OperationRegistry 的
+      // 同一 wcRoot lockKey；heldKind 供两面板的禁用原因文案分列。
+      expect(resolvePanelOccupancy('history', '/wc/root')).toEqual(expected);
+      expect(resolvePanelOccupancy('conflicts', '/wc/root')).toEqual(expected);
+      // 不同副本的 lockKey 不互斥。
+      expect(resolvePanelOccupancy('history', '/wc/other').writeLocked).toBe(false);
+      expect(resolvePanelOccupancy('conflicts', '/wc/other').writeLocked).toBe(false);
+      // 两面板的写入均由各自放行表拒绝（未知态只开放回扫/查看/日志）。
+      const p6 = createP6Gates();
+      const p7 = createP7Gates();
+      expect(gatePermits(p6, false, true, { kind: 'updateToHistoryRevision' })).toBe(false);
+      expect(gatePermits(p7, false, true, { kind: 'applyConflictResolution' })).toBe(false);
+      expect(gatePermits(p7, false, true, { kind: 'planConflictBatch' })).toBe(false);
+      expect(gatePermits(p7, false, true, { kind: 'startConflictBatch' })).toBe(false);
+      await getOperationRegistry().finish(operationId);
+    });
+  }
+
+  it('P7 resolve 未知记录：P6 与 P7 各自开放未知回扫入口，写入仍等待', async () => {
+    const operationId = await beginUnknown('resolve');
+    const p6 = createP6Gates();
+    const p7 = createP7Gates();
+    // 回扫是解除 unknown 写锁的唯一读路径：P6 回扫本次更新范围、
+    // P7 重扫冲突范围/整副本。
+    expect(gatePermits(p6, false, true, { kind: 'rescanHistoryUpdate' })).toBe(true);
+    expect(gatePermits(p7, false, true, { kind: 'rescanConflicts' })).toBe(true);
+    expect(gatePermits(p7, false, true, { kind: 'scanWholeWorkCopy' })).toBe(true);
+    // 非回扫的会话重读与写入不放行。
+    expect(gatePermits(p6, false, true, { kind: 'resetHistorySession' })).toBe(false);
+    expect(gatePermits(p6, false, true, { kind: 'checkoutHistoryDirectory' })).toBe(false);
+    expect(gatePermits(p7, false, true, { kind: 'startConflictBatch' })).toBe(false);
+    await getOperationRegistry().finish(operationId);
+  });
+
+  it('P3 检出在途（prepared/running）：P6/P7 以 busy 互斥同一副本，回扫也不与写入交错', async () => {
+    const begin = await getOperationRegistry().begin({
+      wcRoot: '/wc/root',
+      targetRelPath: '.',
+      nodeKind: 'dir',
+      kind: 'checkout',
+    });
+    expect(begin.ok).toBe(true);
+    if (!begin.ok) {
+      return;
+    }
+    expect(resolvePanelOccupancy('history', '/wc/root')).toEqual({ busy: true, writeLocked: false, heldKind: null });
+    expect(resolvePanelOccupancy('conflicts', '/wc/root')).toEqual({ busy: true, writeLocked: false, heldKind: null });
+    expect(resolvePanelOccupancy('conflicts', '/wc/other').busy).toBe(false);
+    const p6 = createP6Gates();
+    const p7 = createP7Gates();
+    expect(gatePermits(p6, true, false, { kind: 'updateToHistoryRevision' })).toBe(false);
+    expect(gatePermits(p7, true, false, { kind: 'planConflictBatch' })).toBe(false);
+    expect(gatePermits(p6, true, false, { kind: 'rescanHistoryUpdate' })).toBe(false);
+    expect(gatePermits(p7, true, false, { kind: 'rescanConflicts' })).toBe(false);
+    await getOperationRegistry().finish(begin.operationId);
+  });
+
+  it('反向互斥：P7 resolve 在途时 P1 提交与 P6 更新的 begin 被同一注册表拒绝', async () => {
+    const resolveBegin = await getOperationRegistry().begin({
+      wcRoot: '/wc/root',
+      targetRelPath: '.',
+      nodeKind: 'dir',
+      kind: 'resolve',
+    });
+    expect(resolveBegin.ok).toBe(true);
+    if (!resolveBegin.ok) {
+      return;
+    }
+    const commitBegin = await getOperationRegistry().begin({
+      wcRoot: '/wc/root',
+      targetRelPath: '.',
+      nodeKind: 'dir',
+      kind: 'commit',
+    });
+    expect(commitBegin.ok).toBe(false);
+    const updateBegin = await getOperationRegistry().begin({
+      wcRoot: '/wc/root',
+      targetRelPath: '.',
+      nodeKind: 'dir',
+      kind: 'history-update',
+    });
+    expect(updateBegin.ok).toBe(false);
+    // 不同副本仍可发起。
+    const otherBegin = await getOperationRegistry().begin({
+      wcRoot: '/wc/other',
+      targetRelPath: '.',
+      nodeKind: 'dir',
+      kind: 'commit',
+    });
+    expect(otherBegin.ok).toBe(true);
+    await getOperationRegistry().finish(resolveBegin.operationId);
+    if (otherBegin.ok) {
+      await getOperationRegistry().finish(otherBegin.operationId);
+    }
+  });
+
+  it('P7 任务槽与 P6 任务槽互不串扰（conflicts 任务只让 P7 busy）', () => {
+    addTask({
+      taskId: 'task-conflicts',
+      panelKind: 'conflicts',
+      phase: 'scanning',
+      resultScope: { scopeKind: 'conflicts', wcRoot: '/wc/root', scopeRelPath: '.' },
+      lockKey: '/wc/root',
+      initiatorSessionId: 'session-1',
+      abortController: new AbortController(),
+    });
+    expect(resolvePanelOccupancy('conflicts', '/wc/root').busy).toBe(true);
+    expect(resolvePanelOccupancy('history', '/wc/root').busy).toBe(false);
+    resetTaskRegistry();
   });
 });
 

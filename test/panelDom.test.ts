@@ -1315,6 +1315,57 @@ describe('P7 冲突面板：行选择/属性选择/确认对话框/撤下动效'
     app.dispose();
   });
 
+  it('批量策略按钮转发 planConflictBatch + 稳定策略枚举；开始/查看结果为无参意图', () => {
+    const { app, sent } = p7Setup({
+      conflictBatch: {
+        id: 'conflict-batch-plan-9',
+        heading: '批量处理计划',
+        mode: 'plan',
+        summary: [{ label: '工作副本根', value: '/wc', mono: true }],
+        strategyLabel: '策略',
+        strategies: [
+          { value: 'theirs-full', label: '使用传入内容', selected: true },
+          { value: 'mine-full', label: '保留本地内容', selected: false },
+        ],
+        groups: [],
+        actions: [
+          { id: 'startConflictBatch', label: '开始批量处理' },
+          { id: 'showConflictBatchResults', label: '查看批量结果' },
+        ],
+      },
+    });
+    document.querySelector<HTMLButtonElement>(
+      '[data-intent="planConflictBatch"][data-strategy="mine-full"]',
+    )?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'planConflictBatch', strategy: 'mine-full' });
+    document.querySelector<HTMLButtonElement>('[data-intent="startConflictBatch"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'startConflictBatch' });
+    document.querySelector<HTMLButtonElement>('[data-intent="showConflictBatchResults"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'showConflictBatchResults' });
+    app.dispose();
+  });
+
+  it('批量策略按钮 disabled 时不产生意图（DOM 禁用与事件守卫一致）', () => {
+    const { app, sent } = p7Setup({
+      conflictBatch: {
+        id: 'conflict-batch-plan-9',
+        heading: '批量处理计划',
+        mode: 'plan',
+        summary: [],
+        strategyLabel: '策略',
+        strategies: [{ value: 'mine-full', label: '保留本地内容', selected: false, disabled: true }],
+        groups: [],
+        actions: [],
+      },
+    });
+    const before = sent.length;
+    document.querySelector<HTMLButtonElement>(
+      '[data-intent="planConflictBatch"][data-strategy="mine-full"]',
+    )?.click();
+    expect(sent.length).toBe(before);
+    app.dispose();
+  });
+
   function dialogState(id: string): Partial<PanelState> {
     return {
       list: undefined,

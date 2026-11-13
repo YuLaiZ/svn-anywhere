@@ -153,10 +153,21 @@ vi.mock('vscode', () => ({
 
 import { commandShowStatus } from '../src/host/commands/showStatus';
 import { commandRefreshStatus } from '../src/host/commands/refreshStatus';
-import { commandUpdate } from '../src/host/commands/update';
+import { commandUpdate, updateConflictScope } from '../src/host/commands/update';
 import { commandCleanup } from '../src/host/commands/cleanup';
+import { setConflictPanelOpener, type ConflictOpenTarget } from '../src/host/commands/conflicts';
 
 const makeUri = (fsPath: string): vscode.Uri => ({ fsPath, scheme: 'file' }) as unknown as vscode.Uri;
+
+/**
+ * 「处理冲突」按钮值：host/i18n.ts 由 entry 代理在并行阶段统一写入；
+ * 缺键时测试运行时以同一文案补足（与生产键一致，合入后为 no-op），
+ * 生产代码对键的引用由 tsc 校验。
+ */
+if ((strings.update as Record<string, string | undefined>).handleConflictsButton === undefined) {
+  (strings.update as Record<string, string>).handleConflictsButton = '处理冲突';
+}
+const handleConflictsLabel = (strings.update as Record<string, string>).handleConflictsButton;
 
 const channelLines = (): string[] => {
   // 输出按操作域分频道（状态/更新/其它）：聚合全部频道行，断言语义不变。
@@ -200,6 +211,7 @@ beforeEach(() => {
   vscodeMock.openDialogCalls = 0;
   vscodeMock.openDialogResult = undefined;
   vscodeMock.activeTextEditor = undefined;
+  setConflictPanelOpener(undefined);
   wcRoot = realpathSync(mkdtempSync(join(tmpdir(), 'svn-anywhere-stcmd-')));
   mkdirSync(join(wcRoot, '.svn'), { recursive: true });
   writeFileSync(join(wcRoot, '.svn', 'wc.db'), 'fake');
@@ -480,6 +492,80 @@ describe('commandUpdate（更新）', () => {
     ]);
   });
 
+  it('冲突警告同时提供「处理冲突」：点击只打开 P7 并传本次更新范围，不执行 resolve', async () => {
+    const filePath = join(wcRoot, 'a.txt');
+    writeFileSync(filePath, 'x');
+    vscodeMock.confirmResult = strings.update.confirmButton;
+    vscodeMock.inputResult = 'HEAD';
+    vscodeMock.warningChoice = handleConflictsLabel;
+    const opened: ConflictOpenTarget[] = [];
+    setConflictPanelOpener((target) => {
+      opened.push(target);
+    });
+    vi.mocked(runUpdate).mockResolvedValueOnce({
+      stdout: '', stderr: '', exitCode: 0,
+      items: [{ status: 'C', path: 'a.txt' }],
+      finalRevision: 6,
+      conflicts: ['a.txt'],
+    });
+
+    await commandUpdate(makeUri(filePath));
+
+    // 只打开 P7 扫描入口：范围是本次更新目标（文件），不自动 resolve、
+    // 不额外发起任何写命令。
+    expect(opened).toEqual([{ source: 'update', wcRoot, scopeRelPath: 'a.txt' }]);
+    expect(
+      vi.mocked(runOrThrow).mock.calls.every(([, args]) => args[0] !== 'resolve'),
+    ).toBe(true);
+  });
+
+  it('多目标更新冲突：P7 扫描范围为各目标的路径分段公共前缀', async () => {
+    const base = join(wcRoot, 'mod');
+    const d1 = join(base, 'd1');
+    const d2 = join(base, 'd2');
+    mkdirSync(d1, { recursive: true });
+    mkdirSync(d2, { recursive: true });
+    vscodeMock.confirmResult = strings.update.confirmButton;
+    vscodeMock.inputResult = 'HEAD';
+    vscodeMock.warningChoice = handleConflictsLabel;
+    const opened: ConflictOpenTarget[] = [];
+    setConflictPanelOpener((target) => {
+      opened.push(target);
+    });
+    vi.mocked(runUpdate).mockResolvedValueOnce({
+      stdout: '', stderr: '', exitCode: 0,
+      items: [{ status: 'C', path: 'mod/d1/a.txt' }],
+      finalRevision: 7,
+      conflicts: ['mod/d1/a.txt'],
+    });
+
+    await commandUpdate(makeUri(d1), [makeUri(d1), makeUri(d2)]);
+
+    expect(opened).toEqual([{ source: 'update', wcRoot, scopeRelPath: 'mod' }]);
+  });
+
+  it('Summary 报告冲突但未定位路径：警告同样提供「处理冲突」入口', async () => {
+    const filePath = join(wcRoot, 'a.txt');
+    writeFileSync(filePath, 'x');
+    vscodeMock.confirmResult = strings.update.confirmButton;
+    vscodeMock.inputResult = 'HEAD';
+    vscodeMock.warningChoice = handleConflictsLabel;
+    const opened: ConflictOpenTarget[] = [];
+    setConflictPanelOpener((target) => {
+      opened.push(target);
+    });
+    vi.mocked(runUpdate).mockResolvedValueOnce({
+      stdout: '', stderr: '', exitCode: 0,
+      items: [], finalRevision: 6, conflicts: [], conflictSummary: { text: 1 },
+    });
+
+    await commandUpdate(makeUri(filePath));
+
+    // 未定位到路径时仍按冲突结果提供 P7 入口（P7 重新真实扫描）。
+    expect(opened).toEqual([{ source: 'update', wcRoot, scopeRelPath: 'a.txt' }]);
+    expect(vscodeMock.warning.some((m) => m.includes('未能定位冲突文件'))).toBe(true);
+  });
+
   it('多个冲突先选文件再打开：QuickPick 按冲突路径选择', async () => {
     const filePath = join(wcRoot, 'b.txt');
     writeFileSync(filePath, 'x');
@@ -628,6 +714,25 @@ describe('commandUpdate（更新）', () => {
     );
 
     await expect(commandUpdate(makeUri(filePath))).rejects.toBeInstanceOf(SvnError);
+  });
+});
+
+describe('updateConflictScope（更新目标 → P7 扫描范围）', () => {
+  it('单目标原样；副本根与空目标归一为 `.`', () => {
+    expect(updateConflictScope(['a.txt'])).toBe('a.txt');
+    expect(updateConflictScope(['.'])).toBe('.');
+    expect(updateConflictScope([])).toBe('.');
+  });
+
+  it('多目标取路径分段的公共前缀（不是字符串前缀）', () => {
+    expect(updateConflictScope(['a/b', 'a/c'])).toBe('a');
+    expect(updateConflictScope(['a/b', 'a/bc'])).toBe('a');
+    expect(updateConflictScope(['d1', 'd2'])).toBe('.');
+    expect(updateConflictScope(['a/b/c', 'a/b/d', 'a/e'])).toBe('a');
+  });
+
+  it('反斜杠、./ 前缀与尾斜杠归一后再比较', () => {
+    expect(updateConflictScope(['./a/b/', 'a\\b\\c'])).toBe('a/b');
   });
 });
 

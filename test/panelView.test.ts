@@ -8,6 +8,7 @@ import { describe, expect, it } from 'vitest';
 import { commitFixture } from '../src/host/panel/fixture';
 import { render, renderLazyNodeSlice, renderTableRowSlice, type LazyTreeRowView } from '../src/host/panel/view';
 import type {
+  ConflictBatchSpec,
   ConflictListSpec,
   ConfirmDialogSpec,
   FormFieldSpec,
@@ -1673,6 +1674,148 @@ describe('render：P7 冲突列表（ConflictListSpec）', () => {
   });
 });
 
+describe('render：P7 批量计划与结果（ConflictBatchSpec）', () => {
+  function batchState(patch: Partial<ConflictBatchSpec>, statePatch: Partial<PanelState> = {}): PanelState {
+    return baseState({
+      conflictBatch: {
+        id: 'conflict-batch-plan-1',
+        heading: '批量处理计划',
+        mode: 'plan',
+        summary: [
+          { label: '工作副本根', value: 'C:\\wc & <repo>', mono: true },
+          { label: '范围', value: '整个工作副本', mono: true },
+          { label: '策略', value: '使用传入内容（仅文件冲突）' },
+        ],
+        strategyLabel: '策略',
+        strategies: [
+          { value: 'theirs-full', label: '使用传入内容（仅文件冲突）', selected: true },
+          { value: 'mine-full', label: '保留本地内容（仅文件冲突）', selected: false },
+        ],
+        groups: [
+          {
+            id: 'applicable',
+            title: '将执行（2）',
+            items: [
+              { path: 'src/a.ts', note: '整文件策略 使用传入内容（仅文件冲突）' },
+              { path: 'bin/b.dat', note: '整文件策略 使用传入内容（仅文件冲突）' },
+            ],
+          },
+          {
+            id: 'unsupported',
+            title: '不执行（1）',
+            items: [{ path: 'config', note: '不适用：属性冲突需要逐项选择' }],
+          },
+          { id: 'postponed', title: '已推迟（1）', items: [{ path: 'tree-del.txt' }] },
+        ],
+        actions: [
+          { id: 'startConflictBatch', label: '开始批量处理' },
+          { id: 'showConflictBatchResults', label: '查看批量结果' },
+        ],
+        ...patch,
+      },
+      ...statePatch,
+    });
+  }
+
+  it('计划页：概要/策略按钮/三组清单与开始动作，路径只作展示文本', () => {
+    const html = render(batchState({}));
+    expect(html).toContain('data-batch-id="conflict-batch-plan-1" data-batch-mode="plan"');
+    expect(html).toContain('批量处理计划');
+    // 工作副本根原值转义展示（反斜杠与 HTML 特殊字符）。
+    expect(html).toContain('C:\\wc &amp; &lt;repo&gt;');
+    expect(html).toContain(
+      'data-intent="planConflictBatch" data-strategy="theirs-full" data-focus="batch-strategy-theirs-full" aria-pressed="true"',
+    );
+    expect(html).toContain(
+      'data-intent="planConflictBatch" data-strategy="mine-full" data-focus="batch-strategy-mine-full" aria-pressed="false"',
+    );
+    expect(html).toContain('将执行（2）');
+    expect(html).toContain('class="mono batch-path">src/a.ts</span>');
+    expect(html).toContain('不适用：属性冲突需要逐项选择');
+    expect(html).toContain('已推迟（1）');
+    expect(html).toContain('data-intent="startConflictBatch"');
+    expect(html).toContain('data-intent="showConflictBatchResults"');
+    // 批量动作与分组项不把路径塞进 data-* 参数。
+    expect(html).not.toMatch(/data-(intent|strategy|footer)="[^"]*src\/a\.ts/);
+  });
+
+  it('计划页：禁写原因与禁用开始按钮可解释', () => {
+    const html = render(batchState({
+      blockedReason: '工作副本被锁定：批量处理不能写入，请先执行「清理」。',
+      actions: [{
+        id: 'startConflictBatch',
+        label: '开始批量处理',
+        disabled: true,
+        disabledReason: '工作副本被锁定：批量处理不能写入，请先执行「清理」。',
+      }],
+    }));
+    expect(html).toContain('class="batch-blocked" role="note"');
+    expect(html).toContain('工作副本被锁定');
+    expect(html).toMatch(/data-intent="startConflictBatch"[^>]*disabled/);
+    expect(html).toMatch(/title="工作副本被锁定[^"]*"/);
+  });
+
+  it('结果页：摘要 chips、停止位置、最终回扫说明与逐项状态', () => {
+    const html = render(batchState({
+      mode: 'results',
+      strategies: [],
+      groups: [],
+      actions: [],
+      results: {
+        title: '批量处理结果',
+        chips: [
+          { label: '已解决 2', kind: 'ok' },
+          { label: '失败 1', kind: 'error' },
+          { label: '未执行 1', kind: 'warn' },
+          { label: '仍冲突 1', kind: 'error' },
+        ],
+        stoppedNote: '在第 3/4 项停止：src/c.ts；原因：冲突状态在读取后发生变化，批量已停止。',
+        rescanNote: '最终范围回扫完成：仍冲突 1 项。',
+        items: [
+          { path: 'src/a.ts', state: 'resolved', stateLabel: '已解决（使用传入内容（仅文件冲突））' },
+          { path: 'src/c.ts', state: 'unknown', stateLabel: '待核实', detail: '回扫矛盾' },
+          { path: 'src/d.ts', state: 'not-run', stateLabel: '未执行' },
+        ],
+      },
+    }));
+    expect(html).toContain('class="batch-chip batch-chip-ok">已解决 2</span>');
+    expect(html).toContain('batch-chip-error');
+    expect(html).toContain('class="batch-stopped" role="note"');
+    expect(html).toContain('在第 3/4 项停止：src/c.ts');
+    expect(html).toContain('最终范围回扫完成：仍冲突 1 项。');
+    expect(html).toContain('data-batch-item-state="resolved"');
+    expect(html).toContain('batch-state batch-state-unknown');
+    expect(html).toContain('未执行');
+  });
+
+  it('批量区转义动态文案（路径/原因不注入 HTML）', () => {
+    const html = render(batchState({
+      groups: [{
+        id: 'unsupported',
+        title: '不执行（1）',
+        items: [{ path: '<img src=x onerror=alert(1)>', note: '<script>alert(1)</script>' }],
+      }],
+    }));
+    expect(html).not.toContain('<img src=x');
+    expect(html).toContain('&lt;img src=x onerror=alert(1)&gt;');
+    expect(html).not.toContain('<script>alert(1)</script>');
+  });
+
+  it('无批量区时不渲染（既有面板结构不变）', () => {
+    const html = render(baseState());
+    expect(html).not.toContain('class="conflict-batch"');
+  });
+
+  it('占用态策略按钮按 P7 放行表禁用（planConflictBatch 属写集）', () => {
+    const html = render(batchState({}, {
+      busy: true,
+      gate: { busy: ['selectConflict', 'closePanel'], writeLocked: [] },
+    }));
+    expect(html).toMatch(/data-intent="planConflictBatch"[^>]*disabled/);
+    expect(html).toMatch(/data-intent="startConflictBatch"[^>]*disabled/);
+  });
+});
+
 describe('render：P7 冲突详情（辅助文件/属性三值/树元数据/六种变体）', () => {
   function detailState(sections: DetailSectionSpec[], patch: Partial<PanelState> = {}): PanelState {
     return baseState({
@@ -2021,6 +2164,10 @@ describe('render：P7 窄面板 CSS 契约（294/400）', () => {
     expect(css).toContain('.property-value.absent code { color: var(--vscode-descriptionForeground); }');
     expect(css).toContain('.choice-grid {');
     expect(css).toContain('.modal-backdrop[hidden] { display: none; }');
+    // 批量计划/结果区：卡片、分组路径与窄面板单列断言（阶段 7）。
+    expect(css).toContain('.conflict-batch {');
+    expect(css).toMatch(/\.batch-path \{[^}]*overflow-wrap: anywhere;/);
+    expect(css).toMatch(/@media \(max-width: 400px\) \{[\s\S]*?\.conflict-batch \{/);
     // resolved 撤下动效：行状态更新播放一次高亮淡出。
     expect(css).toContain('.conflict-item.just-resolved {');
     expect(css).toContain('@keyframes conflict-resolved');

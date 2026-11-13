@@ -296,6 +296,28 @@ describe('parseViewMessage：M4 参数校验', () => {
     }
   });
 
+  it('planConflictBatch.strategy 只允许 theirs-full/mine-full；缺省不携带策略字段', () => {
+    const without = parseIntentOf({ kind: 'planConflictBatch' });
+    expect(without.ok).toBe(true);
+    if (without.ok) {
+      expect((without.message as IntentMessage).intent).toEqual({ kind: 'planConflictBatch' });
+    }
+    for (const strategy of ['theirs-full', 'mine-full']) {
+      const parsed = parseIntentOf({ kind: 'planConflictBatch', strategy });
+      expect(parsed.ok, strategy).toBe(true);
+      if (parsed.ok) {
+        expect((parsed.message as IntentMessage).intent).toEqual({ kind: 'planConflictBatch', strategy });
+      }
+    }
+    for (const strategy of ['postpone', 'working', 'base', 'mine-conflict', 'theirs', '', 42, null]) {
+      const parsed = parseIntentOf({ kind: 'planConflictBatch', strategy });
+      expect(parsed.ok, `strategy=${String(strategy)}`).toBe(false);
+      if (!parsed.ok) {
+        expect(parsed.reason).toContain('planConflictBatch');
+      }
+    }
+  });
+
   it('rescanConflicts.scope 只允许 task/whole', () => {
     expect(parseIntentOf({ kind: 'rescanConflicts', scope: 'task' }).ok).toBe(true);
     expect(parseIntentOf({ kind: 'rescanConflicts', scope: 'whole' }).ok).toBe(true);

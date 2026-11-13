@@ -3,6 +3,11 @@
  * InputBox 输入目标版本号（正整数或 HEAD，非法输入提示后重试），再以进度
  * 通知执行 svn update（可取消），流式回显明细，完成后汇总最终 revision
  * 与冲突。更新执行段（performUpdate）供提交前检查（F145）复用。
+ *
+ * 跨面板入口（M4 阶段 7）：更新发现冲突时，互斥锁释放后的警告提供
+ * 「打开冲突文件」与「处理冲突」两个动作；后者把本次更新目标范围交给
+ * P7 冲突面板（openConflictTarget，source='update'），只打开扫描入口，
+ * 不在更新命令内执行任何 resolve、也不自动标记已解决。
  */
 import * as vscode from 'vscode';
 import { join, relative } from 'node:path';
@@ -15,6 +20,7 @@ import { createLineBuffer, decodingRunOptions, logCommand, logLine, showOutput }
 import { resolveBatchTargetGroups, resolveWorkingCopyTarget, summarizePaths, type WcTarget } from './target';
 import { confirmModal } from '../ui/confirm';
 import { promptForCredentials } from '../auth';
+import { openConflictTarget } from './conflicts';
 
 export async function commandUpdate(uri?: vscode.Uri, uris?: vscode.Uri[]): Promise<void> {
   const svnPath = readSvnPath();
@@ -126,9 +132,9 @@ export interface UpdateRunOptions {
   revision?: string;
   /**
    * 冲突提示形态：直接更新命令入口为 true，互斥锁释放后弹带「打开冲突
-   * 文件」按钮的警告并等待用户处理（通知会停留，不能在持锁期间等待）；
-   * 提交前检查链路为 false，保持无按钮的即时警告（面板自身会展示冲突
-   * 分组，不阻塞返回）。
+   * 文件」「处理冲突」按钮的警告并等待用户处理（通知会停留，不能在持锁
+   * 期间等待）；提交前检查链路为 false，保持无按钮的即时警告（面板自身
+   * 会展示冲突分组并提供 P7 入口，不阻塞返回）。
    */
   conflictPrompt?: boolean;
 }
@@ -172,10 +178,50 @@ export async function performUpdatePaths(
   }
   // 带按钮的冲突提示在互斥锁释放后进行：通知会停留到用户处理，等待期间
   // 不能持有同副本写锁（否则还原/清理/提交等会被「未完成操作」拒绝）。
-  if (options.conflictPrompt && result.conflicts.length > 0) {
-    await promptConflictOpen(wcRoot, result.conflicts);
+  if (options.conflictPrompt) {
+    const scopeRelPath = updateConflictScope(targetArgs);
+    if (result.conflicts.length > 0) {
+      await promptConflictOpen(wcRoot, result.conflicts, scopeRelPath);
+    } else {
+      // Summary 报告了冲突但明细行未能定位文件时，仍按冲突结果提供 P7
+      // 入口（P7 以真实扫描重新读取冲突集合，不依赖解析出的路径列表）。
+      const summaryTotal = Object.values(result.conflictSummary ?? {}).reduce((sum, n) => sum + (n ?? 0), 0);
+      if (summaryTotal > 0) {
+        await promptConflictOpenUnresolved(wcRoot, summaryTotal, scopeRelPath);
+      }
+    }
   }
   return result;
+}
+
+/**
+ * 更新目标 → P7 初始扫描范围（工作副本相对路径）：
+ * - 单目标原样使用目标路径（文件或目录；副本根归一为 `.`）；
+ * - 多目标取按路径分段比较的公共前缀目录（`/a/b` 与 `/a/bc` 的公共
+ *   前缀是 `a`，不是字符串前缀 `a/b`）；无公共分量归整副本根 `.`。
+ * 分级前缀保证 P7 范围过滤（`scopeRelPath === '.' || relPath === scope ||
+ * relPath.startsWith(scope + '/')`）覆盖本次更新的全部目标。
+ */
+export function updateConflictScope(targetArgs: readonly string[]): string {
+  if (targetArgs.length === 0) {
+    return '.';
+  }
+  const segments = targetArgs.map((arg) => {
+    const normalized = arg.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
+    if (normalized === '' || normalized === '.') {
+      return [] as string[];
+    }
+    return normalized.split('/');
+  });
+  let prefix = segments[0] ?? [];
+  for (const current of segments.slice(1)) {
+    let index = 0;
+    while (index < prefix.length && index < current.length && prefix[index] === current[index]) {
+      index += 1;
+    }
+    prefix = prefix.slice(0, index);
+  }
+  return prefix.length === 0 ? '.' : prefix.join('/');
 }
 
 async function executeUpdate(
@@ -255,27 +301,58 @@ async function executeUpdate(
     return result;
   }
   // 兜底：Summary 段报告了冲突但明细行未能定位到文件时，不静默放行。
+  // conflictPrompt 形态的带按钮提示同样在释放互斥锁后由 performUpdatePaths
+  // 弹出；这里只覆盖无按钮的即时警告（提交前检查链路）。
   const summaryTotal = Object.values(result.conflictSummary ?? {}).reduce((sum, n) => sum + (n ?? 0), 0);
-  if (summaryTotal > 0) {
+  if (!options.conflictPrompt && summaryTotal > 0) {
     void vscode.window.showWarningMessage(format(strings.update.conflictsUnresolved, { count: String(summaryTotal) }));
   }
   return result;
 }
 
 /**
- * 冲突警告（带「打开冲突文件」按钮）与打开交互。必须在互斥锁释放后
- * 调用：带按钮的通知会停留到用户处理，等待期间不应阻塞同副本其他操作。
+ * 冲突警告（带「打开冲突文件」「处理冲突」按钮）与打开交互。必须在
+ * 互斥锁释放后调用：带按钮的通知会停留到用户处理，等待期间不应阻塞
+ * 同副本其他操作。两个按钮按同一冲突结果生成；「处理冲突」只打开 P7
+ * 并将本次更新目标范围作为扫描范围，不自动 resolve。
  */
-async function promptConflictOpen(wcRoot: string, conflicts: string[]): Promise<void> {
+async function promptConflictOpen(
+  wcRoot: string,
+  conflicts: string[],
+  scopeRelPath: string,
+): Promise<void> {
   const choice = await vscode.window.showWarningMessage(
     format(strings.update.conflicts, {
       count: String(conflicts.length),
       paths: conflicts.join('、'),
     }),
     strings.update.openConflictButton,
+    strings.update.handleConflictsButton,
   );
   if (choice === strings.update.openConflictButton) {
     await openConflictFiles(wcRoot, conflicts);
+    return;
+  }
+  if (choice === strings.update.handleConflictsButton) {
+    await openConflictTarget({ source: 'update', wcRoot, scopeRelPath });
+  }
+}
+
+/**
+ * Summary 报告冲突但未定位到路径时的警告：保留既有计数提示，并按同一
+ * 冲突结果提供 P7 入口（P7 重新真实扫描，不依赖未解析出的路径列表）。
+ */
+async function promptConflictOpenUnresolved(
+  wcRoot: string,
+  count: number,
+  scopeRelPath: string,
+): Promise<void> {
+  const choice = await vscode.window.showWarningMessage(
+    format(strings.update.conflictsUnresolved, { count: String(count) }),
+    strings.update.handleConflictsButton,
+  );
+  if (choice === strings.update.handleConflictsButton) {
+    await openConflictTarget({ source: 'update', wcRoot, scopeRelPath });
   }
 }
 

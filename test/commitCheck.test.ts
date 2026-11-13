@@ -103,6 +103,8 @@ const vscodeMock = vi.hoisted(() => ({
   errorMessages: [] as string[],
   confirmResult: undefined as string | undefined,
   commitChoice: undefined as string | undefined,
+  /** 提交前检查冲突提示上的「处理冲突」（P7 入口）按钮点击结果。 */
+  conflictChoice: undefined as string | undefined,
   quickPickChoice: undefined as string | undefined,
   inputResult: undefined as string | undefined,
   config: {} as Record<string, unknown>,
@@ -129,9 +131,16 @@ vi.mock('vscode', () => ({
       dispose() {},
     }),
     showInformationMessage: (message: string) => { vscodeMock.information.push(message); return Promise.resolve(undefined); },
-    showWarningMessage: (message: string, _options?: unknown, ...items: string[]) => {
+    showWarningMessage: (message: string, ...rest: unknown[]) => {
       vscodeMock.warning.push(message);
-      return Promise.resolve(items.length >= 3 ? vscodeMock.commitChoice : vscodeMock.confirmResult);
+      const options = rest[0];
+      const modal = typeof options === 'object' && options !== null
+        && 'modal' in (options as Record<string, unknown>);
+      if (modal) {
+        return Promise.resolve(vscodeMock.commitChoice);
+      }
+      // 非模态带按钮提示（提交前检查冲突的 P7 入口）按独立选择驱动。
+      return Promise.resolve(vscodeMock.conflictChoice);
     },
     showErrorMessage: (message: string) => { vscodeMock.errorMessages.push(message); return Promise.resolve(undefined); },
     showOpenDialog: () => Promise.resolve(undefined),
@@ -164,10 +173,21 @@ vi.mock('vscode', () => ({
 }));
 
 import { commandCommit } from '../src/host/commands/commit';
+import { setConflictPanelOpener, type ConflictOpenTarget } from '../src/host/commands/conflicts';
 import { setCommitPanelContext } from '../src/host/panel/panels/commit';
 import { strings } from '../src/host/i18n';
 
 const makeUri = (fsPath: string): vscode.Uri => ({ fsPath, scheme: 'file' }) as unknown as vscode.Uri;
+
+/**
+ * 「处理冲突」按钮值：host/i18n.ts 由 entry 代理在并行阶段统一写入；
+ * 缺键时测试运行时以同一文案补足（与生产键一致，合入后为 no-op，
+ * 面板横幅渲染也依赖该键），生产代码对键的引用由 tsc 校验。
+ */
+if ((strings.commitCheck as Record<string, string | undefined>).openConflictsButton === undefined) {
+  (strings.commitCheck as Record<string, string>).openConflictsButton = '处理冲突';
+}
+const openConflictsLabel = (strings.commitCheck as Record<string, string>).openConflictsButton;
 
 vi.mocked(runRemoteStatus).mockResolvedValue({ against: 1, entries: [] });
 vi.mocked(runStatus).mockResolvedValue({ targetPath: '.', entries: [] , externals: [] });
@@ -205,6 +225,8 @@ beforeEach(() => {
   vscodeMock.errorMessages.length = 0;
   vscodeMock.confirmResult = undefined;
   vscodeMock.commitChoice = undefined;
+  vscodeMock.conflictChoice = undefined;
+  setConflictPanelOpener(undefined);
   vscodeMock.quickPickChoice = undefined;
   vscodeMock.inputResult = undefined;
   vscodeMock.config = {};
@@ -321,7 +343,34 @@ describe('P1 提交面板 提交前检查', () => {
     }
   });
 
-  it('更新产生冲突：提示指向冲突文件，提交被阻止', async () => {
+  it('本地已有冲突：提交面板冲突横幅提供「处理冲突」入口，点击打开 P7 不自动 resolve', async () => {
+    vi.mocked(runStatus).mockResolvedValue({
+      targetPath: '.',
+      entries: [{ path: 'a.txt', wcStatus: 'conflicted', props: 'none', changelist: null }],
+      externals: [],
+    });
+    const opened: ConflictOpenTarget[] = [];
+    setConflictPanelOpener((target) => {
+      opened.push(target);
+    });
+    const panel = await openPanelAndWait(join(wcRoot, 'a.txt'), strings.panel.conflictBanner);
+    const html = String(
+      [...panel.posted]
+        .reverse()
+        .find((m) => m.type === 'render' && String(m.html ?? '').includes(strings.panel.conflictBanner))
+        ?.html,
+    );
+    expect(html).toContain('data-action-id="openConflicts"');
+
+    panel.sendIntent({ kind: 'bannerAction', bannerId: 'conflict', actionId: 'openConflicts' }, 'p7-1');
+    await vi.waitFor(() => {
+      expect(opened).toEqual([{ source: 'update', wcRoot, scopeRelPath: 'a.txt' }]);
+    });
+    // 不自动 resolve：冲突仍是提交阻止条件。
+    expect(vi.mocked(runOrThrow).mock.calls.every(([, args]) => args[0] !== 'resolve')).toBe(true);
+  });
+
+  it('更新产生冲突：提示指向冲突文件并提供 P7 入口，提交被阻止', async () => {
     vscodeMock.commitChoice = strings.commitCheck.updateAndContinue;
     vi.mocked(runRemoteStatus).mockResolvedValue({
       against: 2,
@@ -342,10 +391,44 @@ describe('P1 提交面板 提交前检查', () => {
     panel.sendIntent({ kind: 'syncInput', fieldId: 'message', value: '提交', inputRevision: 1 }, 'in-1');
     panel.sendIntent({ kind: 'submit' }, 'sub-1');
     await vi.waitFor(() => {
-      expect(vscodeMock.information.some((m) => m.includes('已停止提交') && m.includes('a.txt'))).toBe(true);
+      expect(vscodeMock.warning.some((m) => m.includes('已停止提交') && m.includes('a.txt'))).toBe(true);
     });
     await new Promise((resolve) => setTimeout(resolve, 100));
     expect(vi.mocked(runOrThrow).mock.calls.some(([, args]) => args[0] === 'commit')).toBe(false);
+  });
+
+  it('提交前检查冲突提示的「处理冲突」：只打开 P7 并传更新范围，不自动 resolve', async () => {
+    vscodeMock.commitChoice = strings.commitCheck.updateAndContinue;
+    vscodeMock.conflictChoice = openConflictsLabel;
+    vi.mocked(runRemoteStatus).mockResolvedValue({
+      against: 2,
+      entries: [{ path: 'a.txt', reposStatus: 'modified' }],
+    });
+    vi.mocked(runUpdate).mockResolvedValue({
+      stdout: '', stderr: '', exitCode: 0,
+      items: [{ status: 'C', path: 'a.txt' }],
+      finalRevision: 3,
+      conflicts: ['a.txt'],
+    });
+    vi.mocked(runStatus).mockResolvedValue({
+      targetPath: '.',
+      entries: [{ path: 'a.txt', wcStatus: 'modified', props: 'none', changelist: null }],
+      externals: [],
+    });
+    const opened: ConflictOpenTarget[] = [];
+    setConflictPanelOpener((target) => {
+      opened.push(target);
+    });
+    const panel = await openPanelAndWait(join(wcRoot, 'a.txt'), 'a.txt');
+    panel.sendIntent({ kind: 'syncInput', fieldId: 'message', value: '提交', inputRevision: 1 }, 'in-1');
+    panel.sendIntent({ kind: 'submit' }, 'sub-1');
+    await vi.waitFor(() => {
+      // 范围 = 本次提交前检查更新目标（单文件）；冲突集合由 P7 真实扫描。
+      expect(opened).toEqual([{ source: 'update', wcRoot, scopeRelPath: 'a.txt' }]);
+    });
+    // 冲突仍是提交阻止条件：不自动提交、不自动 resolve。
+    expect(vi.mocked(runOrThrow).mock.calls.some(([, args]) => args[0] === 'commit')).toBe(false);
+    expect(vi.mocked(runOrThrow).mock.calls.every(([, args]) => args[0] !== 'resolve')).toBe(true);
   });
 
   it('关闭 remoteCheckBeforeCommit：面板无远端分组，提交时不做远端检查', async () => {

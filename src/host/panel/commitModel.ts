@@ -716,6 +716,9 @@ function buildBanners(
       title: strings.panel.conflictBanner,
       detail: conflictMetas.map((meta) => meta.path).join('\n'),
       preformatted: true,
+      // 常驻冲突提示的 P7 入口：只打开冲突面板（P7 重新真实扫描），
+      // 不自动 resolve、不解除提交阻止。
+      actions: [{ id: 'openConflicts', label: strings.commitCheck.openConflictsButton }],
     });
   }
   const missingSelected = selectedMetas.filter((meta) => meta.wcStatus === 'missing');

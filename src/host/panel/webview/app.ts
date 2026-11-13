@@ -250,6 +250,14 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
       case 'chooseConflictVariant':
         sendIntent({ kind: 'chooseConflictVariant', value: holder.dataset.value ?? '' });
         return;
+      case 'planConflictBatch': {
+        // 批量策略只转发整文件枚举（theirs-full/mine-full）；非法值由协议层拒绝。
+        const strategy = holder.dataset.strategy;
+        sendIntent(strategy === undefined
+          ? { kind: 'planConflictBatch' }
+          : { kind: 'planConflictBatch', strategy });
+        return;
+      }
       case 'choosePropertyValue':
         // 属性逐项选择：只转发稳定属性名与枚举选择（local/base/incoming）。
         sendIntent({

@@ -154,6 +154,7 @@ import {
   conflictResultScopeOf,
   conflictScopeOf,
 } from '../src/host/panel/conflictModel';
+import { CONFLICT_BATCH_TEXT_DEFAULTS } from '../src/host/panel/conflictBatchModel';
 import {
   putM4ScopeSession,
   readM4ScopeSession,
@@ -311,6 +312,8 @@ let statusDelayMs = 0;
 let resolveDelayMs = 0;
 let statusFailure: string | undefined;
 let persistConflictAfterResolve = false;
+/** 模拟 WC 锁定：status 根条目带 wc-locked="true"（阶段 0 实测形态）。 */
+let wcLockedFlag = false;
 
 function resetSvnState(): void {
   conflicts = [];
@@ -321,6 +324,7 @@ function resetSvnState(): void {
   resolveDelayMs = 0;
   statusFailure = undefined;
   persistConflictAfterResolve = false;
+  wcLockedFlag = false;
 }
 
 function textConflict(path: string, extra: Partial<MockConflict> = {}): MockConflict {
@@ -356,7 +360,7 @@ function buildStatusXml(): string {
       + '</wc-status></entry>';
   }).join('');
   return '<?xml version="1.0" encoding="UTF-8"?>\n<status><target path=".">'
-    + '<entry path="."><wc-status item="normal" revision="3" props="none"></wc-status></entry>'
+    + `<entry path="."><wc-status item="normal" revision="3" props="none"${wcLockedFlag ? ' wc-locked="true"' : ''}></wc-status></entry>`
     + entries
     + '<entry path="extdir/ext"><wc-status item="external" props="none"></wc-status></entry>'
     + '</target></status>';
@@ -1114,5 +1118,253 @@ describe('P7 面板控制器（mock SVN）', () => {
   it('格式化文案与 i18n 键存在（控制器补充键交付对账）', () => {
     expect(format(strings.conflictPanel.busyHeld, {})).toContain('冲突任务');
     expect(format(strings.resolvePanel.outcomeResolved, {})).toBeDefined();
+  });
+});
+
+/* ================================================================================
+ * P7 批量计划与执行（mock SVN）：三组计划、逐项 begin/resolve/回读/收口、
+ * 中途失败停止（余项未执行）、关闭重开恢复、wcLocked 整体禁写与单任务槽。
+ * ================================================================================ */
+
+describe('P7 批量计划与执行（mock SVN）', () => {
+  function mockPropertyConflict(path: string): MockConflict {
+    return {
+      path,
+      kinds: ['property'],
+      nodeRevision: 3,
+      baselineRevision: 2,
+      incomingRevision: 3,
+      properties: [{
+        name: 'k',
+        local: { value: 'local' },
+        base: { value: 'base' },
+        incoming: { value: 'theirs' },
+      }],
+    };
+  }
+
+  async function planBatch(strategy = 'theirs-full'): Promise<void> {
+    await sendIntent({ kind: 'planConflictBatch', strategy });
+  }
+
+  async function startBatch(): Promise<void> {
+    await sendIntent({ kind: 'startConflictBatch' });
+    await waitIdle();
+  }
+
+  it('planConflictBatch：可执行/不适用/推迟三组上屏，不执行任何写命令', async () => {
+    writeWorkFile('text.txt');
+    writeWorkFile('prop.txt');
+    conflicts = [textConflict('text.txt'), mockPropertyConflict('prop.txt'), treeConflict('tree-del.txt')];
+    setup();
+    await openAndScan();
+    await selectPath('tree-del.txt');
+    await sendIntent({ kind: 'postponeConflict' });
+    const before = resolveCalls.length;
+    await planBatch('theirs-full');
+    const snapshot = conflictsSessionSnapshot();
+    expect(snapshot.batch).toMatchObject({
+      mode: 'plan',
+      applicable: 1,
+      unsupported: 1,
+      postponed: 1,
+      writeBlocked: false,
+      planInvalidated: false,
+    });
+    expect(resolveCalls.length).toBe(before);
+    const html = fakePanel().latestRenderHtml();
+    expect(html).toContain(CONFLICT_BATCH_TEXT_DEFAULTS.batchPlanHeading);
+    expect(html).toContain(wcRoot.replaceAll('&', '&amp;'));
+    expect(html).toContain(CONFLICT_BATCH_TEXT_DEFAULTS.batchUnsupportedProperty);
+    expect(html).toContain('data-intent="startConflictBatch"');
+    // 策略切换重新生成计划（新 planId），仍不发写命令。
+    const firstPlanId = snapshot.batch?.planId;
+    await planBatch('mine-full');
+    expect(conflictsSessionSnapshot().batch?.planId).not.toBe(firstPlanId);
+    expect(resolveCalls.length).toBe(before);
+  });
+
+  it('startConflictBatch：逐项 resolve + 回读 + 最终回扫；成功后台账与结果页一致', async () => {
+    writeWorkFile('a.txt');
+    writeWorkFile('b.txt');
+    conflicts = [textConflict('a.txt'), textConflict('b.txt')];
+    setup();
+    await openAndScan();
+    await planBatch('theirs-full');
+    const statusBefore = statusCalls.length;
+    await startBatch();
+    expect(resolveCalls.length).toBe(2);
+    for (const call of resolveCalls) {
+      expect(call.slice(0, 4)).toEqual(['resolve', '--non-interactive', '--accept', 'theirs-full']);
+      expect(call).toContain('--depth');
+      expect(['a.txt', 'b.txt']).toContain(call[call.length - 1]);
+    }
+    // 每项都有独立 operation record（batchId 归组）并已 done 收口。
+    const snapshot = conflictsSessionSnapshot();
+    expect(snapshot.batch).toMatchObject({
+      mode: 'results',
+      items: 2,
+      resolved: 2,
+      failed: 0,
+      unknown: 0,
+      notRun: 0,
+      planInvalidated: false,
+      rescan: 'scanned',
+    });
+    expect(snapshot.ledger).toBe(2);
+    // 最终整范围回扫真实执行了 status（扫描 + 回扫）。
+    expect(statusCalls.length).toBeGreaterThan(statusBefore);
+    expect(getOperationRegistry().writeRestriction(wcRoot)).toBeUndefined();
+    expect(fakePanel().latestRenderHtml()).toContain(CONFLICT_BATCH_TEXT_DEFAULTS.batchResultsHeading);
+    expect(fakePanel().latestRenderHtml()).toContain('已解决 2');
+  });
+
+  it('中途失败停止：首项回读矛盾进 unknown，余项未执行，最终回扫后旧计划作废', async () => {
+    writeWorkFile('a.txt');
+    writeWorkFile('b.txt');
+    writeWorkFile('c.txt');
+    conflicts = [textConflict('a.txt'), textConflict('b.txt'), textConflict('c.txt')];
+    setup();
+    await openAndScan();
+    await planBatch('theirs-full');
+    persistConflictAfterResolve = true;
+    await startBatch();
+    expect(resolveCalls.length).toBe(1);
+    const snapshot = conflictsSessionSnapshot();
+    expect(snapshot.batch).toMatchObject({
+      items: 3,
+      resolved: 0,
+      failed: 0,
+      unknown: 1,
+      notRun: 2,
+      stoppedIndex: 0,
+      planInvalidated: true,
+      rescan: 'scanned',
+    });
+    expect(snapshot.batch?.stopReason).toBeDefined();
+    // 最终回扫仍报告冲突：未决记录按真实扫描收口并释放写锁（不写台账）。
+    expect(snapshot.ledger).toBe(0);
+    expect(snapshot.writeLocked).toBe(false);
+    // 旧计划作废：再次 start 被拒绝，不发第二次 resolve。
+    const resolveBefore = resolveCalls.length;
+    await sendIntent({ kind: 'startConflictBatch' });
+    await delay(20);
+    expect(resolveCalls.length).toBe(resolveBefore);
+  });
+
+  it('最终回扫失败：逐项结果保留且明确未核实，写锁保持到重新扫描收口', async () => {
+    writeWorkFile('a.txt');
+    writeWorkFile('b.txt');
+    conflicts = [textConflict('a.txt'), textConflict('b.txt')];
+    setup();
+    await openAndScan();
+    await planBatch('theirs-full');
+    statusFailure = 'svn: E000013: Permission denied';
+    await startBatch();
+    let snapshot = conflictsSessionSnapshot();
+    expect(snapshot.batch).toMatchObject({
+      items: 2,
+      unknown: 1,
+      notRun: 1,
+      stoppedIndex: 0,
+      planInvalidated: true,
+      rescan: 'failed',
+    });
+    expect(snapshot.batch?.stopReason).toBeDefined();
+    // 结果未知：operation record 保持 unknown 相位，写锁保持。
+    expect(snapshot.writeLocked).toBe(true);
+    expect(snapshot.pendingOperationId).toBeDefined();
+    // 重新扫描（回扫）按真实状态收口未决记录并释放写锁。
+    statusFailure = undefined;
+    await sendIntent({ kind: 'rescanConflicts', scope: 'task' });
+    await waitIdle();
+    snapshot = conflictsSessionSnapshot();
+    expect(snapshot.writeLocked).toBe(false);
+    expect(getOperationRegistry().writeRestriction(wcRoot)).toBeUndefined();
+  });
+
+  it('批量执行中关闭面板：任务继续并写会话缓存，重开恢复逐项结果', async () => {
+    writeWorkFile('a.txt');
+    writeWorkFile('b.txt');
+    conflicts = [textConflict('a.txt'), textConflict('b.txt')];
+    resolveDelayMs = 80;
+    setup();
+    await openAndScan();
+    await planBatch('theirs-full');
+    await sendIntent({ kind: 'startConflictBatch' });
+    expect(hasActiveTask('conflicts')).toBe(true);
+    expect(conflictsSessionSnapshot().taskKind).toBe('batch');
+    fakePanel().dispose();
+    expect(hasActiveTask('conflicts')).toBe(true);
+    await waitIdle();
+    const stored = readSnapshotStore();
+    const storedBatch = (stored?.browsable as {
+      batch?: { result?: { items?: unknown[]; planInvalidated?: boolean } };
+    } | undefined)?.batch;
+    expect(storedBatch?.result?.items).toHaveLength(2);
+    expect(storedBatch?.result?.planInvalidated).toBe(false);
+    // 重开：恢复结果页，不自动重扫（批量结束时的最终回扫已更新快照）。
+    await openConflictPanel({ source: 'local', wcRoot, scopeRelPath: '.' });
+    await delay(10);
+    const snapshot = conflictsSessionSnapshot();
+    expect(snapshot.batch).toMatchObject({ mode: 'results', resolved: 2, rescan: 'scanned' });
+    expect(fakePanel().latestRenderHtml()).toContain(CONFLICT_BATCH_TEXT_DEFAULTS.batchResultsHeading);
+  });
+
+  it('批量执行中关闭后立即重开：绑定同一任务模型并继续逐项进度', async () => {
+    writeWorkFile('a.txt');
+    conflicts = [textConflict('a.txt')];
+    resolveDelayMs = 80;
+    setup();
+    await openAndScan();
+    await planBatch('theirs-full');
+    await sendIntent({ kind: 'startConflictBatch' });
+    expect(hasActiveTask('conflicts')).toBe(true);
+    const taskModel = conflictsModelForTest();
+    fakePanel().dispose();
+    await openConflictPanel({ source: 'local', wcRoot, scopeRelPath: '.' });
+    // 运行中任务按作用域绑定：模型切到任务实例，任务槽与相位保持。
+    expect(conflictsModelForTest()).toBe(taskModel);
+    expect(conflictsSessionSnapshot().taskKind).toBe('batch');
+    await waitIdle();
+    const snapshot = conflictsSessionSnapshot();
+    expect(snapshot.batch).toMatchObject({ mode: 'results', resolved: 1, rescan: 'scanned' });
+  });
+
+  it('wcLocked：计划整体禁写并给出原因，start 被拒绝且不发写命令', async () => {
+    writeWorkFile('a.txt');
+    conflicts = [textConflict('a.txt')];
+    wcLockedFlag = true;
+    setup();
+    await openAndScan();
+    expect(conflictsModelForTest()?.wcLocked()).toBe(true);
+    await planBatch('theirs-full');
+    let snapshot = conflictsSessionSnapshot();
+    expect(snapshot.batch).toMatchObject({ applicable: 1, writeBlocked: true, mode: 'plan' });
+    expect(fakePanel().latestRenderHtml()).toContain(CONFLICT_BATCH_TEXT_DEFAULTS.batchBlockedWcLocked);
+    const resolveBefore = resolveCalls.length;
+    await sendIntent({ kind: 'startConflictBatch' });
+    await delay(20);
+    expect(resolveCalls.length).toBe(resolveBefore);
+    expect(fakePanel().toasts().some((message) => message.includes('工作副本被锁定'))).toBe(true);
+    expect(hasActiveTask('conflicts')).toBe(false);
+  });
+
+  it('批量与扫描共用 conflicts 单任务槽：执行中 plan 意图被放行表拒绝', async () => {
+    writeWorkFile('a.txt');
+    conflicts = [textConflict('a.txt')];
+    resolveDelayMs = 100;
+    setup();
+    await openAndScan();
+    await planBatch('theirs-full');
+    const planId = conflictsSessionSnapshot().batch?.planId;
+    await sendIntent({ kind: 'startConflictBatch' });
+    expect(hasActiveTask('conflicts')).toBe(true);
+    expect(conflictsSessionSnapshot().taskKind).toBe('batch');
+    // busy 期间 planConflictBatch 属于写集：宿主放行表拒绝（不生成第二份计划）。
+    await sendIntent({ kind: 'planConflictBatch', strategy: 'mine-full' });
+    expect(fakePanel().toasts().some((message) => message.includes('已忽略重复请求'))).toBe(true);
+    expect(conflictsSessionSnapshot().batch?.planId).toBe(planId);
+    await waitIdle();
   });
 });

@@ -1451,6 +1451,72 @@ button.th-sort.active { color: var(--vscode-textLink-foreground, var(--vscode-fo
 }
 .confirm-actions button { font-size: 12px; padding: 3px 12px; }
 
+/* P7 批量计划/结果区（阶段 7）：计划概要 + 策略选择 + 三组路径 +
+ * 逐项结果。区域位于主从布局之后、页脚之前；所有动态值由宿主转义。 */
+.conflict-batch {
+  margin: 8px 8px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 4px;
+  background: var(--vscode-editorWidget-background, transparent);
+  min-width: 0;
+}
+.conflict-batch h2 { margin: 0 0 8px; font-size: 13px; }
+.batch-summary {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 2px 10px;
+  margin: 0 0 8px;
+  font-size: 12px;
+}
+.batch-summary dt { color: var(--vscode-descriptionForeground); }
+.batch-summary dd { margin: 0; min-width: 0; overflow-wrap: anywhere; word-break: break-all; }
+.batch-strategy {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 8px;
+  font-size: 12px;
+}
+.batch-label { color: var(--vscode-descriptionForeground); }
+.batch-strategy .choice { font-size: 12px; padding: 2px 10px; }
+.batch-blocked { margin: 0 0 8px; font-size: 12px; color: var(--vscode-editorWarning-foreground); overflow-wrap: anywhere; }
+.batch-group { margin: 0 0 8px; }
+.batch-group h3 { margin: 4px 0; font-size: 12px; }
+.batch-items,
+.batch-result-items {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.batch-items li,
+.batch-result-items li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 12px;
+  min-width: 0;
+}
+.batch-path { min-width: 0; overflow-wrap: anywhere; word-break: break-all; }
+.batch-note { font-size: 11px; }
+.batch-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+.batch-chip { padding: 1px 8px; border-radius: 8px; font-size: 11px; border: 1px solid var(--vscode-panel-border); }
+.batch-chip-ok { border-color: var(--vscode-testing-iconPassed, var(--vscode-charts-green)); }
+.batch-chip-warn { border-color: var(--vscode-editorWarning-foreground); }
+.batch-chip-error { border-color: var(--vscode-editorError-foreground); }
+.batch-stopped { margin: 4px 0; font-size: 12px; color: var(--vscode-editorWarning-foreground); overflow-wrap: anywhere; }
+.batch-rescan { margin: 4px 0; font-size: 12px; overflow-wrap: anywhere; }
+.batch-state { font-size: 11px; color: var(--vscode-descriptionForeground); }
+.batch-state-resolved { color: var(--vscode-testing-iconPassed, var(--vscode-charts-green)); }
+.batch-state-failed,
+.batch-state-unknown { color: var(--vscode-editorWarning-foreground); }
+.batch-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+
 /* P7 窄面板（294/400px）：变体卡与属性三值改为单列，冲突行动作换行，
  * 模态卡片收窄；页面本身不横向溢出（滚动只发生在 pane-scroll 内）。 */
 @media (max-width: 400px) {
@@ -1461,4 +1527,8 @@ button.th-sort.active { color: var(--vscode-textLink-foreground, var(--vscode-fo
   .modal-backdrop { padding: 10px; }
   .confirm-dialog { width: 100%; padding: 12px; }
   .detail-section .property-head { gap: 4px; }
+  .conflict-batch { margin: 6px 4px 0; padding: 8px; }
+  .batch-strategy { flex-direction: column; align-items: stretch; }
+  .batch-summary { grid-template-columns: 1fr; }
+  .batch-summary dd { margin-bottom: 2px; }
 }

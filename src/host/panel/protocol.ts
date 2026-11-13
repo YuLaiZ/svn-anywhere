@@ -48,6 +48,15 @@ export type ConflictVariant = (typeof CONFLICT_VARIANTS)[number];
 export const CONFLICT_RESCAN_SCOPES = ['task', 'whole'] as const;
 export type ConflictRescanScope = (typeof CONFLICT_RESCAN_SCOPES)[number];
 
+/**
+ * P7 批量整文件策略：只允许 mine-full / theirs-full（二进制与文本共用；
+ * 属性、树与混合路径走不适用组）。协议层按白名单拒绝其他值；「全部推迟」
+ * 不是 svn --accept 取值，也不在协议内（推迟只改面板状态）。
+ */
+export const CONFLICT_BATCH_STRATEGIES = ['theirs-full', 'mine-full'] as const;
+export type ConflictBatchStrategy = (typeof CONFLICT_BATCH_STRATEGIES)[number];
+export const DEFAULT_CONFLICT_BATCH_STRATEGY: ConflictBatchStrategy = 'theirs-full';
+
 /** P7 打开冲突版本的角色：本地工作内容 / 冲突基线 / 传入内容。 */
 export const CONFLICT_VERSION_ROLES = ['local', 'base', 'incoming'] as const;
 export type ConflictVersionRole = (typeof CONFLICT_VERSION_ROLES)[number];
@@ -169,7 +178,7 @@ export type Intent =
   | { kind: 'postponeConflict' }
   | { kind: 'prepareTreeConflict' }
   | { kind: 'rescanConflicts'; scope: ConflictRescanScope }
-  | { kind: 'planConflictBatch' }
+  | { kind: 'planConflictBatch'; strategy?: ConflictBatchStrategy }
   | { kind: 'startConflictBatch' }
   | { kind: 'showConflictBatchResults' }
   | { kind: 'scanWholeWorkCopy' }
@@ -469,7 +478,6 @@ function parseIntent(raw: unknown): { ok: true; intent: Intent } | { ok: false; 
     case 'applyConflictResolution':
     case 'postponeConflict':
     case 'prepareTreeConflict':
-    case 'planConflictBatch':
     case 'startConflictBatch':
     case 'showConflictBatchResults':
     case 'scanWholeWorkCopy':
@@ -723,6 +731,17 @@ function parseIntent(raw: unknown): { ok: true; intent: Intent } | { ok: false; 
       return scope.ok
         ? { ok: true, intent: { kind, scope: scope.value } }
         : { ok: false, reason: scope.message };
+    }
+    case 'planConflictBatch': {
+      // 批量策略只接收整文件枚举（theirs-full/mine-full）；缺省时宿主按
+      // DEFAULT_CONFLICT_BATCH_STRATEGY 生成计划，不在此处补默认字段。
+      if (raw.strategy === undefined) {
+        return { ok: true, intent: { kind } };
+      }
+      const strategy = readEnum(raw, 'strategy', CONFLICT_BATCH_STRATEGIES, label);
+      return strategy.ok
+        ? { ok: true, intent: { kind, strategy: strategy.value } }
+        : { ok: false, reason: strategy.message };
     }
     case 'openConflictVersion': {
       const role = readEnum(raw, 'role', CONFLICT_VERSION_ROLES, label);
