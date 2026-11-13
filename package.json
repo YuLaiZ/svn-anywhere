@@ -27,6 +27,7 @@
     "onCommand:svnAnywhere.showRemoteInfo",
     "onCommand:svnAnywhere.browseRepository",
     "onCommand:svnAnywhere.showHistory",
+    "onCommand:svnAnywhere.scanConflicts",
     "onCommand:svnAnywhere.toggleQuickDiff",
     "onCommand:svnAnywhere.toggleInlineBlame",
     "onCommand:svnAnywhere.checkout",
@@ -122,6 +123,11 @@
         "category": "SVN Anywhere"
       },
       {
+        "command": "svnAnywhere.scanConflicts",
+        "title": "扫描冲突",
+        "category": "SVN Anywhere"
+      },
+      {
         "command": "svnAnywhere.toggleQuickDiff",
         "title": "切换快速差异",
         "category": "SVN Anywhere"
@@ -192,6 +198,10 @@
         {
           "command": "svnAnywhere.showHistory",
           "group": "1_info@5"
+        },
+        {
+          "command": "svnAnywhere.scanConflicts",
+          "group": "1_info@6"
         },
         {
           "command": "svnAnywhere.commit",
@@ -298,6 +308,9 @@
         },
         {
           "command": "svnAnywhere.showHistory"
+        },
+        {
+          "command": "svnAnywhere.scanConflicts"
         },
         {
           "command": "svnAnywhere.toggleQuickDiff"

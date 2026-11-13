@@ -8,8 +8,10 @@ import { escapePeg, findWorkingCopy } from './core/workspace';
 import { readSvnPath, readTimeoutMs } from './host/config';
 import { registerAllCommands } from './host/commands';
 import { registerBrowseRepositoryCommand, setBrowsePanelOpener, setHistoryHandoffHandler } from './host/commands/browse';
+import { registerScanConflictsCommand, setConflictPanelOpener } from './host/commands/conflicts';
 import { registerEditorCommands } from './host/commands/editor';
 import { openBrowsePanel, setBrowsePanelContext } from './host/panel/panels/browse';
+import { openConflictPanel, setConflictPanelContext } from './host/panel/panels/conflicts';
 import { openHistoryTarget, registerShowHistoryCommand, setHistoryPanelOpener } from './host/commands/history';
 import { openHistoryPanel, setHistoryPanelContext } from './host/panel/panels/history';
 import {
@@ -74,6 +76,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<SvnAny
   // registerAllCommands 分开管理，二次激活由各自的句柄数组保证幂等。
   registerBrowseRepositoryCommand(context);
   registerShowHistoryCommand(context);
+  // M4 阶段 5：P7 冲突扫描入口（命令数 21→22）——右键/编辑器/命令面板
+  // 解析工作副本根后交给注入的 P7 面板打开器；P6 更新冲突交接共用同一
+  // openConflictTarget 注入点（冲突集合由 P7 重新真实扫描）。
+  setConflictPanelContext(context);
+  setConflictPanelOpener(openConflictPanel);
+  registerScanConflictsCommand(context);
   // M4 阶段 4：编辑器集成命令（命令数 19→21）——快速差异与行内追溯由
   // 各自模块的状态机维护装饰，入口只取当前活动文本编辑器。
   registerEditorCommands(context);

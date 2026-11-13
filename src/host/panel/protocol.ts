@@ -52,6 +52,10 @@ export type ConflictRescanScope = (typeof CONFLICT_RESCAN_SCOPES)[number];
 export const CONFLICT_VERSION_ROLES = ['local', 'base', 'incoming'] as const;
 export type ConflictVersionRole = (typeof CONFLICT_VERSION_ROLES)[number];
 
+/** P7 属性冲突逐项选择：为单个属性取本地 / 冲突基线 / 传入一侧的值。 */
+export const CONFLICT_PROPERTY_CHOICES = ['local', 'base', 'incoming'] as const;
+export type ConflictPropertyChoice = (typeof CONFLICT_PROPERTY_CHOICES)[number];
+
 /**
  * 视图可发起的意图（已知动作的联合类型）。阶段 1 起覆盖 P1 提交面板，
  * 阶段 2 起覆盖 P2 忽略规则编辑器；后续阶段扩展 P3 检出/导入与 P4 磁盘
@@ -159,6 +163,7 @@ export type Intent =
   | { kind: 'selectConflict'; id: string }
   | { kind: 'setConflictTab'; tab: ConflictTab }
   | { kind: 'chooseConflictVariant'; value: ConflictVariant }
+  | { kind: 'choosePropertyValue'; property: string; choice: ConflictPropertyChoice }
   | { kind: 'applyConflictResolution' }
   | { kind: 'postponeConflict' }
   | { kind: 'prepareTreeConflict' }
@@ -278,6 +283,7 @@ export const M4_INTENT_KINDS = [
   'selectConflict',
   'setConflictTab',
   'chooseConflictVariant',
+  'choosePropertyValue',
   'applyConflictResolution',
   'postponeConflict',
   'prepareTreeConflict',
@@ -697,6 +703,17 @@ function parseIntent(raw: unknown): { ok: true; intent: Intent } | { ok: false; 
       return value.ok
         ? { ok: true, intent: { kind, value: value.value } }
         : { ok: false, reason: value.message };
+    }
+    case 'choosePropertyValue': {
+      // 属性名只做类型校验；存在性由宿主从当前详情状态映射校验（视图不能指定任意属性）。
+      const property = readString(raw, 'property', label);
+      if (!property.ok) {
+        return { ok: false, reason: property.message };
+      }
+      const choice = readEnum(raw, 'choice', CONFLICT_PROPERTY_CHOICES, label);
+      return choice.ok
+        ? { ok: true, intent: { kind, property: property.value, choice: choice.value } }
+        : { ok: false, reason: choice.message };
     }
     case 'rescanConflicts': {
       const scope = readEnum(raw, 'scope', CONFLICT_RESCAN_SCOPES, label);

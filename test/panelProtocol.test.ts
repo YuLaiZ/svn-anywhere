@@ -195,6 +195,7 @@ const M4_LEGAL_INTENTS: Array<Record<string, unknown>> = [
   { kind: 'selectConflict', id: 'conflict-1' },
   { kind: 'setConflictTab', tab: 'property' },
   { kind: 'chooseConflictVariant', value: 'mine-conflict' },
+  { kind: 'choosePropertyValue', property: 'svn:mime-type', choice: 'incoming' },
   { kind: 'applyConflictResolution' },
   { kind: 'postponeConflict' },
   { kind: 'prepareTreeConflict' },
@@ -300,6 +301,18 @@ describe('parseViewMessage：M4 参数校验', () => {
     for (const scope of ['current', 'all', 'default', '']) {
       expect(parseIntentOf({ kind: 'rescanConflicts', scope }).ok, scope).toBe(false);
     }
+  });
+
+  it('choosePropertyValue 只允许 local/base/incoming 且属性名必须是字符串', () => {
+    for (const choice of ['local', 'base', 'incoming']) {
+      expect(parseIntentOf({ kind: 'choosePropertyValue', property: 'svn:ignore', choice }).ok, choice).toBe(true);
+    }
+    for (const choice of ['mine', 'theirs', 'LOCAL', 'working', '']) {
+      expect(parseIntentOf({ kind: 'choosePropertyValue', property: 'k', choice }).ok, choice).toBe(false);
+    }
+    expect(parseIntentOf({ kind: 'choosePropertyValue', property: 42, choice: 'local' }).ok).toBe(false);
+    expect(parseIntentOf({ kind: 'choosePropertyValue', choice: 'local' }).ok).toBe(false);
+    expect(parseIntentOf({ kind: 'choosePropertyValue', property: 'k' }).ok).toBe(false);
   });
 
   it('openConflictVersion.role 只允许 local/base/incoming', () => {

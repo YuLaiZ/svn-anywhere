@@ -345,11 +345,12 @@ const P7_READONLY_INTENTS: readonly GateRule[] = [
 ];
 
 /**
- * P7 会话状态意图：只在宿主内存改面板状态（策略选择、推迟），
+ * P7 会话状态意图：只在宿主内存改面板状态（策略选择、属性值选择、推迟），
  * 不发 SVN 写命令，占用态放行。
  */
 const P7_SESSION_STATE_INTENTS: readonly GateRule[] = [
   { action: 'chooseConflictVariant' },
+  { action: 'choosePropertyValue' },
   { action: 'postponeConflict' },
 ];
 

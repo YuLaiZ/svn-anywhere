@@ -1190,3 +1190,275 @@ button.th-sort.active { color: var(--vscode-textLink-foreground, var(--vscode-fo
   .path-item .acts { margin-left: 0; }
   .detail-section { padding-left: 10px; padding-right: 10px; }
 }
+
+/* ------------------------------ P7 冲突面板 ------------------------------ */
+
+/* 冲突列表：宿主已完成 tab 过滤；行是选中查看详情的稳定 ID 按钮。
+ * 路径允许任意换行，徽标可收缩换行，294px 窄面板不横向溢出。 */
+.conflict-list-block { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+.conflict-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px;
+  min-width: 0;
+  /* 独立使用（无主从布局）时由列表自身滚动；在主从 pane 内交给 pane-scroll。 */
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.pane-scroll > .conflict-list { flex: none; min-height: auto; overflow: visible; }
+.conflict-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+  min-width: 0;
+  border: 1px solid transparent;
+  border-radius: 3px;
+}
+.conflict-item:hover { background: var(--vscode-list-hoverBackground); }
+.conflict-item.selected {
+  border-color: var(--vscode-focusBorder);
+  background: var(--vscode-list-inactiveSelectionBackground, var(--vscode-list-hoverBackground));
+}
+.conflict-select {
+  flex: 1;
+  min-width: 0;
+  display: block;
+  width: 100%;
+  padding: 7px 8px;
+  background: transparent;
+  border: none;
+  color: inherit;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+}
+.conflict-select:disabled { cursor: default; }
+.conflict-select:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+.conflict-path {
+  display: block;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+.conflict-badges {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+  min-width: 0;
+}
+.conflict-kind,
+.conflict-content,
+.conflict-auto,
+.conflict-status {
+  flex: none;
+  max-width: 100%;
+  padding: 0 5px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 8px;
+  font-size: 10px;
+  line-height: 16px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.conflict-kind.kind-tree { color: var(--vscode-editorWarning-foreground); }
+.conflict-kind.kind-property { color: var(--vscode-textLink-foreground, var(--vscode-focusBorder)); }
+.conflict-auto.applicable { color: var(--vscode-descriptionForeground); }
+.conflict-auto.unsupported { color: var(--vscode-editorWarning-foreground); }
+.conflict-status.st-unresolved { color: var(--vscode-errorForeground); }
+.conflict-status.st-resolved { color: var(--vscode-gitDecoration-addedResourceForeground, var(--vscode-foreground)); }
+.conflict-status.st-postponed { color: var(--vscode-editorWarning-foreground); }
+.conflict-status.st-unknown { color: var(--vscode-editorWarning-foreground); }
+.conflict-item.status-resolved .conflict-path { color: var(--vscode-descriptionForeground); }
+.conflict-item .acts { margin-left: auto; padding: 4px; display: flex; gap: 4px; flex-wrap: wrap; }
+/* resolved 撤下动效：回扫确认解决后行状态更新播放一次高亮淡出（行保留，
+ * 不伪造「行消失」；动画只在状态变化帧由 Webview 加上 just-resolved）。 */
+.conflict-item.just-resolved {
+  animation: conflict-resolved 600ms ease-out;
+}
+@keyframes conflict-resolved {
+  from { background: var(--vscode-diffEditor-insertedLineBackground, rgba(137, 209, 133, 0.25)); }
+  to { background: transparent; }
+}
+
+/* 属性冲突三值对照与逐属性选择（多属性逐项，不提供一键覆盖）。 */
+.property-list { display: flex; flex-direction: column; gap: 10px; margin: 4px 0; }
+.property-item {
+  min-width: 0;
+  border-top: 1px solid var(--vscode-panel-border);
+  padding-top: 8px;
+}
+.property-item:first-child { border-top: none; padding-top: 0; }
+.property-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 6px; }
+.property-name { font-size: 12px; font-weight: 600; overflow-wrap: anywhere; word-break: break-all; }
+.property-unsupported {
+  flex: none;
+  max-width: 100%;
+  padding: 0 5px;
+  border: 1px solid var(--vscode-editorWarning-foreground);
+  border-radius: 8px;
+  color: var(--vscode-editorWarning-foreground);
+  font-size: 10px;
+  line-height: 16px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.property-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+.property-cell { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.property-cell > strong { font-size: 11px; color: var(--vscode-descriptionForeground); }
+.property-value {
+  min-width: 0;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 3px;
+  padding: 6px 7px;
+}
+.property-value.selected {
+  border-color: var(--vscode-focusBorder);
+  box-shadow: inset 0 0 0 1px var(--vscode-focusBorder);
+}
+.property-value.absent code { color: var(--vscode-descriptionForeground); }
+.property-value code {
+  display: block;
+  font-size: 11px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+.property-value .row-act { margin-top: 6px; font-size: 11px; padding: 1px 6px; }
+
+/* 处理结果变体：常用选项卡 + 高级 SVN 变体折叠区（六种文本变体）。 */
+.choice-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 4px 0;
+}
+.choice {
+  min-width: 0;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 4px;
+  padding: 8px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+.choice:hover:not([disabled]) { border-color: var(--vscode-focusBorder); }
+.choice.selected,
+.choice[aria-pressed="true"] {
+  border-color: var(--vscode-focusBorder);
+  box-shadow: inset 0 0 0 1px var(--vscode-focusBorder);
+}
+.choice:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.choice strong { display: block; font-size: 12px; margin-bottom: 3px; overflow-wrap: anywhere; }
+.choice span {
+  display: block;
+  color: var(--vscode-descriptionForeground);
+  font-size: 10px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.choice:disabled { opacity: 0.55; cursor: default; }
+.advanced { margin-top: 8px; }
+.advanced > summary {
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--vscode-textLink-foreground, var(--vscode-focusBorder));
+  overflow-wrap: anywhere;
+}
+.advanced > summary:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.advanced-grid { margin-top: 6px; }
+.choice-warn {
+  margin: 6px 0 0;
+  font-size: 11px;
+  color: var(--vscode-editorWarning-foreground);
+  overflow-wrap: anywhere;
+}
+
+/* 冲突辅助文件：角色徽标 + 工作副本相对路径 + 可选 revision。 */
+.artifact-list { list-style: none; margin: 4px 0; padding: 0; display: flex; flex-direction: column; gap: 5px; }
+.artifact-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 6px;
+  min-width: 0;
+  font-size: 11px;
+}
+.artifact-role {
+  flex: none;
+  padding: 0 5px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 8px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 10px;
+  line-height: 16px;
+}
+.artifact-path { min-width: 0; overflow-wrap: anywhere; word-break: break-all; }
+.artifact-revision { flex: none; color: var(--vscode-descriptionForeground); }
+
+/* 确认对话框（树冲突节点处理确认/二次确认）：覆盖层 + 模态卡片。
+ * 取消只做视图瞬时关闭；宿主更换 id 的渲染才会再次请求确认。 */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: var(--vscode-widget-shadow, rgba(0, 0, 0, 0.36));
+}
+.modal-backdrop[hidden] { display: none; }
+.confirm-dialog {
+  width: min(100%, 420px);
+  max-height: 85vh;
+  overflow: auto;
+  padding: 14px 16px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 4px;
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  color: var(--vscode-foreground);
+  box-shadow: 0 2px 12px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.36));
+}
+.confirm-dialog.warn { border-color: var(--vscode-editorWarning-foreground); }
+.confirm-dialog h2 { margin: 0 0 8px; font-size: 14px; overflow-wrap: anywhere; }
+.confirm-dialog p { margin: 4px 0; font-size: 12px; overflow-wrap: anywhere; }
+.confirm-dialog pre {
+  margin: 6px 0;
+  font-size: 11px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.confirm-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+.confirm-actions button { font-size: 12px; padding: 3px 12px; }
+
+/* P7 窄面板（294/400px）：变体卡与属性三值改为单列，冲突行动作换行，
+ * 模态卡片收窄；页面本身不横向溢出（滚动只发生在 pane-scroll 内）。 */
+@media (max-width: 400px) {
+  .choice-grid,
+  .property-grid { grid-template-columns: 1fr; }
+  .conflict-item .acts { margin-left: 0; }
+  .conflict-list { padding: 4px; }
+  .modal-backdrop { padding: 10px; }
+  .confirm-dialog { width: 100%; padding: 12px; }
+  .detail-section .property-head { gap: 4px; }
+}

@@ -96,6 +96,17 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
   let currentViewEpoch: number | null = null;
   /** 已折叠的导航目录 key（data-nav-key）；视图瞬时状态，宿主重绘后恢复。 */
   const foldedNavKeys = new Set<string>();
+  /**
+   * 用户已取消的确认对话框 id（P7 树冲突确认等）：取消只做视图瞬时关闭，
+   * 不发意图、不改宿主状态；同一 id 的对话框在后续整帧重绘中保持关闭，
+   * 直到某一帧不再包含对话框（宿主已关闭确认）或宿主更换 id 重新请求。
+   */
+  let dismissedDialogId: string | null = null;
+  /**
+   * 冲突行状态记忆（P7）：仅用于识别 unresolved/postponed → resolved 的
+   * 状态变化并播放一次撤下动效；整帧重绘后重建，会话切换清空。
+   */
+  const conflictRowStatuses = new Map<string, string>();
 
   /* --------------------------- 事件委托 --------------------------- */
 
@@ -239,6 +250,14 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
       case 'chooseConflictVariant':
         sendIntent({ kind: 'chooseConflictVariant', value: holder.dataset.value ?? '' });
         return;
+      case 'choosePropertyValue':
+        // 属性逐项选择：只转发稳定属性名与枚举选择（local/base/incoming）。
+        sendIntent({
+          kind: 'choosePropertyValue',
+          property: holder.dataset.property ?? '',
+          choice: holder.dataset.choice ?? '',
+        });
+        return;
       case 'rescanConflicts':
         sendIntent({ kind: 'rescanConflicts', scope: holder.dataset.scope ?? '' });
         return;
@@ -316,6 +335,21 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
     }
   };
 
+  /**
+   * 关闭确认对话框（视图瞬时）：记住被取消的 id 并隐藏当前覆盖层。
+   * 不发送意图——宿主状态（待确认动作）不变，下一次更换 id 的渲染才会
+   * 再次请求确认。
+   */
+  const dismissDialog = (dialogId: string): void => {
+    dismissedDialogId = dialogId;
+    const backdrop = root.querySelector<HTMLElement>(
+      `[data-confirm-dialog-id="${cssEscape(dialogId)}"]`,
+    );
+    if (backdrop) {
+      backdrop.hidden = true;
+    }
+  };
+
   const onClick = (event: MouseEvent): void => {
     if (isComposing) {
       return;
@@ -333,6 +367,15 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
           foldedNavKeys.delete(key);
         }
         applyFold(toggle, folded);
+      }
+      return;
+    }
+    // P7 确认对话框取消：纯视图瞬时行为，不发意图（宿主状态不变）。
+    const dismiss = target?.closest<HTMLElement>('[data-dialog-dismiss]');
+    if (dismiss && !dismiss.hasAttribute('disabled')) {
+      const dialogId = dismiss.dataset.dialogDismiss;
+      if (dialogId) {
+        dismissDialog(dialogId);
       }
       return;
     }
@@ -406,6 +449,17 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
     // Enter 快捷动作不抢占输入法组合；组合期间事件交还给输入法。
     if (event.key === 'Enter' && (isComposing || event.isComposing)) {
       event.stopPropagation();
+    }
+    // Escape 关闭可见的确认对话框（与取消按钮同一条视图瞬时通道）。
+    if (event.key === 'Escape' && !isComposing) {
+      const backdrop = root.querySelector<HTMLElement>('[data-confirm-dialog-id]');
+      if (backdrop && !backdrop.hidden) {
+        const dialogId = backdrop.dataset.confirmDialogId;
+        if (dialogId) {
+          dismissDialog(dialogId);
+          event.stopPropagation();
+        }
+      }
     }
   };
 
@@ -497,11 +551,60 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
     }
   };
 
+  /**
+   * 整帧重绘后的确认对话框状态：没有对话框的帧清空取消记忆；同一 id
+   * 若已被用户取消则保持关闭；新 id 或新帧正常展示并聚焦取消按钮。
+   */
+  const applyDialogVisibility = (): void => {
+    const backdrop = root.querySelector<HTMLElement>('[data-confirm-dialog-id]');
+    if (!backdrop) {
+      dismissedDialogId = null;
+      return;
+    }
+    const dialogId = backdrop.dataset.confirmDialogId ?? '';
+    if (dialogId !== '' && dialogId === dismissedDialogId) {
+      backdrop.hidden = true;
+      return;
+    }
+    // 模态确认打开时焦点落在取消按钮（安全默认），避免背景控件继续输入。
+    backdrop.querySelector<HTMLElement>('[data-dialog-dismiss]')?.focus?.({ preventScroll: true });
+  };
+
+  /**
+   * 冲突行状态变化（P7）：整帧重绘后按行 ID 对比上一帧状态，把
+   * unresolved/postponed → resolved 的行标为 just-resolved，播放一次
+   * 撤下动效（行本身保留在列表中，不伪造「消失=已解决」）。
+   */
+  const applyConflictRowTransitions = (): void => {
+    const seen = new Set<string>();
+    for (const item of root.querySelectorAll<HTMLElement>('.conflict-item[data-row-id]')) {
+      const rowId = item.dataset.rowId ?? '';
+      const status = item.dataset.status ?? '';
+      if (!rowId) {
+        continue;
+      }
+      seen.add(rowId);
+      const previous = conflictRowStatuses.get(rowId);
+      if (status === 'resolved' && previous !== undefined && previous !== 'resolved') {
+        item.classList.add('just-resolved');
+      }
+      conflictRowStatuses.set(rowId, status);
+    }
+    for (const rowId of [...conflictRowStatuses.keys()]) {
+      if (!seen.has(rowId)) {
+        conflictRowStatuses.delete(rowId);
+      }
+    }
+  };
+
   const applyRender = (html: string, formRevision: number, sessionChanged = false): void => {
     const snapshot = captureState();
     if (sessionChanged) {
       // 目标切换：捕获只是为了新旧 DOM 对齐，旧目标的滚动记忆必须丢弃。
       scrollPositions.clear();
+      // 旧目标的已取消确认与冲突行状态不带入新目标。
+      dismissedDialogId = null;
+      conflictRowStatuses.clear();
     }
     root.innerHTML = html;
     // 视图更新的输入不回退：宿主 formRevision 落后于本地未确认输入时，
@@ -557,6 +660,9 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
       }
     }
     restoreState(snapshot);
+    // P7：冲突行状态撤下动效与确认对话框的取消记忆（均在整帧替换后应用）。
+    applyConflictRowTransitions();
+    applyDialogVisibility();
   };
 
   /** 应用一个导航目录的折叠/展开状态到 DOM（符号、aria 与子树显隐）。 */

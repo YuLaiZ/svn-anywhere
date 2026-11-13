@@ -26,7 +26,7 @@ import {
   type ViewToHostMessage,
 } from './protocol';
 import { allowedActions, gatePermits, M2_PANEL_GATES, type PanelGates } from './gates';
-import type { LazyTreeRowSpec, PanelState, RowSpec, TableRowSpec } from './state';
+import type { ConflictRowSpec, LazyTreeRowSpec, PanelState, RowSpec, TableRowSpec } from './state';
 import { findRow } from './state';
 import { render } from './view';
 
@@ -533,10 +533,12 @@ function findLazyNode(rows: LazyTreeRowSpec[] | undefined, nodeId: string): Lazy
   return undefined;
 }
 
-/** 行 ID 在列表或表格中查找（M4 面板按数据形态二选一承载行）。 */
-function findStateRow(state: PanelState, id: string): RowSpec | TableRowSpec | undefined {
+/** 行 ID 在列表、表格或 P7 冲突列表中查找（M4 面板按数据形态承载行）。 */
+function findStateRow(state: PanelState, id: string): RowSpec | TableRowSpec | ConflictRowSpec | undefined {
   const listRow = state.list ? findRow(state.list.rows, id) : undefined;
-  return listRow ?? state.table?.rows.find((row) => row.id === id);
+  return listRow
+    ?? state.table?.rows.find((row) => row.id === id)
+    ?? state.conflictList?.rows.find((row) => row.id === id);
 }
 
 /**

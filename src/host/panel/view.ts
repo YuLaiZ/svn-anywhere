@@ -22,9 +22,16 @@ import {
   visibleRows,
   type ActionSpec,
   type BannerSpec,
+  type ConflictListSpec,
+  type ConflictPanelRowStatus,
+  type ConflictRowSpec,
+  type ConfirmDialogSpec,
+  type DetailArtifactSpec,
   type DetailCopyWindowSpec,
   type DetailPathChangeSpec,
+  type DetailPropertySpec,
   type DetailSectionSpec,
+  type DetailVariantOptionSpec,
   type FilterPanelSpec,
   type FilterSpec,
   type LazyTreeRowSpec,
@@ -85,6 +92,9 @@ export function render(state: PanelState): string {
     if (state.table) {
       parts.push(renderTable(state));
     }
+    if (state.conflictList) {
+      parts.push(renderConflictList(state));
+    }
     if (state.list) {
       parts.push(renderFilterBar(state, locked));
       parts.push(renderSelectionBar(state, locked));
@@ -98,6 +108,8 @@ export function render(state: PanelState): string {
   if (busy) {
     parts.push('<div class="progress" role="status" aria-label="busy"><i></i></div>');
   }
+  // P7 确认对话框：覆盖层最后渲染（fixed 定位，不在文档流中挤压面板）。
+  parts.push(renderConfirmDialog(state));
   return `<main class="panel" data-busy="${busy ? '1' : '0'}" data-revision="${state.revision}">${parts.join('')}</main>`;
 }
 
@@ -425,13 +437,16 @@ function renderMasterDetail(state: PanelState, locked: boolean): string {
   );
 }
 
-/** 主区内容优先级：懒加载树 > 表格 > 列表；面板每帧只应声明一种主组件。 */
+/** 主区内容优先级：懒加载树 > 表格 > 冲突列表 > 列表；每帧只声明一种主组件。 */
 function renderMasterContent(state: PanelState, locked: boolean): string {
   if (state.lazyTree) {
     return renderLazyTree(state);
   }
   if (state.table) {
     return renderTable(state);
+  }
+  if (state.conflictList) {
+    return renderConflictList(state);
   }
   if (state.list) {
     return renderFilterBar(state, locked) + renderSelectionBar(state, locked) + renderList(state, locked);
@@ -506,8 +521,272 @@ function renderDetailSection(
     const body = renderCopyWindow(section.items, section.emptyText);
     return `<div class="detail-section">${heading}${body}</div>`;
   }
+  if (section.kind === 'artifacts') {
+    return renderArtifactsSection(section.artifacts, section.heading, section.emptyText, section.note);
+  }
+  if (section.kind === 'properties') {
+    return renderPropertiesSection(section.properties, section.heading, section.note, state);
+  }
+  if (section.kind === 'variants') {
+    return renderVariantsSection(section, state);
+  }
   const paragraphs = section.paragraphs.map((text) => `<p>${escapeHtml(text)}</p>`).join('');
   return `<div class="detail-section">${heading}${paragraphs}</div>`;
+}
+
+/**
+ * P7 冲突辅助文件段：角色徽标 + 工作副本相对路径 + 可选 revision。
+ * 路径来自当前冲突记录的 info 辅助文件字段（不是按后缀扫描整个副本），
+ * 全部动态值转义，窄面板允许任意位置换行。
+ */
+function renderArtifactsSection(
+  artifacts: DetailArtifactSpec[],
+  heading: string | undefined,
+  emptyText: string | undefined,
+  note: string | undefined,
+): string {
+  const head = heading ? `<h2>${escapeHtml(heading)}</h2>` : '';
+  const body = artifacts.length === 0
+    ? (emptyText ? `<p class="muted">${escapeHtml(emptyText)}</p>` : '')
+    : `<ul class="artifact-list">${artifacts.map((artifact) => {
+        const revision = artifact.revision !== undefined
+          ? `<span class="artifact-revision mono">r${escapeHtml(artifact.revision)}</span>`
+          : '';
+        return `<li class="artifact-item"><span class="artifact-role">${escapeHtml(artifact.roleLabel)}</span>` +
+          `<span class="artifact-path mono" title="${escapeHtml(artifact.path)}">${escapeHtml(artifact.path)}</span>${revision}</li>`;
+      }).join('')}</ul>`;
+  const noteHtml = note ? `<p class="muted">${escapeHtml(note)}</p>` : '';
+  return `<div class="detail-section">${head}${body}${noteHtml}</div>`;
+}
+
+/**
+ * P7 属性冲突三值对照：每个属性一组「本地（working）/基线（source-left）/
+ * 传入（source-right）」，选中值高亮；逐属性选择按钮由宿主 ActionSpec
+ * 提供（意图参数走 data-* 载荷，视图不解释属性语义）。保留属性
+ * （svn:mergeinfo 等）以 autoUnsupportedNote 标注且不渲染选择动作。
+ */
+function renderPropertiesSection(
+  properties: DetailPropertySpec[],
+  heading: string | undefined,
+  note: string | undefined,
+  state: PanelState,
+): string {
+  const head = heading ? `<h2>${escapeHtml(heading)}</h2>` : '';
+  const items = properties.map((property) => {
+    const unsupported = property.autoUnsupported === true;
+    const badge = unsupported && property.autoUnsupportedNote
+      ? `<span class="property-unsupported" title="${escapeHtml(property.autoUnsupportedNote)}">${escapeHtml(property.autoUnsupportedNote)}</span>`
+      : '';
+    const cell = (
+      value: DetailPropertySpec['local'],
+      selected: boolean,
+    ): string => {
+      const action = value.action && !unsupported
+        ? renderActionButton(value.action, {
+            intent: value.action.id,
+            argName: '',
+            argValue: '',
+            extraId: '',
+            gated: actionGated(state, value.action.id),
+          })
+        : '';
+      // exists=false 表示该侧不存在该属性：文本仍由宿主提供，视图只附加
+      // 弱化样式（不推断「不存在」文案，也不伪造空值）。
+      const absent = value.exists === false ? ' absent' : '';
+      return `<div class="property-value${selected ? ' selected' : ''}${absent}">` +
+        `<code class="mono">${escapeHtml(value.text)}</code>${action}</div>`;
+    };
+    const mineLabel = strings.conflictPanel.propertyMine;
+    const baseLabel = strings.conflictPanel.propertyBase;
+    const incomingLabel = strings.conflictPanel.propertyIncoming;
+    return `<div class="property-item" data-property-name="${escapeHtml(property.name)}">` +
+      `<div class="property-head"><span class="property-name mono">${escapeHtml(property.name)}</span>${badge}</div>` +
+      `<div class="property-grid">` +
+      `<div class="property-cell"><strong>${escapeHtml(mineLabel)}</strong>${cell(property.local, property.selected === 'local')}</div>` +
+      `<div class="property-cell"><strong>${escapeHtml(baseLabel)}</strong>${cell(property.base, property.selected === 'base')}</div>` +
+      `<div class="property-cell"><strong>${escapeHtml(incomingLabel)}</strong>${cell(property.incoming, property.selected === 'incoming')}</div>` +
+      `</div></div>`;
+  }).join('');
+  const noteHtml = note ? `<p class="muted">${escapeHtml(note)}</p>` : '';
+  return `<div class="detail-section">${head}<div class="property-list">${items}</div>${noteHtml}</div>`;
+}
+
+/**
+ * P7 处理结果变体：常用选项以 choice 卡渲染，其余收进「高级 SVN 变体」
+ * details（视图瞬时折叠）。选择按钮只转发稳定枚举值（缺省
+ * chooseConflictVariant + payload.value）；混合路径等禁止直接应用时由
+ * 宿主给出 disabledReason 与 warn 说明，视图不自行判断动作对错。
+ */
+function renderVariantsSection(
+  section: Extract<DetailSectionSpec, { kind: 'variants' }>,
+  state: PanelState,
+): string {
+  const head = section.heading ? `<h2>${escapeHtml(section.heading)}</h2>` : '';
+  const advancedEnabled = section.advancedLabel !== undefined;
+  const common = section.options.filter((option) => !(advancedEnabled && option.advanced));
+  const advanced = advancedEnabled ? section.options.filter((option) => option.advanced) : [];
+  const choice = (option: DetailVariantOptionSpec): string => {
+    const intent = option.action?.id ?? 'chooseConflictVariant';
+    const payload = option.action?.payload ?? { value: option.value };
+    const payloadAttrs = Object.entries(payload)
+      .map(([key, value]) => ` data-${escapeHtml(key)}="${escapeHtml(value)}"`)
+      .join('');
+    const selected = option.selected === true;
+    const disabled = option.disabled || actionGated(state, intent) ? ' disabled' : '';
+    const title = option.disabledReason ?? option.description ?? option.label;
+    const description = option.description
+      ? `<span>${escapeHtml(option.description)}</span>`
+      : '';
+    return `<button type="button" class="choice${selected ? ' selected' : ''}" data-intent="${escapeHtml(intent)}"${payloadAttrs}` +
+      ` data-focus="variant-${escapeHtml(option.value)}" aria-pressed="${selected}" title="${escapeHtml(title)}"${disabled}>` +
+      `<strong>${escapeHtml(option.label)}</strong>${description}</button>`;
+  };
+  const grid = common.length > 0 ? `<div class="choice-grid">${common.map(choice).join('')}</div>` : '';
+  const advancedHtml = advanced.length > 0 && section.advancedLabel !== undefined
+    ? `<details class="advanced"><summary>${escapeHtml(section.advancedLabel)}</summary>` +
+      `<div class="choice-grid advanced-grid">${advanced.map(choice).join('')}</div></details>`
+    : '';
+  const warn = section.warn
+    ? `<p class="choice-warn" role="note">${escapeHtml(section.warn)}</p>`
+    : '';
+  const note = section.note ? `<p class="muted">${escapeHtml(section.note)}</p>` : '';
+  return `<div class="detail-section">${head}${grid}${advancedHtml}${warn}${note}</div>`;
+}
+
+/**
+ * P7 冲突列表：宿主已按 tab 过滤；每行是「选中查看详情」的稳定行 ID
+ * 按钮（缺省 selectConflict，不携带路径）。行外层带 data-status，供
+ * Webview 侧识别 resolved 状态变化并播放撤下动效；类型/内容子类型/
+ * 可自动标记/状态徽标全部由宿主文案驱动，视图不推断冲突语义。
+ */
+function renderConflictList(state: PanelState): string {
+  const list = state.conflictList;
+  if (!list) {
+    return '';
+  }
+  if (list.rows.length === 0) {
+    const action = list.empty.action
+      ? renderActionButton(list.empty.action, {
+          intent: list.empty.action.id,
+          argName: 'data-empty',
+          argValue: '1',
+          extraId: '',
+          gated: actionGated(state, list.empty.action.id),
+        })
+      : '';
+    return `<div class="conflict-list-block"><div class="empty"><h3>${escapeHtml(list.empty.title)}</h3>` +
+      `${list.empty.detail ? `<p class="muted">${escapeHtml(list.empty.detail)}</p>` : ''}${action}</div></div>`;
+  }
+  const selectIntent = list.selectIntent ?? 'selectConflict';
+  const rows = list.rows.map((row) => renderConflictRow(state, list, row, selectIntent)).join('');
+  const aria = list.ariaLabel ? ` aria-label="${escapeHtml(list.ariaLabel)}"` : '';
+  return `<div class="conflict-list" role="list" data-conflict-list-id="${escapeHtml(list.id)}"${aria}>${rows}</div>`;
+}
+
+function conflictStatusLabel(row: ConflictRowSpec): string {
+  if (row.statusLabel) {
+    return row.statusLabel;
+  }
+  switch (row.status) {
+    case 'resolved':
+      return strings.conflictPanel.rowStatusResolved;
+    case 'postponed':
+      return strings.conflictPanel.rowStatusPostponed;
+    default:
+      // unknown 无通用默认：宿主应提供 statusLabel；缺省按未解决展示，
+      // 不把未知状态伪装成已解决。
+      return strings.conflictPanel.rowStatusUnresolved;
+  }
+}
+
+function conflictContentKindLabel(kind: NonNullable<ConflictRowSpec['contentKind']>): string {
+  switch (kind) {
+    case 'binary':
+      return strings.conflictPanel.contentKindBinary;
+    case 'unknown':
+      return strings.conflictPanel.contentKindUnknown;
+    default:
+      return strings.conflictPanel.contentKindText;
+  }
+}
+
+function renderConflictRow(
+  state: PanelState,
+  list: ConflictListSpec,
+  row: ConflictRowSpec,
+  selectIntent: string,
+): string {
+  const status: ConflictPanelRowStatus = row.status;
+  const selected = row.selected === true;
+  const classes = ['conflict-item', `status-${status}`, selected ? 'selected' : ''].filter(Boolean).join(' ');
+  const kindBadges = row.kinds
+    .map((kind) => {
+      const label = list.kindLabels?.[kind];
+      return label
+        ? `<span class="conflict-kind kind-${kind}">${escapeHtml(label)}</span>`
+        : '';
+    })
+    .join('');
+  const content = row.contentKind
+    ? `<span class="conflict-content content-${row.contentKind}">${escapeHtml(conflictContentKindLabel(row.contentKind))}</span>`
+    : '';
+  const auto = row.auto
+    ? `<span class="conflict-auto ${row.auto.kind === 'unsupported' ? 'unsupported' : 'applicable'}"` +
+      `${row.auto.reason ? ` title="${escapeHtml(row.auto.reason)}"` : ''}>${escapeHtml(row.auto.label)}</span>`
+    : '';
+  const statusBadge = `<span class="conflict-status st-${status}">${escapeHtml(conflictStatusLabel(row))}</span>`;
+  const actions = (row.actions ?? [])
+    .map((action) =>
+      renderActionButton(action, {
+        intent: action.id,
+        argName: 'data-row-id',
+        argValue: row.id,
+        extraId: '',
+        gated: actionGated(state, action.id),
+      }),
+    )
+    .join('');
+  const acts = actions ? `<div class="acts">${actions}</div>` : '';
+  const selectDisabled = actionGated(state, selectIntent) ? ' disabled' : '';
+  return `<div class="${classes}" data-row-id="${escapeHtml(row.id)}" data-status="${status}" role="listitem">` +
+    `<button type="button" class="conflict-select" data-intent="${escapeHtml(selectIntent)}" data-row-id="${escapeHtml(row.id)}"` +
+    ` data-focus="conflict-row-${escapeHtml(row.id)}" aria-current="${selected ? 'true' : 'false'}"${selectDisabled}>` +
+    `<span class="conflict-path mono" title="${escapeHtml(row.path)}">${escapeHtml(row.path)}</span>` +
+    `<span class="conflict-badges">${kindBadges}${content}${auto}${statusBadge}</span></button>${acts}</div>`;
+}
+
+/**
+ * P7 确认对话框（树冲突节点处理确认/二次确认）：覆盖层 + role=dialog
+ * aria-modal；正文分段渲染（preformatted 原样）。确认按钮转发宿主给出的
+ * 动作意图；取消按钮只带 data-dialog-dismiss（Webview 瞬时关闭，不发
+ * 意图、不改宿主状态），宿主重新请求确认时应更换 id。
+ */
+function renderConfirmDialog(state: PanelState): string {
+  const dialog: ConfirmDialogSpec | undefined = state.confirmDialog;
+  if (!dialog) {
+    return '';
+  }
+  const titleId = `confirm-dialog-title-${dialog.id}`;
+  const detail = !dialog.detail
+    ? ''
+    : dialog.preformatted
+      ? `<pre class="confirm-detail">${escapeHtml(dialog.detail)}</pre>`
+      : dialog.detail
+        .split('\n')
+        .filter((line) => line.length > 0)
+        .map((line) => `<p>${escapeHtml(line)}</p>`)
+        .join('');
+  const cancelLabel = dialog.cancelLabel ?? strings.panel.dismiss;
+  const level = dialog.level === 'warn' ? ' warn' : '';
+  return (
+    `<div class="modal-backdrop" data-confirm-dialog-id="${escapeHtml(dialog.id)}">` +
+    `<section class="confirm-dialog${level}" role="dialog" aria-modal="true" aria-labelledby="${escapeHtml(titleId)}">` +
+    `<h2 id="${escapeHtml(titleId)}">${escapeHtml(dialog.title)}</h2>${detail}` +
+    `<div class="confirm-actions">` +
+    `<button type="button" class="row-act" data-dialog-dismiss="${escapeHtml(dialog.id)}" data-focus="dialog-cancel-${escapeHtml(dialog.id)}">${escapeHtml(cancelLabel)}</button>` +
+    `${renderActionButton(dialog.confirm, { intent: dialog.confirm.id, argName: '', argValue: '', extraId: '' })}` +
+    `</div></section></div>`
+  );
 }
 
 /**
@@ -1365,7 +1644,13 @@ function renderActionButton(action: ActionSpec, binding: ActionBinding): string 
   const payload = Object.entries(action.payload ?? {})
     .map(([key, value]) => ` data-${escapeHtml(key)}="${escapeHtml(value)}"`)
     .join('');
-  return `<button type="button" class="row-act" data-intent="${escapeHtml(binding.intent)}" ${binding.argName}="${escapeHtml(binding.argValue)}"${extra}${payload} data-focus="${escapeHtml(`${binding.intent}-${binding.argValue}`)}" title="${escapeHtml(title)}" aria-label="${escapeHtml(title)}"${disabled}>${escapeHtml(action.label)}</button>`;
+  // 空 argName 表示动作参数完全来自 payload（P7 属性值选择/确认按钮等）：
+  // 不输出绑定属性，data-focus 退化为意图名，避免空的 data-* 绑定。
+  const bindingAttr = binding.argName
+    ? ` ${binding.argName}="${escapeHtml(binding.argValue)}"`
+    : '';
+  const focusKey = binding.argName ? `${binding.intent}-${binding.argValue}` : binding.intent;
+  return `<button type="button" class="row-act" data-intent="${escapeHtml(binding.intent)}"${bindingAttr}${extra}${payload} data-focus="${escapeHtml(focusKey)}" title="${escapeHtml(title)}" aria-label="${escapeHtml(title)}"${disabled}>${escapeHtml(action.label)}</button>`;
 }
 
 function renderFooter(state: PanelState, locked: boolean): string {

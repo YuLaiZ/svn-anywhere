@@ -95,6 +95,10 @@ import {
   registerBrowseRepositoryCommand,
 } from '../src/host/commands/browse';
 import {
+  disposeScanConflictsCommandForTest,
+  registerScanConflictsCommand,
+} from '../src/host/commands/conflicts';
+import {
   disposeEditorCommandsForTest,
   registerEditorCommands,
 } from '../src/host/commands/editor';
@@ -133,6 +137,7 @@ beforeEach(() => {
   resetOutputState();
   disposeBrowseRepositoryCommandForTest();
   disposeShowHistoryCommandForTest();
+  disposeScanConflictsCommandForTest();
   disposeEditorCommandsForTest();
   vscodeMock.channels.length = 0;
   vscodeMock.information.length = 0;
@@ -349,21 +354,24 @@ describe('registerAllCommands 二次激活', () => {
     // registerAllCommands 之后经独立句柄接线（同一注册序列在本用例中复现）。
     // M4 阶段 3：命令数 18→19——showHistory 与 browseRepository 同模式。
     // M4 阶段 4：命令数 19→21——toggleQuickDiff/toggleInlineBlame 同模式。
+    // M4 阶段 5：命令数 21→22——scanConflicts 同模式。
     const firstContext = { subscriptions: [], globalState } as unknown as vscode.ExtensionContext;
     await registerAllCommands(firstContext);
     registerBrowseRepositoryCommand(firstContext);
     registerShowHistoryCommand(firstContext);
+    registerScanConflictsCommand(firstContext);
     registerEditorCommands(firstContext);
-    expect(vscodeMock.registered).toHaveLength(21);
+    expect(vscodeMock.registered).toHaveLength(22);
     const firstHandles = vscodeMock.registered.map((r) => r.disposable);
 
     const secondContext = { subscriptions: [], globalState } as unknown as vscode.ExtensionContext;
     await expect(registerAllCommands(secondContext)).resolves.toBeUndefined();
     registerBrowseRepositoryCommand(secondContext);
     registerShowHistoryCommand(secondContext);
+    registerScanConflictsCommand(secondContext);
     registerEditorCommands(secondContext);
     expect(firstHandles.every((d) => d.disposed)).toBe(true);
-    expect(vscodeMock.registered).toHaveLength(42);
-    expect(vscodeMock.activeCommandIds.size).toBe(21);
+    expect(vscodeMock.registered).toHaveLength(44);
+    expect(vscodeMock.activeCommandIds.size).toBe(22);
   });
 });

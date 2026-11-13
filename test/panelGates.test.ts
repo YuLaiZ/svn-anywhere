@@ -294,14 +294,14 @@ describe('P7 放行表（扫描/写入在途与写锁）', () => {
     'openConflictEditor', 'openConflictVersion', 'copyConflictPath',
     'authenticateConflictSource', 'viewTaskLog', 'closePanel',
   ];
-  const sessionIntents = ['chooseConflictVariant', 'postponeConflict'];
+  const sessionIntents = ['chooseConflictVariant', 'choosePropertyValue', 'postponeConflict'];
   const writeIntents = [
     'applyConflictResolution', 'prepareTreeConflict',
     'planConflictBatch', 'startConflictBatch',
   ];
   const scanIntents = ['rescanConflicts', 'scanWholeWorkCopy'];
 
-  it('busy 放行只读查看与会话状态动作（策略选择/推迟只改宿主内存）', () => {
+  it('busy 放行只读查看与会话状态动作（策略/属性值选择、推迟只改宿主内存）', () => {
     for (const kind of [...readonlyIntents, ...sessionIntents]) {
       expect(gatePermits(gates, true, false, { kind }), `busy ${kind}`).toBe(true);
     }
@@ -492,8 +492,8 @@ describe('M4 占用态派生（与 M1-M3 共享写锁注册表）', () => {
 });
 
 describe('M4 意图全量对账（放行表与协议白名单同源）', () => {
-  it('44 个 M4 意图每个都在某张 P5/P6/P7 表的放行或显式阻塞集中有归宿', () => {
-    expect(M4_INTENT_KINDS).toHaveLength(44);
+  it('45 个 M4 意图每个都在某张 P5/P6/P7 表的放行或显式阻塞集中有归宿', () => {
+    expect(M4_INTENT_KINDS).toHaveLength(45);
     const p5 = createP5Gates();
     const p6 = createP6Gates();
     const p7 = createP7Gates();

@@ -696,6 +696,32 @@ export type DetailSectionSpec =
     heading?: string;
     items: DetailCopyWindowSpec[];
     emptyText?: string;
+  }
+  | {
+    /** P7 冲突辅助文件（角色 + 路径 + 可选 revision）；不按后缀扫描。 */
+    kind: 'artifacts';
+    heading?: string;
+    artifacts: DetailArtifactSpec[];
+    emptyText?: string;
+    note?: string;
+  }
+  | {
+    /** P7 属性冲突三值对照与逐属性选择（多属性逐项，不提供一键覆盖）。 */
+    kind: 'properties';
+    heading?: string;
+    properties: DetailPropertySpec[];
+    note?: string;
+  }
+  | {
+    /** P7 处理结果变体：常用选项 + 高级 SVN 变体折叠区（六种文本变体）。 */
+    kind: 'variants';
+    heading?: string;
+    options: DetailVariantOptionSpec[];
+    /** 高级变体折叠标题（宿主 i18n；缺省时 advanced 选项直接展示）。 */
+    advancedLabel?: string;
+    note?: string;
+    /** warn 级说明（混合路径直接应用禁用原因等）。 */
+    warn?: string;
   };
 
 /** 节点、revision、冲突详情（宿主生成全部文案；视图只排版与转义）。 */
@@ -710,6 +736,135 @@ export interface DetailSpec {
    */
   id?: string;
   sections: DetailSectionSpec[];
+}
+
+/* ---------------- P7 冲突面板组件契约（列表、详情段与确认对话框） ---------------- */
+
+/**
+ * P7 冲突行状态：未知（命令失败/回扫未决）不得伪装成已解决。
+ * resolved 行保留在列表中（resolvedLedger 会话状态），由视图做撤下动效。
+ */
+export type ConflictPanelRowStatus = 'unresolved' | 'resolved' | 'postponed' | 'unknown';
+
+/**
+ * 冲突行的自动处理能力标记：可自动（宿主 i18n 文案）或不适用（原因
+ * 必填，title/aria 展示；如保留属性「不适用：需检查器处理」）。
+ */
+export interface ConflictAutoMarkSpec {
+  kind: 'applicable' | 'unsupported';
+  label: string;
+  reason?: string;
+}
+
+/**
+ * P7 冲突列表行：视图只按稳定行 ID 转发选中意图（缺省 selectConflict），
+ * 不携带路径；行 status 决定状态徽标与 resolved 撤下动效语义。
+ */
+export interface ConflictRowSpec {
+  /** 冲突指纹（ConflictRecord.id / resolvedLedger.fingerprint）。 */
+  id: string;
+  path: string;
+  /** 冲突类型；同一行多种即同路径混合冲突（混合路径由宿主禁用直接应用）。 */
+  kinds: Array<'text' | 'property' | 'tree'>;
+  status: ConflictPanelRowStatus;
+  /** 状态徽标文案（宿主 i18n）；缺省按 status 取 conflictPanel.rowStatus*。 */
+  statusLabel?: string;
+  /** 文件冲突的内容子类型（二进制子类型徽标）；属性/树行缺省。 */
+  contentKind?: 'text' | 'binary' | 'unknown';
+  /** 可自动策略标记（可自动处理 / 不适用：需检查器处理）。 */
+  auto?: ConflictAutoMarkSpec;
+  selected?: boolean;
+  /** 行内动作（检查器等；意图只带稳定 ID，由宿主映射）。 */
+  actions?: ActionSpec[];
+}
+
+/**
+ * P7 冲突列表：宿主已完成 tab 过滤与排序，视图只渲染当前行集。
+ * 空态由宿主区分「没有冲突 / 当前分组无冲突 / 扫描失败」。
+ */
+export interface ConflictListSpec {
+  id: string;
+  ariaLabel?: string;
+  /** 每行类型徽标的展示文案（宿主 i18n：文件/属性/树）。 */
+  kindLabels?: Partial<Record<'text' | 'property' | 'tree', string>>;
+  rows: ConflictRowSpec[];
+  /** 行选中意图（缺省 selectConflict；意图只带稳定行 ID）。 */
+  selectIntent?: string;
+  empty: { title: string; detail?: string; action?: ActionSpec };
+}
+
+/**
+ * P7 确认对话框（树冲突节点处理确认等）：模态文案与二次确认；确认按钮
+ * 的意图由宿主提供（树冲突为 prepareTreeConflict，二次确认为
+ * applyConflictResolution）。取消只是视图瞬时关闭（data-dialog-dismiss），
+ * 不产生意图、不改变宿主状态；宿主每次重新请求确认应生成新的 id，
+ * 视图才会在用户取消后再次展示同一确认。
+ */
+export interface ConfirmDialogSpec {
+  id: string;
+  title: string;
+  /** 正文（按换行分段；preformatted 时原样展示，适合命令范围原文）。 */
+  detail?: string;
+  preformatted?: boolean;
+  level?: 'info' | 'warn';
+  /** 确认动作（意图 id 与 payload 由宿主给出；视图不解释业务语义）。 */
+  confirm: ActionSpec;
+  /** 取消按钮文案（宿主 i18n；缺省 strings.panel.dismiss）。 */
+  cancelLabel?: string;
+}
+
+/** 冲突辅助文件：角色与路径来自当前冲突记录，视图不按后缀扫描/推断。 */
+export interface DetailArtifactSpec {
+  /** 角色展示文案（宿主 i18n：冲突基线/本地工作内容/传入内容/属性拒绝文件）。 */
+  roleLabel: string;
+  path: string;
+  revision?: string;
+}
+
+/** 单个冲突属性的三值之一（本地=working、基线=source-left、传入=source-right）。 */
+export interface DetailPropertyValueSpec {
+  /** 值展示文本（宿主格式化；不存在时由 exists=false 标记存在性）。 */
+  text: string;
+  exists?: boolean;
+  /**
+   * 值的原始字节数（存在时由宿主给出，空值 0）；检查器只输出存在性与
+   * 字节数，属性值原文只留在面板详情，不进入输出频道（技术方案 §5.2/§5.3）。
+   */
+  bytes?: number;
+  /** 该值的逐项选择动作（宿主 ActionSpec；缺省不渲染选择按钮）。 */
+  action?: ActionSpec;
+}
+
+/** 属性冲突单项：名称 + 三值对照 + 可选逐项选择；多属性逐项选择。 */
+export interface DetailPropertySpec {
+  name: string;
+  local: DetailPropertyValueSpec;
+  base: DetailPropertyValueSpec;
+  incoming: DetailPropertyValueSpec;
+  /** 当前选择（视图据此渲染选中样式）。 */
+  selected?: 'local' | 'base' | 'incoming';
+  /** 保留属性（svn:mergeinfo 等）：标注且不可自动处理。 */
+  autoUnsupported?: boolean;
+  /** 不适用说明（宿主 i18n：如「不适用：需检查器处理」）。 */
+  autoUnsupportedNote?: string;
+}
+
+/**
+ * P7 变体选项：value 是 svn --accept 冻结枚举之一（视图只转发 data-value），
+ * advanced 选项收进「高级 SVN 变体」折叠区；混合路径等禁止直接应用时
+ * disabled + disabledReason 表达原因（title/aria 可解释）。
+ */
+export interface DetailVariantOptionSpec {
+  value: string;
+  label: string;
+  description?: string;
+  selected?: boolean;
+  disabled?: boolean;
+  disabledReason?: string;
+  /** 归入高级变体折叠区（如 base / mine-conflict / theirs-conflict）。 */
+  advanced?: boolean;
+  /** 选择动作（缺省 chooseConflictVariant + payload.value）。 */
+  action?: ActionSpec;
 }
 
 export interface FilterPanelFieldSpec {
@@ -803,6 +958,10 @@ export interface PanelState {
   layout?: MasterDetailSpec;
   /** 主从布局的详情内容（节点/revision/冲突详情）。 */
   detail?: DetailSpec;
+  /** P7 冲突列表（与主从布局配合；宿主已完成 tab 过滤与排序）。 */
+  conflictList?: ConflictListSpec;
+  /** P7 确认对话框（树冲突节点处理确认/二次确认；确认意图由宿主提供）。 */
+  confirmDialog?: ConfirmDialogSpec;
   /** 折叠筛选面板（P6 关键词/作者/日期/路径；变化立即提交）。 */
   filterPanel?: FilterPanelSpec;
   /** 分组 tab（P7 文件/属性/树；仅计数与当前 tab）。 */

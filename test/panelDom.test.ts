@@ -1185,3 +1185,281 @@ describe('表格交互：排序/翻页/行内定位/文本筛选转发', () => {
     app.dispose();
   });
 });
+
+describe('P7 冲突面板：行选择/属性选择/确认对话框/撤下动效', () => {
+  function p7Setup(patch: Partial<PanelState> = {}) {
+    return setup({
+      list: undefined,
+      form: undefined,
+      layout: {
+        layout: 'balanced',
+        masterLabel: '冲突列表',
+        detailLabel: '冲突详情',
+        masterScrollKey: 'conflicts-master',
+        detailScrollKey: 'conflicts-detail',
+      },
+      conflictList: {
+        id: 'conflicts',
+        ariaLabel: '冲突列表',
+        kindLabels: { text: '文件', property: '属性', tree: '树' },
+        rows: [
+          {
+            id: 'fp-text',
+            path: 'trunk/src/app.ts',
+            kinds: ['text'],
+            status: 'unresolved',
+            selected: true,
+            actions: [{ id: 'copyConflictPath', label: '复制路径' }],
+          },
+          {
+            id: 'fp-prop',
+            path: 'trunk/config',
+            kinds: ['property'],
+            status: 'unresolved',
+          },
+        ],
+        empty: {
+          title: '当前没有未解决冲突',
+          action: { id: 'rescanConflicts', label: '重新扫描', payload: { scope: 'whole' } },
+        },
+      },
+      detail: {
+        id: 'fp-text',
+        title: 'trunk/src/app.ts',
+        sections: [
+          {
+            kind: 'properties',
+            heading: '属性冲突三值',
+            properties: [{
+              name: 'p1',
+              local: {
+                text: 'local1',
+                action: { id: 'choosePropertyValue', label: '选择本地值', payload: { property: 'p1', choice: 'local' } },
+              },
+              base: { text: 'base1' },
+              incoming: { text: 'incoming1' },
+            }],
+          },
+          {
+            kind: 'variants',
+            heading: '选择处理结果',
+            advancedLabel: '高级 SVN 变体',
+            options: [
+              { value: 'theirs-full', label: '使用传入内容' },
+              { value: 'base', label: '恢复冲突基线', advanced: true },
+            ],
+          },
+          {
+            kind: 'actions',
+            actions: [
+              { id: 'applyConflictResolution', label: '应用并重新扫描' },
+              { id: 'postponeConflict', label: '推迟处理' },
+              { id: 'openWorkCopyTerminal', label: '打开 SVN 交互处理' },
+            ],
+          },
+        ],
+      },
+      ...patch,
+    });
+  }
+
+  it('点击冲突行发送 selectConflict（只带稳定行 ID，不带路径）', () => {
+    const { app, sent } = p7Setup();
+    document.querySelector<HTMLButtonElement>('.conflict-select[data-row-id="fp-text"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'selectConflict', id: 'fp-text' });
+    document.querySelector<HTMLButtonElement>('.conflict-select[data-row-id="fp-prop"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'selectConflict', id: 'fp-prop' });
+    expect(JSON.stringify(lastIntent(sent)?.intent)).not.toContain('trunk/config');
+    app.dispose();
+  });
+
+  it('行内复制路径与详情无参动作分别只转发稳定意图', () => {
+    const { app, sent } = p7Setup();
+    document.querySelector<HTMLButtonElement>('[data-intent="copyConflictPath"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'copyConflictPath', id: 'fp-text' });
+    document.querySelector<HTMLButtonElement>('[data-intent="applyConflictResolution"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'applyConflictResolution' });
+    document.querySelector<HTMLButtonElement>('[data-intent="postponeConflict"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'postponeConflict' });
+    document.querySelector<HTMLButtonElement>('[data-intent="openWorkCopyTerminal"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'openWorkCopyTerminal' });
+    app.dispose();
+  });
+
+  it('属性值选择按钮转发稳定属性名与枚举选择（choosePropertyValue + data-property/data-choice）', () => {
+    const { app, sent } = p7Setup();
+    document.querySelector<HTMLButtonElement>('[data-intent="choosePropertyValue"][data-property="p1"][data-choice="local"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'choosePropertyValue', property: 'p1', choice: 'local' });
+    app.dispose();
+  });
+
+  it('高级变体折叠区内的选项同样只转发稳定枚举值', () => {
+    const { app, sent } = p7Setup();
+    document.querySelector<HTMLDetailsElement>('details.advanced > summary')?.click();
+    document.querySelector<HTMLButtonElement>('[data-intent="chooseConflictVariant"][data-value="base"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'chooseConflictVariant', value: 'base' });
+    app.dispose();
+  });
+
+  it('扫描进度取消入口转发宿主动作（无参意图）', () => {
+    const { app, sent } = p7Setup({
+      progress: {
+        title: '正在扫描工作副本冲突',
+        detail: '已扫描 12 / 40 项',
+        ratio: 0.3,
+        actions: [{ id: 'closePanel', label: '取消' }],
+      },
+    });
+    document.querySelector<HTMLButtonElement>('[data-intent="closePanel"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'closePanel' });
+    app.dispose();
+  });
+
+  function dialogState(id: string): Partial<PanelState> {
+    return {
+      list: undefined,
+      form: undefined,
+      layout: { layout: 'balanced' },
+      confirmDialog: {
+        id,
+        title: '确认树冲突节点已处理',
+        detail: '工作副本根：/repo/wc\n冲突路径：trunk/tree-del.txt',
+        level: 'warn',
+        confirm: { id: 'prepareTreeConflict', label: '我已处理，继续' },
+        cancelLabel: '取消',
+      },
+    };
+  }
+
+  it('树冲突确认对话框：确认按钮发送 prepareTreeConflict', () => {
+    const { app, sent } = setup(dialogState('tree-prepare-fp-tree'));
+    expect(document.querySelector('.modal-backdrop')).not.toBeNull();
+    document.querySelector<HTMLButtonElement>('[data-intent="prepareTreeConflict"]')?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'prepareTreeConflict' });
+    app.dispose();
+  });
+
+  it('取消对话框不发送意图；同 id 重绘保持关闭，无对话框帧后才可重新展示', () => {
+    const { app, sent } = setup(dialogState('tree-prepare-fp-tree'));
+    const backdrop = () => document.querySelector<HTMLElement>('.modal-backdrop')!;
+    expect(backdrop().hidden).toBe(false);
+    const before = sent.length;
+    document.querySelector<HTMLButtonElement>('[data-dialog-dismiss="tree-prepare-fp-tree"]')?.click();
+    expect(backdrop().hidden).toBe(true);
+    // 取消是视图瞬时行为：不产生任何意图（宿主状态不变）。
+    expect(sent.length).toBe(before);
+    expect(sent.some((m) => (m as { type?: string }).type === 'intent')).toBe(false);
+
+    // 同一 id 的整帧重绘（宿主状态未变）保持关闭，不重新弹回。
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's1', revision: 2, formRevision: 0,
+      html: render(stateOf(dialogState('tree-prepare-fp-tree'))),
+    });
+    expect(backdrop().hidden).toBe(true);
+
+    // 某一帧不再包含对话框（宿主已关闭确认）后，同 id 的再次请求可重新展示。
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's1', revision: 3, formRevision: 0,
+      html: render(stateOf({ list: undefined, form: undefined, layout: { layout: 'balanced' } })),
+    });
+    expect(document.querySelector('.modal-backdrop')).toBeNull();
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's1', revision: 4, formRevision: 0,
+      html: render(stateOf(dialogState('tree-prepare-fp-tree'))),
+    });
+    expect(backdrop().hidden).toBe(false);
+    app.dispose();
+  });
+
+  it('宿主更换对话框 id 时立即展示新的确认（二次确认）', () => {
+    const { app } = setup(dialogState('tree-prepare-fp-tree'));
+    document.querySelector<HTMLButtonElement>('[data-dialog-dismiss="tree-prepare-fp-tree"]')?.click();
+    expect(document.querySelector<HTMLElement>('.modal-backdrop')!.hidden).toBe(true);
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's1', revision: 2, formRevision: 0,
+      html: render(stateOf(dialogState('tree-working-fp-tree'))),
+    });
+    const backdrop = document.querySelector<HTMLElement>('.modal-backdrop')!;
+    expect(backdrop.dataset.confirmDialogId).toBe('tree-working-fp-tree');
+    expect(backdrop.hidden).toBe(false);
+    app.dispose();
+  });
+
+  it('Escape 关闭确认对话框（视图瞬时，不发意图）', () => {
+    const { app, sent } = setup(dialogState('tree-prepare-fp-tree'));
+    const before = sent.length;
+    document.getElementById('app')!.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }),
+    );
+    expect(document.querySelector<HTMLElement>('.modal-backdrop')!.hidden).toBe(true);
+    expect(sent.length).toBe(before);
+    app.dispose();
+  });
+
+  it('resolved 行状态更新播放一次撤下动效（unresolved → resolved 才加 just-resolved）', () => {
+    const unresolved = stateOf({
+      list: undefined,
+      form: undefined,
+      layout: { layout: 'balanced' },
+      conflictList: {
+        id: 'conflicts',
+        rows: [
+          { id: 'fp-text', path: 'trunk/src/app.ts', kinds: ['text'], status: 'unresolved' },
+          { id: 'fp-prop', path: 'trunk/config', kinds: ['property'], status: 'postponed' },
+        ],
+        empty: { title: '空' },
+      },
+    });
+    document.body.innerHTML = '<div id="app"></div>';
+    const { api } = makeApi();
+    const app = mountPanel(document, api);
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's1', revision: 1, formRevision: 0,
+      html: render(unresolved),
+    });
+    expect(document.querySelector('.conflict-item.just-resolved')).toBeNull();
+
+    const resolved = stateOf({
+      list: undefined,
+      form: undefined,
+      layout: { layout: 'balanced' },
+      conflictList: {
+        id: 'conflicts',
+        rows: [
+          { id: 'fp-text', path: 'trunk/src/app.ts', kinds: ['text'], status: 'resolved' },
+          { id: 'fp-prop', path: 'trunk/config', kinds: ['property'], status: 'postponed' },
+        ],
+        empty: { title: '空' },
+      },
+    });
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's1', revision: 2, formRevision: 0,
+      html: render(resolved),
+    });
+    const rows = document.querySelectorAll<HTMLElement>('.conflict-item');
+    expect(rows[0].classList.contains('just-resolved')).toBe(true);
+    // 状态未变化（仍 postponed）的行不播放动效。
+    expect(rows[1].classList.contains('just-resolved')).toBe(false);
+    app.dispose();
+  });
+
+  it('P7 主从 pane 滚动位置在整帧重绘后保持（balanced 布局）', () => {
+    const { app, state } = (() => {
+      const result = p7Setup();
+      return { app: result.app, state: result.st };
+    })();
+    const master = document.querySelector<HTMLElement>('[data-scroll-key="conflicts-master"]')!;
+    master.scrollTop = 42;
+    master.scrollLeft = 3;
+    const detail = document.querySelector<HTMLElement>('[data-scroll-key="conflicts-detail"]')!;
+    detail.scrollTop = 11;
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's1', revision: 2, formRevision: 0,
+      html: render(state),
+    });
+    expect(document.querySelector<HTMLElement>('[data-scroll-key="conflicts-master"]')!.scrollTop).toBe(42);
+    expect(document.querySelector<HTMLElement>('[data-scroll-key="conflicts-master"]')!.scrollLeft).toBe(3);
+    expect(document.querySelector<HTMLElement>('[data-scroll-key="conflicts-detail"]')!.scrollTop).toBe(11);
+    app.dispose();
+  });
+});

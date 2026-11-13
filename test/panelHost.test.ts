@@ -989,6 +989,24 @@ describe('M4 门禁注册（P5/P6/P7 表走同一宿主守卫）', () => {
     h.handle.dispose();
   });
 
+  it('P7 冲突列表行校验：conflictList 行 ID 放行，缺失行静默丢弃', async () => {
+    const h = makeM4Panel('p7', createP7Gates());
+    h.patch({
+      conflictList: {
+        id: 'conflicts',
+        rows: [{ id: 'fp-1', path: 'a.txt', kinds: ['text'], status: 'unresolved' }],
+        empty: { title: '没有冲突' },
+      },
+    });
+    await h.receive({ kind: 'selectConflict', id: 'fp-1' });
+    await h.receive({ kind: 'copyConflictPath', id: 'fp-1' });
+    expect(h.intents).toHaveLength(2);
+    await h.receive({ kind: 'selectConflict', id: 'missing' });
+    await h.receive({ kind: 'copyConflictPath', id: 'missing' });
+    expect(h.intents).toHaveLength(2);
+    h.handle.dispose();
+  });
+
   it('P7 表：busy 时重复扫描与批量被拒，日志/关闭与查看放行', async () => {
     const h = makeM4Panel('p7', createP7Gates());
     h.patch({ busy: true });

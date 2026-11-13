@@ -82,8 +82,23 @@ describe('P6 历史入口贡献点（M4 阶段 3）', () => {
     expect(editor.some((item) => item.command === 'svnAnywhere.showHistory')).toBe(true);
   });
 
-  it('命令总数保持 21（17 个核心命令 + browseRepository + showHistory + toggleQuickDiff + toggleInlineBlame）', () => {
-    expect(pkg.contributes.commands).toHaveLength(21);
+  it('命令总数保持 22（17 个核心命令 + browseRepository + showHistory + toggleQuickDiff + toggleInlineBlame + scanConflicts）', () => {
+    expect(pkg.contributes.commands).toHaveLength(22);
+  });
+});
+
+describe('P7 冲突扫描入口贡献点（M4 阶段 5）', () => {
+  it('scanConflicts 已登记命令、1_info 菜单、命令面板与激活事件', () => {
+    const command = pkg.contributes.commands.find((c) => c.command === 'svnAnywhere.scanConflicts');
+    expect(command).toBeDefined();
+    expect(command?.title).toBe(strings.command.scanConflicts);
+    expect(pkg.activationEvents).toContain('onCommand:svnAnywhere.scanConflicts');
+    const submenu = pkg.contributes.menus?.['svnAnywhere.submenu'] ?? [];
+    const menuItem = submenu.find((item) => item.command === 'svnAnywhere.scanConflicts');
+    expect(menuItem, '扫描冲突应挂在 SVN 子菜单 1_info 组').toBeDefined();
+    expect(menuItem?.group?.startsWith('1_info')).toBe(true);
+    const palette = pkg.contributes.menus?.commandPalette ?? [];
+    expect(palette.some((item) => item.command === 'svnAnywhere.scanConflicts')).toBe(true);
   });
 });
 
