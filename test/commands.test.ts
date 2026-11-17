@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as vscode from 'vscode';
 
 const vscodeMock = vi.hoisted(() => ({
-  channels: [] as Array<{ lines: string[]; shown: number; appendLine: (l: string) => void; show: () => void; dispose: () => void }>,
+  channels: [] as Array<{ title: string; lines: string[]; shown: number; appendLine: (l: string) => void; show: () => void; dispose: () => void }>,
   information: [] as string[],
   warning: [] as string[],
   error: [] as Array<unknown[]>,
@@ -25,8 +25,9 @@ const vscodeMock = vi.hoisted(() => ({
 
 vi.mock('vscode', () => ({
   window: {
-    createOutputChannel: () => {
+    createOutputChannel: (title: string) => {
       const ch = {
+        title,
         lines: [] as string[],
         shown: 0,
         appendLine(line: string) {
@@ -104,6 +105,7 @@ import {
 } from '../src/host/commands/editor';
 import {
   disposeShowHistoryCommandForTest,
+  openHistoryTarget,
   registerShowHistoryCommand,
 } from '../src/host/commands/history';
 import { resolveBatchTargetGroups, resolveWorkingCopyTarget } from '../src/host/commands/target';
@@ -373,5 +375,37 @@ describe('registerAllCommands 二次激活', () => {
     expect(firstHandles.every((d) => d.disposed)).toBe(true);
     expect(vscodeMock.registered).toHaveLength(44);
     expect(vscodeMock.activeCommandIds.size).toBe(22);
+  });
+});
+
+/* ---------------------------------------------------------------------------
+ * P6 历史入口的日志频道：P6 定位/错误收口/面板未接入提示必须写
+ * history 频道，不再复用 P5 浏览频道（三频道分离）。
+ * ------------------------------------------------------------------------- */
+
+describe('P6 历史入口的日志频道', () => {
+  it('面板未接入提示写入 history 频道，不创建 browse（P5）频道', async () => {
+    await openHistoryTarget({
+      source: 'handoff',
+      payload: {
+        kind: 'file',
+        repositoryUuid: 'uuid-1',
+        repositoryRootUrl: 'https://example.com/repo',
+        rawUrl: 'https://example.com/repo/trunk/a.txt',
+        relativePath: 'trunk/a.txt',
+        snapshotRevision: 30,
+      },
+    });
+    const history = getOutputChannel('history') as unknown as { lines: string[] } | undefined;
+    expect(history?.lines.join('\n')).toContain(strings.historyCommand.panelNotReady);
+    expect(vscodeMock.channels.map((channel) => channel.title)).not.toContain(strings.output.titleBrowse);
+  });
+
+  it('统一错误收口按 history 频道写入摘要行（P6 错误的显示输出打开 history 频道）', async () => {
+    showCommandError(new Error('history 频道失败'), 'history');
+    await flushAsync();
+    const history = getOutputChannel('history') as unknown as { lines: string[] } | undefined;
+    expect(history?.lines.join('\n')).toContain('history 频道失败');
+    expect(vscodeMock.channels.map((channel) => channel.title)).not.toContain(strings.output.titleBrowse);
   });
 });

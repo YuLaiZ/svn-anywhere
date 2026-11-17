@@ -3,10 +3,10 @@
  * 只读 SVN IO 编排。状态机全部在 historyModel（纯模型）；本文件只做
  * 调度、IO、票据、认证与资源清理。
  *
- * 只读边界（技术方案 §4/§7）：P6 不产生任何 SVN 写命令（update/resolve
+ * 只读边界：P6 不产生任何 SVN 写命令（update/resolve
  * 属阶段 6/5）；历史读取只执行 info/log/cat 类只读命令。
  *
- * 读请求代次（技术方案 §2.3）：
+ * 读请求代次：
  * - 会话级：面板打开/切换目标/reset/refresh 时 handle.beginReadRequest
  *   重新取票据；任何回包先经 isSessionCurrent 校验（面板/模型/票据三元
  *   组），旧目标或旧代次的回包一律丢弃——旧目标状态已在切换前的每次
@@ -16,7 +16,7 @@
  *   credentialProvider 单飞协调器（同源并发只弹一次凭据框），凭据补录
  *   成功后重试原命令。
  *
- * upper 状态（§4.1/§6、HLS-6）：
+ * upper 状态（会话重置与上限刷新语义）：
  * - 本地入口先读 HEAD（失败且有本地 BASE → unresolved + “HEAD 暂不可用”
  *   + base-fallback 入口）；P5 交接固定 snapshotRevision，不读 HEAD；
  * - resetHistorySession 只在模型层未 resolved（unresolved）时拒绝，
@@ -40,6 +40,11 @@ import {
   type HistoryUpperRefreshMode,
 } from '../../../core/history';
 import { SvnError } from '../../../core/errors';
+import {
+  runBlame,
+  type BlameLine,
+  type BlameNotTraceableReason,
+} from '../../../core/blame';
 import {
   checkHistoryUpdatePreconditions,
   prepareHistoryUpdate,
@@ -73,7 +78,12 @@ import {
   type DiffTarget,
 } from '../../diffView';
 import { format, strings } from '../../i18n';
-import { decodingRunOptions, logCommand, logLine } from '../../output';
+import {
+  buildInlineBlameDecorationOptions,
+  buildInlineBlameDecorations,
+  createInlineBlameDecorationType,
+} from '../../inlineBlame';
+import { decodingRunOptions, logCommand, logLine, showOutput } from '../../output';
 import {
   clearM4TerminalPage,
   putM4ScopeSession,
@@ -129,6 +139,7 @@ import {
   setSnapshotComparePage,
   snapshotCandidateProbeSide,
   snapshotCandidateStatusText,
+  snapshotCompareErrorText,
   snapshotCompareSummary,
   snapshotText,
   type SnapshotCandidateContentKind,
@@ -168,10 +179,25 @@ export type HistoryComparisonRunner = (
 let panelContext: HistoryPanelContext | undefined;
 let handle: PanelHandle | undefined;
 let model: HistoryModel | undefined;
+/** 上一次应用到模型的历史每批条数（仅配置值变化时才覆盖用户选择）。 */
+let appliedHistoryPageSize: number | undefined;
 let entryTarget: HistoryOpenTarget | undefined;
 let sessionTicket: ReadRequestTicket | undefined;
 let loadController: AbortController | undefined;
 let detailController: AbortController | undefined;
+/**
+ * upper 刷新在途（refreshHistoryUpper 的 HEAD/BASE 刷新链）：参与 P6 占用态
+ * 的 busy 折算——刷新探测/首批重读期间，加载更多、更新开始、重置与重复
+ * 刷新等会推进会话或写工作副本的动作必须等待，不能中止刷新子进程后静默
+ * 丢弃刷新结果。
+ */
+let refreshInFlight = false;
+/**
+ * 「更新到此版本」写前检查/模态确认窗口：命令尚未发出，但已进入 prepare/
+ * 检查/确认的异步等待段。该段参与 busy 折算，防止刷新完成推进会话票据后
+ * 让用户已确认的更新在 isSessionCurrent 守卫处被静默丢弃。
+ */
+let updatePrepareInFlight = false;
 let comparisonRunner: HistoryComparisonRunner | undefined;
 /** 当前比较结果区（快照候选）：undefined 表示历史列表模式。 */
 let compareState: SnapshotCompareState | undefined;
@@ -197,6 +223,8 @@ interface HistoryUpdateTaskExtra {
   intent: HistoryUpdateIntent;
   /** 更新状态（权威回读事实；任务终态写终态页的数据源）。 */
   state: HistoryUpdateState;
+  /** 终态是否写当前作用域：跨目标回扫的记录只保留横幅事实，不冒充目标归属。 */
+  persistTerminal: boolean;
   callbacks: HistoryUpdateTaskCallbacks;
   done: Promise<void>;
 }
@@ -232,7 +260,11 @@ function updateBlockText(reason: HistoryUpdateBlockReason, message?: string): st
     case 'kind-mismatch':
       return updateText('blockKindMismatch');
     default:
-      return format(strings.historyUpdatePanel.blockInfoError, { message: message ?? '' });
+      // core 只给原始命令输出/系统错误 detail（不再有叙述性文案）；
+      // 为空时用无占位文案，避免模板留下空冒号占位。
+      return message !== undefined && message !== ''
+        ? format(strings.historyUpdatePanel.blockInfoError, { message })
+        : strings.historyUpdatePanel.blockInfoErrorNoDetail;
   }
 }
 
@@ -340,7 +372,7 @@ function persist(): void {
 
 /* ------------------------- 推送与占用态 ------------------------- */
 
-/** 面板占用态：history-update 任务槽 + 共享写锁（技术方案 §7）。 */
+/** 面板占用态：history-update 任务槽 + 共享写锁。 */
 function occupancyOf(): PanelOccupancy {
   const lockKey = entryTarget?.source === 'local' ? entryTarget.wcRoot : null;
   return resolvePanelOccupancy('history', lockKey);
@@ -442,6 +474,10 @@ function buildCandidateDetail(compare: SnapshotCompareState): DetailSpec {
   }
   const sideText = (present: boolean, url: string | undefined): string =>
     present ? (url ?? '') : snapshotText('stateAbsent');
+  // 端标题使用该端实际 revision：复制窗口解析会改写 revision，候选表已
+  // 记录映射后的实际值（left/rightRevision 缺省时才回退用户选择值）。
+  const leftRevision = candidate.leftRevision ?? compare.leftRevision;
+  const rightRevision = candidate.rightRevision ?? compare.rightRevision;
   const sections: DetailSectionSpec[] = [{
     kind: 'kv',
     entries: [
@@ -452,12 +488,12 @@ function buildCandidateDetail(compare: SnapshotCompareState): DetailSpec {
       },
       { label: historyText('candidateStatusLabel'), value: snapshotCandidateStatusText(candidate.status) },
       {
-        label: historyText('candidateLeftHeading', { revision: String(compare.leftRevision) }),
+        label: historyText('candidateLeftHeading', { revision: String(leftRevision) }),
         value: sideText(candidate.leftPresent, candidate.leftUrl),
         mono: candidate.leftPresent,
       },
       {
-        label: historyText('candidateRightHeading', { revision: String(compare.rightRevision) }),
+        label: historyText('candidateRightHeading', { revision: String(rightRevision) }),
         value: sideText(candidate.rightPresent, candidate.rightUrl),
         mono: candidate.rightPresent,
       },
@@ -515,14 +551,23 @@ function buildStateWithOccupancy(): PanelState | undefined {
   if (model === undefined || handle === undefined) {
     return undefined;
   }
-  // 配置变化（historyPageSize）只重置展示前缀，不清已扫描数据。
-  model.setPageSize(readHistoryPageSize());
+  // 配置变化（historyPageSize）只重置展示前缀，不清已扫描数据；仅配置
+  // 值本身变化时应用——过滤面板的「每批条数」选择不能被同一值反复覆盖，
+  // 否则用户选择在下一次推送即被静默回退。
+  const configuredPageSize = readHistoryPageSize();
+  if (appliedHistoryPageSize !== configuredPageSize) {
+    appliedHistoryPageSize = configuredPageSize;
+    model.setPageSize(configuredPageSize);
+  }
   const state = model.buildPanelState(handle.sessionId);
   const occupancy = occupancyOf();
-  state.busy = state.busy || occupancy.busy;
+  // 刷新在途与更新确认窗口同属「命令在途」：与任务槽/共享写锁一样折算
+  // busy，经同一张 P6 放行表拒绝冲突动作（宿主守卫与 DOM 禁用同源）。
+  const busy = state.busy || occupancy.busy || refreshInFlight || updatePrepareInFlight;
+  state.busy = busy;
   state.writeLocked = occupancy.writeLocked;
   applyCompareOverlay(state);
-  applyUpdateOverlay(state, occupancy);
+  applyUpdateOverlay(state, { ...occupancy, busy });
   return state;
 }
 
@@ -549,6 +594,16 @@ function applyUpdateOverlay(state: PanelState, occupancy: PanelOccupancy): void 
     : update.readbackError !== undefined
       ? ` ${format(strings.historyUpdatePanel.unknownReadback, { message: update.readbackError })}`
       : '';
+  // 命令输出初解析线索：只随结果页提示一次，供与回读
+  // 交叉核对；不参与三态结算，缺省（进程级失败）时不渲染。
+  const outputHintDetail = update.outputHint !== undefined
+    ? ` ${format(strings.historyUpdatePanel.outputHint, {
+        revision: update.outputHint.finalRevision !== undefined
+          ? `r${update.outputHint.finalRevision}`
+          : '—',
+        count: String(update.outputHint.conflicts.length),
+      })}`
+    : '';
   const baseDetail = format(strings.historyUpdatePanel.updatingDetail, {
     target: update.targetRelPath === '.' ? '.' : update.targetRelPath,
     pre: String(update.preRevision),
@@ -591,7 +646,7 @@ function applyUpdateOverlay(state: PanelState, occupancy: PanelOccupancy): void 
           target: update.targetRelPath === '.' ? '.' : update.targetRelPath,
           revision: String(update.postNodeRevision ?? update.requestedRevision),
           pre: String(update.preRevision),
-        }),
+        }) + outputHintDetail,
         dismissable: !occupancy.busy && !occupancy.writeLocked,
       }, ...state.banners];
       return;
@@ -605,7 +660,7 @@ function applyUpdateOverlay(state: PanelState, occupancy: PanelOccupancy): void 
           revision: String(update.postNodeRevision ?? update.requestedRevision),
           base: String(update.postNodeRevision ?? update.requestedRevision),
           count: String(update.conflicts.length),
-        }),
+        }) + outputHintDetail,
         dismissable: false,
         actions: [
           { id: 'openUpdateConflicts', label: updateText('openConflictsAction') },
@@ -622,7 +677,7 @@ function applyUpdateOverlay(state: PanelState, occupancy: PanelOccupancy): void 
         detail: format(strings.historyUpdatePanel.unknownDetail, {
           target: update.targetRelPath === '.' ? '.' : update.targetRelPath,
           pre: String(update.preRevision),
-        }) + readbackDetail,
+        }) + readbackDetail + outputHintDetail,
         dismissable: false,
         actions: [
           { id: 'rescanHistoryUpdate', label: updateText('rescanAction') },
@@ -697,8 +752,8 @@ function historyRunOptions(url: string): RunOptions {
   const scope: AuthScope | undefined = authScopeOfUrl(url);
   const options: RunOptions = {
     timeoutMs: readTimeoutMs(),
-    ...decodingRunOptions('browse'),
-    onCredentialRetry: (args) => logCommand(svnPath, args, undefined, 'browse'),
+    ...decodingRunOptions('history'),
+    onCredentialRetry: (args) => logCommand(svnPath, args, undefined, 'history'),
   };
   if (scope !== undefined) {
     options.authScope = scope;
@@ -712,7 +767,7 @@ function historyRunOptions(url: string): RunOptions {
 /** P6 打开器（命令层与 P5 交接经 setHistoryPanelOpener/setHistoryHandoffHandler 注入）。 */
 export async function openHistoryPanel(target: HistoryOpenTarget): Promise<void> {
   if (panelContext === undefined) {
-    logLine(strings.historyCommand.panelNotReady, 'browse');
+    logLine(strings.historyCommand.panelNotReady, 'history');
     void vscode.window.showInformationMessage(strings.historyCommand.panelNotReady);
     return;
   }
@@ -783,7 +838,9 @@ async function resetAndOpen(target: HistoryOpenTarget): Promise<void> {
   entryTarget = target;
   const context = modelContextOf(target);
   const scope = scopeOfContext(context);
-  model = new HistoryModel({ pageSize: readHistoryPageSize() });
+  const initialPageSize = readHistoryPageSize();
+  model = new HistoryModel({ pageSize: initialPageSize });
+  appliedHistoryPageSize = initialPageSize;
   sessionTicket = handle.beginReadRequest(scopeTicketKey(scope));
   // 更新层恢复（活动任务 → 未决 operation record → 终态页）；历史会话
   // 数据本身仍按 m4SessionStore.browsable 独立恢复，两层不互相反推。
@@ -838,9 +895,9 @@ function parseFailure(message: string): BrowserError {
 }
 
 /**
- * 路径在 revision 不存在判定（阶段 0 C11）：`W170000` 与 `E200009` 同时
- * 出现。runOrThrow 抛出的 SvnError 只保留 stderr/message（不含 stdout），
- * 因此以错误码组合为准——C11 实测所有 absent 均为这组码；单独 E200009、
+ * 路径在 revision 不存在判定：`W170000` 与 `E200009` 同时出现。
+ * runOrThrow 抛出的 SvnError 只保留 stderr/message（不含 stdout），
+ * 因此以错误码组合为准——absent 场景均为这组码；单独 E200009、
  * E160013 或 E170013+认证/网络错误都不是 absent 证据，必须进入 error。
  */
 function isInfoAbsentFailure(err: SvnError): boolean {
@@ -858,7 +915,7 @@ async function readHeadRevision(
 ): Promise<HeadProbe> {
   const context = captured.model.context;
   if (context === undefined) {
-    return { status: 'error', error: parseFailure('缺少历史目标上下文') };
+    return { status: 'error', error: parseFailure(historyText('missingTargetContext')) };
   }
   const rootUrl = context.target.repositoryRootUrl;
   let stdout: string;
@@ -869,7 +926,7 @@ async function readHeadRevision(
   }
   const parsed = parseRemoteInfoXml(stdout);
   if (parsed === undefined) {
-    return { status: 'error', error: parseFailure('svn info --xml 输出缺少 HEAD 必需字段') };
+    return { status: 'error', error: parseFailure(historyText('headInfoIncomplete')) };
   }
   return { status: 'ok', revision: parsed.node.snapshotRevision };
 }
@@ -892,7 +949,7 @@ async function probePresence(
 ): Promise<PresenceProbe> {
   const context = captured.model.context;
   if (context === undefined) {
-    return { status: 'error', error: parseFailure('缺少历史目标上下文') };
+    return { status: 'error', error: parseFailure(historyText('missingTargetContext')) };
   }
   const target = context.target;
   const attempt = async (url: string): Promise<
@@ -933,7 +990,11 @@ async function probePresence(
   }
   return {
     status: 'error',
-    error: { kind: 'unknown', message: `目标路径的祖先在 revision ${upper} 均不存在`, codes: [] },
+    error: {
+      kind: 'unknown',
+      message: format(historyText('ancestorMissing'), { revision: String(upper) }),
+      codes: [],
+    },
   };
 }
 
@@ -1083,9 +1144,22 @@ async function pumpNetwork(
     if (!isSessionCurrent(captured)) {
       return;
     }
+    // 畸形/截断 log XML：core 抛 SvnError(XML_PARSE)，与网络失败同走
+    // 错误态呈现（可重试横幅），不静默当作空历史。
+    let entries: HistoryEntry[];
+    try {
+      entries = parseLogXml(stdout);
+    } catch (err) {
+      if (!isSessionCurrent(captured)) {
+        return;
+      }
+      captured.model.failLoad(classifyFailure(err, request.source.queryUrl));
+      pushIfCurrent(captured);
+      return;
+    }
     captured.model.applyLogPage({
       sourceId: request.source.id,
-      entries: parseLogXml(stdout),
+      entries,
       requestedLimit: captured.model.pageSize + 1,
     });
   }
@@ -1168,6 +1242,15 @@ async function refreshHead(captured: CapturedSession): Promise<void> {
   if (context === undefined) {
     return;
   }
+  // 更新确认窗口在途时不开始刷新：刷新完成会推进会话票据，令已确认的
+  // 更新在 isSessionCurrent 守卫处被静默丢弃。
+  if (updatePrepareInFlight) {
+    toast('info', historyText('updateConfirmInProgress'));
+    return;
+  }
+  const previousRefreshInFlight = refreshInFlight;
+  refreshInFlight = true;
+  pushIfCurrent(captured);
   const controller = new AbortController();
   loadController?.abort();
   loadController = controller;
@@ -1223,6 +1306,10 @@ async function refreshHead(captured: CapturedSession): Promise<void> {
     if (loadController === controller) {
       loadController = undefined;
     }
+    refreshInFlight = previousRefreshInFlight;
+    // updated 分支会推进会话票据使 captured 过期：占用态恢复必须按当前
+    // 会话推送，否则宿主会停在刷新中的 busy 快照上。
+    push();
   }
 }
 
@@ -1236,6 +1323,13 @@ async function refreshBaseFallback(captured: CapturedSession): Promise<void> {
   if (context === undefined || base === undefined) {
     return;
   }
+  if (updatePrepareInFlight) {
+    toast('info', historyText('updateConfirmInProgress'));
+    return;
+  }
+  const previousRefreshInFlight = refreshInFlight;
+  refreshInFlight = true;
+  pushIfCurrent(captured);
   const controller = new AbortController();
   loadController?.abort();
   loadController = controller;
@@ -1258,7 +1352,7 @@ async function refreshBaseFallback(captured: CapturedSession): Promise<void> {
         ? createAncestorFilterSource(context.target, presence.ancestor, base)
         : undefined;
     if (probeSource === undefined) {
-      toast('error', format(historyText('baseFallbackFailed'), { message: '没有可用的 BASE 历史源' }));
+      toast('error', format(historyText('baseFallbackFailed'), { message: historyText('baseSourceUnavailable') }));
       return;
     }
     const args = buildHistoryLogArgs(probeSource, captured.model.pageSize, captured.model.followCopies());
@@ -1276,7 +1370,17 @@ async function refreshBaseFallback(captured: CapturedSession): Promise<void> {
     if (!isSessionCurrent(captured)) {
       return;
     }
-    const entries = parseLogXml(stdout);
+    // 畸形/截断 log XML（core 抛 SvnError(XML_PARSE)）：与探测/网络失败
+    // 同口径 toast，不进入 base-fallback 结果、不改动会话状态。
+    let entries: HistoryEntry[];
+    try {
+      entries = parseLogXml(stdout);
+    } catch (err) {
+      toast('error', format(historyText('baseFallbackFailed'), {
+        message: err instanceof Error ? err.message : String(err),
+      }));
+      return;
+    }
     // log 成功：三字段固定 base-fallback/unavailable（upper=BASE）并重建源。
     captured.model.applyBaseFallbackSuccess(base, {
       targetPresentAtUpper: presence.status === 'present',
@@ -1305,6 +1409,8 @@ async function refreshBaseFallback(captured: CapturedSession): Promise<void> {
     if (loadController === controller) {
       loadController = undefined;
     }
+    refreshInFlight = previousRefreshInFlight;
+    push();
   }
 }
 
@@ -1425,7 +1531,9 @@ async function runSnapshotComparison(
     compareState = {
       ...state,
       phase: 'error',
-      errorMessage: err instanceof Error ? (err.message.split('\n')[0] ?? err.message) : String(err),
+      // 与 snapshotModel.applySnapshotCompareError 同一口径：按错误码/分类
+      // 映射 i18n，core 的英文技术诊断不直出。
+      errorMessage: snapshotCompareErrorText(err),
     };
     pushIfCurrent(captured);
   } finally {
@@ -1558,18 +1666,21 @@ async function openCandidateDiff(captured: CapturedSession): Promise<void> {
     toast('info', historyText('candidateDiffUnavailable'));
     return;
   }
+  // 端点 URL 是复制窗口解析后的实际来源 URL，必须配该端实际 revision
+  // （复制解析可能改写 revision，如 dirC r2 → dirB@4）；用用户选择的
+  // compare.*Revision 会读错版本。缺省时才回退比较请求值。
   const left = {
     ...(candidate.leftPresent && candidate.leftUrl !== undefined
       ? { rawUrl: candidate.leftUrl }
       : {}),
-    revision: compare.leftRevision,
+    revision: candidate.leftRevision ?? compare.leftRevision,
     ...(candidate.displayPath !== '' ? { displayName: candidate.displayPath } : {}),
   };
   const right = {
     ...(candidate.rightPresent && candidate.rightUrl !== undefined
       ? { rawUrl: candidate.rightUrl }
       : {}),
-    revision: compare.rightRevision,
+    revision: candidate.rightRevision ?? compare.rightRevision,
     ...(candidate.displayPath !== '' ? { displayName: candidate.displayPath } : {}),
   };
   const outcome = await openSnapshotTextDiff({
@@ -1709,6 +1820,33 @@ async function exportHistoryVersion(captured: CapturedSession): Promise<void> {
 }
 
 /**
+ * 「查看此版本」失败的宿主文案：按 BrowserError.kind 映射 i18n；core 的
+ * 英文技术诊断只进输出频道日志，不作为用户可见主文案。
+ */
+function openRevisionErrorText(error: BrowserError): string {
+  switch (error.kind) {
+    case 'notFound':
+      return snapshotText('openFailedNotFound');
+    case 'revisionNotFound':
+      return snapshotText('openFailedRevisionNotFound');
+    case 'tooLarge':
+      return snapshotText('tooLarge');
+    case 'auth':
+      return snapshotText('openFailedAuth');
+    case 'permission':
+      return snapshotText('openFailedPermission');
+    case 'network':
+      return snapshotText('openFailedNetwork', { message: error.message });
+    case 'cancelled':
+      return snapshotText('openFailedCancelled');
+    case 'parse':
+      return snapshotText('openFailedParse');
+    default:
+      return snapshotText('openFailedUnknown', { message: error.message });
+  }
+}
+
+/**
  * 查看所选版本内容：比较模式下打开选中候选的实际节点（右端优先），
  * 历史详情模式打开实际节点 URL@实际 revision（文本内嵌/二进制外部打开）。
  */
@@ -1766,13 +1904,19 @@ async function viewHistoryRevision(captured: CapturedSession): Promise<void> {
     case 'tooLarge':
       toast('error', snapshotText('tooLarge'));
       return;
+    case 'special':
+      // svn:special 符号链接不进入内置文本预览（与快照差异/导出口径一致）。
+      toast('info', snapshotText('specialNotice'));
+      return;
     case 'insufficientDisk':
-      toast('error', outcome.message);
+      // core 只返回英文技术诊断；用户提示按状态映射 i18n，原文进输出频道。
+      logLine(outcome.message, 'history');
+      toast('error', snapshotText('insufficientDisk'));
       return;
     default:
-      toast('error', outcome.status === 'notFound' || outcome.status === 'error'
-        ? outcome.error.message
-        : String(outcome));
+      logLine(outcome.error.message, 'history');
+      toast('error', openRevisionErrorText(outcome.error));
+      return;
   }
 }
 
@@ -1780,6 +1924,254 @@ async function viewHistoryRevision(captured: CapturedSession): Promise<void> {
 function relativePathWithin(wcRoot: string, targetPath: string): string {
   const rel = relative(wcRoot, targetPath);
   return rel === '' ? '.' : rel.split(sep).join('/');
+}
+
+/* ------------------------- 逐行追溯（F46） ------------------------- */
+
+/** 追溯会话：只读快照编辑器存活期间附加行尾归属，不写工作副本。 */
+interface HistoryBlameSession {
+  uriKey: string;
+  editor?: vscode.TextEditor;
+  decorationType?: vscode.TextEditorDecorationType;
+  closeSub?: vscode.Disposable;
+}
+
+let blameSession: HistoryBlameSession | undefined;
+
+/** 关闭追溯会话：撤下装饰并释放装饰类型与文档关闭监听。 */
+function disposeBlameSession(): void {
+  const session = blameSession;
+  if (session === undefined) {
+    return;
+  }
+  blameSession = undefined;
+  session.closeSub?.dispose();
+  if (session.editor !== undefined && session.decorationType !== undefined) {
+    try {
+      session.editor.setDecorations(session.decorationType, []);
+    } catch {
+      // 编辑器已释放（窗口关闭）时清理异常不影响状态收口。
+    }
+  }
+  session.decorationType?.dispose();
+}
+
+/** blame 不可追溯原因 → 用户可见文案（复用 blamePanel 既有键）。 */
+function blameNotTraceableText(reason: BlameNotTraceableReason): string {
+  switch (reason) {
+    case 'binary':
+      return strings.blamePanel.binary;
+    case 'noCommittedRevision':
+      return strings.blamePanel.noCommittedRevision;
+    case 'notFound':
+      return strings.blamePanel.notFound;
+    case 'directory':
+      return strings.blamePanel.directory;
+    case 'tooLarge':
+      return strings.blamePanel.tooLarge;
+  }
+}
+
+/**
+ * 追溯目标：比较模式取选中候选的探测侧（右端优先）；详情模式取实际
+ * 节点 URL 与实际 revision（与「查看此版本」同一口径）。
+ */
+function blameTargetOf(): { url: string; revision: number; relativePath: string } | undefined {
+  const context = model?.context;
+  if (context === undefined) {
+    return undefined;
+  }
+  const compare = compareState;
+  let url: string | undefined;
+  let revision: number | undefined;
+  let relativePath = context.target.relativePath;
+  if (compare !== undefined) {
+    const candidate = selectedSnapshotCandidate(compare);
+    const side = candidate === undefined ? undefined : snapshotCandidateProbeSide(candidate);
+    url = side?.url;
+    revision = side?.revision;
+    if (candidate !== undefined) {
+      relativePath = candidate.displayPath;
+    }
+  } else {
+    const target = detailActionTarget();
+    url = target?.url;
+    revision = target?.actualRevision ?? target?.revision;
+    relativePath = target?.repositoryPath ?? relativePath;
+  }
+  return url !== undefined && revision !== undefined ? { url, revision, relativePath } : undefined;
+}
+
+/**
+ * 在只读快照编辑器上附加行尾归属（`rN · author`）：
+ * - 只由编辑器文档的内存内容承载，不写工作副本；
+ * - 文档关闭即撤下装饰并释放资源（视图只在该只读编辑器存活期间存在）；
+ * - 再次追溯替换旧会话（同一时间至多一个追溯编辑器持有装饰）。
+ */
+async function attachBlameDecorations(
+  captured: CapturedSession,
+  uri: vscode.Uri,
+  lines: readonly BlameLine[],
+): Promise<void> {
+  disposeBlameSession();
+  if (typeof vscode.window.createTextEditorDecorationType !== 'function'
+    || typeof vscode.window.showTextDocument !== 'function') {
+    return;
+  }
+  let document: vscode.TextDocument | undefined;
+  try {
+    document = typeof vscode.workspace.openTextDocument === 'function'
+      ? await vscode.workspace.openTextDocument(uri)
+      : undefined;
+  } catch {
+    document = undefined;
+  }
+  if (!isSessionCurrent(captured) || document === undefined) {
+    return;
+  }
+  let editor: vscode.TextEditor | undefined;
+  try {
+    editor = await vscode.window.showTextDocument(uri, { preview: false, preserveFocus: false });
+  } catch {
+    editor = undefined;
+  }
+  if (!isSessionCurrent(captured) || editor === undefined) {
+    return;
+  }
+  const decorationType = createInlineBlameDecorationType();
+  const decorations = buildInlineBlameDecorations(lines, document.lineCount);
+  const session: HistoryBlameSession = {
+    uriKey: uri.toString(),
+    editor,
+    decorationType,
+  };
+  blameSession = session;
+  try {
+    editor.setDecorations(decorationType, buildInlineBlameDecorationOptions(document, decorations));
+  } catch {
+    // 编辑器在探测后立即关闭：不保留悬挂会话。
+    disposeBlameSession();
+    return;
+  }
+  if (typeof vscode.workspace.onDidCloseTextDocument === 'function') {
+    session.closeSub = vscode.workspace.onDidCloseTextDocument((closed) => {
+      if (closed.uri.toString() === session.uriKey) {
+        disposeBlameSession();
+      }
+    });
+  }
+  logLine(`[history] blame ${uri.toString()} lines=${decorations.length}`, 'history');
+}
+
+/**
+ * P6 逐行追溯（F46）：对解析后的实际 URL 使用明确 revision 执行 blame，
+ * 打开该 revision 的只读文本快照并在编辑器存活期间附加行尾归属。
+ * 二进制/删除 revision 在入口拒绝；目录目标由模型层禁用。复用
+ * `core/blame` 与只读 provider，不新增业务面板、不写工作副本。
+ */
+async function blameHistoryRevision(captured: CapturedSession): Promise<void> {
+  const context = captured.model.context;
+  if (context === undefined) {
+    return;
+  }
+  const target = blameTargetOf();
+  if (target === undefined) {
+    toast('info', snapshotText('stateNotFoundAtRevision'));
+    return;
+  }
+  const svnPath = readSvnPath();
+  const options = historyRunOptions(context.target.repositoryRootUrl);
+  // 入口探测与「打开内容」同口径：二进制不具备逐行归属语义（blame 对
+  // 二进制的跳过行为不稳定），命中时只提示、不打开文本编辑器。
+  let probe: Awaited<ReturnType<typeof probeRemoteContent>>;
+  try {
+    probe = await probeRemoteContent(svnPath, target.url, { ...options, revision: target.revision });
+  } catch (err) {
+    if (isSessionCurrent(captured)) {
+      toast('error', err instanceof Error ? err.message : String(err));
+    }
+    return;
+  }
+  if (!isSessionCurrent(captured)) {
+    return;
+  }
+  if (probe.status === 'notFound') {
+    toast('info', strings.blamePanel.notFound);
+    return;
+  }
+  if (probe.status === 'error') {
+    toast('error', probe.error.message);
+    return;
+  }
+  if (probe.classification.kind === 'binary') {
+    toast('info', strings.blamePanel.binary);
+    return;
+  }
+  const outcome = await openSnapshotNodeContent(
+    svnPath,
+    {
+      repositoryUuid: context.repositoryUuid,
+      repositoryRootUrl: context.target.repositoryRootUrl,
+      rawUrl: target.url,
+      relativePath: target.relativePath,
+      snapshotRevision: target.revision,
+      lastChangedRevision: target.revision,
+      kind: 'file',
+    },
+    target.revision,
+    options,
+  );
+  if (!isSessionCurrent(captured)) {
+    return;
+  }
+  if (outcome.status === 'openedExternal' || outcome.status === 'externalOpenFailed') {
+    // 超过内嵌上限的文本走系统应用：编辑器不归本会话持有，无法附加归属。
+    toast('info', snapshotText('tooLarge'));
+    return;
+  }
+  if (outcome.status !== 'openedText') {
+    switch (outcome.status) {
+      case 'tooLarge':
+        toast('error', snapshotText('tooLarge'));
+        return;
+      case 'insufficientDisk':
+        toast('error', outcome.message);
+        return;
+      case 'notFound':
+        toast('info', strings.blamePanel.notFound);
+        return;
+      case 'special':
+        // 符号链接（svn:special）不进入只读文本预览，也不提供逐行归属。
+        toast('info', snapshotText('specialNotice'));
+        return;
+      default:
+        toast('error', outcome.error.message);
+        return;
+    }
+  }
+  // blame 对解析后的实际 URL 使用明确 revision（本地工作文件走 F108 的
+  // 无 -r 调用；两者共用 core/blame 的解析与超限降级）。
+  let blamed: Awaited<ReturnType<typeof runBlame>>;
+  try {
+    blamed = await runBlame(svnPath, {
+      target: target.url,
+      remote: true,
+      revision: target.revision,
+    }, options);
+  } catch (err) {
+    if (isSessionCurrent(captured)) {
+      toast('error', err instanceof Error ? err.message : String(err));
+    }
+    return;
+  }
+  if (!isSessionCurrent(captured)) {
+    return;
+  }
+  if (blamed.state === 'notTraceable') {
+    toast('info', blameNotTraceableText(blamed.reason));
+    return;
+  }
+  await attachBlameDecorations(captured, outcome.uri, blamed.lines);
 }
 
 /** P6→P3：把实际目录 URL 与明确 revision 交给检出面板预填（不执行 checkout）。 */
@@ -1810,6 +2202,13 @@ async function checkoutHistoryDirectory(captured: CapturedSession): Promise<void
   toast('info', snapshotText('handoffOpened'));
 }
 
+/**
+ * 目录 BASE 比较一次最多打开的差异个数：目录目标逐项复用单文件 BASE diff，
+ * 一次打开过多原生差异会串行执行等量命令并弹出大量标签页。超出部分不再
+ * 打开（toast 明确提示），用户可缩小比较范围后重试。
+ */
+export const BASE_COMPARE_OPEN_LIMIT = 10;
+
 /** 本地工作副本当前变化与 BASE 比较（目录逐项复用单文件 BASE diff）。 */
 async function compareBase(captured: CapturedSession): Promise<void> {
   const context = captured.model.context;
@@ -1836,7 +2235,29 @@ async function compareBase(captured: CapturedSession): Promise<void> {
     toast('info', snapshotText('baseNoChanges'));
     return;
   }
-  for (const entry of plan.entries) {
+  const count = String(plan.entries.length);
+  if (plan.entries.length > 1) {
+    // 多条目（目录目标）：先给汇总量与一次打开上限的确认，避免一次弹出
+    // 几十上百个原生差异标签页；取消不产生任何打开动作。
+    toast('info', format(snapshotText('baseChangesSummary'), { count }));
+    const limited = plan.entries.length > BASE_COMPARE_OPEN_LIMIT;
+    const confirmed = await confirmModal(
+      format(snapshotText(limited ? 'baseCompareConfirmLimited' : 'baseCompareConfirmWithin'), {
+        count,
+        ...(limited ? { limit: String(BASE_COMPARE_OPEN_LIMIT) } : {}),
+      }),
+      snapshotText('baseCompareConfirmButton'),
+    );
+    if (!isSessionCurrent(captured)) {
+      return;
+    }
+    if (!confirmed) {
+      toast('info', format(snapshotText('baseCompareCanceled'), { count }));
+      return;
+    }
+  }
+  const openable = plan.entries.slice(0, BASE_COMPARE_OPEN_LIMIT);
+  for (const entry of openable) {
     const diffTarget: DiffTarget = {
       svnPath: readSvnPath(),
       wcRoot,
@@ -1854,13 +2275,30 @@ async function compareBase(captured: CapturedSession): Promise<void> {
       toast('error', notice);
     }
   }
+  if (plan.entries.length > openable.length) {
+    toast('info', format(snapshotText('baseCompareTruncated'), {
+      count,
+      limit: String(BASE_COMPARE_OPEN_LIMIT),
+    }));
+  }
 }
 
 /* ------------------------- P6 更新到历史 revision ------------------------- */
 
-/** 本地写命令运行选项：解码/日志口径与只读一致；更新长任务不限时。 */
-function updateRunOptions(): ReturnType<typeof decodingRunOptions> {
-  return decodingRunOptions('history');
+/**
+ * history-update 运行选项：解码/日志口径与只读一致，更新长任务不限时。
+ * 提供目标 URL 时按该 URL 注入认证作用域与单飞凭据补录，使更新前目标
+ * 存在性检查（远端 `svn info URL@revision`）与只读命令同口径地弹框补录。
+ */
+function updateRunOptions(url?: string): RunOptions {
+  const options: RunOptions = { ...decodingRunOptions('history') };
+  const scope: AuthScope | undefined = url === undefined ? undefined : authScopeOfUrl(url);
+  if (scope !== undefined) {
+    options.authScope = scope;
+    options.getCredentials = credentialProvider(scope);
+    options.onCredentialRetry = (args) => logCommand(readSvnPath(), args, undefined, 'history');
+  }
+  return options;
 }
 
 function updateTaskCallbacksFor(scope: HistoryResultScope): HistoryUpdateTaskCallbacks {
@@ -1893,6 +2331,7 @@ function makeUpdateTask(
   intent: HistoryUpdateIntent,
   state: HistoryUpdateState,
   taskId: string,
+  persistTerminal = true,
 ): HistoryUpdateTask {
   return {
     taskId,
@@ -1907,6 +2346,7 @@ function makeUpdateTask(
       scope,
       intent,
       state,
+      persistTerminal,
       callbacks: updateTaskCallbacksFor(scope),
       done: Promise.resolve(),
     },
@@ -1941,9 +2381,37 @@ function syncUpdateState(state: HistoryUpdateState): void {
   }
 }
 
+/** 当前工作副本内当前目标的相对路径（handoff 无本地副本时为 undefined）。 */
+function currentTargetRelPath(): string | undefined {
+  const target = entryTarget;
+  if (target === undefined || target.source !== 'local') {
+    return undefined;
+  }
+  return relativePathWithin(target.wcRoot, target.localPath);
+}
+
+/**
+ * 更新状态是否属于当前面板目标（同一工作副本 + 相同目标身份）。
+ * 同一工作副本另一目标的未决记录可以经当前面板回扫收口，但其回读
+ * BASE 与终态页只能属于记录目标本身，不能按当前作用域应用。
+ */
+function updateStateMatchesCurrentTarget(state: HistoryUpdateState): boolean {
+  const context = model?.context;
+  const relPath = currentTargetRelPath();
+  const wcRoot = entryTarget?.source === 'local' ? entryTarget.wcRoot : undefined;
+  if (context === undefined || relPath === undefined || wcRoot === undefined) {
+    return false;
+  }
+  return state.wcRoot === wcRoot
+    && state.targetRelPath === relPath
+    && state.targetKind === context.target.kind;
+}
+
 /**
  * 任务移除后的恢复（非发起会话路径）：终态页已写入，按它恢复更新状态
- * 与 BASE 徽标；不重复发起任何 SVN 命令。
+ * 与 BASE 徽标；不重复发起任何 SVN 命令。同一工作副本另一目标的更新
+ * 任务结算时，本作用域没有新终态页——只按任务移除后的事实重算占用并
+ * 推送（busy 自动恢复），不应用另一目标的结果。
  */
 async function onUpdateTaskRemoved(): Promise<void> {
   if (handle === undefined || model === undefined) {
@@ -1956,8 +2424,8 @@ async function onUpdateTaskRemoved(): Promise<void> {
   const restored = restoreHistoryUpdateState(readM4ScopeSession(scope)?.terminalPage);
   if (restored !== undefined) {
     updateState = restored;
+    await applySettledUpdate(updateState);
   }
-  await applySettledUpdate(updateState);
   push();
 }
 
@@ -1975,13 +2443,17 @@ function restoreUpdateLayer(scope: HistoryResultScope): void {
   updateState = undefined;
   updateTaskRemovalSub?.dispose();
   updateTaskRemovalSub = undefined;
+  // 绑定即订阅：无论本作用域是否存在活动任务都订阅 history 面板的任务
+  // 移除通知。同一工作副本另一目标的 history-update 在途时，本面板只经
+  // 占用态呈现 busy；没有订阅就收不到结算通知，页脚/刷新等禁用项会停在
+  // busy 直到用户触发下一次推送。
+  subscribeUpdateTaskRemoval();
   const task = findTaskByScope('history', scope);
   if (task !== undefined) {
     const extra = task.extra as HistoryUpdateTaskExtra | undefined;
     if (extra !== undefined && extra.state !== undefined) {
       updateState = extra.state;
       extra.callbacks = updateTaskCallbacksFor(extra.scope);
-      subscribeUpdateTaskRemoval();
       return;
     }
   }
@@ -1999,7 +2471,8 @@ function restoreUpdateLayer(scope: HistoryResultScope): void {
     return;
   }
   updateState = restored;
-  if (historyUpdateSettled(restored) && restored.postNodeRevision !== undefined) {
+  if (historyUpdateSettled(restored) && restored.postNodeRevision !== undefined
+    && updateStateMatchesCurrentTarget(restored)) {
     model?.applyLocalBaseRevision(restored.postNodeRevision);
   }
 }
@@ -2015,6 +2488,11 @@ async function applySettledUpdate(state: HistoryUpdateState | undefined): Promis
     return;
   }
   if (!historyUpdateSettled(state) || state.postNodeRevision === undefined) {
+    return;
+  }
+  if (!updateStateMatchesCurrentTarget(state)) {
+    // 同一工作副本另一目标的记录：只保留横幅事实，不把该目标的回读
+    // BASE 应用到当前目标的 BASE 徽标与 base-fallback 历史会话。
     return;
   }
   const captured = captureSession();
@@ -2040,8 +2518,28 @@ async function applySettledUpdate(state: HistoryUpdateState | undefined): Promis
  * 「更新到此版本」：写前检查（本地目标/复制前禁用/status 本地修改）→
  * 模态确认 → operation begin 落盘 → 后台更新任务。写命令发出前任何一步
  * 失败都不产生可执行意图；已有任务或写锁时只提示，不替换、不抢锁。
+ *
+ * 写前检查/确认窗口以 updatePrepareInFlight 计入 P6 占用态：刷新完成会
+ * 推进会话票据，若不互斥，用户已确认的更新会在 isSessionCurrent 守卫处
+ * 被静默丢弃。刷新在途时本入口直接拒绝并明确提示。
  */
 async function updateToHistoryRevision(captured: CapturedSession): Promise<void> {
+  if (refreshInFlight) {
+    toast('info', historyText('refreshInProgress'));
+    return;
+  }
+  const previousUpdatePrepareInFlight = updatePrepareInFlight;
+  updatePrepareInFlight = true;
+  pushIfCurrent(captured);
+  try {
+    await updateToHistoryRevisionInner(captured);
+  } finally {
+    updatePrepareInFlight = previousUpdatePrepareInFlight;
+    pushIfCurrent(captured);
+  }
+}
+
+async function updateToHistoryRevisionInner(captured: CapturedSession): Promise<void> {
   const context = captured.model.context;
   const target = entryTarget;
   if (context === undefined || target === undefined || target.source !== 'local') {
@@ -2077,7 +2575,11 @@ async function updateToHistoryRevision(captured: CapturedSession): Promise<void>
     toast('info', strings.historyUpdatePanel.taskHeld);
     return;
   }
-  const precondition = await checkHistoryUpdatePreconditions(svnPath, prepared.intent, options);
+  const precondition = await checkHistoryUpdatePreconditions(
+    svnPath,
+    prepared.intent,
+    updateRunOptions(prepared.intent.targetUrl),
+  );
   if (!isSessionCurrent(captured)) {
     return;
   }
@@ -2144,7 +2646,7 @@ async function runUpdateTask(task: HistoryUpdateTask): Promise<void> {
   const operationId = task.taskId;
   let state = extra.state;
   try {
-    const result = await runHistoryUpdate(readSvnPath(), extra.intent, updateRunOptions());
+    const result = await runHistoryUpdate(readSvnPath(), extra.intent, updateRunOptions(extra.intent.targetUrl));
     if (result.outcome === 'unknown') {
       await registry.markPhase(operationId, 'unknown');
       logLine(`[history-update] ${operationId} outcome=unknown${result.readbackError !== undefined ? ` readback=${result.readbackError}` : ''}`, 'history');
@@ -2173,7 +2675,13 @@ async function runUpdateTask(task: HistoryUpdateTask): Promise<void> {
   } finally {
     extra.state = state;
     syncUpdateState(state);
-    settleTask(task.taskId, () => persistUpdateTerminal(extra.scope, state));
+    settleTask(task.taskId, () => {
+      // 终态页按任务创建时的目标身份归属：同一工作副本另一目标的回扫
+      // 结果不写当前面板的作用域（重开当前目标不误显示不属于它的终态）。
+      if (extra.persistTerminal) {
+        persistUpdateTerminal(extra.scope, state);
+      }
+    });
     extra.callbacks.settled(state);
     extra.callbacks.render();
   }
@@ -2201,7 +2709,7 @@ async function rescanUpdate(captured: CapturedSession): Promise<void> {
   const taskId = state.operationId ?? randomOperationId();
   const next = beginHistoryUpdateRescan(state);
   updateState = next;
-  const task = makeUpdateTask('rescan', scope, intent, next, taskId);
+  const task = makeUpdateTask('rescan', scope, intent, next, taskId, updateStateMatchesCurrentTarget(next));
   addTask(task);
   subscribeUpdateTaskRemoval();
   logLine(`[history-update] ${taskId} rescan start target=${intent.targetRelPath} r${intent.requestedRevision}`, 'history');
@@ -2218,7 +2726,7 @@ async function runUpdateRescanTask(task: HistoryUpdateTask): Promise<void> {
   const operationId = extra.state.operationId;
   let state = extra.state;
   try {
-    const rescan = await rescanHistoryUpdate(readSvnPath(), extra.intent, updateRunOptions());
+    const rescan = await rescanHistoryUpdate(readSvnPath(), extra.intent, updateRunOptions(extra.intent.targetUrl));
     state = applyHistoryUpdateRescan(state, rescan);
     if (rescan.outcome === 'still-unknown') {
       if (operationId !== undefined) {
@@ -2252,7 +2760,13 @@ async function runUpdateRescanTask(task: HistoryUpdateTask): Promise<void> {
   } finally {
     extra.state = state;
     syncUpdateState(state);
-    settleTask(task.taskId, () => persistUpdateTerminal(extra.scope, state));
+    settleTask(task.taskId, () => {
+      // 终态页按任务创建时的目标身份归属：同一工作副本另一目标的回扫
+      // 结果不写当前面板的作用域（重开当前目标不误显示不属于它的终态）。
+      if (extra.persistTerminal) {
+        persistUpdateTerminal(extra.scope, state);
+      }
+    });
     extra.callbacks.settled(state);
     extra.callbacks.render();
   }
@@ -2284,6 +2798,12 @@ async function onIntent(intent: Intent, context: { sessionId: string; busy: bool
   }
   switch (intent.kind) {
     case 'loadMoreHistory': {
+      // 刷新在途时加载更多会中止刷新子进程、令刷新结果被静默丢弃：
+      // 与宿主 busy 门禁同口径拒绝，并给出明确提示（控制器兜底）。
+      if (refreshInFlight) {
+        toast('info', historyText('refreshInProgress'));
+        return;
+      }
       // 加载中禁止重复请求（模型相位 + host 请求去重双重保证）。
       if (!captured.model.hasSession() || captured.model.isLoading()) {
         return;
@@ -2296,6 +2816,12 @@ async function onIntent(intent: Intent, context: { sessionId: string; busy: bool
     }
     case 'setHistoryFilter': {
       if (!captured.model.hasSession() || captured.model.sessionView().upperRevision === null) {
+        return;
+      }
+      // follow 切换会重建源栈并推进会话票据（作废在途刷新），刷新在途时
+      // 拒绝而不是静默丢弃刷新结果；其余筛选只重算展示前缀，不受影响。
+      if (intent.id === 'follow' && refreshInFlight) {
+        toast('info', historyText('refreshInProgress'));
         return;
       }
       const result = captured.model.setFilter(intent.id, intent.value);
@@ -2421,6 +2947,11 @@ async function onIntent(intent: Intent, context: { sessionId: string; busy: bool
       return;
     }
     case 'resetHistorySession': {
+      // 重置会中止在途加载/刷新并推进会话票据：刷新在途时拒绝并提示。
+      if (refreshInFlight) {
+        toast('info', historyText('refreshInProgress'));
+        return;
+      }
       // busy/writeLocked 已由 P6 放行表与 refresh 同组拒绝；模型层再拒 unresolved。
       const result = captured.model.reset();
       if (result === 'rejected') {
@@ -2452,6 +2983,11 @@ async function onIntent(intent: Intent, context: { sessionId: string; busy: bool
     }
     case 'bannerAction': {
       if (intent.actionId === 'historyRetry') {
+        // 刷新在途时重试会中止刷新并推进票据：拒绝并提示（与门禁同口径）。
+        if (refreshInFlight) {
+          toast('info', historyText('refreshInProgress'));
+          return;
+        }
         // 打开失败（error 相位）与 HEAD 未解析（unresolved）的重试都重新
         // 解析 HEAD/存在性；其余情况重试当前会话的加载。
         if (captured.model.phase === 'error'
@@ -2482,6 +3018,16 @@ async function onIntent(intent: Intent, context: { sessionId: string; busy: bool
       }
       if (intent.actionId === 'rescanHistoryUpdate') {
         await rescanUpdate(captured);
+        return;
+      }
+      if (intent.actionId === 'viewTaskLog') {
+        // 在途/未知结果页的「查看日志」：打开 P6 命令频道。
+        showOutput(false, 'history');
+        return;
+      }
+      if (intent.actionId === 'closePanel') {
+        // 在途/未知结果页的「关闭面板」：只关面板，任务继续。
+        handle?.dispose();
         return;
       }
       return;
@@ -2516,12 +3062,12 @@ async function onIntent(intent: Intent, context: { sessionId: string; busy: bool
       handle?.dispose();
       return;
     }
+    case 'blameHistoryRevision': {
+      await blameHistoryRevision(captured);
+      return;
+    }
     default:
-      // 追溯（阶段 4）尚未接线：给出明确提示，不静默吞掉用户动作；
-      // 其余未登记动作沿用协议层白名单拒绝。
-      if (intent.kind === 'blameHistoryRevision') {
-        toast('info', historyText('actionNotReady'));
-      }
+      // 未登记动作沿用协议层白名单拒绝（不会到达控制器）。
       return;
   }
 }
@@ -2550,6 +3096,7 @@ function onViewReady(): void {
 function onPanelDispose(): void {
   cancelAllInflight();
   resetCompareState();
+  disposeBlameSession();
   // 更新任务与面板解耦：只解除移除订阅，不取消任务、不清任务 extra
   // 状态；重开按活动任务绑定或终态页恢复（宿主 kill 由 operation record
   // unknown 分诊）。任务回调在 handle/model 置空后自动不再推送。
@@ -2560,6 +3107,8 @@ function onPanelDispose(): void {
   model = undefined;
   entryTarget = undefined;
   sessionTicket = undefined;
+  refreshInFlight = false;
+  updatePrepareInFlight = false;
 }
 
 /* ------------------------- 在途请求清理 ------------------------- */
@@ -2675,9 +3224,13 @@ export function historyCompareForTest(): {
 export function resetHistoryPanelController(): void {
   cancelAllInflight();
   resetCompareState();
+  disposeBlameSession();
   updateTaskRemovalSub?.dispose();
   updateTaskRemovalSub = undefined;
   updateState = undefined;
+  appliedHistoryPageSize = undefined;
+  refreshInFlight = false;
+  updatePrepareInFlight = false;
   handle?.dispose();
   handle = undefined;
   model = undefined;

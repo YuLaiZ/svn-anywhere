@@ -377,6 +377,16 @@ function lastHtml(panel: FakePanel): string {
   return rendersOf(panel).at(-1) ?? '';
 }
 
+/** 取指定表单输入的 value 属性（属性顺序不固定，按 input 标签定位）。 */
+function inputValue(html: string, fieldId: string): string | undefined {
+  for (const tag of html.match(/<input[^>]*>/g) ?? []) {
+    if (tag.includes(`data-field-id="${fieldId}"`)) {
+      return /value="([^"]*)"/.exec(tag)?.[1];
+    }
+  }
+  return undefined;
+}
+
 function findHtml(panel: FakePanel, needle: string): string | undefined {
   return rendersOf(panel).reverse().find((html) => html.includes(needle));
 }
@@ -1804,5 +1814,66 @@ describe('P6 历史 → P3 检出交接（openCheckoutPanelFromHistory）', () =
       sourceUrl: 'http://example.com/svn/trunk?x=1', pinnedRevision: 1, nodeKind: 'dir',
     })).ok).toBe(false);
     expect(vscodeMock.panels).toHaveLength(0);
+  });
+
+  it('同 URL 再次交接不同 revision：表单步重应用预填（复用面板并推送新帧）', async () => {
+    await openCheckoutPanelFromHistory({ sourceUrl: REPO_URL, pinnedRevision: 7, nodeKind: 'dir' });
+    await sleep(0);
+    const panel = lastPanel();
+    expect(inputValue(lastHtml(panel), 'rev')).toBe('7');
+    const rendersBefore = rendersOf(panel).length;
+
+    const again = await openCheckoutPanelFromHistory({ sourceUrl: REPO_URL, pinnedRevision: 9, nodeKind: 'dir' });
+    expect(again).toEqual({ ok: true });
+    await sleep(0);
+    expect(vscodeMock.panels).toHaveLength(1);
+    const html = lastHtml(panel);
+    expect(inputValue(html, 'rev')).toBe('9');
+    expect(rendersOf(panel).length).toBeGreaterThan(rendersBefore);
+    // 交接不绕过连接检查：没有任何 svn 命令被发起。
+    expect(runCalls).toHaveLength(0);
+  });
+
+  it('运行中再次交接同 URL 不同 revision：保持原运行会话、不发新命令', async () => {
+    mockCheckoutHang();
+    await openCheckoutPanelFromHistory({ sourceUrl: REPO_URL, pinnedRevision: 7, nodeKind: 'dir' });
+    await sleep(0);
+    const panel = lastPanel();
+    await fillToReview(panel, REPO_URL, labRoot);
+    send(panel, { kind: 'startCheckout' });
+    await waitTaskRunning();
+    const callsBefore = runCalls.length;
+
+    const again = await openCheckoutPanelFromHistory({ sourceUrl: REPO_URL, pinnedRevision: 9, nodeKind: 'dir' });
+    expect(again).toEqual({ ok: true });
+    await sleep(20);
+    expect(vscodeMock.panels).toHaveLength(1);
+    // 运行页保持原状：仍是取消入口，没有表单字段被重写。
+    const html = lastHtml(panel);
+    expect(html).toContain('data-intent="cancelTask"');
+    expect(html).not.toMatch(/data-field-id="rev"/);
+    expect(runCalls.length).toBe(callsBefore);
+  });
+
+  it('结果页再次交接同 URL 不同 revision：保持结果页原状', async () => {
+    mockCheckoutHang();
+    await openCheckoutPanelFromHistory({ sourceUrl: REPO_URL, pinnedRevision: 7, nodeKind: 'dir' });
+    await sleep(0);
+    const panel = lastPanel();
+    await fillToReview(panel, REPO_URL, labRoot);
+    send(panel, { kind: 'startCheckout' });
+    await waitTaskRunning();
+    vscodeMock.confirmResult = strings.checkoutPanel.cancelConfirmButton;
+    send(panel, { kind: 'cancelTask' });
+    await sleep(60);
+    expect(lastHtml(panel)).toContain(strings.checkoutPanel.resultTitles.canceled);
+
+    const again = await openCheckoutPanelFromHistory({ sourceUrl: REPO_URL, pinnedRevision: 9, nodeKind: 'dir' });
+    expect(again).toEqual({ ok: true });
+    await sleep(20);
+    expect(vscodeMock.panels).toHaveLength(1);
+    const html = lastHtml(panel);
+    expect(html).toContain(strings.checkoutPanel.resultTitles.canceled);
+    expect(html).not.toMatch(/data-field-id="rev"/);
   });
 });

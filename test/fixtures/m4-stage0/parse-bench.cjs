@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// M4 阶段0 V1 压测：svn list --xml 解析基准
+// 压测：svn list --xml 解析基准
 // 用法: node --expose-gc parse-bench.cjs <xml-file> <saxes|fxp>
 // saxes 模式模拟 runStream：createReadStream 64 KiB 分块 + StringDecoder('utf8')，不预读整段。
 // fxp 模式对照：整段 readFileSync + fast-xml-parser（项目 devDependency）。
@@ -7,7 +7,7 @@
 const fs = require('fs');
 const path = require('path');
 const { StringDecoder } = require('string_decoder');
-const { SaxesParser } = require(process.env.M4_SAXES_PATH || '/tmp/m4-stage0-V1/nodetools/node_modules/saxes');
+const { SaxesParser } = require(process.env.M4_SAXES_PATH || path.join(__dirname, '..', '..', '..', 'node_modules', 'saxes'));
 
 const file = process.argv[2];
 const mode = process.argv[3] || 'saxes';

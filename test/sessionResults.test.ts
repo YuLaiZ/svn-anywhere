@@ -5,7 +5,7 @@
  * 守卫丢弃不推送）。
  *
  * M4 增补 m4SessionStore（多作用域 LRU ≤24）：作用域隔离与合并、恢复
- * 顺序（活动任务→终态页→可浏览→fresh）、HLS-5 淘汰顺序（先清最旧
+ * 顺序（活动任务→终态页→可浏览→fresh）、淘汰顺序（先清最旧
  * 非当前终态页、随后整体淘汰最旧非活动作用域）、当前/活动任务不淘汰、
  * 淘汰后重开 fresh。
  */
@@ -216,7 +216,7 @@ describe('只读命令进行中登记', () => {
   });
 });
 
-/* --------------------- m4SessionStore：多作用域 LRU（HLS-5） --------------------- */
+/* --------------------- m4SessionStore：多作用域 LRU --------------------- */
 
 function historyScope(targetKey: string, targetKind: 'file' | 'dir' = 'file'): HistoryResultScope {
   return { scopeKind: 'history', targetKey, targetKind };
@@ -396,7 +396,7 @@ describe('m4SessionStore：控制器恢复顺序（活动任务→终态页→�
   });
 });
 
-describe('m4SessionStore：24 项容量与 HLS-5 淘汰顺序', () => {
+describe('m4SessionStore：24 项容量与淘汰顺序', () => {
   it('第 25 项先清最旧非当前终态页（清页不减少项数），随后整体淘汰最旧非活动作用域', () => {
     const scopes = seedHistoryScopes(24, { terminalAt: [1] });
     const result = putM4ScopeSession(

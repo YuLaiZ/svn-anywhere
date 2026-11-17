@@ -22,6 +22,7 @@
  *   安全重跑分支。
  */
 import { join } from 'node:path';
+import type { ConflictKind } from './conflict';
 
 /** 操作状态机：M2 提交语义相位 + M3 新增的命令执行与残留核验相位。 */
 export type OperationPhase =
@@ -92,7 +93,7 @@ export interface ImportIntent {
 
 /**
  * P6 更新到指定 revision 的固定意图（OperationRecord.historyUpdateIntent
- * 的类型，M4 技术方案 §4.6）：随 begin 一次写入，此后 markPhase 不能改
+ * 的类型）：随 begin 一次写入，此后 markPhase 不能改
  * 目标、revision 或任何策略字段。只保存恢复/回读所需的身份与 revision，
  * 不含凭据、文件内容或属性值。
  */
@@ -110,24 +111,27 @@ export interface HistoryUpdateIntent {
   preRevision: number;
 }
 
+/** P7 冲突解决意图的单项目标（ResolveIntent.targets 的元素，写锁与操作记录契约）。 */
+export interface ResolveIntentTarget {
+  /** 冲突路径（相对 scopeRoot 的规范化 POSIX 路径）。 */
+  relPath: string;
+  conflictKinds: ConflictKind[];
+  /** 发起时读取的路径冲突指纹（回扫比对用；不含凭据）。 */
+  fingerprint: string;
+  /** 用户选择的 SVN --accept 策略或 working（不是属性值/文件内容）。 */
+  strategy: string;
+}
+
 /**
  * P7 冲突解决的固定意图（OperationRecord.resolveIntent 的类型，M4 技术
- * 方案 §5.6）：单项 resolve、单项 resolve 后的回扫与批量父任务共用；
+ * 方案约定的固定意图）：单项 resolve、单项 resolve 后的回扫与批量父任务共用；
  * 只保存工作副本根、规范化相对路径、冲突类型/指纹、用户策略与可选
  * batchId——不保存属性原值、文件内容或凭据。
  */
 export interface ResolveIntent {
   /** 扫描/互斥范围根（规范化工作副本根）。 */
   scopeRoot: string;
-  targets: Array<{
-    /** 冲突路径（相对 scopeRoot 的规范化 POSIX 路径）。 */
-    relPath: string;
-    conflictKinds: Array<'text' | 'property' | 'tree'>;
-    /** 发起时读取的路径冲突指纹（回扫比对用；不含凭据）。 */
-    fingerprint: string;
-    /** 用户选择的 SVN --accept 策略或 working（不是属性值/文件内容）。 */
-    strategy: string;
-  }>;
+  targets: ResolveIntentTarget[];
   /** 批量父任务 ID（批内项共用；单项 resolve 不写）。 */
   batchId?: string;
 }
@@ -234,7 +238,7 @@ const WRITE_RESTRICTED_PHASES: Readonly<Record<OperationKind, ReadonlySet<Operat
   checkout: new Set(['prepared', 'running']),
   import: new Set(['prepared', 'running', 'unknown']),
   vacuum: new Set(['prepared', 'running', 'unknown']),
-  // M4 写 kind：写命令前 begin、结果未决时 unknown 冻结（技术方案 §5.6）。
+  // 写 kind：写命令前 begin、结果未决时 unknown 冻结（写锁与操作记录契约）。
   'history-update': new Set(['prepared', 'running', 'unknown']),
   resolve: new Set(['prepared', 'running', 'unknown']),
   // M1 命令成功/失败都 finally finish、无未知态相位：恒空。
@@ -288,7 +292,7 @@ const PATCHABLE_FIELDS: Readonly<Record<OperationKind, ReadonlySet<string>>> = {
   import: new Set(['knownRevisions', 'tempWcPath', 'baseRevision', 'committedPaths', 'outcome', 'resolvedRevision']),
   vacuum: new Set(['knownRevisions', 'tempWcPath', 'baseRevision', 'committedPaths']),
   // history-update：只允许回读写回节点 BASE 与确认 revision；固定意图（目标/
-  // 请求 revision/更新前 revision）无补写通道（技术方案 §5.6）。
+  // 请求 revision/更新前 revision）无补写通道。
   'history-update': new Set(['baseRevision', 'resolvedRevision']),
   // resolve：固定意图只读，不放宽 patch——无任何可变字段。
   resolve: new Set(),

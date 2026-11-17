@@ -1,10 +1,11 @@
 /**
- * P5 远端只读内容测试（M4 阶段 2，host/readonlyContent）：
+ * P5 远端只读内容测试（host/readonlyContent）：
  * - 文档 URI 携带仓库 UUID、原始 URL、revision 与一次性内容键（解析可还原）；
  * - provider 按内容键返回缓存文本，文档关闭即释放（diffView 关闭释放模式）；
  * - 真实 svnadmin + file:// 隔离仓库（test/helpers）：文本 ≤16 MiB 内嵌、
  *   中文/空格名称、二进制经 runToFile 临时资源 + 系统默认应用、文本实际
- *   超过内嵌上限的降级、已知大小 >2 GiB 不启动 cat、路径不存在不伪装空内容；
+ *   超过内嵌上限的降级、已知大小 >2 GiB 不启动 cat、路径不存在不伪装空内容、
+ *   svn:special 符号链接返回显式状态且不进入内嵌文本预览；
  * - 受管临时目录：停用清理只删本进程资源、过期回收按 mtime 移除、
  *   系统默认应用打开失败的降级状态。
  */
@@ -28,6 +29,8 @@ const vscodeMock = vi.hoisted(() => ({
   shownDocuments: [] as Array<{ uri: { scheme?: string; path?: string; query?: string }; options?: unknown }>,
   openedExternal: [] as Array<{ scheme?: string; fsPath?: string; path?: string }>,
   openExternalResult: true,
+  /** 非空时 showTextDocument 以该消息 reject（宿主 API 异常场景）。 */
+  showTextDocumentError: undefined as string | undefined,
   providers: new Map<string, { provideTextDocumentContent(uri: unknown): string }>(),
   closeHandlers: [] as Array<(doc: { uri: unknown }) => void>,
   providerDisposals: 0,
@@ -72,6 +75,9 @@ vi.mock('vscode', () => ({
     },
     showTextDocument: (uri: unknown, options?: unknown) => {
       vscodeMock.shownDocuments.push({ uri: uri as { scheme?: string; path?: string }, options });
+      if (vscodeMock.showTextDocumentError !== undefined) {
+        return Promise.reject(new Error(vscodeMock.showTextDocumentError));
+      }
       return Promise.resolve(undefined);
     },
   },
@@ -155,6 +161,7 @@ beforeEach(() => {
   vscodeMock.shownDocuments.length = 0;
   vscodeMock.openedExternal.length = 0;
   vscodeMock.openExternalResult = true;
+  vscodeMock.showTextDocumentError = undefined;
   vscodeMock.providers.clear();
   vscodeMock.closeHandlers.length = 0;
   vscodeMock.providerDisposals = 0;
@@ -302,7 +309,7 @@ realSvn('openRemoteContent（真实 svnadmin + file://）', () => {
     writeFile(wc, 'hello.txt', '你好，SVN\n', true);
     // 中文/空格文件名保持 ASCII 文本内容：SVN 1.15 的 add 自动探测会把
     // 「非可打印字节占比过高」的纯中文短文本标成 application/octet-stream
-    //（阶段 0 已有 MIME 判据的既定规则），本用例只验证名称与 URL 编码。
+    //（svn add 自动 MIME 探测的既定规则），本用例只验证名称与 URL 编码。
     writeFile(wc, '中文 名称.txt', 'plain text\n', true);
     writeFile(wc, 'sub/child.txt', 'child\n', true);
     writeFile(wc, 'big.txt', 'B'.repeat(200), true);
@@ -332,6 +339,22 @@ realSvn('openRemoteContent（真实 svnadmin + file://）', () => {
     const parsed = parseRemoteDocumentUri(outcome.uri);
     expect(parsed?.revision).toBe(1);
     expect(parsed?.rawUrl).toBe(urlOf('hello.txt'));
+  });
+
+  it('showTextDocument 抛错：回收一次性内容键并返回 error（不泄漏 ≤16 MiB 文本）', async () => {
+    vscodeMock.showTextDocumentError = 'webview host failure';
+    const { outcome } = await openNode('hello.txt');
+    expect(outcome.status).toBe('error');
+    if (outcome.status !== 'error') {
+      return;
+    }
+    expect(outcome.error.kind).toBe('unknown');
+    expect(outcome.error.message).toContain('webview host failure');
+    // 文档从未打开：关闭事件不会触发，入口必须自行回收内容条目。
+    expect(vscodeMock.shownDocuments).toHaveLength(1);
+    const uri = vscodeMock.shownDocuments[0]?.uri;
+    const provider = vscodeMock.providers.get(REMOTE_DOCUMENT_SCHEME);
+    expect(provider?.provideTextDocumentContent(uri)).toBe(strings.browse.documentReleased);
   });
 
   it('中文/空格名称：URI 保存展示名，原始 URL 保持 %XX 编码', async () => {
@@ -374,6 +397,26 @@ realSvn('openRemoteContent（真实 svnadmin + file://）', () => {
     expect(vscodeMock.openedExternal).toHaveLength(1);
     expect(vscodeMock.openedExternal[0]?.fsPath).toBe(outcome.filePath);
     expect(vscodeMock.shownDocuments).toHaveLength(0);
+  });
+
+  it('svn:special 符号链接：返回 special 状态，不进入内嵌文本预览与外部打开', async () => {
+    // 真实符号链接：svn add 自动设置 svn:special，cat 输出 `link <target>`
+    // 原文且无 mime/NUL；调用方据 special 状态提示，不把它当普通文本打开。
+    const wc = join(lab.root, 'wc');
+    execSync(`mkdir -p ${join(wc, 'trunk')} && ln -s target.txt ${join(wc, 'trunk', 'link.txt')}`);
+    lab.svn(['add', '-q', '--parents', 'trunk/link.txt'], wc);
+    lab.svn(['commit', '-q', '-m', 'r2 special'], wc);
+
+    const nodeResult = await readRemoteNode('svn', urlOf('trunk/link.txt'), {});
+    expect(nodeResult.status).toBe('present');
+    if (nodeResult.status !== 'present') {
+      return;
+    }
+    const outcome = await openRemoteContent('svn', nodeResult.node, {});
+    expect(outcome.status).toBe('special');
+    // 不打开文本编辑器、不交系统默认应用。
+    expect(vscodeMock.shownDocuments).toHaveLength(0);
+    expect(vscodeMock.openedExternal).toHaveLength(0);
   });
 
   it('文本实际超过内嵌上限（等价小阈值）：降级为临时资源外部打开', async () => {

@@ -3,7 +3,7 @@
  * 本文件打包进 media/panel.js —— 任何业务对错判断都不写在这里，
  * 也不出现面向用户的文案字面量：界面文案全部来自宿主渲染好的 HTML。
  *
- * 状态保持（技术方案 §2.1/§2.2/§6）：
+ * 状态保持（整段渲染、增量追加与输入确认的协调口径）：
  * - 宿主推送整段 render 时，先记录输入框值、焦点、光标与全部
  *   `data-scroll-key` 容器的滚动位置（P5 树、P6/P7 左右 pane、表格与
  *   现有 .list 共用一条通道，不保留第二套列表滚动恢复），替换 DOM 后
@@ -639,22 +639,6 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
         control.value = value;
       }
     }
-    // 视图更新的输入不回退：宿主 formRevision 落后于本地未确认输入时，
-    // 保留本地值并重新对齐光标。
-    for (const field of pendingInputs.keys()) {
-      const pending = pendingInputs.get(field);
-      if (!pending || formRevision >= pending.inputRevision) {
-        pendingInputs.delete(field);
-        continue;
-      }
-      const control = root.querySelector<HTMLElement>(`[data-field-id="${cssEscape(field)}"]`);
-      if (control instanceof HTMLInputElement && control.type === 'checkbox') {
-        // 勾选字段的待确认值是 'true'|'false' 派生串：恢复到 checked 态。
-        control.checked = pending.value === 'true';
-      } else if (control instanceof HTMLInputElement || control instanceof HTMLTextAreaElement) {
-        control.value = pending.value;
-      }
-    }
     // 派生半选态（组头/目录聚合）：宿主只输出 data-indeterminate 标记，
     // indeterminate 属性无法用 HTML 表达，这里统一落到 DOM。
     for (const box of root.querySelectorAll<HTMLInputElement>('[data-indeterminate="1"]')) {
@@ -724,6 +708,9 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
           doc.defaultView?.clearTimeout(timer);
         }
         filterTimers.clear();
+        // 待发筛选值（防抖窗口内的本地输入）同属旧目标：只清定时器会让
+        // 值留在 pendingFilters，下一次整帧渲染按字段 ID 回填到新目标。
+        pendingFilters.clear();
         // 旧输入控件已随 DOM 替换，其 compositionend 不会再冒泡到根节点：
         // 清除组合态并丢弃旧会话暂存帧，新目标后续渲染照常上屏。
         isComposing = false;

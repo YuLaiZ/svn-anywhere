@@ -1,6 +1,6 @@
 {
   "name": "m4-v6-probe",
-  "displayName": "M4 V6 Probe",
+  "displayName": "M4 ext-host probe",
   "version": "0.0.1",
   "publisher": "m4-probe",
   "engines": { "vscode": "^1.85.0" },

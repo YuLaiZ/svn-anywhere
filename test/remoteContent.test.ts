@@ -1,5 +1,5 @@
 /**
- * 远端文件内容 core 原语测试（M4 阶段 1，core/remoteContent）：
+ * 远端文件内容 core 原语测试（core/remoteContent）：
  * - MIME/NUL 双重分类矩阵（text/*、非 text/*、NUL、UTF-16 已知边界、
  *   8 KiB 探测窗口）与打开方式规划（16 MiB 内嵌 / 2 GiB 临时文件）；
  * - 真实 svnadmin + file://：probe 读取 mime 与前 8 KiB、文本编码回退
@@ -32,6 +32,7 @@ import {
   probeRemoteContent,
   readRemoteText,
 } from '../src/core/remoteContent';
+import { readRemoteNode } from '../src/core/remoteBrowse';
 import { createSvnLab, writeFile } from './helpers';
 
 let hasSvn = false;
@@ -118,7 +119,7 @@ describe('classifyContentKind（MIME/NUL 双重分类）', () => {
 });
 
 describe('planRemoteContentOpen（16 MiB 内嵌 / 2 GiB 临时资源）', () => {
-  it('默认阈值符合技术方案：16 MiB 内嵌 / 2 GiB 临时文件 / 64 MiB 磁盘余量', () => {
+  it('默认阈值符合契约：16 MiB 内嵌 / 2 GiB 临时文件 / 64 MiB 磁盘余量', () => {
     expect(REMOTE_INLINE_TEXT_MAX_BYTES).toBe(16 * 1024 * 1024);
     expect(REMOTE_TEMP_FILE_MAX_BYTES).toBe(2 * 1024 * 1024 * 1024);
     expect(REMOTE_DISK_HEADROOM_BYTES).toBe(64 * 1024 * 1024);
@@ -457,6 +458,47 @@ describe('downloadRemoteFile（真实 svn：runToFile 预检与降级）', () =>
     } finally {
       lab.cleanup();
       rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 名称以 @ 结尾的节点（cat/probe 经字面尾 @ URL 读取）
+// ---------------------------------------------------------------------------
+
+describe('名称以 @ 结尾的节点（真实 svn file:// 内容读取）', () => {
+  it.runIf(hasSvn && hasSvnadmin)('readRemoteText/probe 用 info 回包的字面尾 @ URL 读到自身内容', async () => {
+    const lab = createSvnLab('svn-anywhere-content-tail-at-');
+    try {
+      const src = join(lab.root, 'src');
+      writeFile(src, 'tail', 'brother\n');
+      writeFile(src, 'tail@', 'self@\n');
+      lab.svn(['import', '-q', '-m', 'init', src, `${lab.repoUrl}/trunk`]);
+
+      // 入口 URL 走 %40 编码；info 回包的 <url> 原样还原字面尾 @。
+      const info = await readRemoteNode('svn', `${lab.repoUrl}/trunk/tail%40`, { revision: 1 });
+      expect(info.status).toBe('present');
+      if (info.status !== 'present') {
+        return;
+      }
+      const literalUrl = info.node.rawUrl;
+      expect(literalUrl.endsWith('/tail@')).toBe(true);
+
+      // 修复前 …/tail@1 被解析为路径 tail + peg 1，读到兄弟 tail 的内容。
+      const text = await readRemoteText('svn', literalUrl, { revision: 1 });
+      expect(text.status).toBe('text');
+      if (text.status === 'text') {
+        expect(text.text).toBe('self@\n');
+      }
+
+      const probe = await probeRemoteContent('svn', literalUrl, { revision: 1 });
+      expect(probe.status).toBe('probed');
+      if (probe.status === 'probed') {
+        expect(probe.classification.kind).toBe('text');
+        expect(probe.headBytes).toBe('self@\n'.length);
+      }
+    } finally {
+      lab.cleanup();
     }
   });
 });

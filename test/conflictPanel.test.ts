@@ -301,6 +301,10 @@ interface MockConflict {
   tree?: { reason: string; action: string; kind: 'file' | 'dir'; item: string; copied?: boolean };
   /** 属性冲突三值（proplist 读取桩按侧返回；未声明时属性读取失败）。 */
   properties?: MockPropertyConflict[];
+  /** 冲突来源仓库 URL 前缀（默认 file:///repo；https 场景模拟认证远端）。 */
+  repoUrl?: string;
+  /** true 时远端 proplist 仅在带 authScope 的调用下成功（模拟认证远端来源）。 */
+  remoteRequiresAuth?: boolean;
 }
 
 const wcRoot = realpathSync(mkdtempSync(join(tmpdir(), 'svn-anywhere-p7-mock-')));
@@ -308,23 +312,46 @@ let conflicts: MockConflict[] = [];
 let statusCalls: string[][] = [];
 let infoCalls: string[][] = [];
 let resolveCalls: string[][] = [];
+let propertyWrites: string[][] = [];
 let statusDelayMs = 0;
 let resolveDelayMs = 0;
 let statusFailure: string | undefined;
 let persistConflictAfterResolve = false;
-/** 模拟 WC 锁定：status 根条目带 wc-locked="true"（阶段 0 实测形态）。 */
+/** 模拟 WC 锁定：status 根条目带 wc-locked="true"（无 wc-locked 时的 svn status 实测形态）。 */
 let wcLockedFlag = false;
+/** 非冲突的路径状态异常（missing/obstructed/deleted/incomplete）：不进扫描记录。 */
+let statusAnomalies: Record<string, string> = {};
+/** info 读取失败的路径（readConflictRecord/verifyResolveOutcome 的不可读证据）。 */
+let infoFailurePaths: Set<string> = new Set();
+/** 扫描阶段 status 的冲突候选覆盖（undefined 用全局 conflicts）。 */
+let scanPhaseConflicts: MockConflict[] | undefined;
+/** 扫描阶段（批量/补偿）info 读取失败的路径：定向回读阶段恢复可读。 */
+let scanInfoFailurePaths: Set<string> = new Set();
+/**
+ * 定向回读 status 的分阶段响应（路径 → 清除/仍冲突）：命中即视为回读阶段，
+ * 支持构造「扫描报告与定向回读不一致」的证据组合。
+ */
+let statusReadback: Map<string, 'clean' | 'conflicted'> = new Map();
+/** 当前 status 调用是否扫描范围（扫描阶段 info 失败按该相位生效）。 */
+let scanPhaseActive = false;
 
 function resetSvnState(): void {
   conflicts = [];
   statusCalls = [];
   infoCalls = [];
   resolveCalls = [];
+  propertyWrites = [];
   statusDelayMs = 0;
   resolveDelayMs = 0;
   statusFailure = undefined;
   persistConflictAfterResolve = false;
   wcLockedFlag = false;
+  statusAnomalies = {};
+  infoFailurePaths = new Set();
+  scanPhaseConflicts = undefined;
+  scanInfoFailurePaths = new Set();
+  statusReadback = new Map();
+  scanPhaseActive = false;
 }
 
 function textConflict(path: string, extra: Partial<MockConflict> = {}): MockConflict {
@@ -345,23 +372,43 @@ function escapeXml(value: string): string {
   return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 }
 
-function buildStatusXml(): string {
-  const entries = conflicts.map((conflict) => {
-    if (conflict.kinds.includes('tree') && conflict.tree !== undefined) {
-      const copied = conflict.tree.copied === true ? ' copied="true"' : '';
-      return `<entry path="${escapeXml(conflict.path)}">`
-        + `<wc-status item="${conflict.tree.item}" revision="3" props="none"${copied} tree-conflicted="true">`
-        + '</wc-status></entry>';
-    }
-    const item = conflict.kinds.includes('text') ? 'conflicted' : 'normal';
-    const props = conflict.kinds.includes('property') ? 'conflicted' : 'none';
+function statusConflictEntryXml(conflict: MockConflict): string {
+  if (conflict.kinds.includes('tree') && conflict.tree !== undefined) {
+    const copied = conflict.tree.copied === true ? ' copied="true"' : '';
     return `<entry path="${escapeXml(conflict.path)}">`
-      + `<wc-status item="${item}" revision="${String(conflict.nodeRevision)}" props="${props}">`
+      + `<wc-status item="${conflict.tree.item}" revision="3" props="none"${copied} tree-conflicted="true">`
       + '</wc-status></entry>';
-  }).join('');
+  }
+  const item = conflict.kinds.includes('text') ? 'conflicted' : 'normal';
+  const props = conflict.kinds.includes('property') ? 'conflicted' : 'none';
+  return `<entry path="${escapeXml(conflict.path)}">`
+    + `<wc-status item="${item}" revision="${String(conflict.nodeRevision)}" props="${props}">`
+    + '</wc-status></entry>';
+}
+
+function buildStatusXml(
+  source: readonly MockConflict[] = conflicts,
+  extraConflicted: readonly string[] = [],
+): string {
+  const entries = source.map(statusConflictEntryXml).join('');
+  // 非冲突的路径状态异常：status 可读但该路径不能作为「已解决」证据。
+  const anomalies = Object.entries(statusAnomalies)
+    .filter(([path]) => !source.some((conflict) => conflict.path === path)
+      && !extraConflicted.includes(path))
+    .map(([path, item]) => `<entry path="${escapeXml(path)}">`
+      + `<wc-status item="${escapeXml(item)}" revision="3" props="none"></wc-status></entry>`)
+    .join('');
+  // 定向回读阶段附加的 conflicted 条目（扫描未报告、回读仍冲突的组合）。
+  const extras = extraConflicted
+    .filter((path) => !source.some((conflict) => conflict.path === path))
+    .map((path) => `<entry path="${escapeXml(path)}">`
+      + '<wc-status item="conflicted" revision="3" props="none"></wc-status></entry>')
+    .join('');
   return '<?xml version="1.0" encoding="UTF-8"?>\n<status><target path=".">'
     + `<entry path="."><wc-status item="normal" revision="3" props="none"${wcLockedFlag ? ' wc-locked="true"' : ''}></wc-status></entry>`
     + entries
+    + anomalies
+    + extras
     + '<entry path="extdir/ext"><wc-status item="external" props="none"></wc-status></entry>'
     + '</target></status>';
 }
@@ -372,19 +419,20 @@ function buildInfoXml(targets: readonly string[]): string {
     if (conflict === undefined) {
       return '';
     }
+    const repoUrl = conflict.repoUrl ?? 'file:///repo';
     if (conflict.kinds.includes('tree') && conflict.tree !== undefined) {
       return `<entry kind="${conflict.tree.kind}" path="${escapeXml(target)}" revision="${String(conflict.nodeRevision)}">`
         + `<tree-conflict operation="update" kind="${conflict.tree.kind}" reason="${conflict.tree.reason}"`
         + ` victim="${escapeXml(target)}" action="${conflict.tree.action}">`
-        + `<version side="source-right" kind="file" path-in-repos="${escapeXml(target)}" repos-url="file:///repo" revision="${String(conflict.incomingRevision ?? 3)}"/>`
+        + `<version side="source-right" kind="file" path-in-repos="${escapeXml(target)}" repos-url="${repoUrl}" revision="${String(conflict.incomingRevision ?? 3)}"/>`
         + '</tree-conflict></entry>';
     }
     const nodes: string[] = [];
     if (conflict.kinds.includes('text')) {
       nodes.push(
         '<conflict operation="update" type="text">'
-        + `<version side="source-left" kind="file" path-in-repos="${escapeXml(target)}" repos-url="file:///repo" revision="${String(conflict.baselineRevision ?? 2)}"/>`
-        + `<version side="source-right" kind="file" path-in-repos="${escapeXml(target)}" repos-url="file:///repo" revision="${String(conflict.incomingRevision ?? 3)}"/>`
+        + `<version side="source-left" kind="file" path-in-repos="${escapeXml(target)}" repos-url="${repoUrl}" revision="${String(conflict.baselineRevision ?? 2)}"/>`
+        + `<version side="source-right" kind="file" path-in-repos="${escapeXml(target)}" repos-url="${repoUrl}" revision="${String(conflict.incomingRevision ?? 3)}"/>`
         + `<prev-base-file>${escapeXml(join(wcRoot, `${target}.r2`))}</prev-base-file>`
         + `<prev-wc-file>${escapeXml(join(wcRoot, `${target}.mine`))}</prev-wc-file>`
         + `<cur-base-file>${escapeXml(join(wcRoot, `${target}.r3`))}</cur-base-file>`
@@ -394,14 +442,14 @@ function buildInfoXml(targets: readonly string[]): string {
     if (conflict.kinds.includes('property')) {
       nodes.push(
         '<conflict operation="update" type="property">'
-        + `<version side="source-left" kind="file" path-in-repos="${escapeXml(target)}" repos-url="file:///repo" revision="${String(conflict.baselineRevision ?? 2)}"/>`
-        + `<version side="source-right" kind="file" path-in-repos="${escapeXml(target)}" repos-url="file:///repo" revision="${String(conflict.incomingRevision ?? 3)}"/>`
+        + `<version side="source-left" kind="file" path-in-repos="${escapeXml(target)}" repos-url="${repoUrl}" revision="${String(conflict.baselineRevision ?? 2)}"/>`
+        + `<version side="source-right" kind="file" path-in-repos="${escapeXml(target)}" repos-url="${repoUrl}" revision="${String(conflict.incomingRevision ?? 3)}"/>`
         + `<prop-file>${escapeXml(join(wcRoot, `${target}.prej`))}</prop-file>`
         + '</conflict>',
       );
     }
     return `<entry kind="file" path="${escapeXml(target)}" revision="${String(conflict.nodeRevision)}">`
-      + `<url>file:///repo/${escapeXml(target)}</url>${nodes.join('')}</entry>`;
+      + `<url>${repoUrl}/${escapeXml(target)}</url>${nodes.join('')}</entry>`;
   }).join('');
   return `<?xml version="1.0" encoding="UTF-8"?>\n<info>${entries}</info>`;
 }
@@ -410,23 +458,28 @@ function runResult(stdout: string, stderr = '', exitCode = 0): RunResult {
   return { stdout, stderr, exitCode };
 }
 
-/** proplist 目标 → 冲突记录与侧：本地=工作副本相对路径；基线/传入=file:///repo/<path>@rev。 */
+/** proplist 目标 → 冲突记录与侧：本地=工作副本相对路径；基线/传入=<repoUrl>/<path>@rev。 */
 function resolveProplistTarget(
   target: string,
 ): { conflict: MockConflict; side: 'local' | 'base' | 'incoming' } | undefined {
-  const remotePrefix = 'file:///repo/';
-  const isRemote = target.startsWith(remotePrefix);
   const at = target.lastIndexOf('@');
-  const path = isRemote && at > remotePrefix.length ? target.slice(remotePrefix.length, at) : target;
-  const conflict = conflicts.find((candidate) => candidate.path === path);
-  if (conflict === undefined || conflict.properties === undefined) {
-    return undefined;
+  for (const conflict of conflicts) {
+    if (conflict.properties === undefined) {
+      continue;
+    }
+    const remotePrefix = `${conflict.repoUrl ?? 'file:///repo'}/`;
+    const isRemote = target.startsWith(remotePrefix);
+    const path = isRemote && at > remotePrefix.length ? target.slice(remotePrefix.length, at) : target;
+    if (conflict.path !== path) {
+      continue;
+    }
+    if (!isRemote) {
+      return { conflict, side: 'local' };
+    }
+    const revision = Number(target.slice(at + 1));
+    return { conflict, side: revision === (conflict.incomingRevision ?? 3) ? 'incoming' : 'base' };
   }
-  if (!isRemote) {
-    return { conflict, side: 'local' };
-  }
-  const revision = Number(target.slice(at + 1));
-  return { conflict, side: revision === (conflict.incomingRevision ?? 3) ? 'incoming' : 'base' };
+  return undefined;
 }
 
 /** 按侧生成 `proplist --xml --verbose` 输出；缺失侧不输出 property 节点。 */
@@ -465,12 +518,30 @@ function installSvnStub(): void {
       if (statusFailure !== undefined) {
         return runResult('', statusFailure, 1);
       }
-      return runResult(buildStatusXml());
+      const target = (args[args.lastIndexOf('--') + 1] ?? '').replace(/@$/, '');
+      const readback = statusReadback.get(target);
+      if (readback === undefined) {
+        // 扫描范围（'.' 或子目录）：按阶段性候选覆盖返回。
+        scanPhaseActive = true;
+        return runResult(buildStatusXml(scanPhaseConflicts ?? conflicts));
+      }
+      // 定向回读：按分阶段响应当前路径（clean 或仍 conflicted）。
+      scanPhaseActive = false;
+      return runResult(buildStatusXml(conflicts, readback === 'conflicted' ? [target] : []));
     }
     if (command === 'info') {
       infoCalls.push([...args]);
       const separator = args.lastIndexOf('--');
       const targets = args.slice(separator + 1);
+      const normalized = targets.map((target) => target.replace(/@$/, ''));
+      // 扫描阶段的详情读取失败（批量入口与补偿都失败）：只看该阶段，
+      // 定向回读阶段恢复可读，以区分「扫描失败证据」与「回读证据」。
+      if (scanPhaseActive && normalized.some((target) => scanInfoFailurePaths.has(target))) {
+        return runResult('', 'svn: E170001: Authorization failed', 1);
+      }
+      if (normalized.some((target) => infoFailurePaths.has(target))) {
+        return runResult('', 'svn: E170001: Authorization failed', 1);
+      }
       return runResult(buildInfoXml(targets));
     }
     if (command === 'propget' || command === 'proplist') {
@@ -478,7 +549,7 @@ function installSvnStub(): void {
     }
     return runResult('');
   });
-  vi.mocked(runOrThrow).mockImplementation(async (_svnPath, args) => {
+  vi.mocked(runOrThrow).mockImplementation(async (_svnPath, args, options) => {
     if (args[0] === 'resolve') {
       resolveCalls.push([...args]);
       if (resolveDelayMs > 0) {
@@ -492,12 +563,30 @@ function installSvnStub(): void {
       return runResult('');
     }
     if (args[0] === 'propset' || args[0] === 'propdel') {
+      propertyWrites.push([...args]);
       return runResult('');
     }
     if (args[0] === 'proplist') {
-      const resolved = resolveProplistTarget(args[args.lastIndexOf('--') + 1] ?? '');
+      const target = args[args.lastIndexOf('--') + 1] ?? '';
+      const resolved = resolveProplistTarget(target);
       if (resolved === undefined) {
-        return runResult('', 'svn: E200009: none', 1);
+        // runOrThrow 语义：非零退出必须抛出（否则解析空输出会被误当空属性集）。
+        throw new SvnError({
+          message: 'svn proplist 失败',
+          command: [...args],
+          stderr: 'svn: E200009: none',
+          exitCode: 1,
+        });
+      }
+      // 认证远端来源：无 authScope 的远端读取失败（模拟凭据补录前的状态）。
+      if (resolved.side !== 'local' && resolved.conflict.remoteRequiresAuth === true
+        && options?.authScope === undefined) {
+        throw new SvnError({
+          message: 'svn proplist 认证失败',
+          command: [...args],
+          stderr: 'svn: E170001: Authorization failed',
+          exitCode: 1,
+        });
       }
       return runResult(buildPropertyValuesXml(resolved.conflict.properties!, resolved.side));
     }
@@ -687,7 +776,14 @@ describe('P7 面板控制器（mock SVN）', () => {
     const snapshot = conflictsSessionSnapshot();
     expect(snapshot.phase).toBe('error');
     expect(snapshot.rows).toBe(0);
-    expect(fakePanel().latestRenderHtml()).toContain(strings.conflictPanel.scanFailedTitle);
+    const html = fakePanel().latestRenderHtml();
+    expect(html).toContain(strings.conflictPanel.scanFailedTitle);
+    // 首次扫描即失败（无旧快照）：列表空态、页脚与头部徽标按失败态优先，
+    // 不与错误横幅同帧显示「没有冲突」。
+    expect(html).toContain(strings.conflictPanel.scanFailedEmptyTitle);
+    expect(html).toContain(strings.conflictPanel.summaryScanFailed);
+    expect(html).not.toContain(strings.conflictPanel.emptyTitle);
+    expect(html).not.toContain(strings.conflictPanel.summaryNone);
   });
 
   it('取消扫描：在途回包因代次过期，状态回到未扫描而不是失败', async () => {
@@ -743,6 +839,134 @@ describe('P7 面板控制器（mock SVN）', () => {
     const snapshot = conflictsSessionSnapshot();
     expect(snapshot.ledger).toBe(1);
     expect(snapshot.resolveNotice).toBe(strings.resolvePanel.outcomeResolved);
+    // 单项成功立即从当前冲突快照移出：行状态为已解决、摘要与 tab 计数减一。
+    const resolvedModel = conflictsModelForTest()!;
+    expect(resolvedModel.rows().find((row) => row.path === 'text.txt')?.status).toBe('resolved');
+    expect(resolvedModel.summary()).toMatchObject({ total: 0, text: 0, property: 0, tree: 0 });
+    expect(resolvedModel.tabCounts()).toEqual({ all: 0, text: 0, property: 0, tree: 0 });
+    expect(fakePanel().latestRenderHtml()).toContain(strings.conflictPanel.rowStatusResolved);
+
+    // 重开恢复同样成立（快照已移除记录，台账按已解决展示）。
+    fakePanel().dispose();
+    await openConflictPanel({ source: 'local', wcRoot, scopeRelPath: '.' });
+    await delay(10);
+    const reopened = conflictsModelForTest()!;
+    expect(reopened.rows().find((row) => row.path === 'text.txt')?.status).toBe('resolved');
+    expect(reopened.summary().total).toBe(0);
+  });
+
+  it('纯属性冲突：逐项选择后从详情入口执行「应用所选属性值」并写回 working', async () => {
+    conflicts = [{
+      path: 'prop.txt',
+      kinds: ['property'],
+      nodeRevision: 3,
+      baselineRevision: 2,
+      incomingRevision: 3,
+      properties: [
+        { name: 'k1', local: { value: 'l1' }, base: { value: 'b1' }, incoming: { value: 'i1' } },
+        { name: 'k2', local: { value: 'l2' }, base: { value: 'b2' }, incoming: { value: 'i2' } },
+      ],
+    }];
+    setup();
+    await openAndScan();
+    await selectPath('prop.txt');
+
+    const buttonOf = (source: string): string => {
+      const match = /<button[^>]*data-intent="applyConflictResolution"[^>]*>/.exec(source);
+      expect(match).not.toBeNull();
+      return match![0];
+    };
+
+    // 纯属性记录的详情渲染稳定 working 入口；未选完时禁用（与守卫同源）。
+    const html = fakePanel().latestRenderHtml();
+    expect(html).toContain(strings.conflictPanel.detailApplyPropertyWorking);
+    expect(buttonOf(html)).toContain(' disabled');
+    await sendIntent({ kind: 'applyConflictResolution' });
+    await waitIdle();
+    expect(resolveCalls).toHaveLength(0);
+    expect(propertyWrites).toHaveLength(0);
+    expect(fakePanel().toasts().some((message) => message.includes('并非所有冲突属性'))).toBe(true);
+
+    // 逐项选择：k1 取本地（不写回），k2 取传入（propset 写回）。
+    await sendIntent({ kind: 'choosePropertyValue', property: 'k1', choice: 'local' });
+    await sendIntent({ kind: 'choosePropertyValue', property: 'k2', choice: 'incoming' });
+    await waitIdle();
+    expect(buttonOf(fakePanel().latestRenderHtml())).not.toContain(' disabled');
+
+    await sendIntent({ kind: 'applyConflictResolution' });
+    await waitIdle();
+    expect(propertyWrites).toHaveLength(1);
+    expect(propertyWrites[0]).toEqual(expect.arrayContaining(['propset', '-q', 'k2']));
+    expect(resolveCalls).toHaveLength(1);
+    expect(resolveCalls[0]).toEqual([
+      'resolve', '--non-interactive', '--accept', 'working', '--depth', 'empty', '--', 'prop.txt',
+    ]);
+    expect(conflictsSessionSnapshot().ledger).toBe(1);
+  });
+
+  it('认证远端来源的纯属性 working：扫描补录与执行端重读同口径，不误报 fingerprint-changed', async () => {
+    conflicts = [{
+      path: 'prop.txt',
+      kinds: ['property'],
+      nodeRevision: 3,
+      baselineRevision: 2,
+      incomingRevision: 3,
+      repoUrl: 'https://example.com/svn/repo',
+      remoteRequiresAuth: true,
+      properties: [
+        { name: 'k1', local: { value: 'l1' }, base: { value: 'b1' }, incoming: { value: 'i1' } },
+      ],
+    }];
+    setup();
+    await openAndScan();
+
+    // 扫描端：无凭据远端读取失败 → authorizeRemote 单飞补录后三值可读。
+    const model = conflictsModelForTest()!;
+    const row = model.rows().find((candidate) => candidate.path === 'prop.txt')!;
+    expect(row.record?.propertyConflicts?.[0]?.name).toBe('k1');
+    expect(model.propertyValueFailures()).toEqual([]);
+
+    await selectPath('prop.txt');
+    await sendIntent({ kind: 'choosePropertyValue', property: 'k1', choice: 'incoming' });
+    await waitIdle();
+    await sendIntent({ kind: 'applyConflictResolution' });
+    await waitIdle();
+
+    // 执行端以带认证的同口径重读指纹：与扫描一致 → working 真正执行
+    // （旧实现执行端无凭据重读，属性名集合为空，误报 fingerprint-changed）。
+    expect(resolveCalls).toHaveLength(1);
+    expect(propertyWrites).toHaveLength(1);
+    expect(conflictsSessionSnapshot().ledger).toBe(1);
+    expect(fakePanel().toasts().some((message) => message.includes('冲突状态在读取后发生变化'))).toBe(false);
+  });
+
+  it('属性值补查失败横幅：点击「补齐认证并重新扫描」触发真实重新扫描', async () => {
+    // 属性冲突未声明三值：proplist 读取失败 → 补查失败横幅（含认证入口）。
+    conflicts = [{
+      path: 'prop.txt',
+      kinds: ['property'],
+      nodeRevision: 3,
+      baselineRevision: 2,
+      incomingRevision: 3,
+    }];
+    setup();
+    await openAndScan();
+    expect(conflictsModelForTest()!.propertyValueFailures()).toEqual(['prop.txt']);
+    const html = fakePanel().latestRenderHtml();
+    expect(html).toContain('data-banner-id="conflictPropertyValueFailures"');
+    expect(html).toContain('data-action-id="authenticateConflictSource"');
+
+    // 点击横幅动作：与顶层 authenticateConflictSource 同源，发生新一次
+    // status 往返（旧实现落裸 return，点击无任何效果）。
+    const statusBefore = statusCalls.length;
+    await sendIntent({
+      kind: 'bannerAction',
+      bannerId: 'conflictPropertyValueFailures',
+      actionId: 'authenticateConflictSource',
+    });
+    await waitIdle();
+    expect(statusCalls.length).toBe(statusBefore + 1);
+    expect(hasActiveTask('conflicts')).toBe(false);
   });
 
   it('树冲突：必须先确认节点；确认后 working 才执行', async () => {
@@ -863,6 +1087,105 @@ describe('P7 面板控制器（mock SVN）', () => {
     expect(snapshot.ledger).toBe(1);
     const ledger = conflictsModelForTest()!.ledger();
     expect(ledger[0]).toMatchObject({ path: 'text.txt', kinds: ['text'], strategy: 'theirs-full' });
+    expect(getOperationRegistry().writeRestriction(wcRoot)).toBeUndefined();
+  });
+
+  /** 制造一条 resolve 未知记录（回扫矛盾 → unknown 写锁），随后清空外部冲突视图。 */
+  async function createUnknownResolveRecord(): Promise<void> {
+    writeWorkFile('text.txt');
+    conflicts = [textConflict('text.txt')];
+    persistConflictAfterResolve = true;
+    setup();
+    await openAndScan();
+    await selectPath('text.txt');
+    await sendIntent({ kind: 'chooseConflictVariant', value: 'theirs-full' });
+    await sendIntent({ kind: 'applyConflictResolution' });
+    await waitIdle();
+    expect(conflictsSessionSnapshot().writeLocked).toBe(true);
+    expect(getOperationRegistry().writeRestriction(wcRoot)?.phase).toBe('unknown');
+    // 外部视角：扫描不再报告该冲突。
+    conflicts = [];
+  }
+
+  it('reconcile：扫描未报告但回读为 missing 时保持 unknown，路径恢复后才宣告已解决', async () => {
+    await createUnknownResolveRecord();
+    // 路径外部消失：status 可读但条目为 missing，不能宣称已解决。
+    statusAnomalies = { 'text.txt': 'missing' };
+    await sendIntent({ kind: 'rescanConflicts', scope: 'task' });
+    await waitIdle();
+    let snapshot = conflictsSessionSnapshot();
+    expect(snapshot.ledger).toBe(0);
+    expect(snapshot.writeLocked).toBe(true);
+    expect(getOperationRegistry().writeRestriction(wcRoot)?.phase).toBe('unknown');
+
+    // 路径恢复且无冲突：再次扫描以回读证据收口（写台账并释放写锁）。
+    statusAnomalies = {};
+    await sendIntent({ kind: 'rescanConflicts', scope: 'task' });
+    await waitIdle();
+    snapshot = conflictsSessionSnapshot();
+    expect(snapshot.ledger).toBe(1);
+    expect(snapshot.writeLocked).toBe(false);
+    expect(getOperationRegistry().writeRestriction(wcRoot)).toBeUndefined();
+  });
+
+  it('reconcile：扫描未报告但回读为 obstructed 时保持 unknown（外部替换节点不是已解决证据）', async () => {
+    await createUnknownResolveRecord();
+    statusAnomalies = { 'text.txt': 'obstructed' };
+    await sendIntent({ kind: 'rescanConflicts', scope: 'task' });
+    await waitIdle();
+    const snapshot = conflictsSessionSnapshot();
+    // 列表以真实扫描为准（异常路径不生成冲突记录），但未决记录保持
+    // unknown：不写台账、写锁不放宽。
+    expect(snapshot.ledger).toBe(0);
+    expect(snapshot.writeLocked).toBe(true);
+    expect(getOperationRegistry().writeRestriction(wcRoot)?.phase).toBe('unknown');
+  });
+
+  it('reconcile：扫描未报告但目标 info 读取失败时保持 unknown（不可读不是已解决证据）', async () => {
+    await createUnknownResolveRecord();
+    infoFailurePaths.add('text.txt');
+    await sendIntent({ kind: 'rescanConflicts', scope: 'task' });
+    await waitIdle();
+    expect(conflictsSessionSnapshot().ledger).toBe(0);
+    expect(conflictsSessionSnapshot().writeLocked).toBe(true);
+    expect(getOperationRegistry().writeRestriction(wcRoot)?.phase).toBe('unknown');
+
+    // 恢复可读且无冲突：再次扫描收口。
+    infoFailurePaths.delete('text.txt');
+    await sendIntent({ kind: 'rescanConflicts', scope: 'task' });
+    await waitIdle();
+    expect(conflictsSessionSnapshot().ledger).toBe(1);
+    expect(conflictsSessionSnapshot().writeLocked).toBe(false);
+  });
+
+  it('reconcile：扫描阶段该路径详情读取失败时保持 unknown（失败路径不能作为已解决证据）', async () => {
+    await createUnknownResolveRecord();
+    // 回扫时 status 仍报告该路径为冲突候选，但扫描阶段的详情读取失败：
+    // 扫描产出 failures（不产出记录），定向回读本身可读且已无冲突。
+    scanPhaseConflicts = [textConflict('text.txt')];
+    scanInfoFailurePaths = new Set(['text.txt']);
+    statusReadback = new Map([['text.txt', 'clean']]);
+    await sendIntent({ kind: 'rescanConflicts', scope: 'task' });
+    await waitIdle();
+    expect(conflictsModelForTest()!.failures().map((failure) => failure.path)).toEqual(['text.txt']);
+    const snapshot = conflictsSessionSnapshot();
+    // 不可读路径不能作为「已解决」证据：不写台账、写锁保持 unknown。
+    expect(snapshot.ledger).toBe(0);
+    expect(snapshot.writeLocked).toBe(true);
+    expect(getOperationRegistry().writeRestriction(wcRoot)?.phase).toBe('unknown');
+  });
+
+  it('reconcile：扫描未报告但定向回读仍冲突时释放写锁且不写台账', async () => {
+    await createUnknownResolveRecord();
+    // 扫描范围不报告该冲突（conflicts=[]），定向回读 status 仍报告
+    // conflicted（扫描与回读之间外部写回冲突的组合）：不得宣称已解决。
+    statusReadback = new Map([['text.txt', 'conflicted']]);
+    await sendIntent({ kind: 'rescanConflicts', scope: 'task' });
+    await waitIdle();
+    const snapshot = conflictsSessionSnapshot();
+    // 回读明确仍冲突：与「扫描仍报告」同口径释放写锁待重新选择，不写台账。
+    expect(snapshot.ledger).toBe(0);
+    expect(snapshot.writeLocked).toBe(false);
     expect(getOperationRegistry().writeRestriction(wcRoot)).toBeUndefined();
   });
 
@@ -1082,6 +1405,40 @@ describe('P7 面板控制器（mock SVN）', () => {
     await waitIdle();
     expect(conflictsSessionSnapshot().updateTaskContext).toBeUndefined();
     expect(fakePanel().latestRenderHtml()).not.toContain('更新请求 r5');
+  });
+
+  it('属性值补查失败：详情「补齐认证」动作触发重新扫描（authenticateConflictSource）', async () => {
+    // property 冲突但属性三值补查失败（proplist 返回非零）→ 记录无
+    // propertyConflicts，propertyValuesUnavailable 为真。
+    conflicts = [{ path: 'prop.txt', kinds: ['property'], nodeRevision: 3, baselineRevision: 2, incomingRevision: 3 }];
+    setup();
+    await openAndScan();
+    const before = statusCalls.length;
+    await selectPath('prop.txt');
+    expect(fakePanel().latestRenderHtml()).toContain(strings.conflictPanel.detailAuthenticateSource);
+    await sendIntent({ kind: 'authenticateConflictSource' });
+    await waitIdle();
+    // 补录入口经重新扫描触发 authorizeRemote 单飞补查（新一次 status 往返）。
+    expect(statusCalls.length).toBe(before + 1);
+  });
+
+  it('扫描最后收口（reconcile）拒绝不悬挂任务槽', async () => {
+    writeWorkFile('a.txt');
+    conflicts = [textConflict('a.txt')];
+    setup();
+    const registry = new OperationRegistry();
+    // 记录库读取失败：reconcilePendingResolveRecords 在扫描 finally 中拒绝。
+    vi.spyOn(registry, 'loadAllRecords').mockRejectedValueOnce(new Error('record store read failed'));
+    setOperationRegistryForTest(registry);
+    await openConflictPanel({ source: 'local', wcRoot, scopeRelPath: '.' });
+    await waitIdle();
+    // 收口失败不能让 settleTask 不执行：任务槽不悬挂、扫描结果照常上屏。
+    expect(hasActiveTask('conflicts')).toBe(false);
+    expect(conflictsSessionSnapshot().phase).toBe('ready');
+    // 任务槽可用：再次扫描（记录库已恢复）能正常完成。
+    await sendIntent({ kind: 'rescanConflicts' });
+    await waitIdle();
+    expect(hasActiveTask('conflicts')).toBe(false);
   });
 
   it('终态页恢复：resolve 结果提示在重开后一次性展示', async () => {

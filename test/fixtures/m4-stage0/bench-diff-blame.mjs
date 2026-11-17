@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 /**
- * M4 阶段 0 V5-4 性能基准：快速差异（svn diff -U0）与行内追溯（svn blame --xml）
- * 的命令耗时与解析耗时。参数：<工作副本目录>，默认 /tmp/m4-stage0-v5/perf-wc。
+ * 性能基准：快速差异（svn diff -U0）与行内追溯（svn blame --xml）
+ * 的命令耗时与解析耗时。参数：<工作副本目录>，默认 /tmp/svn-anywhere-perf-wc。
  *
  * 复跑前提：工作副本内 small-1mib.txt、large-10mib.txt、lines-10k.txt 已提交，
  * 且各自中部有一处本地修改（脚本会打印状态提示，不修改文件）。
- * 依赖项目 devDependencies 的 fast-xml-parser（blame XML 解析口径与阶段 1 一致）。
+ * 依赖项目 devDependencies 的 fast-xml-parser（与 blame XML 解析口径一致）。
  *
- * 用法：node test/fixtures/m4-stage0/m4-v5-bench.mjs [wcPath]
+ * 用法：node test/fixtures/m4-stage0/bench-diff-blame.mjs [wcPath]
  */
 import { execFile } from 'node:child_process';
 import { createRequire } from 'node:module';
@@ -20,7 +20,7 @@ const projectDir = join(scriptDir, '..', '..', '..');
 const requireFromProject = createRequire(join(projectDir, 'package.json'));
 const { XMLParser } = requireFromProject('fast-xml-parser');
 
-const WC = process.argv[2] || '/tmp/m4-stage0-v5/perf-wc';
+const WC = process.argv[2] || '/tmp/svn-anywhere-perf-wc';
 const ENV = { ...process.env, LANG: 'en_US.UTF-8', LC_ALL: 'en_US.UTF-8' };
 const FILES = ['small-1mib.txt', 'large-10mib.txt', 'lines-10k.txt'];
 

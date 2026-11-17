@@ -1,7 +1,7 @@
 #!/bin/bash
-# V6-2 跨客户端工作副本：SVN 1.14.5 客户端（Alpine 容器）创建混合 revision WC，
+# 跨客户端工作副本：SVN 1.14.5 客户端（Alpine 容器）创建混合 revision WC，
 # 由宿主机 SVN 1.15 客户端执行 status/info/log/relocate/update/resolve，
-# 再回到 1.14 客户端读回。目标仓库用 svn110（1.10.4 服务端），避免污染 V6-1 的 svn114 数据。
+# 再回到 1.14 客户端读回。目标仓库用 svn110（1.10.4 服务端），避免污染 svn114 上的跨版本字段实验数据。
 #
 # 用法：
 #   bash wc-cross-version.sh prepare   # 1.14 checkout r5 + update 到混合 revision，输出 revision 表
@@ -12,7 +12,7 @@
 # 前置：矩阵容器 svn114 镜像可用；svn110 已提交 seed-data.sh 的 r5-r9。
 # WC 落在 $WORK_DIR/wc/wc14（容器内挂载为 /work/wc14）。
 set -eu
-source "$(dirname "$0")/env-v6.sh"
+source "$(dirname "$0")/env.sh"
 STEP=${1:-}
 WC_HOST="$WORK_DIR/wc/wc14"
 # 容器访问宿主映射端口；宿主无法解析 host.docker.internal，因此 relocate 必需。

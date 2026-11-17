@@ -1,7 +1,7 @@
 /**
  * 「查看历史」命令（P6 历史入口，M4 阶段 3 任务 1）。
  *
- * 入口语义（技术方案 §7、交互设计 §三）：
+ * 入口语义：
  * - 资源管理器右键本地文件/目录：向上定位工作副本根，读取节点身份
  *   （URL/仓库根/UUID/kind）与本地 BASE revision（本地 `svn info`，
  *   不访问网络）；
@@ -72,7 +72,7 @@ export async function openHistoryTarget(target: HistoryOpenTarget): Promise<void
     await historyPanelOpener(target);
     return;
   }
-  logLine(strings.historyCommand.panelNotReady, 'browse');
+  logLine(strings.historyCommand.panelNotReady, 'history');
   void vscode.window.showInformationMessage(strings.historyCommand.panelNotReady);
 }
 
@@ -129,7 +129,7 @@ export async function resolveLocalHistoryTarget(
   try {
     const identity = await readNodeIdentity(svnPath, fsPath, {
       ...runOptions,
-      onLog: (args, cwd) => logCommand(svnPath, args, cwd, 'browse'),
+      onLog: (args, cwd) => logCommand(svnPath, args, cwd, 'history'),
     });
     return {
       status: 'ok',
@@ -177,7 +177,7 @@ export async function commandShowHistory(uri?: vscode.Uri): Promise<void> {
     return;
   }
   const svnPath = readSvnPath();
-  const runOptions: RunOptions = { timeoutMs: readTimeoutMs(), ...decodingRunOptions('browse') };
+  const runOptions: RunOptions = { timeoutMs: readTimeoutMs(), ...decodingRunOptions('history') };
   const resolved = await resolveLocalHistoryTarget(fsPath, svnPath, runOptions);
   switch (resolved.status) {
     case 'ok':
@@ -193,7 +193,7 @@ export async function commandShowHistory(uri?: vscode.Uri): Promise<void> {
       void vscode.window.showWarningMessage(strings.activation.svnMissing);
       return;
     case 'error':
-      showCommandError(resolved.error, 'browse');
+      showCommandError(resolved.error, 'history');
       return;
   }
 }
@@ -215,7 +215,7 @@ export function registerShowHistoryCommand(context: vscode.ExtensionContext): vo
     disposable.dispose();
   }
   registeredDisposables = [
-    registerCommand(context, 'svnAnywhere.showHistory', commandShowHistory, 'browse'),
+    registerCommand(context, 'svnAnywhere.showHistory', commandShowHistory, 'history'),
   ];
 }
 

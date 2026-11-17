@@ -23,7 +23,7 @@ export interface StatusEntry {
   changelist: string | null;
   /**
    * 树冲突标记（wc-status@tree-conflicted）：树冲突的 item 可能是
-   * added/replaced/deleted，不能只筛 item=conflicted（技术方案 §5.1）。
+   * added/replaced/deleted，不能只筛 item=conflicted。
    */
   treeConflicted?: boolean;
   /** 条目所在的整副本写锁标记（wc-status@wc-locked，含根 item=incomplete）。 */

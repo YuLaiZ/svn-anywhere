@@ -331,6 +331,11 @@ describe('checkRemote', () => {
     ['E200009', 'urlNotFound', 'svn: warning: W170000: URL non-existent\nsvn: E200009: Could not display info for all targets'],
     ['E160006', 'revisionNotFound', 'svn: E160006: No such revision 99'],
     ['E175002', 'connection', 'svn: E175002: Unable to connect to a repository'],
+    // 检出侧第二套连接码集合：超时、连接中断、无法连接。
+    // 仅带目标码（不叠加集合内其它码），确保对应码从集合移除时用例即红。
+    ['E175012', 'connection', 'svn: E175012: Connection timed out'],
+    ['E120108', 'connection', 'svn: E120108: Connection reset by peer'],
+    ['E000061', 'connection', 'svn: E000061: Unable to connect to a repository at URL'],
   ])('失败分类：%s → %s', async (_code, failure, stderr) => {
     vi.mocked(runOrThrow).mockRejectedValue(svnError(stderr));
     const result = await checkRemote('svn', 'https://h/repo/trunk');

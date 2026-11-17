@@ -2,7 +2,7 @@
  * 远端文件内容的 core 原语：MIME/NUL 双重分类、文本内嵌读取、runToFile
  * 临时资源与降级状态。core 模块，不依赖 vscode。
  *
- * 口径（技术方案 §3.4，阶段 0 实测）：
+ * 口径（远端资源纪律，真实 svn 实测）：
  * - `svn cat` 必须真流式：文本内嵌读取经 runStream 不累计整段、按字节
  *   计数到 16 MiB 上限即终止；二进制/大文本经 runToFile 直接管道到
  *   `.part`，宿主内存峰值与文件大小无关（256 MiB 实测父进程约 24 MiB
@@ -115,7 +115,7 @@ class ProbeWindowReached extends Error {
 }
 
 /**
- * 读取远端文件的前 limit 字节：读满窗口立即抛哨兵终止 cat（阶段 0 的
+ * 读取远端文件的前 limit 字节：读满窗口立即抛哨兵终止 cat（既有的
  * 探测方式），整文件小于窗口时随进程正常结束返回全部字节。非零退出
  * 由 runOrThrowWithRunner 转成 SvnError，交给调用方分类；认证补录重试
  * 前清空已读字节。

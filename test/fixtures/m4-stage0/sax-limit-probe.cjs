@@ -1,11 +1,11 @@
 #!/usr/bin/env node
-// M4 阶段0 V1：合成大 XML 的 SAX 流式字节上限验证（tooLarge 路径可行性）
+// 合成大 XML 的 SAX 流式字节上限验证（tooLarge 路径可行性）
 // 用法: node sax-limit-probe.cjs <xml-file> <limit-bytes> [--synthetic-mb N]
 // 若文件不存在则先合成 N MiB 的合法 <lists> XML（条目名 200 字节），并写盘。
 'use strict';
 const fs = require('fs');
 const { StringDecoder } = require('string_decoder');
-const { SaxesParser } = require(process.env.M4_SAXES_PATH || '/tmp/m4-stage0-V1/nodetools/node_modules/saxes');
+const { SaxesParser } = require(process.env.M4_SAXES_PATH || require('path').join(__dirname, '..', '..', '..', 'node_modules', 'saxes'));
 
 const file = process.argv[2];
 const limit = Number(process.argv[3] || 64 * 1024 * 1024);

@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-// M4 阶段 0 / V2 历史上限语义参考验证（C12）。
+// 历史上限语义参考验证。
 //
 // 产品上限为 5,000 个唯一命中 revision 与 100,000 个唯一扫描 revision；
 // 这里用同构的小参数（matched=3、scanned=6、pageSize=2、单轮原始回包预算=6）
-// 验证技术方案 4.1 的语义：到达上限停止请求、越过时完整保留整页与 lookahead、
+// 验证历史分页契约：到达上限停止请求、越过时完整保留整页与 lookahead、
 // reasons 记录 matched/scanned、同一轮可两项并存、页内记录不截断、清理重置会话。
 //
 // 用法：node gen-limit-fixture.mjs

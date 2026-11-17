@@ -1,7 +1,7 @@
 /**
  * svn resolve 的参数、动作矩阵与回扫判定。core 模块，不依赖 vscode。
  *
- * 关键纪律（技术方案 §5.2 / §5.3，阶段 0 V4 实测回填）：
+ * 关键纪律（属性冲突处理与冲突解决回读契约，真实 svn 冲突场景实测回填）：
  * - `svn resolve` 固定路径级 `--depth empty --non-interactive`，绝不带
  *   infinity，也不波及同路径以外的冲突；
  * - `postpone` 不是 `svn resolve --accept` 合法值（E205000），只作为面板
@@ -22,12 +22,15 @@ import {
   type ConflictContentKind,
   type ConflictKind,
   type ConflictRecord,
+  type ConflictRecordReadResult,
   type ConflictStatusScan,
 } from './conflict';
 import { SvnError, tailText } from './errors';
+import type { ResolveIntent, ResolveIntentTarget } from './operations';
 import { run, runOrThrow, type RunOptions, type RunResult } from './svnCli';
 import { escapePeg } from './workspace';
-// parseStatusXml 只用于回读时识别 missing/deleted 条目；冲突判定仍走 conflict 的三判据投影。
+// parseStatusXml 只用于回读时识别 missing/deleted/obstructed/incomplete 条目；
+// 冲突判定仍走 conflict 的三判据投影。
 import { parseStatusXml } from './status';
 
 /** `svn resolve --accept` 的六个合法值（`svn help resolve` 枚举）。 */
@@ -94,27 +97,11 @@ export type ResolveSelection =
   /** 推迟：只改面板状态，不触发 SVN 写命令。 */
   | { kind: 'postpone' };
 
-/** 单项固定意图目标（技术方案 §5.6 ResolveIntent.targets）。 */
-export interface ResolveIntentTarget {
-  /** 规范化工作副本相对路径。 */
-  relPath: string;
-  conflictKinds: ConflictKind[];
-  /** 冲突指纹（与 ConflictRecord.id 同源）。 */
-  fingerprint: string;
-  /** 用户策略（accept 值 / working / 属性选择摘要）；不保存属性原值。 */
-  strategy: string;
-}
-
 /**
- * resolve 的固定持久意图（技术方案 §5.3/§5.6 冻结契约）：
- * 只保存工作副本根、规范化相对路径、冲突类型/指纹、用户策略与可选
- * batchId；不保存属性原值、文件内容或凭据。
+ * 固定意图的单一权威定义在 core/operations（OperationRecord.resolveIntent
+ * 的持久契约）；这里只重导出供既有调用方从 resolve 模块引用，不复制形状。
  */
-export interface ResolveIntent {
-  scopeRoot: string;
-  targets: ResolveIntentTarget[];
-  batchId?: string;
-}
+export type { ResolveIntent, ResolveIntentTarget };
 
 /** 单步执行计划；属性值只存在于运行期内存，不写操作记录。 */
 export type ResolveStep =
@@ -144,7 +131,7 @@ function hasKind(record: ConflictRecord, kind: ConflictKind): boolean {
 }
 
 /**
- * 动作矩阵（技术方案 §5.2 冻结表）：
+ * 动作矩阵（属性冲突处理契约）：
  * - 纯文本：六种 --accept 值；working 走人工确认流程；
  * - 二进制：mine-full/theirs-full/working，禁用冲突块变体与 base；
  * - 纯属性：逐属性选择后 working（整值 accept 不开放）；
@@ -389,9 +376,34 @@ function errorMessage(err: unknown): string {
 }
 
 /**
- * 命令后回读（技术方案 §5.3）：status + info 联合判定。
- * - status 报 missing（`!`）或非树冲突场景的 deleted（`D`）→ anomalous：
- *   外部删除路径后 info 仍 exit 0 且不返回冲突，只看 info 会误判已解决；
+ * status 条目是否属于「路径状态异常」：即使 info 已无冲突节点也不能宣称
+ * 已解决（status 出现 missing/deleted 等异常时不得宣称已解决）。
+ * - missing（`!`）与 deleted（`D`）是外部删除路径的已知形态；
+ * - obstructed（`~`）：版本化文件被同名非版本化节点（目录/文件）替换，
+ *   svn resolve --accept working 后 info 仍 exit 0 且无 <conflict>，
+ *   只看 info 会误判已解决（SVN 1.15 实测）；
+ * - incomplete：遍历中断/未完成的条目，不能作为「已解决」证据；
+ * - 树冲突 working 的预期结果可以是保留 D：previousKinds 含 tree 时
+ *   deleted 不视为异常。
+ */
+export function isAnomalousResolveStatus(
+  statusItem: string | undefined,
+  previousKinds: readonly ConflictKind[] = [],
+): boolean {
+  if (statusItem === undefined) {
+    return false;
+  }
+  if (statusItem === 'missing' || statusItem === 'obstructed' || statusItem === 'incomplete') {
+    return true;
+  }
+  return statusItem === 'deleted' && !previousKinds.includes('tree');
+}
+
+/**
+ * 命令后回读：status + info 联合判定。
+ * - status 报 missing（`!`）、obstructed（`~`）、incomplete 或非树冲突场景
+ *   的 deleted（`D`）→ anomalous：外部删除/替换路径后 info 仍 exit 0 且
+ *   不返回冲突，只看 info 会误判已解决；
  * - status 三判据仍命中或 info 仍有冲突节点 → unresolved；
  * - info 回读失败或 status 整体失败 → unknown（不得凭退出码宣称成功）；
  * - 二者都明确清除才 resolved。
@@ -411,7 +423,7 @@ export async function verifyResolveOutcome(
     return { outcome: 'unknown', detail: errorMessage(err) };
   }
   if (statusResult.exitCode !== 0) {
-    return { outcome: 'unknown', detail: tailText(statusResult.stderr.trim() || `svn status 退出码 ${statusResult.exitCode}`) };
+    return { outcome: 'unknown', detail: tailText(statusResult.stderr.trim() || `svn status exit code ${statusResult.exitCode}`) };
   }
   let scan: ConflictStatusScan;
   try {
@@ -428,12 +440,7 @@ export async function verifyResolveOutcome(
     return { outcome: 'unknown', detail: info.error, statusItem: statusEntry?.wcStatus };
   }
   const statusItem = statusEntry?.wcStatus;
-  if (statusItem === 'missing') {
-    return { outcome: 'anomalous', record: info.record, statusItem };
-  }
-  if (statusItem === 'deleted' && !(previousKinds ?? []).includes('tree')) {
-    // 树冲突 working 的预期结果可以是保留 D；其他类型解决后出现 D 说明
-    // 路径状态被外部改变，不能宣称已解决。
+  if (isAnomalousResolveStatus(statusItem, previousKinds)) {
     return { outcome: 'anomalous', record: info.record, statusItem };
   }
   if (stillConflicted || info.record) {
@@ -447,6 +454,12 @@ export interface ExecuteResolveParams {
   record: ConflictRecord;
   selection: ResolveSelection;
   contentKind?: ConflictContentKind;
+  /**
+   * 执行前重读的当前冲突记录（可选）。远端属性值需要认证时，宿主以与
+   * 扫描同一口径（authorizeRemote 补录）重读并传入；提供时不再用无凭据
+   * 选项重读——否则认证远端来源下属性名集合读取失败会让指纹误报变化。
+   */
+  preReadRecord?: ConflictRecord;
 }
 
 export interface ExecuteResolveResult {
@@ -475,7 +488,11 @@ export async function executeResolve(
   if (!plan.ok) {
     return { outcome: 'rejected', reason: plan.reason };
   }
-  const pre = await readConflictRecord(svnPath, wcRoot, params.record.path, options);
+  // 宿主已按扫描同口径（含远端认证补录）完成执行前重读时直接采用，
+  // 不再用无凭据选项重读（认证远端来源的属性记录会因此误报指纹变化）。
+  const pre: ConflictRecordReadResult = params.preReadRecord !== undefined
+    ? { record: params.preReadRecord }
+    : await readConflictRecord(svnPath, wcRoot, params.record.path, options);
   if (pre.error) {
     return { outcome: 'unknown', error: pre.error };
   }

@@ -1,16 +1,16 @@
 #!/bin/sh
-# M4 阶段 0 / V2（历史、复制与筛选）本地 SVN 实验 fixture 构造脚本。
+# 本地 SVN 实验 fixture 构造脚本（历史、复制与筛选场景）。
 # 只使用 svnadmin + file:// + svnmucc，不访问网络、不使用真实凭据。
-# 用法：build-fixtures.sh [目标目录]（默认 /tmp/m4-stage0-v2/repos）
+# 用法：build-fixtures.sh [目标目录]（默认 /tmp/svn-anywhere-fixtures/repos）
 # 复跑：脚本先删除目标目录下同名仓库再重建，保证 revision 编号与提交内容一致。
 
 set -eu
 
-ROOT=${1:-/tmp/m4-stage0-v2/repos}
+ROOT=${1:-/tmp/svn-anywhere-fixtures/repos}
 SVNADMIN=${SVNADMIN:-svnadmin}
 SVNMUCC=${SVNMUCC:-svnmucc}
 SVN=${SVN:-svn}
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/m4-stage0-v2-build.XXXXXX")
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/svn-anywhere-fixtures-build.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 
 export LANG=${LANG:-en_US.UTF-8}

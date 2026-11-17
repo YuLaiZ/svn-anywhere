@@ -1,5 +1,5 @@
 /**
- * 远端仓库浏览 core 原语测试（M4 阶段 1，core/remoteBrowse）：
+ * 远端仓库浏览 core 原语测试（core/remoteBrowse）：
  * - info --xml 解析：快照 revision 与最后修改 revision 分字段、文件 size、
  *   原始 URL 保留、相对路径逐段解码、缺字段判解析失败；
  * - list --xml 流式 SAX：不 trim、实体一次解码、CDATA、中文/emoji 任意
@@ -12,9 +12,11 @@
  * XML fixture 全部内联；真实 svn 行为用 test/helpers 的本地实验仓库。
  */
 import { execSync } from 'node:child_process';
-import { mkdirSync } from 'node:fs';
+import { chmodSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { parseLogXml, buildHistoryLogArgs, createTargetSource } from '../src/core/history';
+import { run } from '../src/core/svnCli';
 import {
   BINARY_PROBE_BYTES,
   BrowseLimitExceededError,
@@ -310,7 +312,7 @@ describe('parseDirectoryListXml（saxes 流式）', () => {
     }
   });
 
-  it('预算常量符合技术方案（100k 条目 / 64 MiB）', () => {
+  it('预算常量符合契约（100k 条目 / 64 MiB）', () => {
     expect(REMOTE_BROWSE_MAX_ENTRIES).toBe(100_000);
     expect(REMOTE_BROWSE_MAX_XML_BYTES).toBe(64 * 1024 * 1024);
   });
@@ -731,6 +733,32 @@ describe('真实 svn 浏览（file:// 实验仓库）', () => {
       lab.cleanup();
     }
   });
+
+  it.runIf(hasSvn && hasSvnadmin)('info 输出缺必要字段判 parse：错误消息为英文技术诊断', async () => {
+    const lab = createSvnLab('svn-anywhere-browse-parse-');
+    try {
+      const wrapper = join(lab.root, 'svn-info-missing-fields.sh');
+      writeFileSync(wrapper, [
+        '#!/bin/bash',
+        'if [ "$1" = "info" ]; then',
+        '  printf \'<?xml version="1.0"?><info><entry kind="file" path="a.txt" revision="1"></entry></info>\'',
+        '  exit 0',
+        'fi',
+        `exec "${execSync('which svn', { encoding: 'utf8' }).trim()}" "$@"`,
+        '',
+      ].join('\n'));
+      chmodSync(wrapper, 0o755);
+      const result = await readRemoteNode(wrapper, `${lab.repoUrl}/trunk/a.txt`, { revision: 1 });
+      expect(result.status).toBe('error');
+      if (result.status === 'error') {
+        // 稳定分类是 parse；面向用户的文案由宿主按 kind 映射 i18n。
+        expect(result.error.kind).toBe('parse');
+        expect(result.error.message).not.toMatch(/[一-鿿]/);
+      }
+    } finally {
+      lab.cleanup();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -778,8 +806,8 @@ describe('parseDirectoryNameList（无元数据 svn list）', () => {
     // 空输出 = 空目录（ready 判定由 exit 0 承担）。
     expect(parseDirectoryNameList('').total).toBe(0);
     // 空行（输出损坏/名称异常）不静默少计条目。
-    expect(() => parseDirectoryNameList('a.txt\n\nb.txt\n')).toThrow(/异常空行/);
-    expect(() => parseDirectoryNameList('/\n')).toThrow(/异常空行/);
+    expect(() => parseDirectoryNameList('a.txt\n\nb.txt\n')).toThrow(/malformed empty line/);
+    expect(() => parseDirectoryNameList('/\n')).toThrow(/malformed empty line/);
   });
 
   it('任意字节分块（切在多字节字符中间）与整段结果一致；CRLF 行结束符被剥离', () => {
@@ -903,6 +931,150 @@ describe('真实 svn 名称列表（file:// 实验仓库）', () => {
         expect(limited.reason).toBe('entries');
         expect(limited.limit).toBe(2);
       }
+    } finally {
+      lab.cleanup();
+    }
+  });
+
+  it.runIf(hasSvn && hasSvnadmin)('末行无换行且恰好越限：end 收口的越限返回 tooLarge，不降级为 parse', async () => {
+    // readRemoteDirectoryNames 内层 catch 曾把 end() 收口时
+    // 抛出的 BrowseLimitExceededError 一并转成 kind:'parse'。用 wrapper
+    // 伪造「exit 0 + 末行无换行 + 恰好超过 maxEntries」的输出。
+    const lab = createSvnLab('svn-anywhere-namelist-end-limit-');
+    try {
+      const wrapper = join(lab.root, 'svn-list-tail-noeol.sh');
+      writeFileSync(wrapper, [
+        '#!/bin/bash',
+        'if [ "$1" = "list" ]; then',
+        '  printf \'a\\nb\\nc\'',
+        '  exit 0',
+        'fi',
+        `exec "${execSync('which svn', { encoding: 'utf8' }).trim()}" "$@"`,
+        '',
+      ].join('\n'));
+      chmodSync(wrapper, 0o755);
+
+      const limited = await readRemoteDirectoryNames(wrapper, `${lab.repoUrl}/trunk`, {
+        revision: 1,
+        maxEntries: 2,
+      });
+      // 修复前：status='error', error.kind='parse'；修复后 tooLarge(entries)。
+      expect(limited.status).toBe('tooLarge');
+      if (limited.status === 'tooLarge') {
+        expect(limited.reason).toBe('entries');
+        expect(limited.limit).toBe(2);
+        expect(limited.error.kind).toBe('tooLarge');
+      }
+    } finally {
+      lab.cleanup();
+    }
+  });
+
+  it.runIf(hasSvn && hasSvnadmin)('异常空行的名称列表判 parse：错误消息为英文技术诊断', async () => {
+    const lab = createSvnLab('svn-anywhere-namelist-parse-');
+    try {
+      const wrapper = join(lab.root, 'svn-list-blank-lines.sh');
+      writeFileSync(wrapper, [
+        '#!/bin/bash',
+        'if [ "$1" = "list" ]; then',
+        "  printf 'a\\n\\nb\\n'",
+        '  exit 0',
+        'fi',
+        `exec "${execSync('which svn', { encoding: 'utf8' }).trim()}" "$@"`,
+        '',
+      ].join('\n'));
+      chmodSync(wrapper, 0o755);
+      const result = await readRemoteDirectoryNames(wrapper, `${lab.repoUrl}/trunk`, { revision: 1 });
+      expect(result.status).toBe('error');
+      if (result.status === 'error') {
+        expect(result.error.kind).toBe('parse');
+        expect(result.error.message).not.toMatch(/[一-鿿]/);
+      }
+    } finally {
+      lab.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 名称以 @ 结尾的节点（urlWithPeg 固定拼接，不剥除字面尾 @）
+// ---------------------------------------------------------------------------
+
+/**
+ * 真实 svn 实测：仓库可提交名称 `tail@`，`svn info`
+ * 回包的 `<url>` 原样保留字面尾 `@`（不编码 `%40`）。旧构造器剥除尾 `@`
+ * 后拼 peg（`…/tail@1`），svn 会解析为路径 `tail` + peg 1——指向同名兄弟
+ * 节点；无 revision 时原样 `…/tail@` 被解析为路径 `tail` + 空 peg 并报
+ * W170000。本用例断言 info/list/log 都经 info 回包的字面 URL 读回自身。
+ */
+describe('名称以 @ 结尾的节点（真实 svn file:// 回读）', () => {
+  it.runIf(hasSvn && hasSvnadmin)('info/list/log 以字面尾 @ URL 读回自身而不是同名兄弟', async () => {
+    const lab = createSvnLab('svn-anywhere-tail-at-');
+    try {
+      const src = join(lab.root, 'src');
+      writeFile(src, 'tail', 'brother\n');
+      writeFile(src, 'tail@', 'self@\n');
+      writeFile(src, 'dir@/inner.txt', 'inner@\n');
+      lab.svn(['import', '-q', '-m', 'init', src, `${lab.repoUrl}/trunk`]);
+      const trunkUrl = `${lab.repoUrl}/trunk`;
+
+      const trunk = await readRemoteNode('svn', trunkUrl, { revision: 1 });
+      expect(trunk.status).toBe('present');
+      if (trunk.status !== 'present') {
+        return;
+      }
+      const listing = await readRemoteDirectory('svn', trunkUrl, { revision: 1 });
+      expect(listing.status).toBe('ready');
+      if (listing.status !== 'ready') {
+        return;
+      }
+      const names = listing.listing.entries.map((entry) => entry.name).sort();
+      expect(names).toEqual(['dir@', 'tail', 'tail@'].sort());
+
+      // 条目 URL 逐段编码为 %40；info 回包 <url> 原样还原字面尾 @。
+      const tailAtEntry = listing.listing.entries.find((entry) => entry.name === 'tail@')!;
+      const viaEntry = await readRemoteNode('svn', entryNodeRef(trunk.node, tailAtEntry).rawUrl, { revision: 1 });
+      expect(viaEntry.status).toBe('present');
+      if (viaEntry.status !== 'present') {
+        return;
+      }
+      const literalUrl = viaEntry.node.rawUrl;
+      expect(literalUrl.endsWith('/tail@')).toBe(true);
+      expect(viaEntry.node.relativePath).toBe('trunk/tail@');
+
+      // 无 revision：修复前原样 …/tail@ 被解析为「路径 tail + 空 peg」报 W170000。
+      const noRevision = await readRemoteNode('svn', literalUrl);
+      expect(noRevision.status).toBe('present');
+      if (noRevision.status === 'present') {
+        expect(noRevision.node.relativePath).toBe('trunk/tail@');
+        expect(noRevision.node.kind).toBe('file');
+      }
+
+      // 带 revision：修复前 …/tail@1 指向同名兄弟 tail（present 但身份错误）。
+      const withRevision = await readRemoteNode('svn', literalUrl, { revision: 1 });
+      expect(withRevision.status).toBe('present');
+      if (withRevision.status === 'present') {
+        expect(withRevision.node.relativePath).toBe('trunk/tail@');
+      }
+
+      // list 文件 URL 返回单条目：必须是 tail@ 自身，不是兄弟 tail。
+      const fileList = await readRemoteDirectory('svn', literalUrl, { revision: 1 });
+      expect(fileList.status).toBe('ready');
+      if (fileList.status === 'ready') {
+        expect(fileList.listing.entries.map((entry) => entry.name)).toEqual(['tail@']);
+      }
+
+      // log 走同一 peg 构造：历史路径必须落在 /trunk/tail@ 上。
+      const log = await run('svn', buildHistoryLogArgs(createTargetSource({
+        url: literalUrl,
+        repositoryRootUrl: lab.repoUrl,
+        relativePath: 'trunk/tail@',
+        kind: 'file',
+      }, 1), 50, false));
+      expect(log.exitCode).toBe(0);
+      const entries = parseLogXml(log.stdout);
+      expect(entries.length).toBeGreaterThan(0);
+      expect(entries.flatMap((entry) => entry.paths.map((change) => change.path))).toContain('/trunk/tail@');
     } finally {
       lab.cleanup();
     }

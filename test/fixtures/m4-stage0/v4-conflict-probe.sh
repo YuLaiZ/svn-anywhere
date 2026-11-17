@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M4 阶段 0 / V4 冲突类型与动作的可复跑探针。
+# 冲突类型与动作的可复跑探针。
 # 只依赖本机 svn/svnadmin、file:// 仓库与 xmllint，不访问任何远端服务器或真实凭据。
 # 用法：bash test/fixtures/m4-stage0/v4-conflict-probe.sh [--keep]
 # 断言失败时以非零码退出；--keep 保留临时目录供人工核查。

@@ -1,8 +1,8 @@
 /**
- * F108 行内追溯 / P6 逐行追溯的 `svn blame --xml` 执行与解析。core 模块，
+ * 行内追溯与 P6 历史 revision 逐行追溯共用的 `svn blame --xml` 执行与解析。core 模块，
  * 不依赖 vscode。
  *
- * 口径（技术方案 §4.7 与阶段 0 V5/V6 实测）：
+ * 口径（逐行追溯契约与真实 svn blame/diff 实测）：
  * - 当前工作文件必须执行**不带任何 -r** 的默认调用，行号才与当前工作文件
  *   对齐；显式 `-r 1:HEAD`/`-r BASE` 对工作副本按 BASE 内容输出，本地修改/
  *   新增后行号错位。P6 历史 revision 对解析后的 URL 使用明确 revision。
@@ -10,7 +10,7 @@
  *   urlWithPeg 构造（含字面 @ 的 URL 必须补 peg，无 revision 也追加空 peg）。
  * - XML 每行 `<entry line-number>`；`<commit>` 可缺失（本地修改/新增行 →
  *   「未提交/未归属」），`<author>` 可整体缺失；`<date>` 为 ISO8601 UTC。
- * - 解析不得使用 fast-xml-parser 一次性 DOM（阶段 0：10 MiB XML 1.2 s，
+ * - 解析不得使用 fast-xml-parser 一次性 DOM（实测：10 MiB XML 1.2 s，
  *   超 50 ms 阈值 24 倍）；这里用 runStream + StringDecoder('utf8') +
  *   saxes 流式分片解析，只在内存保留每行的小对象，进程管道块边界自然
  *   让出事件循环。
@@ -28,7 +28,7 @@
  */
 import { SaxesParser } from 'saxes';
 import { SvnError, extractSvnErrorCodes, tailText } from './errors';
-import { runStream, urlWithPeg, Utf8StreamDecoder, type RunOptions, type RunStreamResult } from './svnCli';
+import { runOrThrowWithRunner, runStream, urlWithPeg, Utf8StreamDecoder, type RunOptions, type RunResult, type RunStreamResult } from './svnCli';
 import { escapePeg } from './workspace';
 
 /** blame XML 默认输出字节上限：64 MiB（工作文件的约 2.18 倍）。 */
@@ -230,7 +230,7 @@ export class BlameXmlParser {
 /** blame 输出超过字节上限；由驱动层映射为 notTraceable('tooLarge')。 */
 export class BlameBudgetError extends Error {
   constructor() {
-    super('blame XML 输出超过字节上限');
+    super('blame XML output exceeds the byte limit');
     this.name = 'BlameBudgetError';
   }
 }
@@ -281,29 +281,56 @@ export async function runBlame(
   options: RunOptions = {},
 ): Promise<BlameResult> {
   const args = buildBlameArgs(params);
-  const parser = new BlameXmlParser({ maxBytes: params.maxBytes });
-  const decoder = new Utf8StreamDecoder();
-  let result: RunStreamResult;
+  let parser = new BlameXmlParser({ maxBytes: params.maxBytes });
+  let decoder = new Utf8StreamDecoder();
+  let lastResult: RunStreamResult | undefined;
+  // 认证失败（E170001/E215004）经统一补录原语重试一次；重试前重建解析器
+  // 与解码器（SaxesParser 不能吞回已喂入的半个文档，StringDecoder 也可能
+  // 残留分块边界字节），避免两次尝试的数据混合。
+  const streamOptions: RunOptions = {
+    ...options,
+    onCredentialRetry: (retryArgs) => {
+      parser = new BlameXmlParser({ maxBytes: params.maxBytes });
+      decoder = new Utf8StreamDecoder();
+      return options.onCredentialRetry?.(retryArgs);
+    },
+  };
+  let result: RunResult;
   try {
-    result = await runStream(svnPath, args, {
-      ...options,
-      onStdoutChunk: (chunk) => {
-        parser.feed(decoder.write(chunk));
+    result = await runOrThrowWithRunner(
+      svnPath,
+      args,
+      streamOptions,
+      async (runnerPath, runnerArgs, runnerOptions = {}) => {
+        lastResult = undefined;
+        const attempt = await runStream(runnerPath, runnerArgs, {
+          ...runnerOptions,
+          onStdoutChunk: (chunk) => {
+            parser.feed(decoder.write(chunk));
+          },
+        });
+        lastResult = attempt;
+        return attempt;
       },
-    });
+    );
   } catch (err) {
     if (err instanceof BlameBudgetError) {
       return { state: 'notTraceable', reason: 'tooLarge', detail: err.message };
     }
-    if (err instanceof SvnError) {
+    if (err instanceof SvnError && lastResult !== undefined && lastResult.exitCode !== 0) {
+      // 命令已正常结束但退出码非零（含认证补录重试后仍失败）：保持既有
+      // 业务结果形态，交给下方按 stderr 分流（notTraceable / 抛 SvnError）。
+      result = lastResult;
+    } else if (err instanceof SvnError) {
       throw err;
+    } else {
+      throw new SvnError({
+        message: `blame XML parse failed: ${err instanceof Error ? err.message : String(err)}`,
+        command: args,
+        cwd: options.cwd,
+        code: 'XML_PARSE',
+      });
     }
-    throw new SvnError({
-      message: `blame XML 解析失败：${err instanceof Error ? err.message : String(err)}`,
-      command: args,
-      cwd: options.cwd,
-      code: 'XML_PARSE',
-    });
   }
 
   if (result.exitCode !== 0) {
@@ -322,7 +349,7 @@ export async function runBlame(
       return { state: 'notTraceable', reason: 'notFound', detail: tailText(result.stderr) };
     }
     throw new SvnError({
-      message: tailText(result.stderr.trim() || `svn blame 退出码 ${result.exitCode}`),
+      message: tailText(result.stderr.trim() || `svn blame exit code ${result.exitCode}`),
       command: args,
       cwd: options.cwd,
       exitCode: result.exitCode,
@@ -343,14 +370,14 @@ export async function runBlame(
       return { state: 'notTraceable', reason: 'tooLarge', detail: err.message };
     }
     throw new SvnError({
-      message: `blame XML 解析失败：${err instanceof Error ? err.message : String(err)}`,
+      message: `blame XML parse failed: ${err instanceof Error ? err.message : String(err)}`,
       command: args,
       cwd: options.cwd,
       code: 'XML_PARSE',
     });
   }
 
-  // 二进制跳过是「成功但空结果 + 警告」：不能当作 0 行文件（阶段 0 V6）。
+  // 二进制跳过是「成功但空结果 + 警告」：不能当作 0 行文件（真实 svn 实测）。
   if (/Skipping binary file/i.test(result.stderr)) {
     return { state: 'notTraceable', reason: 'binary', detail: tailText(result.stderr) };
   }

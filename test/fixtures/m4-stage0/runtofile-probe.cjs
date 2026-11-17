@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// M4 阶段0 V1：svn cat 真 stdout 管道到临时文件的峰值内存与降级路径探针
+// svn cat 真 stdout 管道到临时文件的峰值内存与降级路径探针
 // 场景:
 //   pipe      正确的 runToFile 模型：spawn svn cat → stdout 直接 pipe 到 .part 文件，按字节计数，成功后 rename
 //   accumulate 错误对照：把 stdout 累积到 Buffer[] 再拼接写文件（证明会随文件大小爆内存）
@@ -15,7 +15,7 @@ const url = process.argv[2];
 const mode = process.argv[3];
 const arg = (name, dflt) => { const i = process.argv.indexOf(name); return i > 0 ? process.argv[i + 1] : dflt; };
 if (!url || !mode) { console.error('usage: runtofile-probe.cjs <url> <pipe|accumulate|limit|diskfree> [--limit N] [--out DIR]'); process.exit(2); }
-const outDir = arg('--out', '/tmp/m4-stage0-V1/tmpout');
+const outDir = arg('--out', '/tmp/svn-anywhere-fixture-lab/tmpout');
 const hardLimit = Number(arg('--limit', String(2 * 1024 * 1024 * 1024)));
 fs.mkdirSync(outDir, { recursive: true });
 const target = path.join(outDir, `probe-${Date.now()}-${Math.random().toString(36).slice(2)}.part`);

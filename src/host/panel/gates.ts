@@ -252,7 +252,7 @@ const P5_READONLY_INTENTS: readonly GateRule[] = [
 ];
 
 /**
- * P5 放行表：读请求一般不受 busy/writeLocked 阻止（技术方案 §7）。
+ * P5 放行表：读请求一般不受 busy/writeLocked 阻止。
  * busy 只可能来自元数据补全任务或等待态，writeLocked 来自与其他面板
  * 共享的写操作锁——两者都不改变「浏览只读」的事实，因此两行放行全部
  * P5 意图；P5 没有写入口需要拒绝。
@@ -300,7 +300,7 @@ const P6_READONLY_INTENTS: readonly GateRule[] = [
 const P6_BLOCKED_IN_OCCUPANCY: readonly GateRule[] = [
   // 推进会话网络读取：与更新任务结果页/会话交错。
   { action: 'loadMoreHistory' },
-  // 清会话重读与刷新上限：HLS-6 要求 reset 与 refresh 同组禁用。
+  // 清会话重读与刷新上限：reset 与 refresh 必须同组禁用。
   { action: 'resetHistorySession' },
   { action: 'refreshHistoryUpper' },
   // 写工作副本与检出交接：写入在途禁止重复写入与切换目标。

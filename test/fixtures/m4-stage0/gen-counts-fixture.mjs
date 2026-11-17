@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// M4 阶段 0 / V2 计数 fixture 生成与参考验证（C9/C12）。
+// 计数 fixture 生成与参考验证。
 //
-// 生成两轮“加载更多”的多源合成回包，用于阶段 3 单测直接断言六类计数：
+// 生成两轮“加载更多”的多源合成回包，用于宿主单元测试直接断言六类计数：
 //   rawFetchedInLoad / scannedThisLoad / rawFetchedTotal /
 //   scannedRevisionIds / entriesByRevision / visibleMatched
 //
@@ -175,8 +175,8 @@ const expected = {
   checks: Object.fromEntries(checks),
   failed,
   hasMoreAssertions: {
-    // 本 fixture 只有 2 条可见匹配，不足以演示 pending；阶段 3 用 budget 仓库
-    // （500 raw / 80 matched / 每页 50）断言三态：见 probe-history.sh B6B_*。
+    // 本 fixture 只有 2 条可见匹配，不足以演示 pending；500 条扫描预算仓库
+    // （500 raw / 80 matched / 每页 50）断言三态：见 probe-history.sh 的分页模拟输出。
     pendingFirst: "displayedCount=50 < visibleMatched=80 => hasMore=true",
     unscannedSources: "displayedCount=visibleMatched 且源未耗尽 => canFetchMore=true => hasMore=true",
     sessionLimit: "historyLimitState.reasons 非空 => canFetchMore=false；pending 清空后 hasMore=false，未清空仍 true",

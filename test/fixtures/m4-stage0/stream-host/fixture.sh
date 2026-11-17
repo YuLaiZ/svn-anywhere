@@ -1,17 +1,17 @@
 #!/bin/bash
-# M4 阶段 0 / V3 可复跑 fixture：快照比较与差异资源。
+# 可复跑 fixture：快照比较与差异资源。
 # 本机 svnadmin + file:// 只读实验，不访问真实服务器。统一产品同源 locale。
-# 用法：M4_STAGE0_ROOT=/tmp/m4-stage0-V3 ./fixture.sh
+# 用法：FIXTURE_ROOT=/tmp/svn-anywhere-stream-host ./fixture.sh
 set -euo pipefail
 export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
-ROOT=${M4_STAGE0_ROOT:-/tmp/m4-stage0-V3}
+ROOT=${FIXTURE_ROOT:-/tmp/svn-anywhere-stream-host}
 BASE=$ROOT/fixture01
 REPO=$BASE/repo
 URL="file://$REPO"
 WC=$BASE/wc
 mkdir -p "$BASE" "$ROOT/logs"
-exec > >(tee "$ROOT/logs/v3-fixture.log") 2>&1
-echo "== V3 fixture 构造 $(date -u +%FT%TZ) =="
+exec > >(tee "$ROOT/logs/stream-fixture.log") 2>&1
+echo "== 快照 fixture 构造 $(date -u +%FT%TZ) =="
 
 # ---------- r1：基础树（文本/二进制/属性/空目录/空格路径/符号链接） ----------
 svnadmin create "$REPO"
@@ -99,4 +99,4 @@ svnmucc -U "$URL" -m 'r15: replace trunk/meta.txt file->dir; replace trunk/empty
 
 echo "-- 最终 log:"
 svn log -v --non-interactive "$URL"
-echo "== V3 fixture 完成 $(date -u +%FT%TZ) =="
+echo "== 快照 fixture 完成 $(date -u +%FT%TZ) =="

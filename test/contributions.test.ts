@@ -8,6 +8,11 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_HISTORY_PAGE_SIZE, HISTORY_PAGE_SIZES } from '../src/core/history';
 import { strings } from '../src/host/i18n';
+import { BROWSE_TEXT_DEFAULTS } from '../src/host/panel/browseModel';
+import { CONFLICT_BATCH_TEXT_DEFAULTS } from '../src/host/panel/conflictBatchModel';
+import { CONFLICT_TEXT_DEFAULTS } from '../src/host/panel/conflictModel';
+import { HISTORY_TEXT_DEFAULTS } from '../src/host/panel/historyModel';
+import { SNAPSHOT_TEXT_DEFAULTS } from '../src/host/panel/snapshotModel';
 
 interface Manifest {
   activationEvents?: string[];
@@ -145,6 +150,33 @@ describe('配置贡献点（M4 新增 historyPageSize）', () => {
   it('所有配置项都带非空 description（设置页可读）', () => {
     for (const [key, prop] of Object.entries(properties)) {
       expect(prop.description, `${key} 缺少 description`).toBeTruthy();
+    }
+  });
+});
+
+/* ---------------------------------------------------------------------------
+ * 面板文案单一真相源对拍：i18n 与各 *_TEXT_DEFAULTS 双份维护，
+ * 同键同值；任一漂移都会让用户看到与本地默认值不同的文案（例如
+ * snapshotPanel.tooLarge 丢失读取上限预算信息），视为回归。
+ * ------------------------------------------------------------------------- */
+
+describe('面板文案默认值与 i18n 同键同值对拍', () => {
+  const tables: Array<[section: string, defaults: Record<string, string>]> = [
+    ['historyPanel', HISTORY_TEXT_DEFAULTS as unknown as Record<string, string>],
+    ['browsePanel', BROWSE_TEXT_DEFAULTS as unknown as Record<string, string>],
+    ['snapshotPanel', SNAPSHOT_TEXT_DEFAULTS as unknown as Record<string, string>],
+    ['conflictPanel', CONFLICT_TEXT_DEFAULTS as unknown as Record<string, string>],
+    ['conflictPanel', CONFLICT_BATCH_TEXT_DEFAULTS as unknown as Record<string, string>],
+  ];
+
+  it('全部 DEFAULTS 键在对应 i18n section 存在且取值相同', () => {
+    const sections = strings as unknown as Record<string, Record<string, string> | undefined>;
+    for (const [sectionName, defaults] of tables) {
+      const section = sections[sectionName];
+      expect(section, `i18n 缺少 section：${sectionName}`).toBeDefined();
+      for (const [key, value] of Object.entries(defaults)) {
+        expect(section?.[key], `${sectionName}.${key} 缺失或漂移`).toBe(value);
+      }
     }
   });
 });

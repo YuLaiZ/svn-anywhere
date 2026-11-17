@@ -168,6 +168,59 @@ describe('事件委托 → 意图', () => {
     app.dispose();
   });
 
+  it('P6 页脚「比较所选版本」按钮点击发送 compareHistoryRevisions', () => {
+    const { app, sent } = setup({
+      gate: { busy: [], writeLocked: [] },
+      footer: {
+        summary: '历史',
+        primary: { id: 'loadMoreHistory', label: '加载更多' },
+        secondary: [{ id: 'compareHistoryRevisions', label: '比较所选版本' }],
+      },
+    });
+    const button = document.querySelector<HTMLButtonElement>('[data-intent="compareHistoryRevisions"]');
+    expect(button).not.toBeNull();
+    expect(button?.disabled).toBe(false);
+    button?.click();
+    expect(lastIntent(sent)?.intent).toEqual({ kind: 'compareHistoryRevisions' });
+    app.dispose();
+  });
+
+  it('P6 busy 帧按放行表禁用的页脚/横幅×点击不发送意图，放行动作仍可发送', () => {
+    const { app, sent } = setup({
+      busy: true,
+      gate: { busy: ['viewTaskLog', 'closePanel'], writeLocked: [] },
+      footer: {
+        summary: '历史',
+        primary: { id: 'loadMoreHistory', label: '加载更多' },
+      },
+      banners: [{
+        id: 'historyUpdate',
+        level: 'info',
+        title: '正在更新',
+        actions: [{ id: 'viewTaskLog', label: '查看日志' }],
+        dismissable: true,
+      }],
+    });
+    const intents = (): number => sent.filter((m) => (m as { type?: string }).type === 'intent').length;
+    const before = intents();
+    const primary = document.querySelector<HTMLButtonElement>('[data-intent="loadMoreHistory"]');
+    expect(primary?.disabled).toBe(true);
+    primary?.click();
+    // dismissBanner 不在 P6 busy 放行集：× 与页脚写动作同源禁用，点击不发意图。
+    const dismiss = document.querySelector<HTMLButtonElement>('[data-intent="dismissBanner"]');
+    expect(dismiss?.disabled).toBe(true);
+    dismiss?.click();
+    expect(intents()).toBe(before);
+    // 放行集内的横幅动作仍可发送（与宿主守卫同一张表）。
+    document.querySelector<HTMLButtonElement>('[data-intent="bannerAction"][data-action-id="viewTaskLog"]')?.click();
+    expect(lastIntent(sent)?.intent).toMatchObject({
+      kind: 'bannerAction',
+      bannerId: 'historyUpdate',
+      actionId: 'viewTaskLog',
+    });
+    app.dispose();
+  });
+
   it('筛选空态的清除筛选按钮发送 clearFilters', () => {
     const { app } = setup({ list: undefined });
     // 手动渲染筛选空态（绕过宿主）：直接调用 render 更贴近视图职责边界。
@@ -909,6 +962,7 @@ describe('M4 通用组件事件转发', () => {
         sort: { key: 'revision', direction: 'desc' },
         pagination: { page: 1, pageSize: 2, total: 2, pageCount: 1, mode: 'append' },
         selection: { mode: 'revision', maxSelected: 2 },
+        rowSelectIntent: 'selectHistoryRevision',
         rows: [
           { id: 'r9', cells: { revision: 'r9' } },
           { id: 'r8', cells: { revision: 'r8' } },
@@ -950,6 +1004,32 @@ describe('M4 通用组件事件转发', () => {
     expect(lastIntent(sent)?.intent).toEqual({ kind: 'selectHistoryRevision', id: 'r8' });
     document.querySelector<HTMLButtonElement>('[data-intent="loadMoreHistory"]')?.click();
     expect(lastIntent(sent)?.intent).toEqual({ kind: 'loadMoreHistory' });
+    app.dispose();
+  });
+
+  it('未声明 rowSelectIntent 的表格（导入预览/大文件表）：行无意图、点击不发送', () => {
+    document.body.innerHTML = '<div id="app"></div>';
+    const { api, sent } = makeApi();
+    const app = mountPanel(document, api);
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's1', revision: 1, formRevision: 0,
+      html: render(stateOf({
+        list: undefined,
+        form: undefined,
+        table: {
+          id: 'importPreview',
+          columns: [{ key: 'path', label: '路径' }],
+          sort: { key: 'path', direction: 'asc' },
+          pagination: { page: 1, pageSize: 50, total: 1, pageCount: 1 },
+          rows: [{ id: 'preview:a.txt', cells: { path: 'a.txt' } }],
+          empty: { title: '空' },
+        },
+      })),
+    });
+    const row = document.querySelector<HTMLTableRowElement>('tr[data-row-id="preview:a.txt"]')!;
+    expect(row.hasAttribute('data-intent')).toBe(false);
+    row.click();
+    expect(sent.filter((m) => (m as { type?: string }).type === 'intent')).toHaveLength(0);
     app.dispose();
   });
 
@@ -996,6 +1076,33 @@ describe('M4 通用组件事件转发', () => {
     expect(lastIntent(sent)?.intent).toEqual({ kind: 'clearHistoryFilters' });
     vi.advanceTimersByTime(500);
     expect(lastIntent(sent)?.intent).toEqual({ kind: 'clearHistoryFilters' });
+    vi.useRealTimers();
+    app.dispose();
+  });
+
+  it('会话切换丢弃旧目标待发筛选值：新目标筛选框不被回填、迟到防抖不再发送', () => {
+    vi.useFakeTimers();
+    const { app, sent, state } = historySetup();
+    const input = document.querySelector<HTMLInputElement>('[data-filter-field-id="keyword"]')!;
+    input.value = 'old target';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    const before = sent.length;
+    // 防抖窗口未到期即切换到新目标：筛选字段 ID 跨目标稳定，若待发值
+    // 不清，新目标的同一输入框会被旧目标的输入回填。
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's2', revision: 1, formRevision: 0,
+      html: render({ ...state, sessionId: 's2' }),
+    });
+    expect(document.querySelector<HTMLInputElement>('[data-filter-field-id="keyword"]')!.value).toBe('');
+    // 旧目标的防抖定时器已取消：推进时间不发出旧目标的 setHistoryFilter。
+    vi.advanceTimersByTime(500);
+    expect(sent.length).toBe(before);
+    // 新目标后续整帧渲染同样不回填旧值。
+    app.handleHostMessage({
+      type: 'render', protocolVersion: 1, sessionId: 's2', revision: 2, formRevision: 0,
+      html: render({ ...state, sessionId: 's2' }),
+    });
+    expect(document.querySelector<HTMLInputElement>('[data-filter-field-id="keyword"]')!.value).toBe('');
     vi.useRealTimers();
     app.dispose();
   });

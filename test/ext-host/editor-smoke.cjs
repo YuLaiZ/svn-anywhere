@@ -1,6 +1,6 @@
 'use strict';
 /**
- * M4 阶段 4 真实 Extension Host 装饰冒烟（F107 快速差异 / F108 行内追溯）。
+ * 真实 Extension Host 装饰冒烟（快速差异 / 行内追溯）。
  *
  * 由 scripts/extension-host-test.mjs 经 --extensionTestsPath 加载：
  *   node scripts/extension-host-test.mjs --extension . --tests test/ext-host/editor-smoke.cjs
@@ -25,6 +25,8 @@ const { execFileSync } = require('child_process');
 
 const OUTPUT_DIR = process.env.M4_EXT_HOST_OUT;
 const RESULT_FILE = OUTPUT_DIR ? path.join(OUTPUT_DIR, 'result.json') : null;
+// 本次运行的唯一标识（由 scripts/extension-host-test.mjs 注入并校验，防假通过）。
+const RUN_ID = process.env.M4_EXT_HOST_RUN_ID || null;
 const checks = [];
 
 function check(name, condition, detail) {
@@ -40,7 +42,7 @@ function writeResult(result) {
     return;
   }
   fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-  fs.writeFileSync(RESULT_FILE, JSON.stringify(Object.assign({ checks }, result), null, 2));
+  fs.writeFileSync(RESULT_FILE, JSON.stringify(Object.assign({ runId: RUN_ID, checks }, result), null, 2));
 }
 
 const SVN_ENV = { ...process.env, LANG: 'en_US.UTF-8', LC_ALL: 'en_US.UTF-8' };
@@ -95,13 +97,13 @@ exports.run = async function run() {
     // 23 行内容 + 末尾换行产生的最后一个空行。
     check('文档行数', document.lineCount === 24, document.lineCount);
 
-    // F107：开启 → 内部 status/info/mime 判定 + svn diff -r BASE -x -U0 + 装饰。
+    // 快速差异：开启 → 内部 status/info/mime 判定 + svn diff -r BASE -x -U0 + 装饰。
     await vscode.commands.executeCommand('svnAnywhere.toggleQuickDiff');
     check('快速差异开启（真实 diff + 装饰调用成功）', api.isQuickDiffEnabled() === true);
     await vscode.commands.executeCommand('svnAnywhere.toggleQuickDiff');
     check('快速差异再次执行关闭，装饰已撤销', api.isQuickDiffEnabled() === false);
 
-    // F108：开启 → 不带 -r 的 svn blame --xml + 逐行 after 装饰。
+    // 行内追溯：开启 → 不带 -r 的 svn blame --xml + 逐行 after 装饰。
     await vscode.commands.executeCommand('svnAnywhere.toggleInlineBlame');
     check('行内追溯开启（真实 blame + 装饰调用成功）', api.isInlineBlameEnabled() === true);
     await vscode.commands.executeCommand('svnAnywhere.toggleInlineBlame');
@@ -109,12 +111,35 @@ exports.run = async function run() {
 
     // 未保存编辑后保存：小文件保存自动刷新链路（再次开启后保存不抛错）。
     await vscode.commands.executeCommand('svnAnywhere.toggleQuickDiff');
+    // 开启时的应用结果；保存后的刷新结果必须是新的对象（内容可回读的替身）。
+    const refreshBeforeSave = typeof api.getLastQuickDiffRefresh === 'function'
+      ? api.getLastQuickDiffRefresh()
+      : undefined;
     const edit = new vscode.WorkspaceEdit();
     edit.insert(document.uri, new vscode.Position(0, 0), '// saved\n');
     check('WorkspaceEdit 应用到文档', await vscode.workspace.applyEdit(edit));
     await document.save();
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    check('保存后快速差异仍开启（自动刷新未中断）', api.isQuickDiffEnabled() === true);
+    // 保存触发的 refresh 是异步的：轮询到「最近刷新结果」被替换后再断言。
+    let refreshAfterSave = refreshBeforeSave;
+    for (let i = 0; i < 100; i += 1) {
+      refreshAfterSave = typeof api.getLastQuickDiffRefresh === 'function'
+        ? api.getLastQuickDiffRefresh()
+        : undefined;
+      if (refreshAfterSave !== undefined && refreshAfterSave !== refreshBeforeSave) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    // 只证明会话存活不足以证明自动刷新完成：失败会清空装饰但保留会话，
+    // 因此改按「最近刷新结果已更新且产出行标记」断言。
+    check('保存后快速差异自动刷新完成（最近刷新结果更新且有行标记）',
+      api.isQuickDiffEnabled() === true
+        && refreshAfterSave !== undefined
+        && refreshAfterSave !== refreshBeforeSave
+        && refreshAfterSave.uriKey === document.uri.toString()
+        && typeof refreshAfterSave.markerCount === 'number'
+        && refreshAfterSave.markerCount >= 1,
+      JSON.stringify({ before: refreshBeforeSave, after: refreshAfterSave }));
     await vscode.commands.executeCommand('svnAnywhere.toggleQuickDiff');
     check('保存刷新后关闭无异常', api.isQuickDiffEnabled() === false);
 
@@ -122,12 +147,14 @@ exports.run = async function run() {
       ok: true,
       phase: 'editor-integration-smoke',
       vscodeVersion: vscode.version,
+      startedAt,
       elapsedMs: Date.now() - startedAt,
     });
   } catch (err) {
     writeResult({
       ok: false,
       phase: 'editor-integration-smoke',
+      startedAt,
       elapsedMs: Date.now() - startedAt,
       error: String((err && err.stack) || err),
     });

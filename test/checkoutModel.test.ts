@@ -33,6 +33,7 @@ import {
   newTask,
   pickDirectDir,
   pickParentDir,
+  reapplyHistoryPrefill,
   selectHistoryUrl,
   setConnError,
   setResult,
@@ -776,6 +777,38 @@ describe('newTask、switchMode 与错误承载', () => {
     expect(fieldIds(panel)).toContain('message');
   });
 
+  it('switchMode：以目标模式重建表单——checkout→import 不串入交接预填，import→checkout 仍按预填重建', () => {
+    const prefill = { url: 'http://example.com/svn/trunk/proj', revision: 1281 };
+    const checkout = createCheckoutPanelState({
+      sessionId: 's1',
+      entryKey: 'history:http://example.com/svn/trunk/proj',
+      mode: 'checkout',
+      prefill,
+    });
+    expect(checkout.form.url).toBe(prefill.url);
+    expect(checkout.form.rev).toBe('1281');
+
+    // checkout → import：导入表单不得带出交接的 URL/revision（预填只对 checkout 生效）。
+    const imported = switchMode(checkout);
+    expect(imported.mode).toBe('import');
+    expect(imported.form.url).toBe('');
+    expect(imported.form.urlInput).toBe('');
+    expect(imported.form.rev).toBe('');
+    expect(imported.form.revMode).toBe('head');
+    // 预填快照保留，切回 checkout 时按初始值重建（同 revision 再次交接
+    // 因 sameHandoffPrefill 判同不再 reapply，表单仍须已就位）。
+    expect(imported.entry.prefill).toEqual(prefill);
+
+    // import → checkout：按预填重建表单（旧实现会得到空白表单）。
+    const back = switchMode(imported);
+    expect(back.mode).toBe('checkout');
+    expect(back.form.url).toBe(prefill.url);
+    expect(back.form.urlInput).toBe(prefill.url);
+    expect(back.form.revMode).toBe('number');
+    expect(back.form.rev).toBe('1281');
+    expect(back.form.dirName).toBe('proj');
+  });
+
   it('setConnError：宿主写入的连接/源预检失败原因渲染为表单页 error 横幅', () => {
     const s = setConnError(state(), '无法连接仓库');
     expect(s.conn.phase).toBe('failed');
@@ -980,5 +1013,41 @@ describe('P6→P3 交接预填（CheckoutPanelEntry.prefill）', () => {
     expect(s.form.url).toBe('');
     expect(s.form.rev).toBe('');
     expect(s.form.revMode).toBe('head');
+  });
+
+  it('reapplyHistoryPrefill：表单步且无任务时重应用新 revision 并刷新入口快照', () => {
+    const s = createCheckoutPanelState({
+      sessionId: 's1',
+      entryKey: 'history:http://example.com/svn/trunk/proj',
+      mode: 'checkout',
+      prefill: { url: 'http://example.com/svn/trunk/proj', revision: 1281 },
+    });
+    const next = reapplyHistoryPrefill(s, {
+      url: 'http://example.com/svn/trunk/proj',
+      revision: 1290,
+    });
+    expect(next).not.toBe(s);
+    expect(next.step).toBe('form');
+    expect(next.task).toBeNull();
+    // 入口快照（同 URL 再次交接的判重依据）同步为新预填。
+    expect(next.entry.prefill).toEqual({ url: 'http://example.com/svn/trunk/proj', revision: 1290 });
+    expect(next.form.revMode).toBe('number');
+    expect(next.form.rev).toBe('1290');
+    expect(next.form.url).toBe('http://example.com/svn/trunk/proj');
+  });
+
+  it('reapplyHistoryPrefill：核对/运行/结果页保持原状态引用（不改写运行会话）', () => {
+    const review = toReview().state;
+    const prefill = { url: 'http://example.com/svn/trunk/dabs', revision: 100 };
+    const base: CheckoutPanelState = { ...review, entry: { ...review.entry, prefill } };
+    expect(reapplyHistoryPrefill(base, { ...prefill, revision: 200 })).toBe(base);
+
+    const running = beginTask(base, { opId: 'op-1', targetPath: '/parent/dabs' });
+    expect(running.step).toBe('running');
+    expect(reapplyHistoryPrefill(running, { ...prefill, revision: 200 })).toBe(running);
+
+    const result = setResult(base, buildInterruptedPage({ path: '/parent/dabs' }));
+    expect(result.step).toBe('result');
+    expect(reapplyHistoryPrefill(result, { ...prefill, revision: 200 })).toBe(result);
   });
 });

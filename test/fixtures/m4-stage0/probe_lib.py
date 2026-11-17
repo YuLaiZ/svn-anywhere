@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M4 阶段 0 / V2 历史与复制实验的 XML 解析辅助。
+"""历史与复制实验的 XML 解析辅助。
 
 只用于实验证据统计，不是产品代码。用法见 probe-history.sh。
 """
@@ -41,7 +41,7 @@ def _text(body, tag):
 
 
 def relevant(path, action, target, kind):
-    """ancestor-filter 路径命中规则（与实施计划 V2-2/技术方案 4.1 对应）：
+    """ancestor-filter 路径命中规则：
     - 路径等于目标：命中；
     - 路径是目标的祖先目录且 action 为 A/R/D（结构变更）：命中；
     - 目录目标：任意后代路径变更命中；

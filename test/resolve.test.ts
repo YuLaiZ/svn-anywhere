@@ -1,11 +1,12 @@
 /**
- * resolve 动作矩阵、计划与回扫测试（M4 阶段 1）：
+ * resolve 动作矩阵、计划与回扫测试：
  * - 纯逻辑覆盖六值枚举、postpone 不入 CLI、二进制 base/块变体拒绝、
  *   混合路径禁止单选择、属性逐项选择与 working 二次确认；
  * - 集成用例走本地 file:// 副本：命令前指纹、命令后 status+info 联合回读、
  *   resolve 静默 exit 0 不当作成功、外部删除后的异常判定。
  */
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import {
@@ -20,6 +21,7 @@ import {
   availableResolveActions,
   buildResolveArgs,
   executeResolve,
+  isAnomalousResolveStatus,
   planResolve,
   verifyResolveOutcome,
 } from '../src/core/resolve';
@@ -99,6 +101,26 @@ describe('svn resolve 参数纪律', () => {
       '--',
       'p.txt',
     ]);
+  });
+});
+
+/* ---------------------------------------------------------------------------
+ * 命令后回扫的异常 status 集合
+ * ------------------------------------------------------------------------- */
+
+describe('isAnomalousResolveStatus 异常集合', () => {
+  it('missing/obstructed/incomplete 与 deleted(非树) 为异常；deleted(树) 与普通项不报', () => {
+    for (const item of ['missing', 'obstructed', 'incomplete']) {
+      expect(isAnomalousResolveStatus(item, ['text']), item).toBe(true);
+      expect(isAnomalousResolveStatus(item, ['property']), item).toBe(true);
+    }
+    expect(isAnomalousResolveStatus('deleted', ['text'])).toBe(true);
+    expect(isAnomalousResolveStatus('deleted', ['property'])).toBe(true);
+    // 树冲突 working 的预期结果可以是保留 D。
+    expect(isAnomalousResolveStatus('deleted', ['tree'])).toBe(false);
+    expect(isAnomalousResolveStatus('modified', ['text'])).toBe(false);
+    expect(isAnomalousResolveStatus('normal', [])).toBe(false);
+    expect(isAnomalousResolveStatus(undefined, [])).toBe(false);
   });
 });
 
@@ -278,6 +300,15 @@ function makeTextConflict(name: string, relPath = `${name}.txt`): string {
   return base;
 }
 
+/** 生成仅拦截指定子命令的 svn wrapper（其余命令转真实 svn）。 */
+function writeWrapper(name: string, lines: string[]): string {
+  const realSvn = execFileSync('which', ['svn'], { encoding: 'utf8' }).trim();
+  const file = join(lab.root, name);
+  writeFileSync(file, `#!/bin/bash\n${lines.join('\n').replaceAll('__REAL_SVN__', realSvn)}\n`);
+  chmodSync(file, 0o755);
+  return file;
+}
+
 describe('executeResolve 集成（本地 file:// 副本）', () => {
   it('working 未确认被拒绝且不发写命令；确认后回读 resolved、辅助文件清除', async () => {
     const wc = makeTextConflict('res-text');
@@ -342,6 +373,38 @@ describe('executeResolve 集成（本地 file:// 副本）', () => {
     const verification = await verifyResolveOutcome('svn', wc, rel, { previousKinds: ['text'] });
     expect(verification.outcome).toBe('anomalous');
     expect(verification.statusItem).toBe('missing');
+  });
+
+  it('resolve 成功后版本化文件被同名目录替换（obstructed）：判 anomalous，不宣称已解决', async () => {
+    // 核验场景（SVN 1.15 file:// 实测）：resolve --accept working
+    // 后把版本化文件换成同名目录，status 输出 item="obstructed"、info
+    // exit 0 且无 <conflict> 节点；旧判定只认 missing/deleted，会被当作
+    // 已解决并写台账。修复后 obstructed 归 anomalous。
+    const wc = makeTextConflict('res-obstructed');
+    const rel = 'res-obstructed.txt';
+    const record = { ...(await readConflictRecord('svn', wc, rel)).record!, contentKind: 'text' as const };
+    const done = await executeResolve('svn', wc, { record, selection: { kind: 'working', confirmed: true } });
+    expect(done.outcome).toBe('resolved');
+    rmSync(join(wc, rel));
+    mkdirSync(join(wc, rel));
+    const verification = await verifyResolveOutcome('svn', wc, rel, { previousKinds: ['text'] });
+    expect(verification.outcome).toBe('anomalous');
+    expect(verification.statusItem).toBe('obstructed');
+  });
+
+  it('status 非零退出且 stderr 为空：unknown 且 detail 为英文技术诊断', async () => {
+    const wc = makeTextConflict('res-silent-status');
+    const rel = 'res-silent-status.txt';
+    const wrapper = writeWrapper('svn-status-silent-fail.sh', [
+      'if [ "$1" = "status" ]; then',
+      '  exit 3',
+      'fi',
+      'exec "__REAL_SVN__" "$@"',
+    ]);
+    const verification = await verifyResolveOutcome(wrapper, wc, rel, { previousKinds: ['text'] });
+    expect(verification.outcome).toBe('unknown');
+    expect((verification as { detail?: string }).detail).toBe('svn status exit code 3');
+    expect((verification as { detail?: string }).detail).not.toMatch(/[一-鿿]/);
   });
 
   it('属性冲突：逐项选择写回后 working，propertyConflicts 三值来自 source-left/right', async () => {

@@ -1,9 +1,9 @@
 /**
- * core/blame 测试（M4 阶段 1，实施计划 §3 任务 2）：
+ * core/blame 测试：
  * - 纯解析：entry/commit/author/date、空 entry（本地修改/新增行）、author
  *   缺失、实体一次解码、CDATA、任意字节分块（StringDecoder）、空文件
  *   （有 target 无 entry）、64 MiB 输出上限；
- * - 参数构造：本地工作文件必须**不带任何 -r**（阶段 0 实测任何 -r 都会按
+ * - 参数构造：本地工作文件必须**不带任何 -r**（实测任何 -r 都会按
  *   BASE 内容输出、与工作文件行号错位）；本地路径 escapePeg、远端 URL
  *   urlWithPeg；
  * - 真实本地 SVN：默认调用对齐工作文件（本地修改行无 commit）、URL 明确
@@ -11,9 +11,9 @@
  *   目录、未提交新增、@ 文件名、输出超限。
  */
 import { execFileSync } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { chmodSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   BLAME_XML_BYTE_LIMIT,
   BlameBudgetError,
@@ -23,6 +23,7 @@ import {
   runBlame,
 } from '../src/core/blame';
 import { Utf8StreamDecoder } from '../src/core/svnCli';
+import { SvnError } from '../src/core/errors';
 import { createSvnLab, writeFile } from './helpers';
 
 let hasSvn = false;
@@ -176,7 +177,7 @@ function buildBlameFixture(): BlameFixture {
   lab.svn(['add', '-q', 'binary.bin'], wc);
   lab.svn(['propset', '-q', 'svn:mime-type', 'application/octet-stream', 'binary.bin'], wc);
   lab.svn(['commit', '-q', '-m', 'r4'], wc);
-  // 阶段 0：同一 mime，旧 BASE 未 update 时可能不跳过；更新后再 blame 才稳定跳过。
+  // 实测：同一 mime，旧 BASE 未 update 时可能不跳过；更新后再 blame 才稳定跳过。
   lab.svn(['update', '-q'], wc);
 
   writeFile(wc, 'gone.txt', 'gone\n', true);
@@ -212,7 +213,7 @@ describe('core/blame：真实工作副本默认调用', () => {
     const fixture = buildBlameFixture();
     try {
       // 改第 2 行 + 末尾新增第 4 行：默认 blame 必须输出 4 行（=工作文件），
-      // 而不是 -r BASE/1:HEAD 的 3 行（阶段 0 实测的行号错位场景）。
+      // 而不是 -r BASE/1:HEAD 的 3 行（实测的行号错位场景）。
       writeFileSync(join(fixture.wc, 'file.txt'), 'line1\nCHANGED\nline3\nNEW\n');
       const result = await runBlame('svn', { target: 'file.txt' }, { cwd: fixture.wc });
       expect(result.state).toBe('ready');
@@ -339,6 +340,96 @@ describe('core/blame：真实 URL 与错误路径', () => {
         { cwd: fixture.wc },
       );
       expect(result).toMatchObject({ state: 'notTraceable', reason: 'tooLarge' });
+    } finally {
+      fixture.lab.cleanup();
+    }
+  });
+
+  it.runIf(hasSvn && hasSvnadmin)('XML 解析失败抛 SvnError(XML_PARSE)：消息为英文技术诊断', integration, async () => {
+    const fixture = buildBlameFixture();
+    try {
+      const realSvn = execFileSync('which', ['svn'], { encoding: 'utf8' }).trim();
+      const wrapper = join(fixture.lab.root, 'svn-blame-bad-xml.sh');
+      writeFileSync(wrapper, [
+        '#!/bin/bash',
+        'if [ "$1" = "blame" ]; then',
+        '  printf \'<blame><target path="file.txt"><entry line-number="1">\'',
+        '  exit 0',
+        'fi',
+        `exec "${realSvn}" "$@"`,
+        '',
+      ].join('\n'));
+      chmodSync(wrapper, 0o755);
+      const err = await runBlame(wrapper, { target: 'file.txt' }, { cwd: fixture.wc })
+        .catch((caught: unknown) => caught);
+      expect(err).toBeInstanceOf(SvnError);
+      // 稳定分类是 XML_PARSE；面向用户的文案由宿主映射。
+      expect((err as SvnError).code).toBe('XML_PARSE');
+      expect((err as Error).message).not.toMatch(/[一-鿿]/);
+    } finally {
+      fixture.lab.cleanup();
+    }
+  });
+
+  it.runIf(hasSvn && hasSvnadmin)('非零退出且 stderr 为空：消息为英文机器可读诊断（svn blame exit code N）', integration, async () => {
+    const fixture = buildBlameFixture();
+    try {
+      const realSvn = execFileSync('which', ['svn'], { encoding: 'utf8' }).trim();
+      const wrapper = join(fixture.lab.root, 'svn-blame-silent-fail.sh');
+      writeFileSync(wrapper, [
+        '#!/bin/bash',
+        'if [ "$1" = "blame" ]; then',
+        '  exit 3',
+        'fi',
+        `exec "${realSvn}" "$@"`,
+        '',
+      ].join('\n'));
+      chmodSync(wrapper, 0o755);
+      const err = await runBlame(wrapper, { target: 'file.txt' }, { cwd: fixture.wc })
+        .catch((caught: unknown) => caught);
+      expect(err).toBeInstanceOf(SvnError);
+      expect((err as Error).message).toBe('svn blame exit code 3');
+      expect((err as Error).message).not.toMatch(/[一-鿿]/);
+    } finally {
+      fixture.lab.cleanup();
+    }
+  });
+
+  it.runIf(hasSvn && hasSvnadmin)('认证失败（E170001）经统一补录重试：第一次半截 XML 不残留，重试得到完整行归属', integration, async () => {
+    // runBlame 旧实现直接 runStream、不消费 getCredentials；
+    // 修复后走 runOrThrowWithRunner，重试前重建解析器与解码器。
+    const fixture = buildBlameFixture();
+    try {
+      const realSvn = execFileSync('which', ['svn'], { encoding: 'utf8' }).trim();
+      const wrapper = join(fixture.lab.root, 'svn-blame-auth.sh');
+      writeFileSync(wrapper, [
+        '#!/bin/bash',
+        'for arg in "$@"; do',
+        '  if [ "$arg" = "--username" ]; then',
+        `    exec "${realSvn}" "$@"`,
+        '  fi',
+        'done',
+        'if [ "$1" = "blame" ]; then',
+        '  printf \'<blame><target path="file.txt"><entry line-number="1"><commit revision="1"><author>half</author></commit></entry>\'',
+        '  echo \'svn: E170001: Authentication failed\' >&2',
+        '  exit 1',
+        'fi',
+        `exec "${realSvn}" "$@"`,
+        '',
+      ].join('\n'));
+      chmodSync(wrapper, 0o755);
+
+      const getCredentials = vi.fn().mockResolvedValue({ username: 'yu', password: 's3cret' });
+      const result = await runBlame(wrapper, { target: 'file.txt' }, { cwd: fixture.wc, getCredentials });
+      expect(getCredentials).toHaveBeenCalledTimes(1);
+      expect(result.state).toBe('ready');
+      if (result.state === 'ready') {
+        // 真实 file.txt 三行；第一次尝试的半截 entry 不出现在结果里。
+        expect(result.lines).toHaveLength(3);
+        expect(result.lines.map((line) => line.lineNumber)).toEqual([1, 2, 3]);
+        expect(result.lines[0]?.author).toBeTruthy();
+        expect(result.lines[0]?.author).not.toBe('half');
+      }
     } finally {
       fixture.lab.cleanup();
     }

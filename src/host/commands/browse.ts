@@ -1,7 +1,7 @@
 /**
  * 「浏览仓库」命令（P5 仓库浏览器入口，M4 阶段 2 任务 1/5）。
  *
- * 入口语义（技术方案 §3.1）：
+ * 入口语义：
  * - 资源管理器右键本地文件或目录：向上定位工作副本根，读取节点 URL、
  *   仓库根、UUID 与 kind（本地 `svn info` 元数据查询，不访问网络）；
  * - 命令面板无本地目标：原生输入框接收远端 URL，显示值经
@@ -153,7 +153,7 @@ export type BrowseUrlParseResult =
   | { ok: false; reason: BrowseUrlRejectReason; message: string };
 
 /**
- * 远端 URL 校验链（技术方案 §3.1）：
+ * 远端 URL 校验链：
  * 1. 空输入给「URL 不能为空」；
  * 2. 先按 P5 白名单拒绝其它协议（file/svn+ssh/ftp 等）——检出侧的
  *    通用校验允许五种协议，P5 浏览入口只接受 http/https/svn；

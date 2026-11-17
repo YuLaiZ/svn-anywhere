@@ -1,7 +1,7 @@
 #!/bin/bash
-# V6-1 补充探测：客户端选项拒绝、删除路径 peg、反向 diff、多目标 info、二进制属性、cursor 分页。
+# 补充探测：客户端选项拒绝、删除路径 peg、反向 diff、多目标 info、二进制属性、cursor 分页。
 set -u
-source "$(dirname "$0")/env-v6.sh"
+source "$(dirname "$0")/env.sh"
 for n in svn16 svn18 svn110 svn114; do
   url=$(url_of "$n")
   run $n x-list-v svn list --xml -v "${SVN_OPTS[@]}" "$url/exp"

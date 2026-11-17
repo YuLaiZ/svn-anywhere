@@ -8,7 +8,7 @@
  *   路径一律由宿主从当前状态映射取得，视图不能传任意路径执行；
  * - TypeScript 类型不替代消息校验：parseViewMessage 对每条入站消息做
  *   结构、类型与动作白名单的运行时检查，非法消息被拒绝并给出原因。
- * - M4 起新增 P5/P6/P7 意图（技术方案 §6 冻结动作对账表），意图仍只携带
+ * - M4 起新增 P5/P6/P7 意图（冻结动作），意图仍只携带
  *   稳定 nodeId/行/ revision ID 或枚举值，不接收宿主路径；枚举参数在解析
  *   层按白名单拒绝（例如 refreshHistoryUpper.mode 只允许 head/base-fallback）。
  */
@@ -17,7 +17,7 @@ import { format, strings } from '../i18n';
 export const PROTOCOL_VERSION = 1;
 
 /* --------------------------------------------------------------------------------
- * M4 意图枚举取值（技术方案 §6：需要参数时只传稳定 ID 或枚举值）。
+ * M4 意图枚举取值（需要参数时只传稳定 ID 或枚举值）。
  * 导出供宿主控制器、放行表与测试共用，不在各面板重复定义。
  * -------------------------------------------------------------------------------- */
 
@@ -256,9 +256,11 @@ export interface IntentMessage {
 export type ViewToHostMessage = ReadyMessage | IntentMessage;
 
 /**
- * M4 冻结动作对账表（技术方案 §6）登记的 P5/P6/P7 全部意图 kind。
- * 独立导出供运行时白名单、放行表与单测交叉校验；新增动作必须同时进
- * 这里、Intent 联合与 parseIntent 分支，避免只登记一处。
+ * M4 冻结动作登记的 P5/P6/P7 全部意图 kind；其中的
+ * 意图清单已按运行时回填为同 46 项（`rescanHistoryUpdate` 与
+ * `choosePropertyValue` 为后续增补登记）。独立导出供运行时白
+ * 名单、放行表与单测交叉校验；新增动作必须同时进这里、Intent 联合与
+ * parseIntent 分支，避免只登记一处。
  */
 export const M4_INTENT_KINDS = [
   // P5 仓库浏览器

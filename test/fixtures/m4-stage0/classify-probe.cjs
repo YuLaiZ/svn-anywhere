@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// M4 阶段0 V1：远端文本/二进制分类探测矩阵
-// 规则（技术方案 3.4）：repository 的 svn:mime-type 非 text/* → binary；否则前 8 KiB 含 NUL → binary；否则 text。
+// 远端文本/二进制分类探测矩阵
+// 规则：repository 的 svn:mime-type 非 text/* → binary；否则前 8 KiB 含 NUL → binary；否则 text。
 // mime 获取：svn propget svn:mime-type --non-interactive <url>（属性不存在时 exit 1 + W200017）。
 // 方法：spawn svn cat，读满 8 KiB 后立即 kill，验证提前终止与部分流读取。
 'use strict';

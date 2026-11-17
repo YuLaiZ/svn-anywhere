@@ -3,11 +3,11 @@
  * 远端只读 IO 编排。状态机全部在 browseModel（纯模型）；本文件只做
  * 调度、IO、票据与资源清理。
  *
- * 只读边界（技术方案 §3.1）：P5 只执行 info/list/propget/cat 读命令，
+ * 只读边界：P5 只执行 info/list/propget/cat 读命令，
  * 不产生 SVN 写命令，不在工作副本产生本地文件；远端内容经
  * host/readonlyContent 的只读 provider 或受管临时资源打开。
  *
- * 读请求代次（技术方案 §2.3/§3.3，阶段 1 host API）：
+ * 读请求代次（阶段 1 host API）：
  * - 会话级：面板打开/切换目标/刷新根时 handle.beginReadRequest(入口 URL)
  *   重新取票据；任何回包先经 handle.isReadRequestCurrent(ticket) 校验，
  *   旧目标或根刷新前的回包一律丢弃；
@@ -326,7 +326,7 @@ async function loadRootInfo(
     return;
   }
   if (result.status === 'present') {
-    captured.model.applyRootInfo(result.node);
+    captured.model.applyRootInfo(result.node, result.sizeBytes);
     pushIfCurrent(captured);
     advanceRestoreAndContinue(captured);
     pumpLoads();
@@ -683,8 +683,15 @@ async function openNode(captured: CapturedSession, key: string): Promise<void> {
         limit: formatBytes(outcome.limitBytes),
       }));
       return;
+    case 'special':
+      // svn:special 符号链接的 cat 输出是 `link <target>` 原文：不进入内置
+      // 文本预览，也不提供导出/外部打开；文案与快照面板 specialNotice 对齐。
+      handle?.toast('info', strings.browse.specialNotice);
+      return;
     case 'insufficientDisk':
-      handle?.toast('error', outcome.message);
+      // core 只返回英文技术诊断；用户提示按状态映射 i18n，原文进输出频道。
+      logLine(outcome.message, 'browse');
+      handle?.toast('error', strings.browse.insufficientDisk);
       return;
     case 'notFound':
       captured.model.pushNotice('error', browseText('loadFailedTitle'), browseText('notFoundMessage'));
@@ -780,7 +787,7 @@ async function onIntent(intent: Intent, context: { sessionId: string; busy: bool
       const previousVisible = node.dir?.visible ?? 0;
       const result = captured.model.loadMore(node.key);
       if (result.added > 0) {
-        // 增量通道（技术方案 §3.2 冻结条款）：只发送本次新增的 ≤40 行
+        // 增量通道（冻结条款）：只发送本次新增的 ≤40 行
         // 片段，按 `treeId:nodeId` 定位目标节点的 .tree-node-children
         // 容器，不重复发送整棵树；附带的完整快照只更新宿主意图校验与
         // 视图重建重推依据，不触发整帧渲染。行内已读取计数等随下一次

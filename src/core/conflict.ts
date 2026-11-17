@@ -1,7 +1,7 @@
 /**
  * 冲突扫描与归一化。core 模块，不依赖 vscode。
  *
- * 职责（M4 技术方案 §5.1 / §5.2，阶段 0 V4 实测回填）：
+ * 职责（冲突记录与属性冲突处理契约，真实 svn 冲突场景实测回填）：
  * - `svn status --xml --ignore-externals` 的三判据候选识别
  *   （item=conflicted / props=conflicted / tree-conflicted=true）、
  *   external 边界防御过滤与 wc-locked 透出；
@@ -24,13 +24,13 @@ import { run, runOrThrow, urlWithPeg, type RunOptions, type RunResult } from './
 import { isCompleteStatusXml, parseStatusXml, type StatusEntry } from './status';
 import { escapePeg } from './workspace';
 
-/** 冲突类型（技术方案 §5.1 ConflictRecord.kinds）。 */
+/** 冲突类型（冲突记录契约的 ConflictRecord.kinds）。 */
 export type ConflictKind = 'text' | 'property' | 'tree';
 
 /** 内容类型：二进制冲突在 info 中仍是 type=text，必须靠 mime/NUL 分类。 */
 export type ConflictContentKind = 'text' | 'binary' | 'unknown';
 
-/** 辅助文件的通用角色：不假定文件名总是 .rOLDREV（技术方案 §5.1）。 */
+/** 辅助文件的通用角色：不假定文件名总是 .rOLDREV。 */
 export type ConflictArtifactRole = 'base' | 'mine' | 'incoming' | 'reject';
 
 export interface ConflictArtifact {
@@ -78,7 +78,7 @@ export interface PropertyConflictValue {
 }
 
 /**
- * 统一冲突记录（技术方案 §5.1 冻结契约）。
+ * 统一冲突记录（冲突记录契约）。
  * 同一路径的文件与属性冲突合并为一条记录的多个 kinds；
  * 摘要按 kinds 项计数，不按路径数掩盖混合冲突。
  */
@@ -225,7 +225,7 @@ export interface ConflictScanOptions extends RunOptions {
   classifyContent?: (relPath: string) => Promise<ConflictContentKind | undefined>;
   /** 进度：已完成候选数 / 候选总数。 */
   onProgress?: (completed: number, total: number) => void;
-  /** 批量 info 每批路径数，默认 32（阶段 0 实测）。 */
+  /** 批量 info 每批路径数，默认 32（实测）。 */
   infoBatchSize?: number;
   /** 逐项补偿并发，默认 4。 */
   compensationConcurrency?: number;
@@ -260,7 +260,7 @@ function toOptionalNumber(value: unknown): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
-/** 三判据之一（技术方案 §5.1）：item=conflicted / props=conflicted / tree-conflicted=true。 */
+/** 三判据之一：item=conflicted / props=conflicted / tree-conflicted=true。 */
 function isConflictCandidate(entry: StatusEntry): boolean {
   return entry.wcStatus === 'conflicted'
     || entry.props === 'conflicted'
@@ -280,7 +280,7 @@ function isConflictCandidate(entry: StatusEntry): boolean {
 export function parseConflictStatusXml(xml: string): ConflictStatusScan {
   if (!isCompleteStatusXml(xml)) {
     throw new SvnError({
-      message: 'svn status XML 不完整（遍历可能中断），不能解析残片',
+      message: 'svn status XML is incomplete (output may be truncated); refusing to parse partial content',
       command: ['status', '--xml', '--ignore-externals'],
       stderr: tailText(xml),
       code: 'STATUS_XML_TRUNCATED',
@@ -291,7 +291,7 @@ export function parseConflictStatusXml(xml: string): ConflictStatusScan {
     parsed = parseStatusXml(xml);
   } catch {
     throw new SvnError({
-      message: 'svn status XML 解析失败',
+      message: 'svn status XML parse failed',
       command: ['status', '--xml', '--ignore-externals'],
       stderr: tailText(xml),
       code: 'STATUS_XML_PARSE',
@@ -516,7 +516,7 @@ function propertyArtifacts(
     return [];
   }
   const path = wcRoot ? toWcRelativePath(wcRoot, raw) : normalizePosixPath(raw);
-  // 阶段 0 实测偏差：mixed 文本+属性冲突的 prop-file 指向 cur-base-file
+  // 实测偏差：mixed 文本+属性冲突的 prop-file 指向 cur-base-file
   // （传入文件内容），磁盘上真正的属性拒绝文件是 <path>.prej。
   if (knownIncomingPaths.has(path)) {
     return [{ role: 'reject', path: `${entryPath}.prej` }];
@@ -609,7 +609,7 @@ function makeTreeConflictInfo(
  * 把 info 条目归一为统一冲突记录：
  * - entry revision 非数字（树冲突 victim 的 "Resource is not under version
  *   control."）只让 nodeBaseRevision 缺省，记录照常生成；
- * - 重复冲突节点按 type+operation+source 双侧+辅助文件去重（阶段 0 实测
+ * - 重复冲突节点按 type+operation+source 双侧+辅助文件去重（实测
  *   mixed 4 个节点收敛为 text/property 各一条，multi 的两个属性节点收敛为
  *   一条属性记录）；
  * - 同 entry 的文本与属性冲突合并为一条记录的两个 kinds；
@@ -816,7 +816,7 @@ export function mergeResolvedLedger(
  * ------------------------------------------------------------------ */
 
 /**
- * 内容类型分类（技术方案 §5.2）：MIME 非 text/* 或前 8 KiB 含 NUL 即二进制。
+ * 内容类型分类：MIME 非 text/* 或前 8 KiB 含 NUL 即二进制。
  * 二进制冲突在 info 中仍是 type=text 且无 prev-wc-file，不能由冲突 type 推断。
  */
 export function classifyContentKind(input: {
@@ -907,7 +907,7 @@ function samePropertyValue(a: PropertyValue, b: PropertyValue): boolean {
 }
 
 /**
- * 属性冲突三值判定（技术方案 §5.2）：候选名取本地/基线/传入并集，只保留
+ * 属性冲突三值判定：候选名取本地/基线/传入并集，只保留
  * local != base、incoming != base、local != incoming 三项同时成立的属性；
  * 只有一侧变化或两侧变成本地均不误列。svn: 保留属性带 autoUnsupported。
  */
@@ -960,13 +960,13 @@ async function readPropertyMap(
     const result = await runOrThrow(svnPath, args, options);
     return parsePropertyValuesXml(result.stdout);
   } catch {
-    // 属性值读取失败：该路径属性冲突不提供自动处理（§5.2）。
+    // 属性值读取失败：该路径属性冲突不提供自动处理。
     return undefined;
   }
 }
 
 /**
- * 读取一条属性冲突记录的本地/基线/传入三值集合（技术方案 §5.2）：
+ * 读取一条属性冲突记录的本地/基线/传入三值集合：
  * 本地为当前路径工作属性，基线取 source-left 的 path-in-repos + revision，
  * 传入取 source-right。任一侧读取失败返回 undefined，调用方据此不提供
  * 自动处理；属性名集合不依赖 info 冲突节点（节点不携带属性名）。
@@ -997,12 +997,12 @@ export async function readPropertyConflictValues(
   const base = left?.kind === 'none'
     ? {}
     : baseUrl
-      ? await readPropertyMap(svnPath, ['proplist', '--xml', '--verbose', '--', baseUrl], options)
+      ? await readPropertyMap(svnPath, ['proplist', '--xml', '--verbose', '--non-interactive', '--', baseUrl], options)
       : undefined;
   const incoming = right?.kind === 'none'
     ? {}
     : incomingUrl
-      ? await readPropertyMap(svnPath, ['proplist', '--xml', '--verbose', '--', incomingUrl], options)
+      ? await readPropertyMap(svnPath, ['proplist', '--xml', '--verbose', '--non-interactive', '--', incomingUrl], options)
       : undefined;
   if (!base || !incoming) {
     return undefined;
@@ -1038,7 +1038,7 @@ export async function readConflictRecord(
   const args = ['info', '--xml', '--non-interactive', '--', escapePeg(relPath)];
   const result = await run(svnPath, args, { cwd: wcRoot, ...runOptions });
   if (result.exitCode !== 0) {
-    return { error: tailText(result.stderr.trim() || `svn info 退出码 ${result.exitCode}`) };
+    return { error: tailText(result.stderr.trim() || `svn info exit code ${result.exitCode}`) };
   }
   const target = toWcRelativePath(wcRoot, relPath);
   const entry = parseInfoXml(result.stdout)
@@ -1073,19 +1073,25 @@ export interface RealPathResolution {
 
 /**
  * 缺失/移动树路径的 realpath 解析：不能直接对 victim realpath，向上找到
- * 最近存在祖先做 realpath，再拼回经校验的分段后缀。后缀只按路径分段保留，
- * 不做字符串前缀误判；任何分段为 '.'/'..' 时拒绝（越界防御）。
+ * 最近存在祖先做 realpath，再拼回经校验的分段后缀。目标自身始终不作为
+ * 祖先：末段是符号链接时保留链接名而不解析到链接目标（范围判定基于路径
+ * 在文件系统中的位置，与遍历工作副本的路径语义一致）。后缀只按路径分段
+ * 保留，不做字符串前缀误判；任何分段为 '.'/'..' 时拒绝（越界防御）。
+ *
+ * 宿主参考实现：当前生产链路的 P7 任务范围由扫描命令的 status 目标限定，
+ * 本函数与 isRelPathWithinScope 为宿主过滤（conflictModel）提供的参考
+ * 实现与单测基线，生产扫描路径尚未接线。
  */
 export function resolveRealPathWithSuffix(fsPath: string): RealPathResolution | undefined {
-  let current = fsPath;
+  let current = dirname(fsPath);
   for (;;) {
     try {
       const realPath = realpathSync(current);
-      if (!statSync(realPath).isDirectory() && current !== fsPath) {
+      if (!statSync(realPath).isDirectory()) {
         // 祖先必须是目录；文件不可能是目标的祖先。
         return undefined;
       }
-      const relative = pathRelative(realPath, fsPath);
+      const relative = pathRelative(current, fsPath);
       const suffix = relative === '' ? [] : relative.split(sep);
       if (suffix.some((segment) => segment === '' || segment === '.' || segment === '..')) {
         return undefined;
@@ -1113,7 +1119,10 @@ export function isWithinRealScope(scopeRealPath: string, targetRealPath: string)
   return !relative.startsWith(`..${sep}`) && !relative.startsWith('../') && !relative.startsWith('..\\');
 }
 
-/** 真实路径下某个工作副本相对路径的范围判定（缺失路径用最近存在祖先）。 */
+/**
+ * 真实路径下某个工作副本相对路径的范围判定（缺失路径用最近存在祖先）。
+ * 与 resolveRealPathWithSuffix 同属宿主过滤的参考实现，生产扫描尚未接线。
+ */
 export function isRelPathWithinScope(
   scopeRealPath: string,
   wcRoot: string,
@@ -1148,7 +1157,7 @@ function stripScanOptions(options: ConflictScanOptions): RunOptions {
 }
 
 /**
- * 完整冲突扫描（技术方案 §5.1）：
+ * 完整冲突扫描：
  * 1. `status --xml --ignore-externals` 三判据取候选，external 边界防御过滤；
  * 2. 候选批量 `info --xml`（默认每批 32 条），`run()` 保留非零退出时的
  *    stdout，先解析已返回 entry；
@@ -1225,7 +1234,7 @@ export async function scanConflicts(
       }
       const entry = parseInfoXml(result.stdout)[0];
       if (result.exitCode !== 0 || !entry) {
-        failures.push({ path: next, message: tailText(result.stderr.trim() || `svn info 退出码 ${result.exitCode}`) });
+        failures.push({ path: next, message: tailText(result.stderr.trim() || `svn info exit code ${result.exitCode}`) });
       } else {
         remember(entry);
       }

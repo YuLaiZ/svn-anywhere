@@ -2,7 +2,7 @@
  * 远端仓库浏览的 core 原语：svn info/list XML、仓库节点、目录直属条目与
  * 远端属性读取。core 模块，不依赖 vscode。
  *
- * 口径（技术方案 §2.2/§3.2/§3.3，阶段 0 实测）：
+ * 口径（URL 目标身份、目录读取与取消语义契约，真实 svn 实测）：
  * - 节点身份：`svn info --xml --non-interactive -r <rev> -- <URL@rev>`；
  *   `entry@revision` 是快照 revision，`commit@revision` 是节点最后修改
  *   revision，两者分字段保存；文件大小只在 `entry@size`（list 中为
@@ -46,14 +46,14 @@ import {
 // 常量与冻结类型
 // ---------------------------------------------------------------------------
 
-/** 目录直属条目解析硬上限（技术方案 §3.2）。 */
+/** 目录直属条目解析硬上限（目录读取契约）。 */
 export const REMOTE_BROWSE_MAX_ENTRIES = 100_000;
 
-/** 目录 XML 原始字节硬上限：64 MiB（技术方案 §3.2）。 */
+/** 目录 XML 原始字节硬上限：64 MiB（目录读取契约）。 */
 export const REMOTE_BROWSE_MAX_XML_BYTES = 64 * 1024 * 1024;
 
 /**
- * 大目录两段式加载的直属条目数阈值（技术方案 §3.2 定案）：超过该值时
+ * 大目录两段式加载的直属条目数阈值：超过该值时
  * 先用无元数据 `svn list` 取得名称与精确总数并立即首屏，`list --xml`
  * 元数据改由选中节点 `svn info` 与可取消后台任务按可见片补全。
  */
@@ -66,7 +66,7 @@ export const REMOTE_BROWSE_METADATA_THRESHOLD = 5_000;
 export const BINARY_PROBE_BYTES = 8 * 1024;
 
 /**
- * 共享目标身份（技术方案 §2.2 冻结契约）。所有 M4 远端命令以它作为
+ * 共享目标身份。所有远端命令以它作为
  * 结构化输入，不在 Webview 拼 URL。
  */
 export interface RepoNodeRef {
@@ -136,8 +136,8 @@ export class BrowseLimitExceededError extends Error {
 
   constructor(reason: 'entries' | 'bytes', limit: number) {
     super(reason === 'entries'
-      ? `目录直属条目超过 ${limit} 条上限，已终止读取`
-      : `目录 XML 超过 ${limit} 字节上限，已终止读取`);
+      ? `directory has more than ${limit} entries; read aborted`
+      : `directory XML exceeds ${limit} bytes; read aborted`);
     this.name = 'BrowseLimitExceededError';
     this.reason = reason;
     this.limit = limit;
@@ -192,7 +192,7 @@ export function classifyBrowseFailure(err: unknown, url?: string): BrowserError 
       return { kind: 'revisionNotFound', ...base };
     }
     // W160013/W170000 是 info/list 的路径不存在；propget 对不存在的目标
-    // 输出 E150000（`... does not exist in revision N`，阶段 0 补充实测）。
+    // 输出 E150000（`... does not exist in revision N`，补充实测）。
     if (codes.includes('W160013') || codes.includes('W170000') || codes.includes('E150000')) {
       return { kind: 'notFound', ...base };
     }
@@ -402,7 +402,7 @@ export async function readRemoteNode(
         status: 'error',
         error: {
           kind: 'parse',
-          message: 'svn info --xml 输出缺少必要字段',
+          message: 'svn info --xml output is missing required fields',
           codes: [],
           exitCode: result.exitCode,
         },
@@ -513,7 +513,7 @@ export class DirectoryListParser {
     this.parser.write(this.decoder.end());
     this.parser.close();
     if (this.listPath === undefined) {
-      throw new Error('svn list --xml 输出缺少 <list> 根元素');
+      throw new Error('svn list --xml output is missing the <list> root element');
     }
     return {
       listPath: this.listPath,
@@ -831,7 +831,7 @@ export class DirectoryNameListParser {
       this.finishLine(tail);
     }
     if (this.malformedLines > 0) {
-      throw new Error(`svn list 输出含 ${this.malformedLines} 个异常空行，拒绝按名称列表解析`);
+      throw new Error(`svn list output contains ${this.malformedLines} malformed empty line(s); refusing to parse as a name list`);
     }
     return { entries: this.entries, total: this.entries.length, bytes: this.bytes };
   }
@@ -924,7 +924,7 @@ export type BrowseNameListResult =
 
 /**
  * 读取远端目录的直属名称与精确总数（无元数据 `svn list`，不加载
- * last-changed/author/date/size；阶段 0 实测 100k 条目 0.16 s）。
+ * last-changed/author/date/size；实测 100k 条目 0.16 s）。
  *
  * 返回语义与 readRemoteDirectory 对齐：exit 0 且零条目 → ready（空目录，
  * total=0）；路径不存在（W160013/W170000 + E200009）→ notFound；条目或
@@ -961,6 +961,11 @@ export async function readRemoteDirectoryNames(
     try {
       listing = parser.end();
     } catch (err) {
+      // 末行无换行时条目在 end 收口才完成，同样可能触发条目/字节预算；
+      // 与 readRemoteDirectory 同口径：越限不能被降级为 parse 错误。
+      if (err instanceof BrowseLimitExceededError) {
+        throw err;
+      }
       return {
         status: 'error',
         error: {
@@ -1111,7 +1116,7 @@ export async function readRemoteProperty(
         status: 'error',
         error: {
           kind: 'parse',
-          message: `svn propget --xml 输出缺少属性 ${propertyName}`,
+          message: `svn propget --xml output does not contain property ${propertyName}`,
           codes: [],
           exitCode: result.exitCode,
         },

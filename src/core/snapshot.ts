@@ -2,7 +2,7 @@
  * P6 快照比较的目标节点解析、目录/文件两端口径与候选构造。core 模块，
  * 不依赖 vscode。
  *
- * 口径（技术方案 §4.3/§4.4 与阶段 0 V3 实测）：
+ * 口径（节点解析与快照读取契约，真实 svn 快照读取实测）：
  * - 端点解析区分 present / absent（已知删除）/ notFoundAtRevision：
  *   `svn info --xml -r <rev> URL@<rev>` 成功即 present；失败为「不存在」
  *   （`W170000`/`W160013` + `E200009`）时，只有删除提交可由 deletionRevision
@@ -26,23 +26,23 @@
  * - 目录候选预算固定 50,000 条目 / 64 MiB XML（解析侧），任一超限返回
  *   `tooLarge`，不展示部分候选冒充完整差异；正常 summarize 同样走
  *   `runStream + StringDecoder('utf8') + saxes` 流式 SAX，不先累计整段 XML
- *   （阶段 0 实测整段缓冲 6–65 MB XML 达 77–264 MiB 增量内存，必须流式）；
+ *   （实测整段缓冲 6–65 MB XML 达 77–264 MiB 增量内存，必须流式）；
  * - 内容层面的二进制判定（svn:mime-type + NUL）由 remoteContent 承担；
  *   本模块只回答节点 kind、表格差异（item/props）与两端存在性/实际 URL。
  */
 import { SaxesParser } from 'saxes';
 import { SvnError, extractSvnErrorCodes, tailText } from './errors';
 import { parseRemoteInfoXml, type RepoNodeRef } from './remoteBrowse';
-import { runOrThrow, runStream, urlWithPeg, Utf8StreamDecoder, type RunOptions, type RunStreamResult } from './svnCli';
+import { runOrThrow, runOrThrowWithRunner, runStream, urlWithPeg, Utf8StreamDecoder, type RunOptions, type RunResult, type RunStreamResult } from './svnCli';
 
-// 共享目标身份（技术方案 §2.2 冻结契约）由 remoteBrowse 定义；这里只复用，
+// 共享目标身份由 remoteBrowse 定义；这里只复用，
 // 避免两套 RepoNodeRef 漂移。其中 relativePath 为逐段解码后的仓库相对路径。
 export type { RepoNodeRef } from './remoteBrowse';
 
-/** 目录候选的条目预算：50,000 条（技术方案 §4.4 固定预算）。 */
+/** 目录候选的条目预算：50,000 条（快照读取契约固定预算）。 */
 export const SNAPSHOT_ENTRY_LIMIT = 50_000;
 
-/** 目录候选的 XML 字节预算：64 MiB（技术方案 §4.4 固定预算）。 */
+/** 目录候选的 XML 字节预算：64 MiB（快照读取契约固定预算）。 */
 export const SNAPSHOT_XML_BYTE_LIMIT = 64 * 1024 * 1024;
 
 /** 删除前回退的历史 revision 尝试上限（含 deletionRevision-1 本身）。 */
@@ -64,7 +64,7 @@ export class SnapshotBudgetError extends Error {
   readonly limit: 'entries' | 'bytes';
 
   constructor(limit: 'entries' | 'bytes') {
-    super(limit === 'entries' ? '快照条目数超过上限' : '快照 XML 字节数超过上限');
+    super(limit === 'entries' ? 'snapshot entry budget exceeded' : 'snapshot XML byte budget exceeded');
     this.name = 'SnapshotBudgetError';
     this.limit = limit;
   }
@@ -129,10 +129,33 @@ function extractWarningAndErrorCodes(text: string): string[] {
   return [...text.matchAll(/\b[WE]\d{6}\b/g)].map((match) => match[0]);
 }
 
-/** 是否属于「路径在该 revision 不存在」类失败（不是认证/网络/权限）。 */
-function isNotExistFailure(text: string): boolean {
+/**
+ * `svn info` 的「路径在该 revision 不存在」判定：只认 W170000 + E200009
+ * （与 history.isInfoAbsent 同口径）。E160013 出现在
+ * `svn log` 无 peg 的路径失败等场景，不用于 info 的 absent 判定——
+ * 把它当不存在会把可通过补读/重试解释的失败静默降级为 notFound。
+ */
+function isInfoNotExistFailure(text: string): boolean {
+  const codes = extractWarningAndErrorCodes(text);
+  return codes.includes('W170000') && codes.includes('E200009');
+}
+
+/**
+ * `svn diff --summarize` 的「目标端不可读」判定：保留 E160013
+ * （实测 summarize 对不存在目标报 E160013）。
+ */
+function isSummarizeNotExistFailure(text: string): boolean {
   const codes = extractWarningAndErrorCodes(text);
   return codes.some((code) => code === 'W170000' || code === 'W160013' || code === 'E160013');
+}
+
+/**
+ * `svn list` 的「路径不存在」判定：只认 W160013 / W170000
+ * （真实 svn list 报 W160013 + E200009；E160013 不是 list 的不存在形态）。
+ */
+function isListNotExistFailure(text: string): boolean {
+  const codes = extractWarningAndErrorCodes(text);
+  return codes.some((code) => code === 'W170000' || code === 'W160013');
 }
 
 /** 归一化 URL 根：去掉尾部斜杠（`file://` 这类只有协议分隔符的形态除外）。 */
@@ -193,7 +216,8 @@ export function joinSnapshotUrl(rootUrl: string, relativePath: string): string {
 /** 由非零退出码构造 SvnError（保留 stderr 供认证/权限/网络分类）。 */
 function commandFailure(args: string[], options: RunOptions, stderr: string, exitCode: number): SvnError {
   return new SvnError({
-    message: tailText(stderr.trim() || `svn ${args[0]} 退出码 ${exitCode}`),
+    // stderr 为空时给出机器可读的英文最简诊断；面向用户的文案由宿主映射。
+    message: tailText(stderr.trim() || `svn ${args[0]} exit code ${exitCode}`),
     command: args,
     cwd: options.cwd,
     exitCode,
@@ -228,7 +252,7 @@ export async function resolveSnapshotNode(
   } catch (err) {
     if (err instanceof SvnError) {
       const text = `${err.stderr}\n${err.message}`;
-      if (isNotExistFailure(text)) {
+      if (isInfoNotExistFailure(text)) {
         if (params.deletionRevision !== undefined && params.revision >= params.deletionRevision) {
           return {
             state: 'absent',
@@ -247,7 +271,7 @@ export async function resolveSnapshotNode(
     info = parseRemoteInfoXml(stdout);
   } catch (err) {
     throw new SvnError({
-      message: `svn info XML 解析失败：${err instanceof Error ? err.message : String(err)}`,
+      message: `svn info XML parse failed: ${err instanceof Error ? err.message : String(err)}`,
       command: args,
       cwd: options.cwd,
       stderr: tailText(stdout),
@@ -256,7 +280,7 @@ export async function resolveSnapshotNode(
   }
   if (!info) {
     throw new SvnError({
-      message: 'svn info --xml 输出缺少节点必需字段（URL/仓库根/UUID/kind/revision）',
+      message: 'svn info --xml output is missing required node fields (url/repository root/uuid/kind/revision)',
       command: args,
       cwd: options.cwd,
       stderr: tailText(stdout),
@@ -601,6 +625,10 @@ type SaxStreamOutcome<T> =
  * 按块喂 SAX；预算越限在回调内抛出并终止子进程，映射为 tooLarge。
  * 退出码非零时不关闭 XML（多条错误路径的 stdout 是未闭合文档），原样
  * 返回 stderr/exitCode 供调用方分类，绝不把半截输出当结果。
+ *
+ * 认证失败（E170001/E215004）经统一补录原语 runOrThrowWithRunner 重试一次；
+ * 重试前重建收集器与解码器（SaxesParser 无法吞回已喂入的半个文档，
+ * StringDecoder 也可能残留分块边界字节），两次尝试的数据不混合。
  */
 async function runSaxStream<T>(
   svnPath: string,
@@ -608,33 +636,57 @@ async function runSaxStream<T>(
   options: RunOptions,
   makeCollector: () => SaxCollector<T>,
 ): Promise<SaxStreamOutcome<T>> {
-  const collector = makeCollector();
-  const decoder = new Utf8StreamDecoder();
-  let result: RunStreamResult;
+  let collector = makeCollector();
+  let decoder = new Utf8StreamDecoder();
+  let lastResult: RunStreamResult | undefined;
+  const streamOptions: RunOptions = {
+    ...options,
+    onCredentialRetry: (retryArgs) => {
+      collector = makeCollector();
+      decoder = new Utf8StreamDecoder();
+      return options.onCredentialRetry?.(retryArgs);
+    },
+  };
+  let result: RunResult;
   try {
-    result = await runStream(svnPath, args, {
-      ...options,
-      onStdoutChunk: (chunk) => {
-        collector.feed(decoder.write(chunk));
+    result = await runOrThrowWithRunner(
+      svnPath,
+      args,
+      streamOptions,
+      async (runnerPath, runnerArgs, runnerOptions = {}) => {
+        lastResult = undefined;
+        const attempt = await runStream(runnerPath, runnerArgs, {
+          ...runnerOptions,
+          onStdoutChunk: (chunk) => {
+            collector.feed(decoder.write(chunk));
+          },
+        });
+        lastResult = attempt;
+        return attempt;
       },
-    });
+    );
   } catch (err) {
     if (err instanceof SnapshotBudgetError) {
       return { kind: 'tooLarge', limit: err.limit };
+    }
+    if (err instanceof SvnError && lastResult !== undefined && lastResult.exitCode !== 0) {
+      // 命令已正常结束但退出码非零（含认证补录重试后仍失败）：保持既有
+      // 业务结果形态，由调用方按 stderr 分类（notFound / 抛 SvnError）。
+      return { kind: 'failed', stderr: lastResult.stderr, exitCode: lastResult.exitCode };
     }
     if (err instanceof SvnError) {
       throw err;
     }
     throw new SvnError({
-      message: `XML 解析失败：${err instanceof Error ? err.message : String(err)}`,
+      message: `XML parse failed: ${err instanceof Error ? err.message : String(err)}`,
       command: args,
       cwd: options.cwd,
       code: 'XML_PARSE',
     });
   }
-  if (result.exitCode !== 0) {
-    return { kind: 'failed', stderr: result.stderr, exitCode: result.exitCode };
-  }
+  // runOrThrowWithRunner 的成功返回恒为退出码 0：非零退出经 assertSuccess
+  // 抛出 SvnError，已在上方 catch 的 lastResult 分支按业务结果返回，这里
+  // 不再保留不可达的非零判断。
   try {
     const tail = decoder.end();
     if (tail !== '') {
@@ -646,7 +698,7 @@ async function runSaxStream<T>(
       return { kind: 'tooLarge', limit: err.limit };
     }
     throw new SvnError({
-      message: `XML 解析失败：${err instanceof Error ? err.message : String(err)}`,
+      message: `XML parse failed: ${err instanceof Error ? err.message : String(err)}`,
       command: args,
       cwd: options.cwd,
       code: 'XML_PARSE',
@@ -695,7 +747,7 @@ export async function summarizeSnapshots(
     case 'tooLarge':
       return { state: 'tooLarge', limit: outcome.limit };
     case 'failed':
-      if (isNotExistFailure(outcome.stderr)) {
+      if (isSummarizeNotExistFailure(outcome.stderr)) {
         return { state: 'notFound' };
       }
       throw commandFailure(args, options, outcome.stderr, outcome.exitCode);
@@ -743,7 +795,7 @@ export async function enumerateSnapshot(
     case 'tooLarge':
       return { state: 'tooLarge', limit: outcome.limit };
     case 'failed':
-      if (isNotExistFailure(outcome.stderr)) {
+      if (isListNotExistFailure(outcome.stderr)) {
         return { state: 'notFound' };
       }
       throw commandFailure(args, options, outcome.stderr, outcome.exitCode);
@@ -859,7 +911,7 @@ function summarizeCandidates(
     if (relativePath === undefined) {
       // 证据不支持「旧根 + 相对路径」映射时不做猜测，避免把来源路径虚增到新目录。
       throw new SvnError({
-        message: `summarize 输出路径不以 --old 根为基准，无法建立相对路径映射：${entry.path}`,
+        message: `summarize output path is not under the --old root; cannot map a relative path: ${entry.path}`,
         command: ['diff', '--xml', '--summarize'],
         code: 'SUMMARIZE_MAPPING',
       });
@@ -967,7 +1019,7 @@ export async function compareDirectorySnapshots(
     }
     if (enumeration.state === 'notFound') {
       throw new SvnError({
-        message: `目录枚举失败：节点在 revision ${node.snapshotRevision} 报告存在但 list 找不到`,
+        message: `directory enumeration failed: node reported present at revision ${node.snapshotRevision} but list did not find it`,
         command: ['list', '--xml'],
         code: 'ENUMERATION_NOT_FOUND',
       });
@@ -993,7 +1045,7 @@ export async function compareDirectorySnapshots(
     }
     if (enumeration.state === 'notFound') {
       throw new SvnError({
-        message: `目录枚举失败：节点在 revision ${node.snapshotRevision} 报告存在但 list 找不到`,
+        message: `directory enumeration failed: node reported present at revision ${node.snapshotRevision} but list did not find it`,
         command: ['list', '--xml'],
         code: 'ENUMERATION_NOT_FOUND',
       });
@@ -1027,7 +1079,7 @@ export async function compareDirectorySnapshots(
     // 两端 info 都报告存在却 E160013：证据自相矛盾，不做猜测（不能把半输出
     // 或缺端当完整差异），交由调用方按错误呈现。
     throw new SvnError({
-      message: 'svn diff --summarize 报告目标不存在，但两端 info 均解析为存在；不展示部分候选',
+      message: 'svn diff --summarize reported the target as absent, but both endpoint infos resolved; partial candidates are not shown',
       command: ['diff', '--xml', '--summarize'],
       code: 'SUMMARIZE_NOT_FOUND',
     });
@@ -1100,7 +1152,7 @@ export async function compareFileSnapshots(
   }
   if (summary.state === 'notFound') {
     throw new SvnError({
-      message: 'svn diff --summarize 报告目标不存在，但两端 info 均解析为存在；不展示部分候选',
+      message: 'svn diff --summarize reported the target as absent, but both endpoint infos resolved; partial candidates are not shown',
       command: ['diff', '--xml', '--summarize'],
       code: 'SUMMARIZE_NOT_FOUND',
     });

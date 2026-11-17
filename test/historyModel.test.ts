@@ -1,5 +1,5 @@
 /**
- * P6 历史面板模型（historyModel.ts）单测：upper 状态机（HLS-6 的
+ * P6 历史面板模型（historyModel.ts）单测：upper 状态机（重置与上限刷新语义的
  * reset/refresh 语义）、筛选与展示前缀、勾选上限、详情与“上一条可见
  * 记录”边界、序列化恢复与 append 表格渲染。
  *
@@ -10,6 +10,7 @@ import { describe, expect, it } from 'vitest';
 import type { HistoryEntry, HistoryLimits } from '../src/core/history';
 import type { ConflictRecord } from '../src/core/conflict';
 import type { HistoryUpdateIntent, HistoryUpdateRescan, HistoryUpdateResult } from '../src/core/historyUpdate';
+import { strings } from '../src/host/i18n';
 import {
   applyHistoryUpdateRescan,
   applyHistoryUpdateResult,
@@ -21,6 +22,7 @@ import {
   historyUpdateTerminalPage,
   historyRowId,
   historyTargetKey,
+  HISTORY_TEXT_DEFAULTS,
   historyText,
   HistoryModel,
   parentRepositoryPath,
@@ -100,7 +102,7 @@ function fill(model: HistoryModel, revisions: number[]): void {
 
 /* ------------------------------ 测试 ------------------------------ */
 
-describe('resetHistorySession（HLS-6 模型级语义）', () => {
+describe('resetHistorySession（模型级语义）', () => {
   it('live-head reset：headState=available 与 upper/filter/follow 保持，数据与计数归零', () => {
     const model = liveModel([9, 8, 7]);
     model.setFilter('keyword', 'r9');
@@ -234,32 +236,21 @@ describe('refreshHistoryUpper 运行时校验与来源恢复', () => {
     expect(fallback.sessionView().entriesByRevision.size).toBe(0);
   });
 
-  it('base-fallback 成功固定 unavailable；失败分支（调用方不应用）三字段与数据不变', () => {
+  it('base-fallback 成功固定 upper=BASE 且 headState=unavailable', () => {
     const model = makeModel();
     model.beginOpen(localContext());
     model.applyUnresolved({ kind: 'network', message: '无法连接', codes: [] });
     model.applyBaseFallbackSuccess(7, { targetPresentAtUpper: true });
     fill(model, [5, 4]);
     const session = model.sessionView();
-    const before = {
-      upperRevision: session.upperRevision,
-      upperSource: session.upperSource,
-      headState: session.headState,
-      rawFetchedTotal: session.rawFetchedTotal,
-      entries: session.entriesByRevision.size,
-      displayedCount: session.displayedCount,
-    };
-    // 失败分支：控制器直接放弃，不调用 applyBaseFallbackSuccess/applyUpperRefresh。
-    expect({
-      upperRevision: session.upperRevision,
-      upperSource: session.upperSource,
-      headState: session.headState,
-      rawFetchedTotal: session.rawFetchedTotal,
-      entries: session.entriesByRevision.size,
-      displayedCount: session.displayedCount,
-    }).toEqual(before);
+    expect(session.upperRevision).toBe(7);
     expect(session.upperSource).toBe('base-fallback');
     expect(session.headState).toBe('unavailable');
+    expect(session.entriesByRevision.size).toBe(2);
+    // 失败分支（info/log 失败）由控制器直接放弃、不调用模型的
+    // applyBaseFallbackSuccess/applyUpperRefresh；真实失败 mock 下的
+    // 「三字段与已加载数据不变」断言见 historyPanel.test.ts
+    // 「第二次 base-fallback 的 log 失败」用例。
   });
 });
 
@@ -340,17 +331,69 @@ describe('筛选变化只重算展示前缀', () => {
   });
 
   it('每批条数变化只重置展示前缀，不清已扫描数据', () => {
-    const model = makeModel(50);
+    const model = makeModel(100);
     model.beginOpen(localContext());
-    model.applyResolvedUpper({ upperRevision: 10, upperSource: 'live-head', targetPresentAtUpper: true });
-    fill(model, [9, 8, 7, 6, 5]);
-    expect(model.sessionView().displayedCount).toBe(5);
-    expect(model.setPageSize(2)).toBe(true);
-    expect(model.sessionView().displayedCount).toBe(2);
-    expect(model.sessionView().entriesByRevision.size).toBe(5);
-    expect(model.setPageSize(50)).toBe(true);
-    expect(model.sessionView().displayedCount).toBe(5);
-    expect(model.setPageSize(50)).toBe(false);
+    model.applyResolvedUpper({ upperRevision: 30, upperSource: 'live-head', targetPresentAtUpper: true });
+    fill(model, Array.from({ length: 25 }, (_, index) => 30 - index));
+    expect(model.sessionView().displayedCount).toBe(25);
+    expect(model.setPageSize(20)).toBe(true);
+    expect(model.sessionView().displayedCount).toBe(20);
+    expect(model.sessionView().entriesByRevision.size).toBe(25);
+    expect(model.setPageSize(100)).toBe(true);
+    expect(model.sessionView().displayedCount).toBe(25);
+    expect(model.setPageSize(100)).toBe(false);
+  });
+
+  it('setPageSize 只接受 20/50/100：协议非法值归一为默认 50，不渲染全部已加载匹配', () => {
+    const model = liveModel(Array.from({ length: 60 }, (_, index) => 60 - index));
+    expect(model.pageSize).toBe(20);
+    expect(model.sessionView().displayedCount).toBe(20);
+
+    // 协议可传任意大整数：不得当作每批条数一次渲染全部 60 条已加载匹配。
+    expect(model.setFilter('pageSize', '100000')).toEqual({ changed: true, rebuild: false });
+    expect(model.pageSize).toBe(50);
+    expect(model.sessionView().displayedCount).toBe(50);
+
+    // 合法值原样生效。
+    expect(model.setFilter('pageSize', '100').changed).toBe(true);
+    expect(model.pageSize).toBe(100);
+    expect(model.sessionView().displayedCount).toBe(60);
+
+    // 其余非法值（0/负数/浮点/NaN）统一回退默认 50。
+    expect(model.setPageSize(0)).toBe(true);
+    expect(model.pageSize).toBe(50);
+    expect(model.setPageSize(-1)).toBe(false);
+    expect(model.setPageSize(33.5)).toBe(false);
+    expect(model.setPageSize(Number.NaN)).toBe(false);
+    expect(model.pageSize).toBe(50);
+    expect(model.sessionView().entriesByRevision.size).toBe(60);
+  });
+
+  it('作者下拉来自会话累计扫描作者：未命中身份提交的作者也计入、按首次出现顺序', () => {
+    // ancestor-filter 源（BASE 上限、目标在该 revision 不存在）：回包既有
+    // 命中身份的记录，也有更早身份的未命中记录。
+    const model = makeModel();
+    model.beginOpen(localContext());
+    model.applyUnresolved({ kind: 'network', message: 'x', codes: [] });
+    model.applyBaseFallbackSuccess(7, { targetPresentAtUpper: false, nearestExistingAncestor: '/trunk' });
+    const sourceId = model.sessionView().sources[0].id;
+    model.applyLogPage({
+      sourceId,
+      entries: [
+        entry(9, { author: 'bob', paths: [{ path: '/trunk/b.txt', action: 'M', kind: 'file' }] }),
+        entry(8, { author: 'carol' }),
+        entry(7, { author: 'bob', paths: [{ path: '/trunk/b.txt', action: 'M', kind: 'file' }] }),
+      ],
+      requestedLimit: 4,
+    });
+    model.finishLoadMore();
+    // 仅 r8 命中目标身份；作者下拉仍收录未命中的 bob/carol（确实被扫描过），
+    // 按原始回包首次出现顺序去重。
+    expect(model.sessionView().entriesByRevision.has(9)).toBe(false);
+    expect(model.authors()).toEqual(['bob', 'carol']);
+    const authorField = model.buildPanelState('s')
+      .filterPanel?.fields.find((field) => field.id === 'author');
+    expect(authorField?.options?.map((option) => option.value)).toEqual(['__all__', 'bob', 'carol']);
   });
 });
 
@@ -446,6 +489,7 @@ describe('序列化与关闭重开恢复', () => {
     expect(session.upperSource).toBe('live-head');
     expect(session.headState).toBe('available');
     expect(session.entriesByRevision.size).toBe(3);
+    expect(session.scannedAuthors).toEqual(['alice']);
     expect(session.displayedCount).toBe(2);
     expect(restored.selectedRevisions()).toEqual([9]);
     expect(restored.detailState()?.revision).toBe(8);
@@ -472,6 +516,23 @@ describe('序列化与关闭重开恢复', () => {
       upperSource: 'live-head',
       headState: 'available',
     }, null)).toBe(false);
+  });
+
+  it('旧持久化数据缺少 scannedAuthors：恢复为空数组，后续回包继续累计', () => {
+    const model = liveModel([9]);
+    const saved = model.serialize()!;
+    expect(saved.browsable.session.scannedAuthors).toEqual(['alice']);
+    const legacyBrowsable = {
+      ...saved.browsable,
+      session: { ...saved.browsable.session, scannedAuthors: undefined },
+    };
+    const restored = makeModel();
+    expect(restored.restore(localContext(), legacyBrowsable, saved.upper, saved.historyLimitState)).toBe(true);
+    expect(restored.sessionView().scannedAuthors).toEqual([]);
+    expect(restored.authors()).toEqual([]);
+    // 恢复后新一批回包仍按会话口径继续累计。
+    fill(restored, [8]);
+    expect(restored.authors()).toEqual(['alice']);
   });
 
   it('恢复 unresolved 会话：upper 三字段原样、无源无数据', () => {
@@ -522,6 +583,48 @@ describe('渲染（append 表格 / 详情 / 分态）', () => {
     const secondaryIds = (state.footer?.secondary ?? []).map((action) => action.id);
     expect(secondaryIds).toContain('refreshHistoryUpper');
     expect(secondaryIds).toContain('resetHistorySession');
+    // 冻结动作 compareHistoryRevisions 的稳定入口：只勾一项时禁用并给原因。
+    const compare = (state.footer?.secondary ?? []).find((action) => action.id === 'compareHistoryRevisions');
+    expect(compare).toBeDefined();
+    expect(compare?.label).toBe(historyText('compareSelected'));
+    expect(compare?.disabled).toBe(true);
+    expect(compare?.disabledReason).toBe(historyText('compareNeedsTwo'));
+
+    // 恰好勾选两项后启用（选择集合是入口可用性的唯一事实）。
+    model.toggleRevision(historyRowId(8));
+    const twoSelected = model.buildPanelState('s1');
+    const compareTwo = (twoSelected.footer?.secondary ?? []).find((action) => action.id === 'compareHistoryRevisions');
+    expect(compareTwo?.disabled).toBe(false);
+    expect(compareTwo?.disabledReason).toBeUndefined();
+  });
+
+  it('页脚「加载更多」禁用原因按真实原因给出，不复用面板标题充当 tooltip', () => {
+    // 已加载全部匹配记录（唯一源耗尽、无后续页）：禁用并给出明确原因。
+    const model = liveModel([9], 50);
+    const allLoaded = model.buildPanelState('s1').footer?.primary!;
+    expect(allLoaded.disabled).toBe(true);
+    expect(allLoaded.disabledReason).toBe(historyText('loadMoreAllLoaded'));
+    expect(allLoaded.disabledReason).not.toBe(historyText('panelTitle'));
+
+    // 加载中（仍有后续可加载）：给出加载中文案。
+    const loadingModel = makeModel(1);
+    loadingModel.beginOpen(localContext());
+    loadingModel.applyResolvedUpper({ upperRevision: 10, upperSource: 'live-head', targetPresentAtUpper: true });
+    loadingModel.applyLogPage({
+      sourceId: 'target',
+      entries: [entry(9), entry(8)],
+      requestedLimit: 2,
+    });
+    loadingModel.finishLoadMore();
+    loadingModel.markLoading();
+    const loading = loadingModel.buildPanelState('s1').footer?.primary!;
+    expect(loading.disabled).toBe(true);
+    expect(loading.disabledReason).toBe(historyText('loadMoreLoading'));
+
+    // 未建立会话：沿用 openingTitle（既有行为）。
+    const opening = makeModel().buildPanelState('s1').footer?.primary!;
+    expect(opening.disabled).toBe(true);
+    expect(opening.disabledReason).toBe(historyText('openingTitle'));
   });
 
   it('详情：变更路径/复制来源/删除存在性与动作能力/复制动作', () => {
@@ -974,6 +1077,32 @@ describe('P6 更新状态机（五态与固定意图）', () => {
     })).toBeUndefined();
   });
 
+  it('命令输出线索：applyHistoryUpdateResult 防御性复制、终态恢复保留、损坏形状拒绝', () => {
+    const base = createHistoryUpdateState(UPDATE_INTENT, 'op-1', 1000);
+    const hint = { finalRevision: 40, conflicts: ['trunk/sub/a.txt'] };
+    const updated = applyHistoryUpdateResult(base, updateResult({ outputHint: hint }), 1100);
+    expect(updated.outputHint).toEqual(hint);
+    expect(updated.outputHint).not.toBe(hint);
+    expect(updated.outputHint?.conflicts).not.toBe(hint.conflicts);
+
+    const restored = restoreHistoryUpdateState(historyUpdateTerminalPage(updated));
+    expect(restored?.outputHint).toEqual(hint);
+    expect(restoreHistoryUpdateState({
+      version: 1,
+      kind: 'history-update',
+      state: { ...updated, outputHint: { finalRevision: 0, conflicts: [] } },
+    })).toBeUndefined();
+    expect(restoreHistoryUpdateState({
+      version: 1,
+      kind: 'history-update',
+      state: { ...updated, outputHint: { conflicts: [1] } },
+    })).toBeUndefined();
+
+    // 新结果未携带线索时清空旧线索（不沿用上一轮命令输出）。
+    const cleared = applyHistoryUpdateResult(updated, updateResult({ postNodeRevision: 40 }), 1200);
+    expect(cleared.outputHint).toBeUndefined();
+  });
+
   it('HistoryModel.applyLocalBaseRevision：只接受正整数，BASE 徽标随之刷新', () => {
     const model = new HistoryModel();
     model.beginOpen(localContext());
@@ -986,5 +1115,48 @@ describe('P6 更新状态机（五态与固定意图）', () => {
     expect(model.localBaseRevision()).toBe(40);
     const badges = model.buildPanelState('s').headerBadges ?? [];
     expect(badges.some((badge) => badge.text.includes('40'))).toBe(true);
+  });
+});
+
+/* ---------------------------------------------------------------------------
+ * 文案对账与勾选契约对拍
+ * ------------------------------------------------------------------------- */
+
+describe('文案对账', () => {
+  it('HISTORY_TEXT_DEFAULTS 与 i18n.historyPanel 键值一致（含控制器诊断文案）', () => {
+    const panel = strings.historyPanel as unknown as Record<string, string>;
+    for (const [key, value] of Object.entries(HISTORY_TEXT_DEFAULTS)) {
+      expect(panel[key], `i18n.historyPanel 缺少或漂移：${key}`).toBe(value);
+    }
+  });
+
+  it('P6 勾选上限与表格选择契约（applyTableSelection/appendTableRows）同口径', async () => {
+    // 契约参考实现的 revision 模式硬上限为 2；P6 模型勾选同一语义：
+    // 第三个选择被拒（limit），取消后可再选。
+    const { applyTableSelection, selectedTableRowIds, tableSelectionLimit } = await import('../src/host/panel/state');
+    const table = {
+      id: 't',
+      columns: [{ key: 'revision', label: 'Revision' }],
+      sort: { key: 'revision', direction: 'desc' as const },
+      pagination: { page: 1, pageSize: 3, total: 3, pageCount: 1 },
+      empty: { title: '无记录' },
+      rows: [9, 8, 7].map((revision) => ({
+        id: historyRowId(revision),
+        cells: { revision: `r${revision}` },
+      })),
+      selection: { mode: 'revision' as const },
+    };
+    expect(tableSelectionLimit(table.selection)).toBe(2);
+    const first = applyTableSelection(table, historyRowId(9), true);
+    const second = applyTableSelection(first.table, historyRowId(8), true);
+    const third = applyTableSelection(second.table, historyRowId(7), true);
+    expect(third).toMatchObject({ changed: false, limitReached: true });
+    expect(selectedTableRowIds(second.table)).toEqual([historyRowId(9), historyRowId(8)]);
+
+    const model = liveModel([9, 8, 7]);
+    expect(model.toggleRevision(historyRowId(9))).toBe('toggled');
+    expect(model.toggleRevision(historyRowId(8))).toBe('toggled');
+    expect(model.toggleRevision(historyRowId(7))).toBe('limit');
+    expect(model.selectedRevisions()).toEqual([9, 8]);
   });
 });

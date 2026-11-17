@@ -4,23 +4,23 @@
  * 筛选、5,000 命中 / 100,000 扫描上限与 upper 状态语义。core 模块，
  * 不依赖 vscode。
  *
- * 语义来源（M4 技术方案 §4.1/§4.2/§4.3 与阶段 0 V2 实测，关键结论）：
+ * 语义来源（历史分页、作者口径与节点解析契约，真实 svn 实测；关键结论）：
  * - 单页请求固定 `-l <historyPageSize + 1> -r <cursor>:1`，+1 只用于判断
  *   是否还有下一批、不多展示一条；
  * - 下一批 cursor 取「上一批最小 revision − 1」；cursor < 1 本地停止，
- *   不能发 `-r 0:1`（阶段 0 实测 svn 把 0 视为起点、会重复返回 r1）；
+ *   不能发 `-r 0:1`（实测 svn 把 0 视为起点、会重复返回 r1）；
  * - 默认跟随复制（target 源不传 --stop-on-copy，由服务端默认跟随）；
  *   ancestor-filter 与 copyfrom 源始终传 --stop-on-copy，遇到带
  *   copyfrom-path/rev 的结构变更时由客户端压入来源源；
  * - 一次 loadMore 最多处理 500 条原始回包（跨源重复计入），下一次
  *   loadMore 重新获得独立预算；每页请求返回的 51 条中若有超出预算的
  *   尾部，只处理预算内前缀，cursor 按最后处理条目的 revision 推进
- *   （阶段 0 B6 fixture：单轮 500 扫描 → 80 命中 → 展示 50、pending 30、
+ *   （500 条扫描场景 fixture：单轮 500 扫描 → 80 命中 → 展示 50、pending 30、
  *   next cursor=60）；
  * - 三个集合语义不混用：scannedRevisionIds 是各源回包中出现过的全部
  *   revision（含未命中），entriesByRevision 是其中命中目标身份的记录，
  *   visibleEntries 是再经当前筛选后的可见记录；
- * - ancestor-filter 采用阶段 0 C8 固定的严格规则：目标路径自身记录命中；
+ * - ancestor-filter 采用实测固定的严格规则：目标路径自身记录命中；
  *   祖先 D 命中；祖先 A/R 带 copyfrom 命中；祖先 A 无 copyfrom 只通过
  *   「同 revision 存在目标路径自身记录」间接命中，避免把「祖先目录首次
  *   创建」误当成从未存在的目标的历史；目录目标另命中任意后代路径变更；
@@ -29,16 +29,16 @@
  *   整页（actual>limit）不截断；同一轮可同时记录 matched/scanned；
  *   pending 未清空时 hasMore 仍为 true，清空后转 false。
  */
-import { XMLParser } from 'fast-xml-parser';
+import { XMLParser, XMLValidator } from 'fast-xml-parser';
 import {
   SvnError,
   extractSvnErrorCodes,
   tailText,
 } from './errors';
-import { run, urlWithPeg, type RunOptions, type RunResult } from './svnCli';
+import { run, runOrThrowWithRunner, urlWithPeg, type RunOptions, type RunResult } from './svnCli';
 
 // ---------------------------------------------------------------------------
-// 常量与冻结契约类型（M4 技术方案 §4.1）
+// 常量与冻结契约类型（历史分页契约）
 // ---------------------------------------------------------------------------
 
 /** 配置项 svnAnywhere.historyPageSize 的可选值（非法值回退 50）。 */
@@ -56,7 +56,7 @@ export const HISTORY_MATCHED_LIMIT = 5_000;
 /** 扫描去重集合（scannedRevisionIds）上限。 */
 export const HISTORY_SCANNED_LIMIT = 100_000;
 
-/** 会话历史上限参数；单测用同构小参数验证语义（阶段 0 C12）。 */
+/** 会话历史上限参数；单测用同构小参数验证语义。 */
 export interface HistoryLimits {
   matched: number;
   scanned: number;
@@ -69,10 +69,10 @@ export const DEFAULT_HISTORY_LIMITS: HistoryLimits = {
   rawBudgetPerLoad: HISTORY_RAW_BUDGET_PER_LOAD,
 };
 
-/** 历史上限来源（§4.1 冻结枚举）。 */
+/** 历史上限来源（历史分页契约的冻结枚举）。 */
 export type HistoryUpperSource = 'unresolved' | 'live-head' | 'snapshot' | 'base-fallback';
 
-/** HEAD 状态（§4.1 冻结枚举）。 */
+/** HEAD 状态（历史分页契约的冻结枚举）。 */
 export type HistoryHeadState = 'available' | 'unavailable' | 'unknown';
 
 /** 日志源类型。 */
@@ -104,7 +104,7 @@ export interface HistoryEntry {
   paths: HistoryPathChange[];
 }
 
-/** 串行源栈中的一条日志源（§4.1 冻结字段）。 */
+/** 串行源栈中的一条日志源（历史分页契约的冻结字段）。 */
 export interface HistorySource {
   id: string;
   kind: HistorySourceKind;
@@ -124,7 +124,7 @@ export interface HistoryLimitReason {
   actual: number;
 }
 
-/** 会话状态（§4.1 冻结字段）。 */
+/** 会话状态（历史分页契约的冻结字段）。 */
 export interface HistorySession {
   upperRevision: number | null;
   upperSource: HistoryUpperSource;
@@ -135,6 +135,12 @@ export interface HistorySession {
   visibleEntries: HistoryEntry[];
   displayedCount: number;
   scannedRevisionIds: Set<number>;
+  /**
+   * 会话累计「已扫描原始批次中的实际作者」（作者下拉数据源）：
+   * 收录各源原始回包中的全部作者（含未命中目标身份的提交），按首次
+   * 出现顺序去重；不能从 fixture 或命中记录之外预先编造作者全集。
+   */
+  scannedAuthors: string[];
   rawFetchedTotal: number;
   rawFetchedInLoad: number;
   scannedThisLoad: Set<number>;
@@ -291,16 +297,38 @@ function parseLogPath(raw: RawLogPath | string): HistoryPathChange {
  * 解析 `svn log --xml -v` 输出。返回按 XML 顺序（服务端 revision 降序）
  * 的提交记录；revision 缺失或非法的条目丢弃（不伪造记录）。
  * 不依赖 text-mods/prop-mods（SVN 1.6.17 缺失），字段存在时保留原值。
+ *
+ * 畸形/截断 XML 不静默吞掉：抛 SvnError（code=XML_PARSE），与 snapshot/
+ * blame 的 XML_PARSE 口径一致，宿主按错误态呈现而不是「空历史」。
+ * 空输出（无任何记录）与空 <log> 仍返回空数组。
  */
 export function parseLogXml(xml: string): HistoryEntry[] {
   if (xml.trim() === '') {
     return [];
   }
+  // fast-xml-parser 的 XMLParser 容错很强（截断文档/纯文本会静默产出
+  // 空对象）；先做结构校验，把截断、未闭合标签与非 XML 输出归为
+  // XML_PARSE，与 snapshot/blame 的 XML_PARSE 口径一致。
+  const validation = XMLValidator.validate(xml);
+  if (validation !== true) {
+    throw new SvnError({
+      // 机器可读的英文技术诊断；面向用户的文案由宿主按错误分类映射。
+      message: `svn log XML parse failed: ${validation.err.msg} (line ${validation.err.line}, col ${validation.err.col})`,
+      command: ['log', '--xml'],
+      stderr: tailText(xml),
+      code: 'XML_PARSE',
+    });
+  }
   let parsed: { log?: { logentry?: RawLogEntry[] } };
   try {
     parsed = logParser.parse(xml) as { log?: { logentry?: RawLogEntry[] } };
-  } catch {
-    return [];
+  } catch (err) {
+    throw new SvnError({
+      message: `svn log XML parse failed: ${err instanceof Error ? err.message : String(err)}`,
+      command: ['log', '--xml'],
+      stderr: tailText(xml),
+      code: 'XML_PARSE',
+    });
   }
   const entries = parsed.log?.logentry;
   if (!Array.isArray(entries)) {
@@ -478,6 +506,7 @@ export function createHistorySession(init: HistorySessionInit): HistorySession {
     visibleEntries: [],
     displayedCount: 0,
     scannedRevisionIds: new Set(),
+    scannedAuthors: [],
     rawFetchedTotal: 0,
     rawFetchedInLoad: 0,
     scannedThisLoad: new Set(),
@@ -509,6 +538,7 @@ export function createUnresolvedHistorySession(params: { followCopies: boolean }
     visibleEntries: [],
     displayedCount: 0,
     scannedRevisionIds: new Set(),
+    scannedAuthors: [],
     rawFetchedTotal: 0,
     rawFetchedInLoad: 0,
     scannedThisLoad: new Set(),
@@ -534,6 +564,7 @@ export function clearHistorySessionData(session: HistorySession): void {
   session.visibleEntries = [];
   session.displayedCount = 0;
   session.scannedRevisionIds.clear();
+  session.scannedAuthors = [];
   session.rawFetchedTotal = 0;
   session.rawFetchedInLoad = 0;
   session.scannedThisLoad = new Set();
@@ -561,7 +592,7 @@ function isAncestorOrSelf(candidate: string, target: string): boolean {
 }
 
 /**
- * ancestor-filter 严格命中规则（阶段 0 C8 / probe_lib.relevant_strict）：
+ * ancestor-filter 严格命中规则（本地实测口径 / probe_lib.relevant_strict）：
  * - 目标路径自身记录命中；
  * - 祖先目录 D 命中（目标被删除）；
  * - 祖先目录 A/R 带 copyfrom 命中（复制映射是否真正带入目标由来源源确认）；
@@ -569,7 +600,7 @@ function isAncestorOrSelf(candidate: string, target: string): boolean {
  *   自身记录时，那条记录使该 revision 命中，由本条与单条记录 OR 达成）；
  * - 目录目标另命中任意后代路径变更。
  * 若按 basename 而非完整仓库路径前缀匹配，`/branches/base/x.txt` 会被
- * 误归给 `/trunk/x.txt`（阶段 0 C7），因此这里只做完整前缀判定。
+ * 误归给 `/trunk/x.txt`（本地实测），因此这里只做完整前缀判定。
  */
 export function revisionMatchesHistoryTrackedPath(
   entry: HistoryEntry,
@@ -618,7 +649,7 @@ export interface HistoryCopySourceInfo {
  * - 目标自身或更近祖先的复制记录优先（change.path 越深越具体），
  *   避免把来源目录里的同名相对路径误归给当前目标；
  * - 同深度多条时取 revision 最大（当前身份链上最近一次复制）；
- * - 相对后缀从复制目标带到 copyfrom-path 上（C7：来源 /branches/base，
+ * - 相对后缀从复制目标带到 copyfrom-path 上（如来源 /branches/base，
  *   后缀 x.txt）。
  * 无复制记录（例如无 copyfrom 的首次 A）返回 undefined，身份链结束。
  */
@@ -701,7 +732,7 @@ export function isHistoryDateRangeReversed(filter: HistoryFilter): boolean {
 /**
  * 日志时间的本地日期键（YYYY-MM-DD）：列表展示与筛选共用同一转换，
  * 先按扩展宿主本地时区转换再取日期，避免列表显示本地日期、筛选却按
- * UTC 字符串比较（阶段 0 C10 date-edge）。无效/缺失日期返回 undefined。
+ * UTC 字符串比较（实测日期边界）。无效/缺失日期返回 undefined。
  */
 export function localDateKey(dateIso: string | undefined): string | undefined {
   if (dateIso === undefined || dateIso === '') {
@@ -788,7 +819,25 @@ function sortedHistoryEntries(entries: Iterable<HistoryEntry>): HistoryEntry[] {
   return [...entries].sort((a, b) => b.revision - a.revision);
 }
 
-/** 作者下拉数据源：当前会话已扫描原始批次中的实际作者，按首次出现顺序去重。 */
+/**
+ * 会话累计扫描原始批次作者（作者下拉数据源）：按首次出现顺序去重，
+ * 收录原始回包中的全部作者（含未命中目标身份的提交）。作者匹配本身
+ * 大小写不敏感，但下拉选项保留实际出现过的原值。
+ */
+function recordScannedAuthor(session: HistorySession, author: string | undefined): void {
+  if (author === undefined || author === '') {
+    return;
+  }
+  if (!session.scannedAuthors.includes(author)) {
+    session.scannedAuthors.push(author);
+  }
+}
+
+/**
+ * 收集一组历史记录中的作者（按首次出现顺序去重），保留给需要从任意
+ * 记录集合取作者的调用方。作者下拉必须使用会话累计的扫描作者口径
+ * （已扫描原始批次中的实际作者），即 `session.scannedAuthors`。
+ */
 export function collectHistoryAuthors(entries: Iterable<HistoryEntry>): string[] {
   const seen = new Set<string>();
   const authors: string[] = [];
@@ -994,7 +1043,7 @@ function unionHistoryPaths(existing: HistoryPathChange[], incoming: HistoryPathC
 }
 
 /**
- * 身份链终止判定（§4.1）：跟踪路径自身或祖先的 A/R 若没有 copyfrom，
+ * 身份链终止判定：跟踪路径自身或祖先的 A/R 若没有 copyfrom，
  * 说明该身份链在此首次创建/重建，更早的 revision 属于另一个身份，
  * 不再进入更早历史（本轮之后把源标记为耗尽）。
  * 目录目标的后代路径首次新增不终止当前目录身份。
@@ -1056,6 +1105,9 @@ export function applyHistoryLogPage(
     source.scannedRaw += 1;
     session.scannedThisLoad.add(entry.revision);
     session.scannedRevisionIds.add(entry.revision);
+    // 作者下拉口径：原始批次中出现的全部作者，未命中身份的提交
+    // 同样计入（它们确实被扫描过），按首次出现顺序追加。
+    recordScannedAuthor(session, entry.author);
     if (chainEnded) {
       // 更早 revision 属于另一个身份：仍算原始回包/扫描，但不进入历史。
       continue;
@@ -1141,7 +1193,7 @@ export function finishHistoryLoadMore(
 // ---------------------------------------------------------------------------
 
 /**
- * 清空当前目标的历史会话并重读首批（§6 冻结意图）：
+ * 清空当前目标的历史会话并重读首批（冻结意图）：
  * - 保留已解析的 upperRevision/upperSource/headState 与 followCopies；
  * - 清 source 栈、entriesByRevision/visibleEntries、scannedRevisionIds、
  *   rawFetchedTotal/rawFetchedInLoad、scannedThisLoad、displayedCount、
@@ -1158,7 +1210,7 @@ export function resetHistorySession(session: HistorySession): boolean {
   return true;
 }
 
-/** refreshHistoryUpper 协议层只接受的两个 mode（§6）。 */
+/** refreshHistoryUpper 协议层只接受的两个 mode。 */
 export type HistoryUpperRefreshMode = 'head' | 'base-fallback';
 
 /** refreshHistoryUpper 运行时校验的拒绝原因。 */
@@ -1260,7 +1312,7 @@ export type HistoryPathMapping =
   | { kind: 'unknown' };
 
 /**
- * 在已加载复制窗口中为「路径 + 所选 revision」解析一层实际位置（§4.3）：
+ * 在已加载复制窗口中为「路径 + 所选 revision」解析一层实际位置：
  * 1. 同 revision 发生覆盖该路径的 A/R 复制 → 使用新路径（same-revision）；
  * 2. 由新到旧找覆盖该路径的 A/R 复制记录：复制晚于所选 revision 时，
  *    把相对后缀带到 copyfrom-path 上并继续解析来源 revision；
@@ -1399,7 +1451,7 @@ function parseInfoUrl(xml: string): string | undefined {
 }
 
 /**
- * info 路径不存在判定（阶段 0 C11）：`W170000` + `E200009` 且 stdout
+ * info 路径不存在判定：`W170000` + `E200009` 且 stdout
  * 为合法空骨架（无 <entry>）。单独 E200009、E160013 或
  * E170013+E215004/E175013/网络错误都不是 absent 证据。
  * W170000 是警告码（W 前缀），extractSvnErrorCodes 只收集 E 码，这里
@@ -1442,25 +1494,30 @@ export async function resolveHistoryNodeAtRevision(
     visited.add(key);
     const url = urlForRepositoryPath(params.target.repositoryRootUrl, path);
     const args = ['info', '--xml', '--non-interactive', '--', urlWithPeg(url, revision)];
-    const result = await run(svnPath, args, options);
-    if (result.exitCode === 0) {
+    // 认证失败（E170001/E215004）必须经统一补录原语：options.getCredentials
+    // 由宿主注入，失效凭据时弹补录框并重试一次。runner 显式传模块内 run
+    // （保持测试对 run 的替身注入）；命令结果另存，absent（W170000+E200009
+    // + 空骨架）是业务结果，不是命令失败。
+    let lastResult: RunResult | undefined;
+    let result: RunResult | undefined;
+    try {
+      result = await runOrThrowWithRunner(svnPath, args, options, async (runnerPath, runnerArgs, runnerOptions = {}) => {
+        lastResult = await run(runnerPath, runnerArgs, runnerOptions);
+        return lastResult;
+      });
+    } catch (err) {
+      if (!(err instanceof SvnError) || lastResult === undefined || !isInfoAbsent(lastResult)) {
+        // 非 absent 错误（认证/权限/网络/revision 不存在等）原样抛出。
+        throw err;
+      }
+    }
+    if (result !== undefined) {
       return {
         status: 'present',
         repositoryPath: toHistoryRelativePath(path),
         url: parseInfoUrl(result.stdout) ?? url,
         revision,
       };
-    }
-    if (!isInfoAbsent(result)) {
-      // 非 absent 错误（认证/权限/网络/revision 不存在等）原样抛出。
-      throw new SvnError({
-        message: tailText(result.stderr.trim() || `svn info 退出码 ${result.exitCode}`),
-        command: args,
-        cwd: options.cwd,
-        exitCode: result.exitCode,
-        stderr: tailText(result.stderr),
-        code: extractSvnErrorCodes(result.stderr)[0],
-      });
     }
     const mapping = findRevisionPathMapping(entries, path, params.target.kind, revision);
     if (mapping.kind === 'copy') {
@@ -1469,7 +1526,7 @@ export async function resolveHistoryNodeAtRevision(
       continue;
     }
     if (mapping.kind === 'same-revision') {
-      // §4.3 步骤 4：复制在该 revision 本身发生时使用新路径。
+      // 复制解析步骤 4：复制在该 revision 本身发生时使用新路径。
       return { status: 'present', repositoryPath: toHistoryRelativePath(path), url, revision };
     }
     if (mapping.kind === 'deleted') {
@@ -1488,7 +1545,7 @@ export async function resolveHistoryNodeAtRevision(
 export type HistoryOutcome = 'ready' | 'empty' | 'noMatch' | 'notFound';
 
 /**
- * 结果分类（§4.1 末尾）：
+ * 结果分类：
  * - 已加载命中且当前筛选有可见记录 → ready；
  * - 已加载命中但筛选零匹配 → noMatch（不是 empty）；
  * - 尚无命中且仍有可扫描源 → ready（页面显示“已扫描 N 条，暂无匹配”）；

@@ -1,11 +1,11 @@
 #!/bin/bash
-# M4 阶段0 V1：本地 file:// fixture 构建脚本（可复跑）
-# 用法: ./make-v1-fixtures.sh [BASE_DIR]  （默认 /tmp/m4-stage0-V1）
+# 本地 file:// fixture 构建脚本（可复跑）
+# 用法: ./make-classify-fixtures.sh [BASE_DIR]  （默认 /tmp/svn-anywhere-fixture-lab）
 # 产出: repo-main（字段/mime/NUL/特殊字符/大文件/阈值文本）、repo-sizes（10k 与 100k 直属目录）
 # 全部命令 --non-interactive；不访问网络；不进入项目仓库。
 set -euo pipefail
 export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
-BASE=${1:-/tmp/m4-stage0-V1}
+BASE=${1:-/tmp/svn-anywhere-fixture-lab}
 mkdir -p "$BASE"
 cd "$BASE"
 

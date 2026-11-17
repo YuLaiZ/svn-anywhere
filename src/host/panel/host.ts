@@ -66,7 +66,7 @@ export interface PanelEntryOptions {
   gates?: PanelGates;
   /**
    * writeLocked 时是否拒绝切换目标：M4 的 P6/P7 写入在途禁止切换目标
-   * （技术方案 §7、交互基线「写入在途」行）；不携带时维持 M1-M3 行为
+   * （写入在途约定）；不携带时维持 M1-M3 行为
    * ——只有 busy 拒绝切换，写锁（结果未知/待协调记录）不阻止换目标。
    */
   blockSwitchWhenWriteLocked?: boolean;
@@ -157,7 +157,7 @@ export interface PanelHandle {
 }
 
 /**
- * 读请求票据（技术方案 §2.3）：读结果携带 targetKey + requestSeq +
+ * 读请求票据：读结果携带 targetKey + requestSeq +
  * viewEpoch，只写回同一目标会话。targetKey 供旧目标缓存寻址与控制器
  * 比对当前目标；requestSeq 由 beginReadRequest 递增，同目标的旧回包
  * 因代次过期被丢弃；viewEpoch 标记发起时的视图代次，供控制器在视图
@@ -507,10 +507,12 @@ function intentRequiresRow(intent: Intent): intent is Intent & { id: string } {
     case 'selectHistoryRevision':
     case 'toggleHistoryRevision':
     case 'selectCompareCandidate':
-    case 'copyHistoryText':
     case 'selectConflict':
     case 'copyConflictPath':
       return true;
+    // copyHistoryText 不按展示行校验：详情层独立于表格展示前缀存活（缩小
+    // 每批条数后详情仍渲染），控制器按稳定 ID 从会话已加载数据解析复制值；
+    // 要求行在 table.rows 会让详情复制被宿主静默丢弃。
     default:
       return false;
   }

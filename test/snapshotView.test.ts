@@ -1,9 +1,9 @@
 /**
- * P6 快照差异宿主层测试（M4 阶段 3 任务 4/5）：
+ * P6 快照差异宿主层测试（M4 阶段 3）：
  * - 快照只读文档 URI：revision 与一次性内容键可解析，非法形状拒绝；
  * - openSnapshotTextDiff：两端文本经 provider 打开原生 vscode.diff、文档
  *   关闭即释放；单端不存在用空内容端；二进制与 svn:special 不进入文本
- *   差异；超过内嵌上限返回 tooLarge；
+ *   差异；超过内嵌上限返回 tooLarge；vscode.diff 失败回收已写入内容键；
  * - promptSnapshotExport：原生保存对话框、覆盖确认（拒绝即取消）、
  *   导出产物内容与删除前版本明示字段；
  * - openSnapshotBaseCompareEntry：目录 BASE 比较逐项复用单文件 BASE diff。
@@ -14,9 +14,11 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import * as vscode from 'vscode';
 
 const vscodeMock = vi.hoisted(() => ({
   executedCommands: [] as unknown[][],
+  executeCommandError: undefined as Error | undefined,
   providers: new Map<string, { provideTextDocumentContent(uri: unknown): string }>(),
   closeHandlers: [] as Array<(doc: { uri: unknown }) => void>,
   saveDialogResult: undefined as { fsPath?: string; path?: string } | undefined,
@@ -94,6 +96,9 @@ vi.mock('vscode', () => ({
   },
   commands: {
     executeCommand: async (command: string, ...args: unknown[]) => {
+      if (vscodeMock.executeCommandError !== undefined) {
+        throw vscodeMock.executeCommandError;
+      }
       vscodeMock.executedCommands.push([command, ...args]);
       return undefined;
     },
@@ -115,7 +120,7 @@ vi.mock('../src/host/output', () => ({
 
 vi.mock('../src/host/config', () => ({ readTimeoutMs: () => 1000 }));
 
-import { planSnapshotExport } from '../src/host/panel/snapshotModel';
+import { planSnapshotExport, snapshotText } from '../src/host/panel/snapshotModel';
 import {
   buildSnapshotDocumentUri,
   openSnapshotBaseCompareEntry,
@@ -124,6 +129,7 @@ import {
   promptSnapshotExport,
   resetDiffViewForTest,
   SNAPSHOT_DOCUMENT_SCHEME,
+  snapshotContentCountForTest,
 } from '../src/host/diffView';
 import { createSvnLab, writeFile, type SvnLab } from './helpers';
 
@@ -147,6 +153,7 @@ function tempDir(prefix: string): string {
 afterEach(() => {
   resetDiffViewForTest();
   vscodeMock.executedCommands.length = 0;
+  vscodeMock.executeCommandError = undefined;
   vscodeMock.providers.clear();
   vscodeMock.closeHandlers.length = 0;
   vscodeMock.saveDialogResult = undefined;
@@ -263,6 +270,9 @@ describe.skipIf(!hasSvn)('openSnapshotTextDiff：原生 vscode.diff 接线', () 
     expect(leftUri.scheme).toBe(SNAPSHOT_DOCUMENT_SCHEME);
     expect(provider.provideTextDocumentContent(leftUri)).toBe('');
     expect(provider.provideTextDocumentContent(rightUri)).toBe('line1\n');
+    // 不存在一端的编辑器标签取 i18n 文案（不再是 '(absent)'）。
+    expect(leftUri.path.endsWith(`/${snapshotText('displayNameAbsent')}`)).toBe(true);
+    expect(leftUri.path).not.toContain('(absent)');
   });
 
   it('二进制端不进入文本差异（返回 binary 状态，不打开 diff）', async () => {
@@ -334,6 +344,39 @@ describe.skipIf(!hasSvn)('openSnapshotTextDiff：原生 vscode.diff 接线', () 
     expect(lastDiff()).toBeUndefined();
   });
 
+  it('vscode.diff 失败：回收已写入的快照内容键，不残留内存文本', async () => {
+    lab = buildRepo();
+    const url = `${lab.repoUrl}/trunk/a.txt`;
+    // 对照：成功打开期间两侧内容键各一条，关闭文档后清零（计数辅助可信）。
+    const opened = await openSnapshotTextDiff({
+      svnPath: 'svn',
+      title: '对照',
+      left: { rawUrl: url, revision: 1 },
+      right: { rawUrl: url, revision: 2 },
+    });
+    expect(opened.status).toBe('opened');
+    expect(snapshotContentCountForTest()).toBe(2);
+    const diff = lastDiff()!;
+    for (const handler of vscodeMock.closeHandlers) {
+      handler({ uri: diff.left });
+    }
+    for (const handler of vscodeMock.closeHandlers) {
+      handler({ uri: diff.right });
+    }
+    expect(snapshotContentCountForTest()).toBe(0);
+
+    // 注入命令失败：结果 failed，已写入的内容键回收，不滞留到停用清理。
+    vscodeMock.executeCommandError = new Error('vscode.diff 不可用');
+    const outcome = await openSnapshotTextDiff({
+      svnPath: 'svn',
+      title: '失败',
+      left: { rawUrl: url, revision: 1 },
+      right: { rawUrl: url, revision: 2 },
+    });
+    expect(outcome).toMatchObject({ status: 'failed', message: 'vscode.diff 不可用' });
+    expect(snapshotContentCountForTest()).toBe(0);
+  });
+
   it('BASE 比较逐项复用：目录变化条目交给单文件 BASE diff', async () => {
     lab = buildRepo();
     const wc = join(lab.root, 'wc');
@@ -359,6 +402,29 @@ describe.skipIf(!hasSvn)('promptSnapshotExport：保存对话框与覆盖确认'
     local.svn(['commit', '-q', '-m', 'r2'], wc);
     return { lab: local, url: `${local.repoUrl}/trunk/file.txt` };
   }
+
+  it('宿主缺少保存对话框：返回 failed 并明示 exportNoSaveDialog', async () => {
+    const plan = {
+      status: 'present' as const,
+      url: 'file:///repo/trunk/file.txt',
+      revision: 2,
+      repositoryPath: 'trunk/file.txt',
+      nodeKind: 'file' as const,
+    };
+    const windowApi = vscode.window as unknown as { showSaveDialog?: unknown };
+    const original = windowApi.showSaveDialog;
+    windowApi.showSaveDialog = undefined;
+    try {
+      const outcome = await promptSnapshotExport({ svnPath: 'svn', plan, suggestedName: 'file.txt' });
+      expect(outcome.status).toBe('failed');
+      if (outcome.status === 'failed') {
+        expect(outcome.message).toContain(snapshotText('exportNoSaveDialog'));
+        expect(outcome.message).toContain('宿主缺少保存对话框');
+      }
+    } finally {
+      windowApi.showSaveDialog = original;
+    }
+  });
 
   it('对话框取消：不写文件、不弹覆盖确认', async () => {
     const built = buildRepo();

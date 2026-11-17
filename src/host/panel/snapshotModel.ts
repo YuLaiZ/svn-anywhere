@@ -3,7 +3,7 @@
  * 任务 4/5/6）。纯 TypeScript + core 调用，不依赖 vscode，可在 vitest 中
  * 直接驱动；对话框/原生 diff 的宿主壳在 host/diffView.ts。
  *
- * 口径（技术方案 §4.3–§4.5 与阶段 0 V2/V3 实测）：
+ * 口径（本地 SVN 实测）：
  * - 左右方向只看用户选择的 revision 数值（较小者为左/旧端），勾选顺序无
  *   影响；每端先按历史复制窗口解析「所选 revision 的实际节点」，再以实际
  *   URL + 实际 revision 交给 core/snapshot 比较（不拿删除后的 URL 读内容，
@@ -18,7 +18,7 @@
  *   宿主在选中候选时经 remoteContent 探测后回填，未探测前不伪造二进制
  *   判定；
  * - 导出只写用户选择的目标路径：svn 先导出到同目录临时文件再原子替换；
- *   导出源 URL 与含字面 `@` 的本地目标路径都必须 peg 转义（阶段 0 V3-6
+ *   导出源 URL 与含字面 `@` 的本地目标路径都必须 peg 转义（实测
  *   实测 `E200009`）；删除提交导出 `deletionRevision - 1` 的实际节点，
  *   不可读时按已加载历史前序回退并明确实际导出版本；目录导出仍归 M6；
  * - BASE 比较：文件目标复用单文件 BASE diff 的数据形态；目录目标先以
@@ -36,6 +36,7 @@ import {
   type HistoryEntry,
   type HistoryTarget,
 } from '../../core/history';
+import { classifyBrowseFailure } from '../../core/remoteBrowse';
 import {
   candidateDiffType,
   compareDirectorySnapshots,
@@ -59,7 +60,7 @@ import type { TableFilterSpec, TableSpec } from './state';
 // 常量
 // ---------------------------------------------------------------------------
 
-/** 比较候选每页最多条数（技术方案 §4.4：Webview TableSpec 每页最多 100）。 */
+/** 比较候选每页最多条数（Webview TableSpec 每页最多 100）。 */
 export const SNAPSHOT_CANDIDATE_PAGE_SIZE = 100;
 
 /** 删除前历史前序回退候选的最大数量（core/snapshot 内部另有 8 次尝试上限）。 */
@@ -70,7 +71,11 @@ export const SNAPSHOT_DELETION_FALLBACK_MAX = 8;
 // 与 browseModel 的本地文案模式一致。新键集合登记见交付的 i18n_keys）
 // ---------------------------------------------------------------------------
 
-const SNAPSHOT_TEXT_DEFAULTS = {
+/**
+ * 模型本地文案默认值（i18n.snapshotPanel 落地同名键后自动优先取 i18n）。
+ * 导出供文案漂移对账测试（同键同值；漂移视为回归）。
+ */
+export const SNAPSHOT_TEXT_DEFAULTS = {
   statePresent: '存在',
   stateAbsent: '该 revision 不存在（与删除相关）',
   stateNotFoundAtRevision: '无法在该 revision 定位实际节点',
@@ -81,8 +86,35 @@ const SNAPSHOT_TEXT_DEFAULTS = {
   diffBinary: '二进制',
   diffSame: '无差异',
   tooLarge: '快照条目超出读取上限（50,000 条 / 64 MiB），请缩小比较范围后重试。',
+  /** 差异一端不存在时的编辑器标签（snapshotDisplayName 兜底）。 */
+  displayNameAbsent: '（不存在）',
+  /** 宿主缺少 showSaveDialog 时导出失败的原因。 */
+  exportNoSaveDialog: '宿主缺少保存对话框',
   binaryNotice: '二进制文件不做文本差异；可查看版本或导出。',
   specialNotice: '该节点是符号链接（svn:special），不进入文本差异；可导出或外部打开。',
+  /** 临时资源打开失败：磁盘余量不足（原始诊断只进输出频道日志）。 */
+  insufficientDisk: '磁盘剩余空间不足，未写出临时文件；请清理磁盘后重试。',
+  /** 「查看此版本」失败：按 BrowserError.kind 映射，原始诊断只进日志。 */
+  openFailedNotFound: '目标在该 revision 不存在。',
+  openFailedRevisionNotFound: '该 revision 在仓库中不存在。',
+  openFailedAuth: '读取该版本内容需要认证，认证未完成；请重试并补录凭据。',
+  openFailedPermission: '没有读取该版本内容的权限。',
+  openFailedNetwork: '读取该版本内容时网络错误：{message}',
+  openFailedParse: '读取该版本内容的响应无法解析，已中止；请重试。',
+  openFailedCancelled: '读取该版本内容已取消。',
+  openFailedUnknown: '读取该版本内容失败：{message}',
+  /** 快照比较失败：按 SvnError.code / 错误分类映射（不直出英文技术诊断）。 */
+  compareXmlParse: '快照 XML 解析失败，未能生成比较结果；请重试。',
+  compareSummarizeMapping: '差异输出路径不在旧端根下，无法映射相对路径；本次比较已中止。',
+  compareSummarizeNotFound: '两端节点都存在，但差异命令报告目标缺失；未展示不完整结果，请重试。',
+  compareEnumerationNotFound: '目录枚举未找到节点信息声称存在的路径；请重试。',
+  compareAuthFailed: '读取快照需要认证，认证未完成；请重新比较并补录凭据。',
+  comparePermissionFailed: '没有读取该快照目标的权限。',
+  compareNetworkFailed: '读取快照时网络错误：{message}',
+  compareNotFoundFailed: '比较目标在某端 revision 不存在。',
+  compareRevisionNotFoundFailed: '所选 revision 在仓库中不存在。',
+  compareCancelledFailed: '快照读取已取消。',
+  compareUnknownFailed: '读取快照时发生未分类错误：{message}',
   exportSaved: '已导出到：{path}',
   exportDeletedNotice: '已导出删除前版本 r{revision}（请求 r{requested}）：{path}',
   exportFallbackNotice: '请求的 revision 不可读，已按历史前序回退到 r{revision} 导出：{path}',
@@ -97,6 +129,11 @@ const SNAPSHOT_TEXT_DEFAULTS = {
   exportNotFound: '所选 revision 上没有可导出的实际节点。',
   baseNoChanges: '本地没有需要比较的变化。',
   baseChangesSummary: '本地实际变化 {count} 项（目录目标逐项复用 BASE 差异）。',
+  baseCompareConfirmWithin: '本地实际变化 {count} 项（目录目标逐项复用 BASE 差异）；确认后逐项打开差异。',
+  baseCompareConfirmLimited: '本地实际变化 {count} 项（目录目标逐项复用 BASE 差异）；一次最多打开 {limit} 个差异，确认后打开前 {limit} 个。',
+  baseCompareConfirmButton: '打开差异',
+  baseCompareCanceled: '已取消打开 BASE 差异（本地实际变化 {count} 项）。',
+  baseCompareTruncated: '已打开前 {limit} 个差异（共 {count} 项）；其余未打开，请缩小范围后重试。',
   baseCompareFailed: '读取本地状态失败：{message}',
   candidateTableTitle: '差异候选',
   columnPath: '路径',
@@ -395,12 +432,52 @@ export function applySnapshotCompareTooLarge(
   };
 }
 
-/** 应用比较失败（认证/权限/网络/自相矛盾等；消息取首行即可展示）。 */
+/**
+ * 比较失败的用户文案：优先按 SvnError.code（XML_PARSE / SUMMARIZE_* /
+ * ENUMERATION_NOT_FOUND）映射专属语义，其余按 classifyBrowseFailure 的
+ * 认证/权限/网络/不存在分类映射；英文技术诊断只作为网络/未知类模板的
+ * 补充信息，不直出为主文案。
+ */
+export function snapshotCompareErrorText(error: unknown): string {
+  if (error instanceof SvnError) {
+    switch (error.code) {
+      case 'XML_PARSE':
+        return snapshotText('compareXmlParse');
+      case 'SUMMARIZE_MAPPING':
+        return snapshotText('compareSummarizeMapping');
+      case 'SUMMARIZE_NOT_FOUND':
+        return snapshotText('compareSummarizeNotFound');
+      case 'ENUMERATION_NOT_FOUND':
+        return snapshotText('compareEnumerationNotFound');
+      default:
+        break;
+    }
+  }
+  const classified = classifyBrowseFailure(error);
+  switch (classified.kind) {
+    case 'auth':
+      return snapshotText('compareAuthFailed');
+    case 'permission':
+      return snapshotText('comparePermissionFailed');
+    case 'network':
+      return snapshotText('compareNetworkFailed', { message: classified.message });
+    case 'notFound':
+      return snapshotText('compareNotFoundFailed');
+    case 'revisionNotFound':
+      return snapshotText('compareRevisionNotFoundFailed');
+    case 'cancelled':
+      return snapshotText('compareCancelledFailed');
+    default:
+      return snapshotText('compareUnknownFailed', { message: classified.message });
+  }
+}
+
+/** 应用比较失败（错误文案按语义分类映射，不直出 core 技术诊断）。 */
 export function applySnapshotCompareError(
   state: SnapshotCompareState,
   error: unknown,
 ): SnapshotCompareState {
-  const message = error instanceof Error ? (error.message.split('\n')[0] ?? error.message) : String(error);
+  const message = snapshotCompareErrorText(error);
   return {
     ...state,
     phase: 'error',
@@ -862,7 +939,7 @@ export function snapshotPrecedingRevisions(
 }
 
 /**
- * svn:special 探测：属性存在且非空即符号链接（阶段 0 V3-6：cat 返回
+ * svn:special 探测：属性存在且非空即符号链接（实测 cat 返回
  * `link <target>` 原文、info/list 只报 kind=file，不能靠大小/扩展名区分）。
  * 属性读取失败不阻塞调用方（按普通文件继续），导出/打开由 SVN 自身语义
  * 兜底。
@@ -999,7 +1076,7 @@ export type WriteSnapshotExportResult =
  * 导出单文件到用户选择的目标路径（任务 5）：
  * - 先导出到目标同目录的 `.part` 临时文件（保证 rename 在同一文件系统），
  *   成功后原子替换目标；`svn export --force` 不会清理目录旧文件，不能拿
- *   它冒充干净覆盖（阶段 0 V3-6）；
+ *   它冒充干净覆盖；
  * - 导出源 URL 经统一 peg 构造器；**本地目标路径含字面 `@` 时同样要补
  *   尾随 `@`**，否则 svn 报 `E200009: a peg revision is not allowed here`；
  * - 失败删除半成品临时文件，不把半文件留在目标路径。
@@ -1143,7 +1220,7 @@ export function isBaseComparableStatus(entry: SnapshotBaseCompareEntry): boolean
 }
 
 // ---------------------------------------------------------------------------
-// P6→P3 交接契约（技术方案 §4.5）
+// P6→P3 交接契约
 // ---------------------------------------------------------------------------
 
 /**

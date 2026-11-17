@@ -9,11 +9,14 @@ import {
   run,
   runOrThrow,
   runOrThrowWithRunner,
+  runToFile,
   svnEnv,
   urlWithPeg,
 } from '../src/core/svnCli';
 import {
+  INSUFFICIENT_DISK,
   MAX_ERROR_TAIL_CHARS,
+  OUTPUT_TOO_LARGE,
   SvnError,
   classifyAuthFailure,
   isNetworkFailure,
@@ -260,7 +263,7 @@ describe('runOrThrow', () => {
     }
   });
 
-  describe('authScope 认证/权限细分（技术方案 §3.4）', () => {
+  describe('authScope 认证/权限细分', () => {
     type Runner = NonNullable<Parameters<typeof runOrThrowWithRunner>[3]>;
 
     const failingRunner = (stderr: string): { runner: Runner; calls: string[][] } => {
@@ -347,7 +350,7 @@ describe('runOrThrow', () => {
   });
 });
 
-describe('urlWithPeg（统一 URL@REV 构造，技术方案 §2.2）', () => {
+describe('urlWithPeg（统一 URL@REV 构造）', () => {
   it('无 revision 时追加空 peg，不裸露用户 URL', () => {
     expect(urlWithPeg('https://host/repo/trunk')).toBe('https://host/repo/trunk@');
     expect(urlWithPeg('file:///tmp/repo')).toBe('file:///tmp/repo@');
@@ -359,7 +362,7 @@ describe('urlWithPeg（统一 URL@REV 构造，技术方案 §2.2）', () => {
     expect(urlWithPeg('https://host/repo/trunk', 'HEAD')).toBe('https://host/repo/trunk@HEAD');
   });
 
-  it('含字面 @ 的 URL 追加 peg 后不会残留 peg 语法歧义（阶段 0 实测 E205000 场景）', () => {
+  it('含字面 @ 的 URL 追加 peg 后不会残留 peg 语法歧义（实测 E205000 场景）', () => {
     expect(urlWithPeg('file:///tmp/repo/at@file#1.txt', 3)).toBe('file:///tmp/repo/at@file#1.txt@3');
     expect(urlWithPeg('file:///tmp/repo/at@file#1.txt')).toBe('file:///tmp/repo/at@file#1.txt@');
   });
@@ -368,11 +371,12 @@ describe('urlWithPeg（统一 URL@REV 构造，技术方案 §2.2）', () => {
     expect(urlWithPeg('https://host/repo/a%40b.txt', 2)).toBe('https://host/repo/a%40b.txt@2');
   });
 
-  it('输入已带尾 @ 时先剥除再统一拼接（幂等，不产生 @@）', () => {
-    const escaped = urlWithPeg('https://host/repo/a@b');
-    expect(escaped).toBe('https://host/repo/a@b@');
-    // 尾 @ 的已转义形态再次经过构造器结果不变（不会产生 a@b@@）。
-    expect(urlWithPeg(escaped)).toBe(escaped);
+  it('以字面 @ 结尾的合法节点 URL 不剥除尾 @：固定拼接为 url + @ + peg', () => {
+    // svn 的 <url> 对名称以 @ 结尾的节点原样回显字面尾 @（实测不编码 %40）；
+    // 剥除会把它解析成「路径 + peg」而指向同名兄弟节点或报 W170000。
+    expect(urlWithPeg('https://host/repo/tail@', 1)).toBe('https://host/repo/tail@@1');
+    expect(urlWithPeg('https://host/repo/tail@')).toBe('https://host/repo/tail@@');
+    expect(urlWithPeg('file:///tmp/repo/dir@', 5)).toBe('file:///tmp/repo/dir@@5');
   });
 
   it('null 与 undefined 等价于空 peg', () => {
@@ -438,7 +442,7 @@ describe('classifyAuthFailure / isNetworkFailure（错误分类基座）', () =>
     expect(classifyAuthFailure('svn: E160013: path not found', 'svn')).toBeUndefined();
   });
 
-  it('E175012（超时）与 E120108（连接中断）归网络类（阶段 0 补充）', () => {
+  it('E175012（超时）与 E120108（连接中断）归网络类（补充实测）', () => {
     expect(isNetworkFailure('svn: E170013: x\nsvn: E175012: Connection timed out')).toBe(true);
     expect(isNetworkFailure('svn: E170013: x\nsvn: E120108: The server unexpectedly closed the connection')).toBe(true);
     expect(isNetworkFailure('svn: E000061: Connection refused')).toBe(true);
@@ -448,7 +452,7 @@ describe('classifyAuthFailure / isNetworkFailure（错误分类基座）', () =>
 });
 
 /**
- * host/auth.ts 的单飞协调器测试（技术方案 §3.4）：
+ * host/auth.ts 的单飞协调器测试：
  * 同一 scheme+host+port 的并发认证失败共享一个凭据弹窗 Promise；
  * 取消/成功只结算一次；不同源各自补录。vscode 用受控 Promise 模拟
  * showInputBox：用例可以精确决定「弹窗何时结算」，验证在途共享。
@@ -598,5 +602,44 @@ describe('host 单飞凭据协调器（auth.ts）', () => {
     await settle(2, 'u2');
     await settle(3, 'p2');
     await expect(p2).resolves.toEqual({ username: 'u2', password: 'p2' });
+  });
+});
+
+describe('runToFile 失败诊断（机器可读 code + 英文技术文本）', () => {
+  it('预算/磁盘预检与创建失败：code 固定，message 不携带面向用户的中文叙述', async () => {
+    const dir = makeTempDir('svn-anywhere-runtofile-diag-');
+    try {
+      const target = join(dir, 'out.bin');
+      const scenarios: Array<{ name: string; code: string; invoke: () => Promise<unknown> }> = [
+        {
+          name: 'expectedBytes 超过字节上限',
+          code: OUTPUT_TOO_LARGE,
+          invoke: () => runToFile('svn', ['cat'], { targetPath: target, expectedBytes: 100, maxBytes: 10 }),
+        },
+        {
+          name: '目标目录磁盘余量不足',
+          code: INSUFFICIENT_DISK,
+          invoke: () => runToFile('svn', ['cat'], { targetPath: target, headroomBytes: Number.MAX_SAFE_INTEGER }),
+        },
+        {
+          name: '临时文件创建失败（目标目录不存在）',
+          code: 'ENOENT',
+          invoke: () => runToFile('svn', ['cat'], { targetPath: join(dir, 'missing-dir', 'out.bin') }),
+        },
+      ];
+      for (const scenario of scenarios) {
+        try {
+          await scenario.invoke();
+          expect.unreachable(`${scenario.name} 必须抛 SvnError`);
+        } catch (err) {
+          expect(err, scenario.name).toBeInstanceOf(SvnError);
+          expect((err as SvnError).code, scenario.name).toBe(scenario.code);
+          // 面向用户的文案由宿主按 code 映射 i18n；core 只给英文技术诊断。
+          expect((err as Error).message, scenario.name).not.toMatch(/[一-鿿]/);
+        }
+      }
+    } finally {
+      cleanupDir(dir);
+    }
   });
 });

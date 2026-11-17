@@ -10,7 +10,7 @@ export const AUTH_ERROR_CODES = ['E170001', 'E215004'] as const;
 export const AUTH_ERROR_TEXTS = ['authorization failed', 'Authentication failed'] as const;
 
 /**
- * 授权/权限拒绝相关的 svn 错误码：HTTP authz 拒绝为 E175013（阶段 0
+ * 授权/权限拒绝相关的 svn 错误码：HTTP authz 拒绝为 E175013（实测
  * 实测 `E170013` + `E175013`），不得触发凭据弹窗补录。
  */
 export const PERMISSION_ERROR_CODES = ['E175013'] as const;
@@ -18,7 +18,7 @@ export const PERMISSION_ERROR_CODES = ['E175013'] as const;
 /**
  * 连接/网络类错误码（可重试，不进入 ancestor-filter 等存在性判断）：
  * E170013 为错误链首位（仓库不可达/认证/权限/网络共用），第二级细分见
- * classifyAuthFailure；E175012 为超时（阶段 0 实测 `http-timeout=2` →
+ * classifyAuthFailure；E175012 为超时（实测 `http-timeout=2` →
  * `E170013 + E175012`），E120108 为连接中断（服务端突然关闭），
  * E180001/E000061 为连接拒绝/无法连接，E175002/E000104/E670003 为
  * 网络/代理类（沿用 core/checkout 的既有连接集合）。
@@ -100,7 +100,7 @@ export function isAuthFailure(text: string): boolean {
 /**
  * 认证类失败细分（仅在知道目标 scheme 时启用细化规则）：
  * - 任何 scheme 下出现 E175013 都归 permission（HTTP authz 拒绝）；
- * - scheme 为 svn 时，E170001 按固定 en_US.UTF-8 消息细分（阶段 0 实测
+ * - scheme 为 svn 时，E170001 按固定 en_US.UTF-8 消息细分（实测
  *   同一错误码同时表示两种语义）：`Authorization failed` 归 permission，
  *   `Can't get username or password` / `Authentication failed` 归 auth；
  * - 其余情况沿用 isAuthFailure：命中为 auth，未命中返回 undefined。

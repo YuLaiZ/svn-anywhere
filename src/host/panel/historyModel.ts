@@ -1,7 +1,7 @@
 /**
  * P6 历史与版本比较：面板模型（纯状态机与渲染，不依赖 vscode）。
  *
- * 语义来源（M4 技术方案 §4.1–§4.3、§6 与阶段 0 V2/V3 实测）：
+ * 语义来源（本地 SVN 实测回填）：
  * - 会话状态机复用 core/history：首批 / 加载更多、每批 historyPageSize、
  *   单源 cursor、多源 source 栈、每轮独立的 500 条原始回包预算、
  *   六类计数、5,000 命中 / 100,000 扫描上限与 pending 展示；
@@ -28,7 +28,6 @@ import {
   canRefreshHistoryUpper,
   classifyHistoryOutcome,
   clearHistorySessionData,
-  collectHistoryAuthors,
   createAncestorFilterSource,
   createHistorySession,
   createTargetSource,
@@ -39,6 +38,7 @@ import {
   HISTORY_PAGE_SIZES,
   isHistoryDateRangeReversed,
   nextHistoryLogRequest,
+  normalizeHistoryPageSize,
   recomputeHistoryView,
   resetHistorySession,
   updateHistoryDerivedCounters,
@@ -62,6 +62,7 @@ import type { BrowserError } from '../../core/remoteBrowse';
 import type { ConflictRecord, ConflictSummary } from '../../core/conflict';
 import type {
   HistoryUpdateIntent,
+  HistoryUpdateOutputHint,
   HistoryUpdateRescan,
   HistoryUpdateResult,
   HistoryUpdateTaskContext,
@@ -97,9 +98,10 @@ export const HISTORY_BROWSABLE_VERSION = 1;
 
 /**
  * 模型本地文案（i18n.historyPanel 落地前的默认值；落地后自动优先取
- * i18n，与 P5 browseModel 的 BROWSE_TEXT_DEFAULTS 同一模式）。
+ * i18n，与 P5 browseModel 的 BROWSE_TEXT_DEFAULTS 同一模式）。导出供
+ * 文案漂移对账测试（同键同值；漂移视为回归）。
  */
-const HISTORY_TEXT_DEFAULTS = {
+export const HISTORY_TEXT_DEFAULTS = {
   panelTitle: '历史',
   masterLabel: '历史记录',
   detailLabel: '提交详情',
@@ -110,6 +112,8 @@ const HISTORY_TEXT_DEFAULTS = {
   columnChangedPaths: '变更路径',
   selectionAriaLabel: '选择 revision 进行比较（最多两个）',
   loadMore: '加载更多',
+  loadMoreLoading: '正在加载更多历史…',
+  loadMoreAllLoaded: '已加载全部匹配记录',
   resetSession: '清除该目标历史会话并重新读取',
   refreshHead: '刷新 HEAD',
   tryBaseUpper: '尝试按 BASE 上限查看',
@@ -178,6 +182,7 @@ const HISTORY_TEXT_DEFAULTS = {
   previousBoundary: '已是最后一条已加载记录；加载更多后可继续比较',
   compareNotReady: '版本比较功能将在后续阶段接入。',
   compareNeedsTwo: '请在列表中勾选两个 revision 后再比较。',
+  compareSelected: '比较所选版本',
   actionNotReady: '该动作将在后续阶段接入。',
   detailActionExport: '导出此版本',
   detailActionView: '查看此版本',
@@ -220,6 +225,12 @@ const HISTORY_TEXT_DEFAULTS = {
   unknownFailedTitle: '历史读取失败',
   baseFallbackFailed: '按 BASE 上限读取失败，保留原会话：{message}',
   baseFallbackNotAllowed: '当前上限来源为 {source}，不能按 BASE 上限查看。',
+  refreshInProgress: '刷新正在进行中，请稍候再试。',
+  updateConfirmInProgress: '更新确认正在进行中，完成后再刷新。',
+  missingTargetContext: '缺少历史目标上下文',
+  headInfoIncomplete: 'svn info --xml 输出缺少 HEAD 必需字段',
+  ancestorMissing: '目标路径的祖先在 revision {revision} 均不存在',
+  baseSourceUnavailable: '没有可用的 BASE 历史源',
 } as const;
 
 type HistoryTextKey = keyof typeof HISTORY_TEXT_DEFAULTS;
@@ -291,6 +302,8 @@ export interface SerializedHistorySession {
   activeSourceIndex: number;
   entries: HistoryEntry[];
   scannedRevisionIds: number[];
+  /** 会话累计扫描原始批次作者（作者下拉数据源；恢复时校验形状）。 */
+  scannedAuthors: string[];
   rawFetchedTotal: number;
   displayedCount: number;
   followCopies: boolean;
@@ -381,6 +394,11 @@ export interface HistoryUpdateState {
   readbackError?: string;
   /** 命令级失败原因（退出码非零/超时/进程错误；仅作未知页说明）。 */
   commandError?: string;
+  /**
+   * 命令输出初解析线索：final revision 与冲突路径只作
+   * 结果页提示与交叉核对，不参与三态结算；进程级失败时缺省。
+   */
+  outputHint?: HistoryUpdateOutputHint;
   /** operation record ID（写锁、日志与回扫收口定位）。 */
   operationId?: string;
   updatedAt: number;
@@ -405,6 +423,14 @@ function cloneConflicts(conflicts: readonly ConflictRecord[]): ConflictRecord[] 
       ? record.artifacts.map((artifact) => ({ ...artifact }))
       : [],
   }));
+}
+
+/** 命令输出线索的防御性副本（会话状态不得与结果对象共享数组）。 */
+function cloneOutputHint(hint: HistoryUpdateOutputHint): HistoryUpdateOutputHint {
+  return {
+    ...(hint.finalRevision !== undefined ? { finalRevision: hint.finalRevision } : {}),
+    conflicts: [...hint.conflicts],
+  };
 }
 
 function emptyConflictSummary(): ConflictSummary {
@@ -482,6 +508,7 @@ export function applyHistoryUpdateResult(
     conflictSummary: { ...result.conflictSummary },
     ...(result.readbackError !== undefined ? { readbackError: result.readbackError } : { readbackError: undefined }),
     ...(result.commandError !== undefined ? { commandError: result.commandError } : { commandError: undefined }),
+    ...(result.outputHint !== undefined ? { outputHint: cloneOutputHint(result.outputHint) } : { outputHint: undefined }),
     updatedAt: now,
   };
 }
@@ -596,6 +623,18 @@ export function restoreHistoryUpdateState(page: unknown): HistoryUpdateState | u
   if (state.commandError !== undefined && typeof state.commandError !== 'string') {
     return undefined;
   }
+  if (state.outputHint !== undefined) {
+    if (typeof state.outputHint !== 'object' || state.outputHint === null) {
+      return undefined;
+    }
+    const hint = state.outputHint as Partial<HistoryUpdateOutputHint>;
+    if (hint.finalRevision !== undefined && !validPositiveRevision(hint.finalRevision)) {
+      return undefined;
+    }
+    if (!Array.isArray(hint.conflicts) || !hint.conflicts.every((path) => typeof path === 'string')) {
+      return undefined;
+    }
+  }
   if (state.operationId !== undefined && typeof state.operationId !== 'string') {
     return undefined;
   }
@@ -613,6 +652,9 @@ export function restoreHistoryUpdateState(page: unknown): HistoryUpdateState | u
     conflictSummary: sanitizeConflictSummary(state.conflictSummary),
     ...(state.readbackError !== undefined ? { readbackError: state.readbackError } : {}),
     ...(state.commandError !== undefined ? { commandError: state.commandError } : {}),
+    ...(state.outputHint !== undefined
+      ? { outputHint: cloneOutputHint(state.outputHint as HistoryUpdateOutputHint) }
+      : {}),
     ...(state.operationId !== undefined ? { operationId: state.operationId } : {}),
     updatedAt: state.updatedAt,
   };
@@ -757,9 +799,13 @@ export class HistoryModel {
     return this.detailValue;
   }
 
-  /** 作者下拉数据源：当前会话已扫描原始批次中的实际作者。 */
+  /**
+   * 作者下拉数据源：当前会话已扫描原始批次中的实际作者。
+   * 会话累计口径（含未命中目标身份的提交、按首次出现顺序去重），
+   * 不是仅命中记录的作者集合。
+   */
   authors(): string[] {
-    return collectHistoryAuthors(this.sessionValue.entriesByRevision.values());
+    return [...this.sessionValue.scannedAuthors];
   }
 
   /** 本轮网络计数（页面“本轮已处理/本轮唯一”行）。 */
@@ -895,6 +941,11 @@ export class HistoryModel {
         restored.scannedRevisionIds.add(revision);
       }
     }
+    // 旧持久化数据可能没有 scannedAuthors（该字段后来新增）：
+    // 形状不合法时清空，后续 applyLogPage 仍会按原始回包继续累计。
+    restored.scannedAuthors = Array.isArray(session.scannedAuthors)
+      ? session.scannedAuthors.filter((author): author is string => typeof author === 'string' && author !== '')
+      : [];
     restored.rawFetchedTotal = finiteNumber(session.rawFetchedTotal, 0);
     restored.rawFetchedInLoad = 0;
     restored.scannedThisLoad = new Set();
@@ -1237,14 +1288,19 @@ export class HistoryModel {
     return { changed: true };
   }
 
-  /** 每批条数变化：只重置展示前缀，不清已扫描数据、不重发网络。 */
+  /**
+   * 每批条数变化：只重置展示前缀，不清已扫描数据、不重发网络。
+   * 取值与配置读取同口径归一（仅 20/50/100，其余回退默认 50）：协议可传
+   * 任意大整数，不能让它一次渲染全部已加载匹配（违反单帧渲染预算）。
+   */
   setPageSize(size: number): boolean {
-    if (!Number.isInteger(size) || size < 1 || size === this.pageSizeValue) {
+    const normalized = normalizeHistoryPageSize(size);
+    if (normalized === this.pageSizeValue) {
       return false;
     }
-    this.pageSizeValue = size;
+    this.pageSizeValue = normalized;
     if (this.sessionReady) {
-      this.sessionValue.displayedCount = Math.min(size, this.sessionValue.visibleEntries.length);
+      this.sessionValue.displayedCount = Math.min(normalized, this.sessionValue.visibleEntries.length);
       updateHistoryDerivedCounters(this.sessionValue);
     }
     return true;
@@ -1430,6 +1486,7 @@ export class HistoryModel {
         activeSourceIndex: session.activeSourceIndex,
         entries: [...session.entriesByRevision.values()],
         scannedRevisionIds: [...session.scannedRevisionIds],
+        scannedAuthors: [...session.scannedAuthors],
         rawFetchedTotal: session.rawFetchedTotal,
         displayedCount: session.displayedCount,
         followCopies: session.followCopies,
@@ -1666,6 +1723,15 @@ export class HistoryModel {
       : historyText('panelTitle');
     const secondary: ActionSpec[] = [];
     if (this.ctx !== undefined && this.sessionReady && this.phaseValue !== 'error') {
+      // 「比较所选版本」是冻结动作 compareHistoryRevisions 的稳定入口：
+      // 恰好勾选两项时可用，其余情况禁用并给出 compareNeedsTwo 原因。
+      const pair = this.selectedPair();
+      secondary.push({
+        id: 'compareHistoryRevisions',
+        label: historyText('compareSelected'),
+        disabled: pair === undefined,
+        ...(pair === undefined ? { disabledReason: historyText('compareNeedsTwo') } : {}),
+      });
       if (session.upperSource === 'snapshot') {
         // 快照会话不显示 refreshHistoryUpper；reset 仍可重读同一快照。
         secondary.push({ id: 'resetHistorySession', label: historyText('resetSession') });
@@ -1678,17 +1744,21 @@ export class HistoryModel {
       secondary.push({ id: 'refresh', label: historyText('retry') });
     }
     // 加载中禁用“加载更多”：与控制器 isLoading 的重复请求守卫同一事实，
-    // 避免出现「可点被拒」的假可用按钮。
+    // 避免出现「可点被拒」的假可用按钮；禁用原因按真实原因给出（未建立
+    // 会话/加载中/已加载全部），不能复用面板标题充当 tooltip。
     const loadMoreDisabled = !this.sessionReady || !session.hasMore || this.isLoading();
+    const loadMoreDisabledReason = !this.sessionReady
+      ? historyText('openingTitle')
+      : !session.hasMore
+        ? historyText('loadMoreAllLoaded')
+        : historyText('loadMoreLoading');
     return {
       summary,
       primary: {
         id: 'loadMoreHistory',
         label: historyText('loadMore'),
         disabled: loadMoreDisabled,
-        ...(loadMoreDisabled
-          ? { disabledReason: this.sessionReady ? historyText('panelTitle') : historyText('openingTitle') }
-          : {}),
+        ...(loadMoreDisabled ? { disabledReason: loadMoreDisabledReason } : {}),
       },
       ...(secondary.length > 0 ? { secondary } : {}),
     };
@@ -2062,7 +2132,7 @@ export class HistoryModel {
       label: historyText('detailActionExport'),
       ...(exportable ? {} : blocked(resolutionBlock)),
     });
-    // 查看/追溯只对存在的文件；目录不提供（技术方案 §4.5）。
+    // 查看/追溯只对存在的文件；目录不提供。
     const filePresent = present && !isDir;
     const fileBlock = present && isDir ? historyText('detailActionDisabledDir') : resolutionBlock;
     actions.push({

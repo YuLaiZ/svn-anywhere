@@ -1,9 +1,9 @@
 #!/bin/bash
-# V6-1 成功路径命令矩阵：四服务端 × list/log/info/diff/blame 等，
+# 成功路径命令矩阵：四服务端 × list/log/info/diff/blame 等，
 # 原始输出与退出码保存在 $WORK_DIR/raw/<srv>/。
 # 前置：bash seed-data.sh 已在四个服务端提交 r5-r9。
 set -u
-source "$(dirname "$0")/env-v6.sh"
+source "$(dirname "$0")/env.sh"
 for n in svn16 svn18 svn110 svn114; do
   url=$(url_of "$n")
   run $n list-imm svn list --xml --depth immediates "${SVN_OPTS[@]}" "$url/exp"

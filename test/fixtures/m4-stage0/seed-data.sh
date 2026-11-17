@@ -1,10 +1,10 @@
 #!/bin/bash
-# V6-1 跨版本字段实验数据：在单个矩阵服务端仓库提交 r5-r9 相同内容。
+# 跨版本字段实验数据：在单个矩阵服务端仓库提交 r5-r9 相同内容。
 # 数据覆盖：普通/中文/空格/@/# 文件名、二进制、空目录、复制、删除、属性、
 # 多行提交消息、多 revision 修改（供 log/diff/blame 采集）。
 # 幂等：HEAD>=9 时跳过。用法：bash seed-data.sh <svn16|svn18|svn110|svn114>
 set -eu
-source "$(dirname "$0")/env-v6.sh"
+source "$(dirname "$0")/env.sh"
 n=$1; url=$(url_of "$n"); wc="$WORK_DIR/wc/seed-$n"
 data="$WORK_DIR/data"
 mkdir -p "$data/exp/sub" "$data/exp/empty"

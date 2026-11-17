@@ -2,7 +2,7 @@
  * P5 仓库浏览器模型（M4 阶段 2 任务 2/3/4 的宿主状态机）。纯 TypeScript，
  * 不依赖 vscode，可在 vitest 中直接驱动。
  *
- * 状态边界（技术方案 §3.2/§3.3）：
+ * 状态边界：
  * - 树只在宿主内存保存当前浏览 revision 的节点与已读取条目；100k 条目
  *   只存在紧凑数组，Webview 每帧只接收每个目录的可见片（首批/每次
  *   加载更多 ≤40 条）；
@@ -52,7 +52,7 @@ import type {
 /** 首批与每次“加载更多”的最大节点数（交互设计「失败与规模」）。 */
 export const BROWSE_FIRST_BATCH = 40;
 
-/** 大目录两段式阈值（技术方案 §3.2 定案，暂定 5,000）。 */
+/** 大目录两段式阈值（暂定 5,000）。 */
 export const BROWSE_METADATA_THRESHOLD = 5_000;
 
 /** 元数据补全任务默认并发（单节点 svn info）。 */
@@ -79,7 +79,7 @@ export function hasBrowseMeta(meta: BrowseMeta): boolean {
   return meta.lastChangedRevision !== undefined;
 }
 
-/** 目录节点状态（技术方案 §3.3 的 BrowseNodeState 落地形态）。 */
+/** 目录节点状态（BrowseNodeState 落地形态）。 */
 export interface BrowseDirState {
   phase: BrowseNodePhase;
   /** 节点级读取代次：回包必须与当前值一致，否则丢弃。 */
@@ -180,10 +180,11 @@ export interface BrowseDetailRequest {
 
 /* ---------------------------------------------------------------------------
  * 本地文案（i18n.browsePanel 落地前的默认值；落地后自动优先取 i18n，
- * 与阶段 1 protocol.ts 的 INVALID_ENUM_DEFAULT 同一模式）。
+ * 与阶段 1 protocol.ts 的 INVALID_ENUM_DEFAULT 同一模式）。导出供文案
+ * 漂移对账测试（同键同值；漂移视为回归）。
  * ------------------------------------------------------------------------- */
 
-const BROWSE_TEXT_DEFAULTS = {
+export const BROWSE_TEXT_DEFAULTS = {
   panelTitle: '仓库浏览',
   masterLabel: '目录树',
   detailLabel: '节点详情',
@@ -271,6 +272,8 @@ export class BrowseModel {
   private snapshotRevision: number | undefined;
   private repositoryRootUrl: string | undefined;
   private repositoryUuid: string | undefined;
+  /** 入口节点为文件时 info 回包的文件大小（详情「文件大小」与资源预算）。 */
+  private rootSizeBytes: number | undefined;
   private rootPhase: 'idle' | 'loading' | 'ready' | 'error' = 'idle';
   private rootError: BrowserError | undefined;
   private readonly nodes = new Map<string, BrowseNodeState>();
@@ -303,6 +306,7 @@ export class BrowseModel {
     this.rootError = undefined;
     this.rootKey = undefined;
     this.snapshotRevision = restore?.snapshotRevision;
+    this.rootSizeBytes = undefined;
     this.nodes.clear();
     this.selectedKey = undefined;
     this.pendingLoads = [];
@@ -318,14 +322,19 @@ export class BrowseModel {
     this.rootError = error;
   }
 
-  /** 入口 info 成功：建立根节点；目录默认展开并排队读取。 */
-  applyRootInfo(node: RepoNodeRef): void {
+  /**
+   * 入口 info 成功：建立根节点；目录默认展开并排队读取。
+   * 入口节点为文件时保留 info 回包的 sizeBytes（详情「文件大小」与打开前
+   * 资源预算检查），不再因根节点不经过目录条目而丢失。
+   */
+  applyRootInfo(node: RepoNodeRef, sizeBytes?: number): void {
     this.rootPhase = 'ready';
     this.rootError = undefined;
     this.rootKey = node.rawUrl;
     this.snapshotRevision = node.snapshotRevision;
     this.repositoryRootUrl = node.repositoryRootUrl;
     this.repositoryUuid = node.repositoryUuid;
+    this.rootSizeBytes = node.kind === 'file' ? sizeBytes : undefined;
     const root = this.createRootNode(node);
     this.nodes.set(root.key, root);
     if (root.kind === 'dir') {
@@ -341,7 +350,7 @@ export class BrowseModel {
   }
 
   /** 根刷新后重新应用入口 info（保持根显示位置；快照 revision 以新值为准）。 */
-  applyRootRefresh(node: RepoNodeRef): void {
+  applyRootRefresh(node: RepoNodeRef, sizeBytes?: number): void {
     const previousRoot = this.rootKey !== undefined ? this.nodes.get(this.rootKey) : undefined;
     const expanded = previousRoot?.expanded ?? true;
     const newRootKey = node.rawUrl;
@@ -355,6 +364,8 @@ export class BrowseModel {
     this.snapshotRevision = node.snapshotRevision;
     this.repositoryRootUrl = node.repositoryRootUrl;
     this.repositoryUuid = node.repositoryUuid;
+    // 文件根的 sizeBytes 随刷新回包更新（与 applyRootInfo 同口径）。
+    this.rootSizeBytes = node.kind === 'file' ? sizeBytes : undefined;
     const root = this.createRootNode(node);
     this.nodes.set(root.key, root);
     if (root.kind === 'dir') {
@@ -1576,7 +1587,7 @@ export class BrowseModel {
 
   private metaOf(node: BrowseNodeState): BrowseMeta {
     if (node.parentKey === null) {
-      return this.metaFromRef(node.ref, undefined);
+      return this.metaFromRef(node.ref, this.rootSizeBytes);
     }
     const parent = this.nodes.get(node.parentKey);
     const entry = parent?.dir?.entries[node.entryIndex ?? -1];
@@ -1739,6 +1750,13 @@ export class BrowseModel {
       }
       if (index >= dir.visible) {
         dir.visible = index + 1;
+        // 恢复路径扩大可见片后与「加载更多」同口径入队元数据补全，
+        // 否则名称模式目录的补全进度与实际可见片脱节（需再次加载更多
+        // 或折叠展开才能恢复）。
+        if (dir.nameMode && dir.metadata === 'complete') {
+          dir.metadata = 'pending';
+        }
+        this.enqueueVisibleMetadata(current, dir);
       }
       const child = this.ensureChildNode(current, index);
       if (child === undefined) {

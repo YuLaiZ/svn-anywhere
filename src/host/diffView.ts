@@ -16,8 +16,8 @@
  * M4 阶段 3 扩展（P6 快照比较）：
  * - openSnapshotTextDiff：两个历史 revision 的快照内容经只读 provider
  *   打开原生 vscode.diff；URI 携带 revision 与一次性内容键，文档关闭即
- *   释放（与临时资源的关闭释放同一监听）；单端不存在用空内容文档（阶段 0
- *   V3-5：不能传不存在的 file URI）；二进制与 svn:special 不进入文本差异；
+ *   释放（与临时资源的关闭释放同一监听）；单端不存在用空内容文档（不能
+ *   传不存在的 file URI）；二进制与 svn:special 不进入文本差异；
  * - promptSnapshotExport：原生保存对话框 + 覆盖确认 + 原子替换写盘入口；
  * - openSnapshotBaseCompareEntry：目录 BASE 比较逐项复用单文件 BASE diff。
  */
@@ -248,7 +248,7 @@ export function diffOutcomeNotice(outcome: DiffOutcome, target: DiffTarget): str
 }
 
 // ---------------------------------------------------------------------------
-// P6 快照文本差异：只读 provider + vscode.diff（M4 阶段 3 任务 4）
+// P6 快照文本差异：只读 provider + vscode.diff（M4 阶段 3）
 // ---------------------------------------------------------------------------
 
 /** 快照只读文本文档的自定义 scheme（与 P5 远端内容分开：内容生命周期不同）。 */
@@ -261,6 +261,11 @@ interface SnapshotDocumentContent {
 
 /** 一次性内容键 → 文本；文档关闭即释放（与临时资源同一关闭监听）。 */
 const snapshotContents = new Map<string, SnapshotDocumentContent>();
+
+/** 测试辅助：当前持有的快照内容键数量（vscode.diff 失败路径不得残留）。 */
+export function snapshotContentCountForTest(): number {
+  return snapshotContents.size;
+}
 
 let snapshotProvider: vscode.Disposable | undefined;
 
@@ -441,7 +446,7 @@ async function readSnapshotDiffSideText(
   inlineTextMaxBytes: number,
 ): Promise<SnapshotSideText> {
   if (side.rawUrl === undefined) {
-    // 单端不存在必须用空内容文档（阶段 0 V3-5：不存在的 file URI 渲染错误文本）。
+    // 单端不存在必须用空内容文档（不存在的 file URI 渲染错误文本）。
     return { state: 'text', text: '', bytes: 0 };
   }
   const read = await readRemoteText(svnPath, side.rawUrl, {
@@ -467,11 +472,11 @@ function snapshotDisplayName(side: SnapshotDiffSideInput): string {
   }
   const last = (side.rawUrl ?? '').split('/').filter((segment) => segment !== '').pop();
   const decoded = last === undefined ? '' : decodeLoose(last);
-  return decoded === '' ? '(absent)' : decoded;
+  return decoded === '' ? snapshotText('displayNameAbsent') : decoded;
 }
 
 /**
- * 打开两个历史 revision 快照的原生文本差异（任务 4）：
+ * 打开两个历史 revision 快照的原生文本差异：
  * - 两端分别按 mime/NUL 探测与 svn:special 检查；任一端为二进制/特殊文件
  *   时返回状态，不打开文本差异（二进制只提供版本、导出或外部打开）；
  * - 单端不存在（absent/notFound）用空内容文档作为该端，不传不存在的
@@ -490,6 +495,10 @@ export async function openSnapshotTextDiff(
     // cat 类长任务不设默认 120 秒超时；删除由 signal 承担。
     runOptions.timeoutMs = 0;
   }
+  // 内容键声明在 try 之外：vscode.diff 失败时没有文档关闭事件，
+  // catch 要能回收已写入的条目。
+  let leftKey: string | undefined;
+  let rightKey: string | undefined;
   try {
     const leftProbe = await probeSnapshotDiffSide(svnPath, left, runOptions, inlineTextMaxBytes);
     const rightProbe = await probeSnapshotDiffSide(svnPath, right, runOptions, inlineTextMaxBytes);
@@ -531,8 +540,8 @@ export async function openSnapshotTextDiff(
 
     ensureSnapshotProvider();
     ensureCloseListener();
-    const leftKey = randomBytes(12).toString('hex');
-    const rightKey = randomBytes(12).toString('hex');
+    leftKey = randomBytes(12).toString('hex');
+    rightKey = randomBytes(12).toString('hex');
     snapshotContents.set(leftKey, { text: leftText.text, bytes: leftText.bytes });
     snapshotContents.set(rightKey, { text: rightText.text, bytes: rightText.bytes });
     const leftUri = buildSnapshotDocumentUri(
@@ -554,6 +563,14 @@ export async function openSnapshotTextDiff(
       rightBytes: rightText.bytes,
     };
   } catch (err) {
+    // vscode.diff 未成功打开时不会触发文档关闭：回收已写入的内容键，
+    // 不把两份快照文本滞留在内存。
+    if (leftKey !== undefined) {
+      snapshotContents.delete(leftKey);
+    }
+    if (rightKey !== undefined) {
+      snapshotContents.delete(rightKey);
+    }
     return {
       status: 'failed',
       message: err instanceof Error ? (err.message.split('\n')[0] ?? err.message) : String(err),
@@ -609,7 +626,7 @@ function sanitizeExportName(name: string): string {
 }
 
 /**
- * 单文件导出的宿主入口（任务 5）：
+ * 单文件导出的宿主入口：
  * - 原生保存对话框选择目标路径；对话框取消不写任何文件；
  * - 目标已存在时显式模态确认覆盖（不依赖宿主对话框自身的覆盖提示，
  *   `svn export --force` 也不清理旧文件，产品走临时文件 + 原子替换）；
@@ -621,7 +638,7 @@ export async function promptSnapshotExport(
 ): Promise<SnapshotExportDialogOutcome> {
   const windowApi = vscode.window;
   if (windowApi === undefined || typeof windowApi.showSaveDialog !== 'function') {
-    return { status: 'failed', message: snapshotText('exportFailed', { message: '宿主缺少保存对话框' }) };
+    return { status: 'failed', message: snapshotText('exportFailed', { message: snapshotText('exportNoSaveDialog') }) };
   }
   const picked = await windowApi.showSaveDialog({
     // 默认保存到用户主目录，避免相对 file URI 由宿主按未知 cwd 解析。

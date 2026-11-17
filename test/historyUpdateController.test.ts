@@ -438,6 +438,10 @@ describe('P6 更新控制器（真实 file:// lab）', () => {
     expect(lab.svn(['status', '--xml'], wc)).toContain('item="conflicted"');
     expect(historyModelForTest()?.localBaseRevision()).toBe(targetRev);
     expect(fakePanel().latestRenderHtml()).toContain('更新完成，存在冲突');
+    // 冲突结算与成功同口径 finalize('done')：操作记录清空且不留写锁，
+    // 冲突本身由 P7 扫描接管，不阻塞后续写命令。
+    expect(getOperationRegistry().writeRestriction(wc)).toBeUndefined();
+    expect(await getOperationRegistry().loadAllRecords()).toEqual([]);
 
     fakePanel().sendIntent({ kind: 'bannerAction', bannerId: 'historyUpdate', actionId: 'openUpdateConflicts' });
     await waitFor(() => vi.mocked(openConflictTarget).mock.calls.length === 1);

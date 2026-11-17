@@ -1,12 +1,12 @@
 #!/usr/bin/env node
-// M4 阶段0 V1 渲染耗时估算（无隔离 VS Code 宿主时的等价方法）
+// 渲染耗时估算（无隔离 VS Code 宿主时的等价方法）
 // 方法：用项目现有 Webview 的等价 DOM 片段（jsdom + 与 src/host/panel/view.ts 树行同构的 div.row）
 // 估算“首批 40 项上屏”和“每片 40 项追加”的纯 Webview 侧构建/插入耗时；不含 VS Code IPC 与真实 Chromium 合成。
 // 用法: node render-bench.cjs <xml-file> [rounds]
 'use strict';
 const fs = require('fs');
 const { JSDOM } = require(process.env.M4_JSDOM_PATH || require('path').join(__dirname, '..', '..', '..', 'node_modules', 'jsdom'));
-const { SaxesParser } = require(process.env.M4_SAXES_PATH || '/tmp/m4-stage0-V1/nodetools/node_modules/saxes');
+const { SaxesParser } = require(process.env.M4_SAXES_PATH || require('path').join(__dirname, '..', '..', '..', 'node_modules', 'saxes'));
 
 const file = process.argv[2];
 const rounds = Number(process.argv[3] || 20);

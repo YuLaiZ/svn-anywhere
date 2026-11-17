@@ -1,5 +1,5 @@
 /**
- * V5-3 第二轮 PoC：活动编辑器语义、保存后“重算→装饰”链路、关闭清理，
+ * 第二轮 PoC：活动编辑器语义、保存后“重算→装饰”链路、关闭清理，
  * 以及真实 svn diff 命令 + hunk 解析 + 装饰的宿主端到端延迟。
  */
 const vscode = require('vscode');
@@ -7,7 +7,7 @@ const fs = require('fs');
 const path = require('path');
 const { execFile } = require('child_process');
 
-const OUT_DIR = process.env.M4_V5_OUT || '/tmp/m4-stage0-v5';
+const OUT_DIR = process.env.VSCODE_POC_OUT || '/tmp/svn-anywhere-vscode-poc';
 function log(obj) {
   fs.appendFileSync(path.join(OUT_DIR, 'poc-result.jsonl'), JSON.stringify(obj) + '\n');
 }
@@ -15,7 +15,7 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** 与阶段 1 预期一致的轻量 hunk 解析：返回每个 hunk 的旧/新行区间。 */
+/** 与快速差异实现同口径的轻量 hunk 解析：返回每个 hunk 的旧/新行区间。 */
 function parseUnifiedHunks(text) {
   const hunks = [];
   let file = null;
@@ -110,7 +110,7 @@ exports.run = async function run() {
     for (let i = 0; i < 100 && !closeEvent; i += 1) await sleep(10);
 
     // 3. 真实 svn diff → 解析 → 装饰（宿主内端到端）
-    const WC = process.env.M4_V5_WC || '/tmp/m4-stage0-v5/wc-clean';
+    const WC = process.env.VSCODE_POC_WC || '/tmp/svn-anywhere-vscode-poc/wc-clean';
     const REL = 'diff-target.txt';
     const tCmd0 = process.hrtime.bigint();
     const diffText = await svnDiff(WC, REL);

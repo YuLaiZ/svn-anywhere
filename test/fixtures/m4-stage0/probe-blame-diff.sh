@@ -1,9 +1,9 @@
 #!/bin/sh
-# M4 阶段 0 V5-1/V5-2 可复跑探针：本机 svnadmin + file:// 构造 blame/diff 关键形态。
+# 可复跑探针：本机 svnadmin + file:// 构造 blame/diff 关键形态。
 # 只写调用方给出的临时目录；不访问网络、不使用凭据。
-# 用法：sh test/fixtures/m4-stage0/m4-v5-svn-probe.sh /tmp/m4-v5-probe
+# 用法：sh test/fixtures/m4-stage0/probe-blame-diff.sh /tmp/svn-anywhere-svn-probe
 set -u
-BASE=${1:-/tmp/m4-v5-probe}
+BASE=${1:-/tmp/svn-anywhere-svn-probe}
 export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 SVN="svn --non-interactive"
 rm -rf "$BASE"

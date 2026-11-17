@@ -219,7 +219,7 @@ export function markRecovered(state: CheckoutPanelState, from: Exclude<CheckoutR
 }
 
 /**
- * P6→P3 交接的预填值（技术方案 §4.5）：P6 只交已解析的实际目录 URL 与
+ * P6→P3 交接的预填值：P6 只交已解析的实际目录 URL 与
  * 明确数字 revision；P3 仍经 normalizeUrlInput 重新校验、固定数字模式，
  * 连接检查/空目标检查/确认全部重新执行（交接不绕过任何写前检查）。
  */
@@ -334,7 +334,7 @@ export function createCheckoutPanelState(entry: CheckoutPanelEntry): CheckoutPan
 }
 
 /**
- * 历史交接预填（P6→P3，技术方案 §4.5）：只在 checkout 模式生效；
+ * 历史交接预填（P6→P3）：只在 checkout 模式生效；
  * - URL 仍走 P3 校验链（非法值保留显示草稿、form.url 置空并给 urlError）；
  * - revision 固定写入数字模式（validateRev 由 refreshDerived 重算）；
  * - 自动命名按 URL 联动目录名（nameMode='auto'，用户可改）。
@@ -357,6 +357,27 @@ function applyHistoryPrefill(
     rev: String(prefill.revision),
   };
   return refreshDerived(applyAutoNaming(next));
+}
+
+/**
+ * 同入口再次交接时的新 prefill 重应用（P6 同 URL 换 revision）：
+ * 面板已在同键同模式会话上时，旧入口判定会直接 reveal，静默保留旧
+ * revision。这里仅在表单步且无运行任务时把新预填写回表单与入口快照；
+ * 核对/运行/结果页保持现状（与切换目标的运行中拒绝同口径，由用户先
+ * 结束当前流程）。返回新状态对象表示已重应用；同状态引用表示忽略。
+ */
+export function reapplyHistoryPrefill(
+  state: CheckoutPanelState,
+  prefill: CheckoutHistoryPrefill,
+): CheckoutPanelState {
+  if (state.mode !== 'checkout' || state.step !== 'form' || state.task !== null) {
+    return state;
+  }
+  return {
+    ...state,
+    entry: { ...state.entry, prefill: { ...prefill } },
+    form: applyHistoryPrefill(state.form, prefill, state.mode),
+  };
 }
 
 function freshConn(): CheckoutConnState {
@@ -1451,9 +1472,11 @@ export function newTask(state: CheckoutPanelState): CheckoutPanelState {
  */
 export function switchMode(state: CheckoutPanelState): CheckoutPanelState {
   const mode: P3Mode = state.mode === 'checkout' ? 'import' : 'checkout';
+  // 目标模式必须在重建初始状态时传入：历史交接预填只对 checkout 模式
+  // 生效，用旧 mode 构造会让 checkout→import 把交接值带进导入表单、
+  // import→checkout 又丢预填（表单按切换后模式的初始值重建）。
   return {
-    ...createCheckoutPanelState({ sessionId: state.sessionId, ...state.entry, history: state.history }),
-    mode,
+    ...createCheckoutPanelState({ sessionId: state.sessionId, ...state.entry, mode, history: state.history }),
     entry: { ...state.entry, mode },
   };
 }

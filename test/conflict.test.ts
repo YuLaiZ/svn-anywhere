@@ -1,10 +1,11 @@
 /**
- * 冲突扫描与归一化测试（M4 阶段 1）：
- * - 纯解析样本取自阶段 0 V4 的 svn 1.15 真实输出（status/info/proplist），
+ * 冲突扫描与归一化测试：
+ * - 纯解析样本取自 svn 1.15 的真实输出（status/info/proplist），
  *   只裁剪重复的 wc-info/repository 块，属性与节点形态保持原样；
  * - 集成用例走本地 svnadmin + file:// 副本，真实构造文本/属性/树冲突。
  */
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -20,12 +21,15 @@ import {
   parseInfoXml,
   parseNodeInfoXml,
   parsePropertyValuesXml,
+  readConflictRecord,
+  readPropertyConflictValues,
   resolveRealPathWithSuffix,
   scanConflicts,
   summarizeConflicts,
   toWcRelativePath,
   type ConflictKind,
   type ConflictRecord,
+  type InfoXmlEntry,
 } from '../src/core/conflict';
 import { createSvnLab, writeFile } from './helpers';
 
@@ -36,7 +40,7 @@ afterAll(() => lab.cleanup());
  * status 三判据与 external 边界
  * ------------------------------------------------------------------ */
 
-/** 阶段 0 V4 实测形态：三判据候选、树冲突三 item、辅助文件、external 边界。 */
+/** svn 1.15 实测形态：三判据候选、树冲突三 item、辅助文件、external 边界。 */
 const STATUS_SAMPLE = `<?xml version="1.0" encoding="UTF-8"?>
 <status>
 <target path=".">
@@ -109,9 +113,18 @@ describe('parseConflictStatusXml', () => {
     expect(result.entries.map((entry) => entry.path)).toEqual(['extdir/ext2/f.txt', 'a.txt']);
   });
 
-  it('无 wc-locked 时为 false；截断 XML 整次失败（不解析残片）', () => {
+  it('无 wc-locked 时为 false；截断 XML 整次失败（按稳定错误码断言，不依赖消息文案）', () => {
     expect(parseConflictStatusXml('<status><target path="."></target></status>').wcLocked).toBe(false);
-    expect(() => parseConflictStatusXml('<status><target path="."><entry path="a.txt"><wc-status item="conflicted"')).toThrow(/status XML 不完整/);
+    try {
+      parseConflictStatusXml('<status><target path="."><entry path="a.txt"><wc-status item="conflicted"');
+      expect.unreachable('截断的 status XML 必须抛 SvnError');
+    } catch (err) {
+      expect(err).toMatchObject({ name: 'SvnError', code: 'STATUS_XML_TRUNCATED' });
+      // 原始输出保留在 stderr 供诊断。
+      expect((err as { stderr?: string }).stderr).toContain('<wc-status item="conflicted"');
+      // core 不返回面向用户的中文叙述句。
+      expect((err as Error).message).not.toMatch(/[一-鿿]/);
+    }
   });
 
   it('isUnderExternalBoundary 按路径分段判定，/a/b 不匹配 /a/bc', () => {
@@ -368,6 +381,51 @@ line2 中文 &lt;&amp;&gt;</property>
     expect(conflicts).toHaveLength(1);
     expect(conflicts[0].base).toEqual({ exists: false });
   });
+
+  it('远端 proplist 补查带 --non-interactive，本地 proplist 维持原样', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'svn-anywhere-proplist-args-'));
+    try {
+      const logPath = join(root, 'args.log');
+      const wrapper = join(root, 'svn-proplist.sh');
+      writeFileSync(wrapper, [
+        '#!/bin/bash',
+        `echo "$@" >> "${logPath}"`,
+        'if [ "$1" = "proplist" ]; then',
+        '  printf \'<?xml version="1.0"?><properties><target path="x"><property name="m">v</property></target></properties>\'',
+        '  exit 0',
+        'fi',
+        'exit 1',
+        '',
+      ].join('\n'));
+      chmodSync(wrapper, 0o755);
+      const entry: InfoXmlEntry = {
+        path: join(root, 'x.txt'),
+        conflict: [{
+          type: 'property',
+          operation: 'update',
+          version: [
+            { side: 'source-left', kind: 'file', 'path-in-repos': 'x.txt', 'repos-url': 'https://example.com/repo', revision: '1' },
+            { side: 'source-right', kind: 'file', 'path-in-repos': 'x.txt', 'repos-url': 'https://example.com/repo', revision: '2' },
+          ],
+        }],
+      };
+      const values = await readPropertyConflictValues(wrapper, root, entry);
+      // 三值读取成功（本地 + 基线/传入两次远端各一次）。
+      expect(values).toEqual([]);
+      const lines = readFileSync(logPath, 'utf8').trim().split('\n');
+      const remoteCalls = lines.filter((line) => line.includes('https://example.com/repo'));
+      const localCalls = lines.filter((line) => !line.includes('https://example.com/repo'));
+      expect(remoteCalls).toHaveLength(2);
+      // 远端命令必须带 --non-interactive（实施纪律：所有远程命令非交互）。
+      for (const line of remoteCalls) {
+        expect(line).toContain('--non-interactive');
+      }
+      expect(localCalls).toHaveLength(1);
+      expect(localCalls[0]).not.toContain('--non-interactive');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 /* ------------------------------------------------------------------ *
@@ -457,6 +515,26 @@ describe('缺失/移动路径的 realpath + 分段后缀', () => {
     expect(isRelPathWithinScope(join(root, 'scope'), root, 'scope2/file.txt')).toBe(false);
   });
 
+  it('符号链接文件路径按链接自身位置判定范围，不解析到链接目标', () => {
+    mkdirSync(join(root, 'scope'), { recursive: true });
+    mkdirSync(join(root, 'outside'), { recursive: true });
+    writeFileSync(join(root, 'outside', 'target.txt'), 'x\n');
+    writeFileSync(join(root, 'scope', 'inner.txt'), 'y\n');
+    // 链接位于 scope 内、目标在范围外：范围判定基于链接位置，判在范围内
+    // （修复前会先 realpath 到 outside 目标，因 '..' 前缀误判越界）。
+    symlinkSync(join(root, 'outside', 'target.txt'), join(root, 'scope', 'link.txt'));
+    expect(isRelPathWithinScope(join(root, 'scope'), root, 'scope/link.txt')).toBe(true);
+    const resolution = resolveRealPathWithSuffix(join(root, 'scope', 'link.txt'));
+    expect(resolution?.realPath).toBe(join(root, 'scope'));
+    expect(resolution?.suffix).toEqual(['link.txt']);
+    // 反向：链接位于 scope 外、目标在 scope 内，按链接自身位置判越界。
+    symlinkSync(join(root, 'scope', 'inner.txt'), join(root, 'outside', 'link-in.txt'));
+    expect(isRelPathWithinScope(join(root, 'scope'), root, 'outside/link-in.txt')).toBe(false);
+    // 符号链接目录同理保留链接名，不解析到目标目录。
+    symlinkSync(join(root, 'outside'), join(root, 'scope', 'linkdir'));
+    expect(isRelPathWithinScope(join(root, 'scope'), root, 'scope/linkdir')).toBe(true);
+  });
+
   it('toWcRelativePath 相对化绝对路径、保留空格名称、POSIX 归一', () => {
     expect(toWcRelativePath('/wc', '/wc/a b/c.txt')).toBe('a b/c.txt');
     expect(toWcRelativePath('/wc', './a/../b.txt')).toBe('b.txt');
@@ -478,6 +556,15 @@ function makeTextConflict(name: string, relPath = `${name}.txt`): string {
   writeFile(base, relPath, 'line1\nlocal\n');
   lab.svn(['update', '-q'], base);
   return base;
+}
+
+/** 生成仅拦截指定子命令的 svn wrapper（其余命令转真实 svn）。 */
+function writeWrapper(name: string, lines: string[]): string {
+  const realSvn = execFileSync('which', ['svn'], { encoding: 'utf8' }).trim();
+  const file = join(lab.root, name);
+  writeFileSync(file, `#!/bin/bash\n${lines.join('\n').replaceAll('__REAL_SVN__', realSvn)}\n`);
+  chmodSync(file, 0o755);
+  return file;
 }
 
 describe('scanConflicts 集成（本地 file:// 副本）', () => {
@@ -563,5 +650,34 @@ describe('scanConflicts 集成（本地 file:// 副本）', () => {
     const progress: Array<[number, number]> = [];
     await scanConflicts('svn', wc, { readPropertyValues: false, onProgress: (done, total) => progress.push([done, total]) });
     expect(progress).toEqual([[1, 1]]);
+  });
+
+  it('readConflictRecord：info 非零退出且 stderr 为空时 error 为英文技术诊断，不混同无冲突', async () => {
+    const wc = lab.checkout('record-silent-info');
+    const wrapper = writeWrapper('svn-info-silent-fail.sh', [
+      'if [ "$1" = "info" ]; then',
+      '  exit 3',
+      'fi',
+      'exec "__REAL_SVN__" "$@"',
+    ]);
+    const result = await readConflictRecord(wrapper, wc, '.');
+    expect(result.record).toBeUndefined();
+    expect(result.error).toBe('svn info exit code 3');
+    expect(result.error).not.toMatch(/[一-鿿]/);
+  });
+
+  it('scanConflicts 候选补偿：info 非零退出且 stderr 为空时 failures 保留英文技术诊断', async () => {
+    const wc = makeTextConflict('scan-silent-info');
+    const wrapper = writeWrapper('svn-info-silent-fail-scan.sh', [
+      'if [ "$1" = "info" ]; then',
+      '  exit 3',
+      'fi',
+      'exec "__REAL_SVN__" "$@"',
+    ]);
+    const result = await scanConflicts(wrapper, wc);
+    expect(result.records).toEqual([]);
+    expect(result.failures.map((failure) => failure.path)).toEqual(['scan-silent-info.txt']);
+    expect(result.failures[0].message).toBe('svn info exit code 3');
+    expect(result.failures[0].message).not.toMatch(/[一-鿿]/);
   });
 });

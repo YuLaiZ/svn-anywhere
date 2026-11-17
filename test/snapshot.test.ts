@@ -1,5 +1,5 @@
 /**
- * core/snapshot 测试（M4 阶段 1，实施计划 §3 任务 2）：
+ * core/snapshot 测试：
  * - 纯解析：summarize/info/list 的 XML 语义（(item,kind) 二元组、item=none、
  *   URL 编码 path、不 trim、实体一次解码、预算超限）；
  * - 真实本地 SVN（svnadmin + file://）：端点 present/absent/notFoundAtRevision、
@@ -9,10 +9,14 @@
  *   类型替换的 deleted+added 双记录；
  * - 纯逻辑：相对路径映射、URL 拼接、端点排序、可用动作、差异分类。
  */
-import { execSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
+import { chmodSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import {
+  DEFAULT_SNAPSHOT_BUDGET,
+  SNAPSHOT_ENTRY_LIMIT,
+  SNAPSHOT_XML_BYTE_LIMIT,
   SnapshotBudgetError,
   candidateDiffType,
   compareDirectorySnapshots,
@@ -27,10 +31,12 @@ import {
   resolveDeletionPrecedingRevision,
   resolveSnapshotNode,
   snapshotNodeActions,
+  summarizeSnapshots,
   type RepoNodeRef,
   type SnapshotEndpointInput,
 } from '../src/core/snapshot';
 import { parseRemoteInfoXml } from '../src/core/remoteBrowse';
+import { SvnError } from '../src/core/errors';
 import { createSvnLab, writeFile, type SvnLab } from './helpers';
 
 let hasSvn = false;
@@ -105,6 +111,40 @@ describe('core/snapshot：summarize XML 解析', () => {
     try {
       parseSummarizeXml(XML, { maxBytes: 64 });
     } catch (err) {
+      expect((err as SnapshotBudgetError).limit).toBe('bytes');
+    }
+  });
+});
+
+describe('core/snapshot：默认解析预算', () => {
+  const SAMPLE = `<?xml version="1.0" encoding="UTF-8"?>
+<diff>
+<paths>
+<path props="none" kind="file" item="modified">https://example.com/repo/trunk/a.txt</path>
+</paths>
+</diff>
+`;
+
+  it('默认预算常量固定为 50,000 条目 / 64 MiB，缺省预算对象与之同值', () => {
+    expect(SNAPSHOT_ENTRY_LIMIT).toBe(50_000);
+    expect(SNAPSHOT_XML_BYTE_LIMIT).toBe(64 * 1024 * 1024);
+    expect(DEFAULT_SNAPSHOT_BUDGET).toEqual({
+      maxEntries: SNAPSHOT_ENTRY_LIMIT,
+      maxBytes: SNAPSHOT_XML_BYTE_LIMIT,
+    });
+  });
+
+  it('不传预算时按默认预算完整解析；只收紧 maxBytes 时命中字节分支', () => {
+    // 不传 maxEntries：默认条目预算（50,000）不会误伤小样本。
+    expect(parseSummarizeXml(SAMPLE)).toEqual([
+      { path: 'https://example.com/repo/trunk/a.txt', item: 'modified', props: 'none', kind: 'file' },
+    ]);
+    // 仅显式收紧字节预算：默认 maxEntries 不参与，由 bytes 分支中止。
+    try {
+      parseSummarizeXml(SAMPLE, { maxBytes: 32 });
+      expect.unreachable('超过字节预算必须抛 SnapshotBudgetError');
+    } catch (err) {
+      expect(err).toBeInstanceOf(SnapshotBudgetError);
       expect((err as SnapshotBudgetError).limit).toBe('bytes');
     }
   });
@@ -764,5 +804,171 @@ describe('core/snapshot：文件比较（真实 SVN）', () => {
       right: { url: fixture.url('trunk/dir2'), revision: 4 },
     });
     expect(dir.state === 'ready' && dir.candidates.length).toBeGreaterThan(0);
+  });
+});
+
+/* ---------------------------------------------------------------------------
+ * not-exist 判据按命令区分与统一认证补录
+ * ------------------------------------------------------------------------- */
+
+/** 生成 svn wrapper 脚本（放共享 lab 根目录，随 lab.cleanup 删除）。 */
+function createWrapperSvn(name: string, lines: string[]): string {
+  const realSvn = execFileSync('which', ['svn'], { encoding: 'utf8' }).trim();
+  const file = join(sharedFixture!.lab.root, name);
+  writeFileSync(file, `#!/bin/bash\n${lines.join('\n').replaceAll('__REAL_SVN__', realSvn)}\n`);
+  chmodSync(file, 0o755);
+  return file;
+}
+
+describe('core/snapshot：not-exist 分类按命令区分', () => {
+  it.runIf(hasSvn && hasSvnadmin)('info 的 E160013 不是 absent 证据：抛 SvnError，不误报 notFoundAtRevision', integration, async () => {
+    const fixture = sharedFixture!;
+    const wrapper = createWrapperSvn('svn-info-e160013.sh', [
+      'if [ "$1" = "info" ]; then',
+      '  echo \'svn: E160013: Filesystem path not found\' >&2',
+      '  exit 1',
+      'fi',
+      'exec "__REAL_SVN__" "$@"',
+    ]);
+    const err = await resolveSnapshotNode(wrapper, {
+      url: fixture.url('trunk/a.txt'),
+      revision: 2,
+    }).catch((caught: unknown) => caught);
+    // 修复前：E160013 命中公共 not-exist 集合 → notFoundAtRevision（潜在误分类）；
+    // 修复后：info 只认 W170000+E200009 → 按命令错误抛出。
+    expect(err).toBeInstanceOf(SvnError);
+    expect((err as SvnError).stderr).toContain('E160013');
+  });
+
+  it.runIf(hasSvn && hasSvnadmin)('enumerate 的 notFound 只认 W160013/W170000：E160013 归命令错误', integration, async () => {
+    const fixture = sharedFixture!;
+    const wrapper = createWrapperSvn('svn-list-e160013.sh', [
+      'if [ "$1" = "list" ]; then',
+      '  echo \'svn: E160013: Filesystem path not found\' >&2',
+      '  exit 1',
+      'fi',
+      'exec "__REAL_SVN__" "$@"',
+    ]);
+    const err = await enumerateSnapshot(wrapper, {
+      url: fixture.url('trunk/dir1'),
+      revision: 1,
+    }).catch((caught: unknown) => caught);
+    expect(err).toBeInstanceOf(SvnError);
+    expect((err as SvnError).stderr).toContain('E160013');
+  });
+
+  it.runIf(hasSvn && hasSvnadmin)('summarize 保留 E160013 作为 notFound（回归）', integration, async () => {
+    const fixture = sharedFixture!;
+    const wrapper = createWrapperSvn('svn-diff-e160013.sh', [
+      'if [ "$1" = "diff" ]; then',
+      '  echo \'svn: E160013: Filesystem path not found\' >&2',
+      '  exit 1',
+      'fi',
+      'exec "__REAL_SVN__" "$@"',
+    ]);
+    const result = await summarizeSnapshots(wrapper, {
+      oldUrl: fixture.url('trunk/dir1'),
+      oldRevision: 1,
+      newUrl: fixture.url('trunk/dir2'),
+      newRevision: 4,
+    });
+    expect(result).toEqual({ state: 'notFound' });
+  });
+
+  it.runIf(hasSvn && hasSvnadmin)('XML 解析失败抛 SvnError(XML_PARSE)：消息为英文技术诊断', integration, async () => {
+    const fixture = sharedFixture!;
+    const wrapper = createWrapperSvn('svn-list-bad-xml.sh', [
+      'if [ "$1" = "list" ]; then',
+      '  printf \'<?xml version="1.0"?><lists><list path="x"><entry>\'',
+      '  exit 0',
+      'fi',
+      'exec "__REAL_SVN__" "$@"',
+    ]);
+    const err = await enumerateSnapshot(wrapper, {
+      url: fixture.url('trunk/dir1'),
+      revision: 1,
+    }).catch((caught: unknown) => caught);
+    expect(err).toBeInstanceOf(SvnError);
+    // 稳定分类是 XML_PARSE；面向用户的文案由宿主映射。
+    expect((err as SvnError).code).toBe('XML_PARSE');
+    expect((err as Error).message).not.toMatch(/[一-鿿]/);
+  });
+
+  it.runIf(hasSvn && hasSvnadmin)('非零退出且 stderr 为空：消息为英文机器可读诊断（svn list exit code N）', integration, async () => {
+    const fixture = sharedFixture!;
+    const wrapper = createWrapperSvn('svn-list-silent-fail.sh', [
+      'if [ "$1" = "list" ]; then',
+      '  exit 3',
+      'fi',
+      'exec "__REAL_SVN__" "$@"',
+    ]);
+    const err = await enumerateSnapshot(wrapper, {
+      url: fixture.url('trunk/dir1'),
+      revision: 1,
+    }).catch((caught: unknown) => caught);
+    expect(err).toBeInstanceOf(SvnError);
+    expect((err as Error).message).toBe('svn list exit code 3');
+    expect((err as Error).message).not.toMatch(/[一-鿿]/);
+  });
+});
+
+describe('core/snapshot：认证失败经统一补录重试', () => {
+  it.runIf(hasSvn && hasSvnadmin)('summarize：E170001 补录后重试，第一次的半截 XML 被丢弃', integration, async () => {
+    const fixture = sharedFixture!;
+    const wrapper = createWrapperSvn('svn-summarize-auth.sh', [
+      'for arg in "$@"; do',
+      '  if [ "$arg" = "--username" ]; then',
+      '    exec "__REAL_SVN__" "$@"',
+      '  fi',
+      'done',
+      'if [ "$1" = "diff" ]; then',
+      '  printf \'<diff><paths><path item="added" kind="file">/half.txt</path>\'',
+      '  echo \'svn: E170001: Authentication failed\' >&2',
+      '  exit 1',
+      'fi',
+      'exec "__REAL_SVN__" "$@"',
+    ]);
+    const getCredentials = vi.fn().mockResolvedValue({ username: 'yu', password: 's3cret' });
+    const result = await summarizeSnapshots(wrapper, {
+      oldUrl: fixture.url('trunk/dir1'),
+      oldRevision: 1,
+      newUrl: fixture.url('trunk/dir2'),
+      newRevision: 4,
+    }, { getCredentials });
+    expect(getCredentials).toHaveBeenCalledTimes(1);
+    expect(result.state).toBe('ready');
+    if (result.state === 'ready') {
+      // 重试前重建收集器/解码器：第一次的半截 XML 不混入结果。
+      expect(result.entries.length).toBeGreaterThan(0);
+      expect(result.entries.every((entry) => !entry.path.endsWith('half.txt'))).toBe(true);
+    }
+  });
+
+  it.runIf(hasSvn && hasSvnadmin)('enumerate：E170001 补录后重试，半截 XML 被丢弃且枚举完整', integration, async () => {
+    const fixture = sharedFixture!;
+    const wrapper = createWrapperSvn('svn-enumerate-auth.sh', [
+      'for arg in "$@"; do',
+      '  if [ "$arg" = "--username" ]; then',
+      '    exec "__REAL_SVN__" "$@"',
+      '  fi',
+      'done',
+      'if [ "$1" = "list" ]; then',
+      '  printf \'<list><entry kind="file"><name>half.txt</name>\'',
+      '  echo \'svn: E170001: Authentication failed\' >&2',
+      '  exit 1',
+      'fi',
+      'exec "__REAL_SVN__" "$@"',
+    ]);
+    const getCredentials = vi.fn().mockResolvedValue({ username: 'yu', password: 's3cret' });
+    const result = await enumerateSnapshot(wrapper, {
+      url: fixture.url('trunk/dir1'),
+      revision: 1,
+    }, { getCredentials });
+    expect(getCredentials).toHaveBeenCalledTimes(1);
+    expect(result.state).toBe('ready');
+    if (result.state === 'ready') {
+      expect(result.entries.some((entry) => entry.relativePath.endsWith('f1.txt'))).toBe(true);
+      expect(result.entries.some((entry) => entry.relativePath.endsWith('half.txt'))).toBe(false);
+    }
   });
 });

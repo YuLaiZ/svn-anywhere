@@ -3,7 +3,7 @@
  * 单项冲突的写入执行链。状态机全部在 conflictModel（纯模型）；本文件只做
  * 调度、IO、任务槽、确认流程、操作记录与资源清理。
  *
- * 边界（技术方案 §5.1/§5.3/§5.6）：
+ * 边界：
  * - 扫描与单项 resolve 共用 conflicts 单任务槽（claimTask）：已有任务时
  *   只绑定/提示，不替换；批量任务属阶段 7，本阶段给出明确提示。
  * - 扫描：`scanConflictScope`（core 三判据 + 批量 info + 逐项补偿 +
@@ -42,10 +42,13 @@ import {
   lockKeyOf,
   randomOperationId,
   type OperationRecord,
+  type ResolveIntentTarget,
 } from '../../../core/operations';
 import {
   executeResolve,
+  verifyResolveOutcome,
   type ResolveSelection,
+  type ResolveVerification,
 } from '../../../core/resolve';
 import { credentialProvider } from '../../auth';
 import { readSvnPath } from '../../config';
@@ -71,6 +74,7 @@ import {
   createRemoteAuthorizer,
   createWorkingCopyContentClassifier,
   persistConflictSession,
+  readRecordPropertyValues,
   resolveRejectText,
   restoreConflictSession,
   scanConflictScope,
@@ -539,7 +543,7 @@ async function runScanTask(task: ConflictTask): Promise<void> {
           return;
         }
         owner.updateProgress(epoch, completed, total);
-        // 进度节流：≥100ms 或到达总数时才推送（阶段 0 实测 100ms 可更新）。
+        // 进度节流：≥100ms 或到达总数时才推送（真实 status+info 扫描实测 100ms 级可更新）。
         const now = Date.now();
         if (completed >= total || now - (extra.lastProgressAt ?? 0) >= 100) {
           extra.lastProgressAt = now;
@@ -571,7 +575,18 @@ async function runScanTask(task: ConflictTask): Promise<void> {
   } finally {
     if (outcome === 'scanned') {
       // 回扫是解除 resolve unknown 写锁的唯一读路径：按真实扫描结果收口。
-      await reconcilePendingResolveRecords(scope, owner);
+      // 收口本身可能失败（记录库读取/改相 reject）：必须吞掉并记日志，
+      // 否则 finally 中断会让 settleTask 不执行、conflicts 单任务槽永久
+      // 占用（P7 重启前不可用）；未决记录保持 unknown（写锁不放宽），
+      // 等待下一次成功回扫收口。
+      try {
+        await reconcilePendingResolveRecords(scope, owner);
+      } catch (err) {
+        logLine(
+          `[scan] ${task.taskId} reconcile failed: ${err instanceof Error ? err.message : String(err)}`,
+          'conflict',
+        );
+      }
     }
     settleTask(task.taskId, () => {
       persistConflictSession(owner, { current: conflictResultScopeOf(scope) });
@@ -626,10 +641,13 @@ export function cancelConflictScan(): boolean {
 
 /**
  * 把未决（unknown）resolve 记录按最新真实扫描收口：
- * - 目标冲突已不再被扫描报告 → 视为回扫确认解决：写台账并以 done 收口；
  * - 扫描仍报告同一目标 → 结束未决记录（未证实执行成功，不写台账），
- *   释放写锁，让用户基于新扫描重新选择策略。
- * 两种情况都不可显示「已解决」，台账只在扫描明确清除时写入。
+ *   释放写锁，让用户基于新扫描重新选择策略；
+ * - 本次扫描未报告 → 不能直接当作已解决：对每个目标以 status+info 定向
+ *   回读复核（与执行后回读同一异常集合），路径 missing/deleted/obstructed/
+ *   incomplete、该路径扫描失败或回读不可用/矛盾时记录保持 unknown
+ *   （写锁不放宽），只有回读明确清除才写台账并 done 收口。
+ * 任何情况都不可显示「已解决」而台账只在回读证据确认清除时写入。
  */
 async function reconcilePendingResolveRecords(
   scope: ConflictScopeTarget,
@@ -658,6 +676,21 @@ async function reconcilePendingResolveRecords(
       await registry.finalizeOperation(record.operationId, 'failed-unconfirmed');
       continue;
     }
+    const evidence = await collectReconcileEvidence(scope, owner, scoped);
+    if (evidence.kind === 'still-conflicted') {
+      // 定向回读仍报告冲突：与「扫描仍报告」同口径，释放写锁待重新选择。
+      logLine(`[resolve] ${record.operationId} targeted readback still reports conflict; release write lock`, 'conflict');
+      await registry.finalizeOperation(record.operationId, 'failed-unconfirmed');
+      continue;
+    }
+    if (evidence.kind === 'inconclusive') {
+      // 异常/不可读/扫描失败：不得宣称已解决，记录保持 unknown（写锁保持）。
+      logLine(
+        `[resolve] ${record.operationId} readback inconclusive (${evidence.detail}); keep unknown`,
+        'conflict',
+      );
+      continue;
+    }
     for (const target of scoped) {
       owner.recordResolved({
         fingerprint: target.fingerprint,
@@ -671,6 +704,53 @@ async function reconcilePendingResolveRecords(
     logLine(`[resolve] ${record.operationId} rescan confirmed resolved`, 'conflict');
     await registry.finalizeOperation(record.operationId, 'done');
   }
+}
+
+type ReconcileEvidence =
+  | { kind: 'resolved' }
+  | { kind: 'still-conflicted' }
+  | { kind: 'inconclusive'; detail: string };
+
+/**
+ * 收口前的定向回读证据：逐目标执行与 executeResolve 同口径的
+ * status+info 复核（含异常状态集合），并对本次扫描该路径的读取失败
+ * 保持保守（不可读目标不能作为已解决证据）。
+ */
+async function collectReconcileEvidence(
+  scope: ConflictScopeTarget,
+  owner: ConflictModel,
+  targets: readonly ResolveIntentTarget[],
+): Promise<ReconcileEvidence> {
+  const options = conflictRunOptions();
+  for (const target of targets) {
+    const scanFailure = owner.failures().some((failure) => failure.path === target.relPath);
+    if (scanFailure) {
+      return { kind: 'inconclusive', detail: `scan failure ${target.relPath}` };
+    }
+    let verification: ResolveVerification;
+    try {
+      verification = await verifyResolveOutcome(readSvnPath(), scope.wcRoot, target.relPath, {
+        ...options,
+        previousKinds: target.conflictKinds,
+      });
+    } catch (err) {
+      return {
+        kind: 'inconclusive',
+        detail: err instanceof Error ? err.message : String(err),
+      };
+    }
+    if (verification.outcome === 'resolved') {
+      continue;
+    }
+    if (verification.outcome === 'unresolved') {
+      return { kind: 'still-conflicted' };
+    }
+    return {
+      kind: 'inconclusive',
+      detail: `${verification.outcome} ${target.relPath}${verification.statusItem !== undefined ? ` status=${verification.statusItem}` : ''}`,
+    };
+  }
+  return { kind: 'resolved' };
 }
 
 /* ---------------------------------------------------------------------------
@@ -906,7 +986,7 @@ async function runResolve(
   logLine(`[resolve] ${operationId} path=${record.path} strategy=${strategy}`, 'conflict');
   toast('info', controlText('resolveStarted', { path: record.path }));
   push();
-  // 写命令不限时（技术方案 §5.3）：意图立即返回，任务后台执行并自行收口。
+  // 写命令不限时：意图立即返回，任务后台执行并自行收口。
   task.extra.done = executeResolveTask(task, record, selection, strategy).catch((err: unknown) => {
     logLine(`[resolve] ${operationId} executor error: ${err instanceof Error ? err.message : String(err)}`, 'conflict');
   });
@@ -945,10 +1025,23 @@ async function executeResolveTask(
     operationId,
   };
   try {
+    // 属性记录的写前指纹重读必须带与扫描相同的远端认证：扫描端在本地
+    // 读取失败后经 authorizeRemote 补录读取属性三值，执行端若无凭据重读
+    // 会得到空属性名集合，把认证远端来源下的纯属性 working 误判为
+    // fingerprint-changed。
+    let preReadRecord: ConflictRecord | undefined;
+    if (record.kinds.includes('property')) {
+      try {
+        preReadRecord = await readRecordPropertyValues(scanRuntimeFor(scope), scope, record);
+      } catch {
+        preReadRecord = undefined;
+      }
+    }
     const result = await executeResolve(svnPath, scope.wcRoot, {
       record,
       selection,
       contentKind: record.contentKind,
+      ...(preReadRecord !== undefined ? { preReadRecord } : {}),
     }, conflictRunOptions());
     const verificationDetail = result.verification?.detail
       ?? (result.verification?.statusItem !== undefined
@@ -956,7 +1049,10 @@ async function executeResolveTask(
         : result.error);
     switch (result.outcome) {
       case 'resolved': {
-        owner.recordResolved({
+        // 与批量执行器同口径：先按指纹从当前冲突快照移除记录并重算摘要，
+        // 再写台账（列表/计数立即显示已解决）。只写台账时旧记录仍被
+        // mergeResolvedLedger 当作未解决输出，需等下一次真实扫描才收口。
+        owner.confirmResolvedLocally({
           fingerprint: key,
           path: record.path,
           kinds: [...record.kinds],
@@ -964,7 +1060,6 @@ async function executeResolveTask(
           operationId,
           resolvedAt: Date.now(),
         });
-        owner.clearUnknown(key);
         resolveNotice = { level: 'info', message: strings.resolvePanel.outcomeResolved };
         toast('info', strings.resolvePanel.outcomeResolved);
         logLine(`[resolve] ${operationId} outcome=resolved`, 'conflict');
@@ -1556,8 +1651,8 @@ function flattenSection(section: DetailSectionSpec): string[] {
     return section.text.split('\n');
   }
   if (section.kind === 'properties') {
-    // 检查器展示范围（技术方案 §5.3）：属性只给名称/存在性/字节数；
-    // 属性值原文（含 base64/多值/空值）不写输出频道（§5.2 日志不记录属性值）。
+    // 检查器展示范围：属性只给名称/存在性/字节数；
+    // 属性值原文（含 base64/多值/空值）不写输出频道（日志不记录属性值）。
     return section.properties.map((property) =>
       `${conflictText('inspectPropertyName')} ${property.name}: `
       + `${strings.conflictPanel.propertyMine}${propertySideSummary(property.local)}`
@@ -1949,6 +2044,21 @@ async function handleBannerAction(bannerId: string, actionId: string): Promise<v
     }
     if (actionId === 'scanWholeWorkCopy') {
       await scanWholeWorkCopy();
+      return;
+    }
+    return;
+  }
+  if (bannerId === 'conflictPropertyValueFailures') {
+    if (actionId === 'authenticateConflictSource') {
+      // 属性值补查失败横幅的「补齐认证并重新扫描」：与顶层
+      // authenticateConflictSource 意图同源——重新扫描触发 authorizeRemote
+      // 单飞补录，认证成功后属性三值可读、横幅随下一次真实扫描消失。
+      resolveNotice = undefined;
+      const scope = currentScope();
+      const owner = model;
+      if (scope !== undefined && owner !== undefined) {
+        await startScan(scope, owner);
+      }
       return;
     }
     return;

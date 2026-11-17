@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * M4 阶段 0 / V3：svn list --xml / diff --xml --summarize 的流式 SAX 解析与预算实测。
+ * svn list --xml / diff --xml --summarize 的流式 SAX 解析与预算实测。
  * 依赖 saxes（在任意目录 `npm install saxes` 后以本目录为 cwd，或 NODE_PATH 指向已装目录）。
  * 用法：
  *   node stream-parse.js <doc:list|summarize> <mode:stream|buffer> <url> <rev> <maxEntries> <maxBytes> [oldUrl]

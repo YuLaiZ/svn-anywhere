@@ -222,7 +222,9 @@ export interface TableRowSpec {
  * 表格选择契约（P6 revision 勾选）：
  * - 'revision' 允许最多两项（硬上限 2，第三个选择由宿主提示）；
  * - 'single' 只允许一项，选新行自动清旧行。
- * 纯函数 applyTableSelection 是勾选上限的最后一道防线，视图与宿主共用。
+ * 纯函数 applyTableSelection 是契约的参考实现与单测基线；P6 现行勾选由
+ * historyModel 的 selectionValue（按 revision 的 Set）承载并复用同一上限
+ * 规则，视图不另行投递 intent:toggleTableSelection（协议只发 toggleRow）。
  */
 export interface TableSelectionSpec {
   mode: 'revision' | 'single';
@@ -437,6 +439,9 @@ function filteredSortedRows<R extends TableRowSpec>(
  * append 模式切片（P6 历史累计展示）：rows 恒为当前已展示前缀
  * （displayedCount 条），total 为筛选后总数；page/pageCount 固定 1，
  * pageSize=max(1, displayedCount)。历史列表不能退化成翻页覆盖。
+ * 说明：P6 生产路径在模型侧完成切片（buildTableRows 取 visibleEntries
+ * 前缀）并只用 appendPagination；本函数保留为 append 切片的参考实现与
+ * 单测基线（与 appendPagination 的分页形状配套）。
  */
 export function appendTableRows<R extends TableRowSpec>(
   items: readonly SortableTableRow<R>[],
@@ -488,10 +493,12 @@ export interface TableSelectionResult {
 }
 
 /**
- * 表格行勾选（纯函数，视图事件与宿主共用同一上限规则）：
+ * 表格行勾选（纯函数，表格选择契约的参考实现与单测基线）：
  * - single 模式选中新行自动取消旧行；
  * - revision 模式最多两项，第三个选择返回 limitReached 且状态不变；
  * - 未知行、disabled 行与重复状态不改变状态。
+ * P6 现行勾选由 historyModel.toggleRevision 承载（同一上限语义）；本函数
+ * 供契约对拍与后续需要视图侧同源上限的面板复用。
  */
 export function applyTableSelection(table: TableSpec, rowId: string, selected: boolean): TableSelectionResult {
   const selection = table.selection;
@@ -898,7 +905,7 @@ export interface DetailPropertyValueSpec {
   exists?: boolean;
   /**
    * 值的原始字节数（存在时由宿主给出，空值 0）；检查器只输出存在性与
-   * 字节数，属性值原文只留在面板详情，不进入输出频道（技术方案 §5.2/§5.3）。
+   * 字节数，属性值原文只留在面板详情，不进入输出频道。
    */
   bytes?: number;
   /** 该值的逐项选择动作（宿主 ActionSpec；缺省不渲染选择按钮）。 */
@@ -1147,7 +1154,8 @@ export function reduce(state: PanelState, event: PanelEvent): PanelState {
       return { ...state, list: { ...nextList, selection: countSelection(nextList) } };
     }
     case 'intent:toggleTableSelection': {
-      // P6 revision 勾选：最多两项；第三个选择被拒绝（宿主据此提示）。
+      // 表格选择契约的 reducer 形态：最多两项；第三个选择被拒绝。当前
+      // 视图不投递该事件（P6 勾选在模型层），保留为契约一致的单测基线。
       if (state.busy || state.writeLocked) {
         return state;
       }

@@ -36,7 +36,7 @@ import { openDiskPanel } from './host/panel/panels/disk';
 import { disposeRemoteContent, initializeRemoteContent } from './host/readonlyContent';
 import { disposeDiffView } from './host/diffView';
 import { disableInlineBlame, isInlineBlameEnabled } from './host/inlineBlame';
-import { disableQuickDiff, isQuickDiffEnabled } from './host/quickDiff';
+import { disableQuickDiff, getLastQuickDiffRefresh, isQuickDiffEnabled, type QuickDiffLastRefresh } from './host/quickDiff';
 import { readSessionResult } from './host/sessionResults';
 import { format, strings } from './host/i18n';
 import { decodingRunOptions, disposeOutputChannel, getOutputChannel, logCommand, logLine, resetOutputState } from './host/output';
@@ -51,6 +51,12 @@ import { decodingRunOptions, disposeOutputChannel, getOutputChannel, logCommand,
 export interface SvnAnywhereExtensionApi {
   isQuickDiffEnabled(): boolean;
   isInlineBlameEnabled(): boolean;
+  /**
+   * 最近一次快速差异保存刷新的结果（行标记数或失败原因；关闭/重新开启
+   * 清空）。自动化冒烟用它等待「保存后刷新完成」，避免只回读开关造成
+   * 刷新尚未执行就通过的盲断言。
+   */
+  getLastQuickDiffRefresh(): QuickDiffLastRefresh | undefined;
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<SvnAnywhereExtensionApi> {
@@ -90,7 +96,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<SvnAny
       message: err instanceof Error ? err.message : String(err),
     }));
   });
-  return { isQuickDiffEnabled, isInlineBlameEnabled };
+  return { isQuickDiffEnabled, isInlineBlameEnabled, getLastQuickDiffRefresh };
 }
 
 function errorMessage(err: unknown): string {

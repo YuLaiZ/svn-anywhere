@@ -42,6 +42,9 @@ export function editorRejectNotice(
       return { level: 'info', message: format(strings.editor.rejectedNotWorkingCopy, { feature: label }) };
     case 'unversioned':
       return { level: 'info', message: format(strings.editor.rejectedUnversioned, { feature: label }) };
+    case 'noCommittedRevision':
+      // 已 svn add 未提交（blame E195002）：未纳入版本控制的说法不准确。
+      return { level: 'info', message: strings.blamePanel.noCommittedRevision };
     case 'missing':
     case 'deleted':
       return { level: 'info', message: format(strings.editor.rejectedMissing, { feature: label }) };

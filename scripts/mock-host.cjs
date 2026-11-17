@@ -57,8 +57,10 @@ const state = {
   globalStateMap: new Map(),
   /** 面板意图自增序号（requestId 去重要求每次不同）。 */
   intentSeq: 0,
-  /** getConfiguration 覆盖项（按场景注入，如 svnPath 指向包装脚本）。 */
+  /** getConfiguration 覆盖项（按配置段组织：{ svnAnywhere: { svnPath } }，按场景注入）。 */
   configOverrides: undefined,
+  /** getConfiguration 收到的 section 参数序列（断言产品只读 svnAnywhere 配置段）。 */
+  configurationSections: [],
   /** 全部频道的追加式写入序列（分频道后保持 channelText() 的追加语义）。 */
   allLines: [],
   /** createTextEditorDecorationType 创建的装饰类型（按创建顺序）。 */
@@ -88,7 +90,7 @@ const state = {
 };
 
 /* ------------------------------------------------------------------ *
- * 编辑器装饰与保存事件替身（M4 阶段 4 F107/F108 验收依赖）。
+ * 编辑器装饰与保存事件替身（快速差异/行内追溯功能与编辑器冒烟测试依赖）。
  * 按 VS Code API 契约实现：
  * - OverviewRulerLane / DecorationRangeBehavior 枚举值与真实 API 一致；
  * - createTextEditorDecorationType 校验 DecorationRenderOptions 形态；
@@ -788,9 +790,13 @@ const fakeVscode = {
         },
       };
     },
-    getConfiguration() {
-      // state.configOverrides 可按场景覆盖配置项（如 svnPath 指向包装脚本）。
-      return { get: (key, fallback) => (Object.prototype.hasOwnProperty.call(state.configOverrides ?? {}, key) ? state.configOverrides[key] : fallback) };
+    getConfiguration(section) {
+      // 真实 VS Code 语义：getConfiguration(section) 只读取该配置段的键。
+      // 场景覆盖按 section 存档，section 不匹配（含未指定）时一律返回
+      // fallback——误写配置段的代码在 mock 下与真实宿主一样读不到值。
+      state.configurationSections.push(section);
+      const values = section === undefined ? undefined : state.configOverrides?.[section];
+      return { get: (key, fallback) => (values && Object.prototype.hasOwnProperty.call(values, key) ? values[key] : fallback) };
     },
     fs: {
       // 真实文件系统探查（冲突路径定位用）；不存在时抛错，与宿主语义一致。
@@ -1045,8 +1051,8 @@ async function openCommitPanel(uriFsPath, expectText) {
 }
 
 /** 搭建含远端提交能力的本地 SVN 实验场，返回两个工作副本与 svn helper。 */
-function makeSvnLab() {
-  const lab = makeTempDir('svn-anywhere-mock-svn-');
+function makeSvnLab(prefix = 'svn-anywhere-mock-svn-') {
+  const lab = makeTempDir(prefix);
   const repoPath = join(lab, 'repo');
   execFileSync('svnadmin', ['create', repoPath]);
   const repoUrl = `file://${repoPath}`;
@@ -2761,7 +2767,7 @@ async function main() {
   const wc49 = makeTempDir('svn-anywhere-mock-wc49-');
   mkdirSync(join(wc49, '.svn'), { recursive: true });
   writeFileSync(join(wc49, '.svn', 'wc.db'), 'fake');
-  state.configOverrides = { svnPath: wrapSvn };
+  state.configOverrides = { svnAnywhere: { svnPath: wrapSvn } };
   try {
     await state.registered.get('svnAnywhere.showStatus')({ fsPath: wc49, scheme: 'file' });
     const statusText49 = channelTextOf('SVN Anywhere · 状态');
@@ -2816,7 +2822,7 @@ async function main() {
   const wc50 = makeTempDir('svn-anywhere-mock-wc50-');
   mkdirSync(join(wc50, '.svn'), { recursive: true });
   writeFileSync(join(wc50, '.svn', 'wc.db'), 'fake');
-  state.configOverrides = { svnPath: authSvn };
+  state.configOverrides = { svnAnywhere: { svnPath: authSvn } };
   const opLogCountBefore50 = (channelByTitle('SVN Anywhere · 操作日志') || { lines: [] }).lines.length;
   const updateLinesBefore50 = (channelByTitle('SVN Anywhere · 更新') || { lines: [] }).lines.length;
   try {
@@ -3491,7 +3497,7 @@ async function main() {
       'exec svn "$@"',
       '',
     ].join('\n'), { mode: 0o755 });
-    state.configOverrides = { svnPath: slowSvn };
+    state.configOverrides = { svnAnywhere: { svnPath: slowSvn } };
     try {
       const target60 = join(lab60.lab, 'bg-target');
       const startedAt60 = Date.now();
@@ -3583,7 +3589,7 @@ async function main() {
       '',
     ].join('\n'), { mode: 0o755 });
     const confirmBefore61 = state.confirmResult;
-    state.configOverrides = { svnPath: slowSvn61 };
+    state.configOverrides = { svnAnywhere: { svnPath: slowSvn61 } };
     state.confirmResult = '取消检出';
     try {
       panel61.sendAuto({ kind: 'syncInput', fieldId: 'url', value: `${trunk61}/sub`, inputRevision: state.intentSeq + 1000 });
@@ -4196,6 +4202,280 @@ async function main() {
       );
       rmSync(storageDir, { recursive: true, force: true });
       rmSync(parentDir, { recursive: true, force: true });
+    }
+  }
+
+  /* ---------------- P6/P7 关键链路（编辑器/冲突面板验收的 mock-host 证据） ---------------- */
+
+  console.log('场景 67：P6 历史——打开→加载更多→关闭重开恢复（真实 file://）');
+  {
+    const lab67 = makeSvnLab();
+    const wc67 = lab67.checkout('history');
+    const file67 = join(wc67, 'history.txt');
+    // 60 个提交 + 每批 20 条：第一页 20 条、加载更多取第二页、重开恢复两页。
+    writeFileSync(file67, 'line1\n');
+    svn(['add', '-q', 'history.txt'], wc67);
+    svn(['commit', '-q', '-m', 'commit-1'], wc67);
+    for (let i = 2; i <= 60; i += 1) {
+      writeFileSync(file67, Array.from({ length: i }, (_, k) => `line${k + 1}`).join('\n') + '\n');
+      svn(['commit', '-q', '-m', `commit-${i}`], wc67);
+    }
+    const configBefore67 = state.configOverrides;
+    state.configOverrides = {
+      ...(state.configOverrides ?? {}),
+      svnAnywhere: { ...(state.configOverrides?.svnAnywhere ?? {}), historyPageSize: 20 },
+    };
+    try {
+      await state.registered.get('svnAnywhere.showHistory')({ fsPath: file67, scheme: 'file' });
+      const panel67 = [...state.panels].reverse().find(
+        (p) => p.viewType === 'svn-anywhere-history' && !p.disposed,
+      );
+      check('showHistory 命令打开历史面板', Boolean(panel67),
+        `panels=${state.panels.map((p) => p.viewType).join(',')}`);
+      panel67.sendReady();
+      const firstFrame67 = await waitRender(panel67, 'commit-60', 600);
+      check('首屏加载第一页（每批 20 条，最新提交说明可见）', Boolean(firstFrame67),
+        firstFrame67 ? '' : '首屏帧未出现');
+      check('第一页不含第二页提交（commit-40 尚未加载）',
+        Boolean(firstFrame67) && !firstFrame67.html.includes('commit-40'));
+
+      await waitPanelIdle(panel67);
+      let posted67 = panel67.webview.posted.length;
+      panel67.sendAuto({ kind: 'loadMoreHistory' });
+      const secondFrame67 = await waitNewRender(panel67, 'commit-40', posted67, 600);
+      check('加载更多取到第二页（commit-40 出现）', Boolean(secondFrame67),
+        secondFrame67 ? '' : '第二页帧未出现');
+
+      // 原生关闭（同一宿主内 dispose）→ 同目标重开：从 m4SessionStore 恢复两页。
+      panel67.dispose();
+      check('历史面板已关闭', panel67.disposed === true);
+      await state.registered.get('svnAnywhere.showHistory')({ fsPath: file67, scheme: 'file' });
+      const reopened67 = [...state.panels].reverse().find(
+        (p) => p.viewType === 'svn-anywhere-history' && !p.disposed,
+      );
+      check('重开创建新的历史面板实例', Boolean(reopened67) && reopened67 !== panel67);
+      reopened67.sendReady();
+      const recovered67 = await waitRender(reopened67, 'commit-40', 600);
+      check('关闭重开恢复已加载两页（第二页仍在、最新提交仍可见）',
+        Boolean(recovered67) && recovered67.html.includes('commit-60'),
+        recovered67 ? '' : '恢复帧未出现');
+      reopened67.dispose();
+    } finally {
+      state.configOverrides = configBefore67;
+      rmSync(lab67.lab, { recursive: true, force: true });
+    }
+  }
+
+  console.log('场景 68：P7 冲突——扫描→单项 working 二次确认→回扫（真实 file://）');
+  {
+    const lab68 = makeSvnLab();
+    const base68 = lab68.checkout('base');
+    writeFileSync(join(base68, 'a.txt'), 'line1\nline2\nline3\n');
+    svn(['add', '-q', 'a.txt'], base68);
+    svn(['commit', '-q', '-m', 'base'], base68);
+    const theirs68 = lab68.checkout('theirs');
+    // local 必须与 theirs 同起点（theirs 提交前 checkout）；否则 checkout 直接
+    // 拿到传入版本、update 无变化，不会产生冲突。
+    const local68 = lab68.checkout('local');
+    writeFileSync(join(theirs68, 'a.txt'), 'line1-theirs\nline2\nline3\n');
+    svn(['commit', '-q', '-m', 'theirs'], theirs68);
+    writeFileSync(join(local68, 'a.txt'), 'line1-local\nline2\nline3\n');
+    svn(['update'], local68);
+
+    await state.registered.get('svnAnywhere.scanConflicts')({ fsPath: join(local68, 'a.txt'), scheme: 'file' });
+    const panel68 = [...state.panels].reverse().find(
+      (p) => p.viewType === 'svn-anywhere-conflicts' && !p.disposed,
+    );
+    check('scanConflicts 命令打开冲突面板', Boolean(panel68),
+      `panels=${state.panels.map((p) => p.viewType).join(',')}`);
+    panel68.sendReady();
+    const scanFrame68 = await waitRender(panel68, 'a.txt', 600);
+    check('打开即真实扫描并列出冲突（文本冲突 1）',
+      Boolean(scanFrame68) && scanFrame68.html.includes('文本冲突 1'),
+      scanFrame68 ? scanFrame68.html.slice(0, 200) : '扫描帧未出现');
+    await waitPanelIdle(panel68);
+
+    const rowId68 = /data-intent="selectConflict"[^>]*data-row-id="([^"]+)"/.exec(scanFrame68?.html ?? '')?.[1];
+    check('冲突行可选中（data-row-id 存在）', typeof rowId68 === 'string' && rowId68.length > 0,
+      String(rowId68));
+
+    let posted68 = panel68.webview.posted.length;
+    panel68.sendAuto({ kind: 'selectConflict', id: rowId68 });
+    const selectFrame68 = await waitNewRender(panel68, '冲突详情', posted68, 600);
+    check('选中冲突行后详情区渲染', Boolean(selectFrame68), selectFrame68 ? '' : '详情帧未出现');
+
+    posted68 = panel68.webview.posted.length;
+    panel68.sendAuto({ kind: 'chooseConflictVariant', value: 'working' });
+    await waitPanelIdle(panel68);
+    posted68 = panel68.webview.posted.length;
+    panel68.sendAuto({ kind: 'applyConflictResolution' });
+    const confirmFrame68 = await waitNewRender(panel68, '确认采用当前工作内容？', posted68, 600);
+    check('working 执行前弹出二次确认横幅', Boolean(confirmFrame68),
+      confirmFrame68 ? '' : '确认横幅未出现');
+    posted68 = panel68.webview.posted.length;
+    panel68.sendAuto({ kind: 'bannerAction', bannerId: 'conflictWorkingConfirm', actionId: 'confirmWorkingApply' });
+    const resolvedFrame68 = await waitNewRender(panel68, '冲突解决结果', posted68, 900);
+    check('确认后执行 resolve 并回扫标记已解决', Boolean(resolvedFrame68),
+      resolvedFrame68 ? '' : '解决结果帧未出现');
+    const status68 = svn(['status', '--xml', '--ignore-externals'], local68);
+    check('回扫后工作副本不再报告冲突', !/item="conflicted"/.test(status68));
+    // working 接受保留工作文件原样（含冲突标记），不是套用传入版本。
+    const content68 = readFileSync(join(local68, 'a.txt'), 'utf8');
+    check('working 保留本地工作内容（含冲突标记原文）',
+      content68.includes('line1-local') && content68.includes('<<<<<<< .mine'),
+      content68.split('\n')[0]);
+    panel68.dispose();
+    rmSync(lab68.lab, { recursive: true, force: true });
+  }
+
+  console.log('场景 69：P7 批量——成功/首项失败停止/关闭重开恢复（真实 file://）');
+  {
+    // 构造三文件文本冲突（双方改同一行）。
+    const buildTripleConflicts = (prefix) => {
+      const lab = makeSvnLab(prefix);
+      const base = lab.checkout('base');
+      for (const name of ['a.txt', 'b.txt', 'c.txt']) {
+        writeFileSync(join(base, name), 'line1\nline2\nline3\n');
+        svn(['add', '-q', name], base);
+      }
+      svn(['commit', '-q', '-m', 'base'], base);
+      const theirs = lab.checkout('theirs');
+      // local 必须与 theirs 同起点（theirs 提交前 checkout），否则不会产生冲突。
+      const local = lab.checkout('local');
+      for (const name of ['a.txt', 'b.txt', 'c.txt']) {
+        writeFileSync(join(theirs, name), 'line1-theirs\nline2\nline3\n');
+      }
+      svn(['commit', '-q', '-m', 'theirs'], theirs);
+      for (const name of ['a.txt', 'b.txt', 'c.txt']) {
+        writeFileSync(join(local, name), 'line1-local\nline2\nline3\n');
+      }
+      svn(['update'], local);
+      return { lab, local };
+    };
+
+    // ① 批量成功：计划（theirs-full）→ 执行 → 结果页；关闭重开恢复结果页。
+    {
+      const { lab, local } = buildTripleConflicts('batch-ok');
+      await state.registered.get('svnAnywhere.scanConflicts')({ fsPath: join(local, 'a.txt'), scheme: 'file' });
+      const panel = [...state.panels].reverse().find(
+        (p) => p.viewType === 'svn-anywhere-conflicts' && !p.disposed,
+      );
+      check('批量成功：扫描列出 3 条文本冲突', Boolean(panel),
+        `panels=${state.panels.map((p) => p.viewType).join(',')}`);
+      panel.sendReady();
+      const scanFrame = await waitRender(panel, '文本冲突 3', 900);
+      check('批量成功：等待扫描完成', Boolean(scanFrame),
+        scanFrame ? '' : `扫描帧未出现；frames=${panel.webview.posted.filter((m) => m.type === 'render').length}`);
+      await waitPanelIdle(panel);
+
+      let posted = panel.webview.posted.length;
+      panel.sendAuto({ kind: 'planConflictBatch', strategy: 'theirs-full' });
+      const planFrame = await waitNewRender(panel, '批量处理计划', posted, 600);
+      check('批量成功：生成计划页', Boolean(planFrame), planFrame ? '' : '计划帧未出现');
+
+      posted = panel.webview.posted.length;
+      panel.sendAuto({ kind: 'startConflictBatch' });
+      // 批量执行逐项 spawn 多个 svn 命令；按完成帧（含「已解决 3」）轮询，
+      // 每 10s 输出一次时间线诊断，避免偶发慢启动被固定等待截断。
+      let resultFrame;
+      for (let waited = 0; waited <= 120; waited += 1) {
+        resultFrame = [...panel.webview.posted.slice(posted)].reverse().find(
+          (m) => m.type === 'render' && m.html.includes('批量处理结果') && m.html.includes('已解决 3'),
+        );
+        if (resultFrame) break;
+        if (waited >= 10 && waited % 10 === 0) {
+          // 只在实际变慢时输出时间线诊断；快速完成不产生额外输出。
+          const last = [...panel.webview.posted].reverse().find((m) => m.type === 'render');
+          console.log(`  [batch-wait] ${waited}s rev=${/data-revision="(\d+)"/.exec(String(last?.html))?.[1]} last=${String(state.allLines.at(-1) ?? '').slice(0, 120)}`);
+        }
+        await new Promise((resolveWait) => setTimeout(resolveWait, 1000));
+      }
+      const resultDetail = () => {
+        const frame = [...panel.webview.posted].reverse().find((m) => m.type === 'render');
+        const revs = panel.webview.posted.filter((m) => m.type === 'render').map(
+          (m) => /data-revision="(\d+)"/.exec(String(m.html))?.[1] ?? '?',
+        ).join(',');
+        return (frame ? String(frame.html).replace(/\s+/g, ' ').slice(0, 500) : 'no render')
+          + ` | revs=${revs} | channel=${state.allLines.slice(-14).join(' / ')}`;
+      };
+      check('批量成功：执行后进入结果页', Boolean(resultFrame), resultFrame ? '' : resultDetail());
+      check('批量成功：结果页显示已解决 3',
+        Boolean(resultFrame) && resultFrame.html.includes('已解决 3'),
+        resultFrame ? resultDetail() : 'no frame');
+      for (const name of ['a.txt', 'b.txt', 'c.txt']) {
+        check(`批量成功：${name} 内容为传入版本`,
+          readFileSync(join(local, name), 'utf8') === 'line1-theirs\nline2\nline3\n');
+      }
+      const status = svn(['status', '--xml', '--ignore-externals'], local);
+      check('批量成功：工作副本无残留冲突标记', !/item="conflicted"/.test(status));
+
+      panel.dispose();
+      await state.registered.get('svnAnywhere.scanConflicts')({ fsPath: join(local, 'a.txt'), scheme: 'file' });
+      const reopened = [...state.panels].reverse().find(
+        (p) => p.viewType === 'svn-anywhere-conflicts' && !p.disposed,
+      );
+      check('批量成功：关闭重开创建新面板', Boolean(reopened) && reopened !== panel);
+      reopened.sendReady();
+      const recovered = await waitRender(reopened, '批量处理结果', 900);
+      check('批量成功：关闭重开恢复批量结果页（不自动重扫）', Boolean(recovered),
+        recovered ? '' : '恢复帧未出现');
+      reopened.dispose();
+      rmSync(lab.lab, { recursive: true, force: true });
+    }
+
+    // ② 首项失败停止：计划生成后外部解决首项 → 执行在首项指纹重读处停止，余项未执行。
+    {
+      const { lab, local } = buildTripleConflicts('batch-stop');
+      await state.registered.get('svnAnywhere.scanConflicts')({ fsPath: join(local, 'a.txt'), scheme: 'file' });
+      const panel = [...state.panels].reverse().find(
+        (p) => p.viewType === 'svn-anywhere-conflicts' && !p.disposed,
+      );
+      panel.sendReady();
+      const scanFrame = await waitRender(panel, '文本冲突 3', 900);
+      check('首项失败：扫描列出 3 条文本冲突', Boolean(scanFrame),
+        scanFrame ? '' : `扫描帧未出现；frames=${panel.webview.posted.filter((m) => m.type === 'render').length}`);
+      await waitPanelIdle(panel);
+
+      let posted = panel.webview.posted.length;
+      panel.sendAuto({ kind: 'planConflictBatch', strategy: 'theirs-full' });
+      const planFrame = await waitNewRender(panel, '批量处理计划', posted, 600);
+      check('首项失败：生成计划页', Boolean(planFrame), planFrame ? '' : '计划帧未出现');
+
+      // 计划生成后、开始前从外部解决首项（模拟另一客户端并发写入）。
+      svn(['resolve', '--non-interactive', '--accept', 'theirs-full', 'a.txt'], local);
+      posted = panel.webview.posted.length;
+      panel.sendAuto({ kind: 'startConflictBatch' });
+      // 批量执行逐项 spawn 多个 svn 命令；按完成帧（含「已解决 3」）轮询，
+      // 每 10s 输出一次时间线诊断，避免偶发慢启动被固定等待截断。
+      let resultFrame;
+      for (let waited = 0; waited <= 120; waited += 1) {
+        resultFrame = [...panel.webview.posted.slice(posted)].reverse().find(
+          (m) => m.type === 'render' && m.html.includes('批量处理结果') && m.html.includes('在第 1/3 项停止'),
+        );
+        if (resultFrame) break;
+        if (waited >= 10 && waited % 10 === 0) {
+          // 只在实际变慢时输出时间线诊断；快速完成不产生额外输出。
+          const last = [...panel.webview.posted].reverse().find((m) => m.type === 'render');
+          console.log(`  [batch-wait] ${waited}s rev=${/data-revision="(\d+)"/.exec(String(last?.html))?.[1]} last=${String(state.allLines.at(-1) ?? '').slice(0, 120)}`);
+        }
+        await new Promise((resolveWait) => setTimeout(resolveWait, 1000));
+      }
+      const resultDetail = () => {
+        const frame = [...panel.webview.posted].reverse().find((m) => m.type === 'render');
+        return frame ? String(frame.html).replace(/\s+/g, ' ').slice(0, 700) : 'no render';
+      };
+      check('首项失败：执行后进入结果页', Boolean(resultFrame), resultFrame ? '' : resultDetail());
+      check('首项失败：结果页显示在第 1/3 项停止且首项失败',
+        Boolean(resultFrame) && resultFrame.html.includes('在第 1/3 项停止') && resultFrame.html.includes('失败 1'),
+        resultFrame ? resultDetail() : 'no frame');
+      check('首项失败：原因说明为冲突状态在读取后发生变化',
+        Boolean(resultFrame) && resultFrame.html.includes('冲突状态在读取后发生变化'));
+      for (const name of ['b.txt', 'c.txt']) {
+        check(`首项失败：${name} 未被写入（保留冲突标记）`,
+          readFileSync(join(local, name), 'utf8').includes('<<<<<<< .mine'));
+      }
+      panel.dispose();
+      rmSync(lab.lab, { recursive: true, force: true });
     }
   }
 

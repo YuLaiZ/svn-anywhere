@@ -1,6 +1,6 @@
 /**
  * P7 单项冲突写入执行链（panels/conflicts.ts）真实 SVN 集成测试：
- * 本地 `svnadmin + file://` 隔离副本按阶段 0 V4 的构造方式产生文本、
+ * 本地 `svnadmin + file://` 隔离副本按实测构造方式产生文本、
  * 二进制、属性与树冲突，从面板入口与意图驱动，验证：
  * - 扫描 → 选择变体 → apply 的完整链路（真实 svn resolve --depth empty）；
  * - 文本/二进制/属性/树动作矩阵与回扫撤下（resolvedLedger）；

@@ -10,8 +10,8 @@
  * 面板控制器：批量成功、首项失败停止（余项未执行）、外部改动导致指纹
  * 变化后停止、失败后旧计划作废且必须重新扫描才能重跑、关闭重开恢复
  * 结果页、不适用项（属性冲突）不进入执行。wcLocked 的整体禁写在纯模型
- * 与 mock 面板测试覆盖（真实 SVN 的 wc-locked 需要中断进程制造，见
- * 阶段 0 V4 记录）。
+ * 与 mock 面板测试覆盖（真实 SVN 的 wc-locked 需要中断进程制造，
+ * 不在本文件覆盖）。
  */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -684,28 +684,44 @@ function readText(wc: string, path: string): string {
   return readFileSync(join(wc, path), 'utf8');
 }
 
-/** `svn status --xml` 中 props=conflicted 是否仍存在。 */
-function propertyStillConflicted(lab: SvnLab, wc: string, path: string): boolean {
+/**
+ * 取 `svn status --xml` 中指定路径的 entry 片段（status 输出截断与
+ * 冲突标记的防假通过口径）：
+ * - entry 未闭合 → 输出被截断，直接抛断言错误；
+ * - marker 缺失本身不是缺陷证据（resolve 后内容与更新后的 BASE 相同，
+ *   路径会从 status 输出中消失）：只有 `svn diff` 能证明该路径内容与
+ *   属性都与 BASE 完全一致（干净，不可能有冲突）时才返回 undefined；
+ *   否则说明路径形态变化或输出截断，抛断言错误而不是静默当作无冲突。
+ */
+function statusEntryOf(lab: SvnLab, wc: string, path: string): string | undefined {
   const xml = lab.svn(['status', '--xml', '--ignore-externals'], wc);
   const marker = `path="${path}"`;
   const index = xml.indexOf(marker);
   if (index < 0) {
-    return false;
+    const diff = lab.svn(['diff', '--', path], wc);
+    if (diff.trim() === '') {
+      return undefined;
+    }
+    throw new Error(`svn status --xml 输出缺少 ${marker} 且 svn diff 仍有变化：路径形态变化或输出被截断，无法判定冲突状态`);
   }
-  const entry = xml.slice(index, xml.indexOf('</entry>', index));
-  return /props="conflicted"/.test(entry);
+  const end = xml.indexOf('</entry>', index);
+  if (end < 0) {
+    throw new Error(`svn status --xml 输出中 ${marker} 的 entry 未闭合：输出被截断，无法判定冲突状态`);
+  }
+  return xml.slice(index, end);
 }
 
-/** `svn status --xml` 是否仍把路径报告为任意类型冲突。 */
+/** `svn status --xml` 中 props=conflicted 是否仍存在（干净路径视为无冲突）。 */
+function propertyStillConflicted(lab: SvnLab, wc: string, path: string): boolean {
+  const entry = statusEntryOf(lab, wc, path);
+  return entry !== undefined && /props="conflicted"/.test(entry);
+}
+
+/** `svn status --xml` 是否仍把路径报告为任意类型冲突（干净路径视为无冲突）。 */
 function stillConflicted(lab: SvnLab, wc: string, path: string): boolean {
-  const xml = lab.svn(['status', '--xml', '--ignore-externals'], wc);
-  const marker = `path="${path}"`;
-  const index = xml.indexOf(marker);
-  if (index < 0) {
-    return false;
-  }
-  const entry = xml.slice(index, xml.indexOf('</entry>', index));
-  return /item="conflicted"/.test(entry) || /props="conflicted"/.test(entry) || /tree-conflicted="true"/.test(entry);
+  const entry = statusEntryOf(lab, wc, path);
+  return entry !== undefined
+    && (/item="conflicted"/.test(entry) || /props="conflicted"/.test(entry) || /tree-conflicted="true"/.test(entry));
 }
 
 /* ------------------------------ 真实 lab 用例 ------------------------------ */

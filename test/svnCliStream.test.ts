@@ -372,7 +372,7 @@ describe('runStream（不累计 stdout 的流式原语）', () => {
 
   it('Utf8StreamDecoder 跨分块解码中文：分块边界落在多字节字符中间也不产生 U+FFFD', async () => {
     // 「中」UTF-8 为 E4 B8 AD：第一块只发首字节，100ms 后补齐剩余两字节，
-    // 用真实管道复现「逐块 toString 产生替换符」的场景（阶段 0 实测）。
+    // 用真实管道复现「逐块 toString 产生替换符」的场景。
     const script = `${JSON.stringify(process.execPath)} -e "process.stdout.write(Buffer.from([0xe4]));setTimeout(()=>process.stdout.write(Buffer.from([0xb8,0xad])),100)"`;
     const decoder = new Utf8StreamDecoder();
     let decoded = '';

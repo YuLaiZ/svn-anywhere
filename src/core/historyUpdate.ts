@@ -1,7 +1,7 @@
 /**
  * P6「更新到指定 revision」的写前检查、命令与回读。core 模块，不依赖 vscode。
  *
- * 边界（技术方案 §4.6，阶段 0 V2/V4 实测回填）：
+ * 边界（更新到指定 revision 契约，真实 svn update/冲突场景实测回填）：
  * - 只允许本地工作副本，且更新对象是当前路径在请求 revision 确实存在的
  *   节点；复制来源可以查看/导出，但不能把「更新新路径」解释为「切回来源
  *   路径」——目标在请求 revision 不存在（复制前）时阻止更新；
@@ -30,24 +30,30 @@ import {
   type ConflictStatusEntry,
   type ConflictSummary,
 } from './conflict';
-import { isAuthFailure, isNetworkFailure, tailText } from './errors';
-import { run, urlWithPeg, type RunOptions, type RunResult } from './svnCli';
+import { isAuthFailure, isNetworkFailure, SvnError, tailText } from './errors';
+import type { HistoryUpdateIntent } from './operations';
+import { run, runOrThrow, urlWithPeg, type RunOptions, type RunResult } from './svnCli';
 import { parseStatusXml } from './status';
+import { parseUpdateOutput } from './update';
 import { escapePeg, findWorkingCopy } from './workspace';
 
 /**
- * 一次 history-update 的固定意图（技术方案 §4.6 冻结契约）。
- * 只经 operation begin 一次写入；markPhase 不得改目标、revision 或路径。
+ * 固定意图的单一权威定义在 core/operations（OperationRecord.historyUpdateIntent
+ * 的持久契约）；这里只重导出供既有调用方从本模块引用。
  */
-export interface HistoryUpdateIntent {
-  wcRoot: string;
-  targetRelPath: string;
-  targetKind: 'file' | 'dir';
-  /** 目标节点当前路径的实际 URL（原始编码形态），用于回读身份核对。 */
-  targetUrl: string;
-  requestedRevision: number;
-  /** 更新开始前回读的节点 BASE revision（不是预期更新值）。 */
-  preRevision: number;
+export type { HistoryUpdateIntent };
+
+/**
+ * 命令输出初解析线索（复用 `core/update.ts` 的
+ * `parseUpdateOutput`）。final revision 与冲突路径只用于结果页提示与
+ * 交叉核对，**不参与** `decideOutcome` 的权威判定——权威类型、版本与
+ * 辅助文件仍来自命令结束后的 status/info 归一化回读。
+ */
+export interface HistoryUpdateOutputHint {
+  /** 命令输出的最终 revision（`Updated to revision N` / `At revision N`）。 */
+  finalRevision?: number;
+  /** 命令输出中的冲突路径（明细 C 行/树冲突行），用于与回读冲突集合交叉核对。 */
+  conflicts: string[];
 }
 
 /** 更新结果对象（P6/P7 共用）。 */
@@ -65,10 +71,15 @@ export interface HistoryUpdateResult {
   readbackError?: string;
   /** 命令级失败（退出码非零/超时/进程错误）；结论仍以回读为准。 */
   commandError?: string;
+  /**
+   * 命令输出初解析线索；进程级失败（没有命令结果）时缺省。仅提示与
+   * 交叉核对，不参与三态结算。
+   */
+  outputHint?: HistoryUpdateOutputHint;
 }
 
 /**
- * P6→P7 更新任务上下文（技术方案 §5.5）：从 P6 更新任务进入 P7 时随
+ * P6→P7 更新任务上下文：从 P6 更新任务进入 P7 时随
  * openConflictPanel(source='update') 内存传递，面板顶部展示更新目标、
  * 请求 revision、更新前 BASE 与回读节点 BASE。只承载展示事实，冲突集合
  * 始终由 P7 对真实 SVN 重新扫描，不从本对象伪造。
@@ -176,7 +187,16 @@ export function checkLocalUpdateTarget(wcRoot: string, relPath: string): LocalUp
 
 export type HistoryUpdatePrepareResult =
   | { ok: true; intent: HistoryUpdateIntent }
-  | { ok: false; reason: HistoryUpdateBlockReason; message?: string };
+  | {
+      ok: false;
+      reason: HistoryUpdateBlockReason;
+      /**
+       * 原始命令输出或系统错误文本（stderr / spawn 错误等），仅供诊断
+       * detail 透传；面向用户的文案由宿主按 reason 映射 i18n 模板，
+       * core 不返回叙述性的中文句子。
+       */
+      message?: string;
+    };
 
 function classifyInfoFailure(stderr: string): HistoryUpdateBlockReason {
   if (/E155007|E155010|E200009|W155010|W155007/.test(stderr)) {
@@ -214,7 +234,8 @@ export async function prepareHistoryUpdate(
     return {
       ok: false,
       reason: classifyInfoFailure(info.result.stderr),
-      message: tailText(info.result.stderr.trim() || `svn info 退出码 ${info.result.exitCode}`),
+      // 只透传必要原始输出；为空时由宿主按 reason 呈现文案。
+      message: info.result.stderr.trim() === '' ? undefined : tailText(info.result.stderr.trim()),
     };
   }
   const infoKind = info.summary.kind === 'file' || info.summary.kind === 'dir' ? info.summary.kind : local.kind!;
@@ -222,10 +243,10 @@ export async function prepareHistoryUpdate(
     return { ok: false, reason: 'kind-mismatch' };
   }
   if (!info.summary.url) {
-    return { ok: false, reason: 'info-error', message: 'svn info 未返回节点 URL' };
+    return { ok: false, reason: 'info-error' };
   }
   if (info.summary.revision === undefined) {
-    return { ok: false, reason: 'not-versioned', message: '节点没有数字 BASE revision' };
+    return { ok: false, reason: 'not-versioned' };
   }
   return {
     ok: true,
@@ -240,7 +261,7 @@ export async function prepareHistoryUpdate(
   };
 }
 
-/** 本地修改/冲突阻断集合（技术方案 §4.6 检查 1）。 */
+/** 本地修改/冲突阻断集合（写前检查第 1 项）。 */
 const BLOCKING_STATUS_ITEMS = new Set(['modified', 'added', 'deleted', 'missing', 'replaced', 'conflicted']);
 
 export interface HistoryUpdateBlockingEntry {
@@ -254,6 +275,11 @@ export interface HistoryUpdatePreconditionResult {
   reason?: HistoryUpdateBlockReason;
   /** reason='local-modifications' 时的阻断条目。 */
   blocking?: HistoryUpdateBlockingEntry[];
+  /**
+   * 原始命令输出或系统错误文本（stderr / spawn 错误等），仅供诊断
+   * detail 透传；面向用户的文案由宿主按 reason 映射 i18n 模板，
+   * core 不返回叙述性的中文句子。
+   */
   message?: string;
 }
 
@@ -264,6 +290,10 @@ function errorMessage(err: unknown): string {
 /**
  * 复制前更新禁用：请求 revision 在该路径当前 URL 下不存在（含 pre-copy）
  * 时阻止；认证/权限/网络错误不进入 absent 判定（不冒充路径缺失）。
+ *
+ * 远端 info 必须经 runOrThrow 统一补录原语：调用方注入 getCredentials 时，
+ * 首次执行的认证失败（E170001/E215004）会补录凭据并重试一次，重试结果与
+ * 单次执行走同一套分类；不得用裸 run 绕过补录。
  */
 async function checkTargetAtRevision(
   svnPath: string,
@@ -271,25 +301,25 @@ async function checkTargetAtRevision(
   options: RunOptions,
 ): Promise<HistoryUpdatePreconditionResult> {
   const url = urlWithPeg(intent.targetUrl, intent.requestedRevision);
-  let result: RunResult;
+  let stdout: string;
   try {
-    result = await run(svnPath, ['info', '--xml', '--non-interactive', '--', url], options);
+    stdout = (await runOrThrow(svnPath, ['info', '--xml', '--non-interactive', '--', url], options)).stdout;
   } catch (err) {
-    return { ok: false, reason: 'info-error', message: errorMessage(err) };
-  }
-  if (result.exitCode !== 0) {
-    const stderr = result.stderr;
-    if (isAuthFailure(stderr) || isNetworkFailure(stderr)) {
+    if (err instanceof SvnError) {
+      const stderr = err.stderr;
+      if (isAuthFailure(stderr) || isNetworkFailure(stderr)) {
+        return { ok: false, reason: 'info-error', message: tailText(stderr) };
+      }
+      if (isAbsentInfoError(stderr)) {
+        return { ok: false, reason: 'target-absent-at-revision', message: tailText(stderr) };
+      }
       return { ok: false, reason: 'info-error', message: tailText(stderr) };
     }
-    if (isAbsentInfoError(stderr)) {
-      return { ok: false, reason: 'target-absent-at-revision', message: tailText(stderr) };
-    }
-    return { ok: false, reason: 'info-error', message: tailText(stderr) };
+    return { ok: false, reason: 'info-error', message: errorMessage(err) };
   }
-  const summary = parseNodeInfoXml(result.stdout);
+  const summary = parseNodeInfoXml(stdout);
   if (!summary || !summary.path) {
-    return { ok: false, reason: 'target-absent-at-revision', message: 'svn info 返回空骨架' };
+    return { ok: false, reason: 'target-absent-at-revision' };
   }
   if (summary.kind !== 'unknown' && summary.kind !== intent.targetKind) {
     return { ok: false, reason: 'kind-mismatch' };
@@ -298,7 +328,7 @@ async function checkTargetAtRevision(
 }
 
 /**
- * 写前检查（技术方案 §4.6）：
+ * 写前检查：
  * 1. 目标节点在请求 revision 存在（复制前更新禁用）；
  * 2. `status --xml --ignore-externals` 检查目标及目录范围：本地
  *    modified/added/deleted/missing/replaced/conflicted、属性修改或树冲突
@@ -322,7 +352,11 @@ export async function checkHistoryUpdatePreconditions(
     return { ok: false, reason: 'info-error', message: errorMessage(err) };
   }
   if (statusResult.exitCode !== 0) {
-    return { ok: false, reason: 'info-error', message: tailText(statusResult.stderr.trim() || `svn status 退出码 ${statusResult.exitCode}`) };
+    return {
+      ok: false,
+      reason: 'info-error',
+      message: statusResult.stderr.trim() === '' ? undefined : tailText(statusResult.stderr.trim()),
+    };
   }
   const parsed = parseStatusXml(statusResult.stdout);
   const blocking: HistoryUpdateBlockingEntry[] = [];
@@ -347,11 +381,8 @@ export async function checkHistoryUpdatePreconditions(
   try {
     treeEntries = parseConflictStatusXml(statusResult.stdout).entries.filter((entry) => entry.treeConflicted);
   } catch {
-    return {
-      ok: false,
-      reason: 'info-error',
-      message: 'svn status XML 不完整（遍历可能中断）',
-    };
+    // XML 遍历中断（status 输出被截断）：不能解析残片，按 info-error 阻止。
+    return { ok: false, reason: 'info-error' };
   }
   for (const entry of treeEntries) {
     addBlocking(entry.path, entry.item, entry.props);
@@ -421,7 +452,11 @@ export async function readHistoryUpdateReadback(
   let nodeUrl: string | undefined;
   let nodeKind: 'file' | 'dir' | 'unknown' = 'unknown';
   if (!info.summary) {
-    readbackError = tailText(info.result.stderr.trim() || `svn info 退出码 ${info.result.exitCode}`);
+    // 只透传必要原始输出；stderr 为空时给出机器可读的最简诊断，
+    // 不返回面向用户的叙述性文案（宿主按语义状态映射 i18n）。
+    readbackError = info.result.stderr.trim() === ''
+      ? `svn info exit code ${info.result.exitCode}`
+      : tailText(info.result.stderr.trim());
   } else {
     postNodeRevision = info.summary.revision;
     nodeUrl = info.summary.url;
@@ -475,7 +510,7 @@ function decideOutcome(
 
 export interface HistoryUpdateRunOptions extends RunOptions {
   /**
-   * 命令超时。默认 0（不限时，技术方案 §4.6：长任务可关面板但不取消）；
+   * 命令超时。默认 0（不限时：长任务可关面板但不取消）；
    * 宿主若显式传入则覆盖。
    */
   timeoutMs?: number;
@@ -493,10 +528,22 @@ export async function runHistoryUpdate(
 ): Promise<HistoryUpdateResult> {
   const args = buildHistoryUpdateArgs(intent);
   let commandError: string | undefined;
+  let outputHint: HistoryUpdateOutputHint | undefined;
   try {
     const result = await run(svnPath, args, { cwd: intent.wcRoot, timeoutMs: 0, ...options });
+    // 命令输出线索复用 parseUpdateOutput 初解析；只作
+    // 结果页提示与交叉核对，不参与 decideOutcome（权威结论仍来自回读）。
+    const parsed = parseUpdateOutput(result.stdout);
+    outputHint = {
+      ...(parsed.finalRevision !== undefined ? { finalRevision: parsed.finalRevision } : {}),
+      conflicts: parsed.conflicts,
+    };
     if (result.exitCode !== 0) {
-      commandError = tailText(result.stderr.trim() || `svn update 退出码 ${result.exitCode}`);
+      // 只透传必要原始输出；stderr 为空时给出机器可读的最简诊断，
+      // 不返回面向用户的叙述性文案（宿主按语义状态映射 i18n）。
+      commandError = result.stderr.trim() === ''
+        ? `svn update exit code ${result.exitCode}`
+        : tailText(result.stderr.trim());
     }
   } catch (err) {
     commandError = errorMessage(err);
@@ -512,6 +559,7 @@ export async function runHistoryUpdate(
     conflictSummary: readback.conflictSummary,
     readbackError: readback.readbackError,
     commandError,
+    ...(outputHint !== undefined ? { outputHint } : {}),
   };
 }
 
@@ -524,7 +572,7 @@ export interface HistoryUpdateRescan {
 }
 
 /**
- * 未知回扫三出口（技术方案 §4.6）：只读同一更新范围；
+ * 未知回扫三出口：只读同一更新范围；
  * - info/范围扫描失败、身份不符、revision 不是请求值 → still-unknown；
  * - 回读请求 revision 且无冲突 → updated；
  * - 回读请求 revision 且有冲突 → conflict。

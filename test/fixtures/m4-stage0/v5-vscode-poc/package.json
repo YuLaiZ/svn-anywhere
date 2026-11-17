@@ -1,5 +1,5 @@
 {
-  "name": "m4-v5-poc",
+  "name": "svn-anywhere-vscode-poc",
   "publisher": "m4-stage0",
   "version": "0.0.1",
   "engines": { "vscode": "^1.85.0" },

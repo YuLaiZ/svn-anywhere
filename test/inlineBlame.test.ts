@@ -1,7 +1,7 @@
 /**
- * F108 行内追溯测试（M4 阶段 4 任务 3，host/inlineBlame）：
+ * 行内追溯测试（host/inlineBlame）：
  * - 大小/行数降级：≤10 MiB 自动刷新、>10 MiB 或 >100k 行按需刷新、
- *   >16 MiB 禁用（阶段 0 V5-5）；
+ *   >16 MiB 禁用；
  * - blame 行归属 → after 文本：`rN · author`、author 缺失 `rN`、无 commit
  *   显示「未提交/未归属」、超出文档行数裁剪；
  * - 开关状态机（mock vscode + 注入探测/blame）：开启装饰、再次关闭清空、
@@ -271,7 +271,7 @@ describe('inlineBlame：开关状态机', () => {
 
     expect(await toggleInlineBlame(editor, baseDeps({
       blame: async () => ({ state: 'notTraceable', reason: 'noCommittedRevision' }),
-    }))).toEqual({ status: 'rejected', reason: 'unversioned' });
+    }))).toEqual({ status: 'rejected', reason: 'noCommittedRevision' });
     expect(await toggleInlineBlame(editor, baseDeps({
       blame: async () => ({ state: 'notTraceable', reason: 'tooLarge' }),
     }))).toEqual({ status: 'rejected', reason: 'tooLarge' });
@@ -373,5 +373,143 @@ describe('inlineBlame：开关状态机', () => {
     await toggleInlineBlame(same.editor, baseDeps());
     vscodeMock.activeEditorHandlers[0]?.(same.editor);
     expect(isInlineBlameEnabled()).toBe(true);
+  });
+
+  it('保存时文件增长跨过 16 MiB：禁用行内追溯、清空装饰并提示', async () => {
+    const { editor, calls } = createFakeEditor('/repo/file.txt', 3);
+    let sizeBytes = 100;
+    let blameCalls = 0;
+    await toggleInlineBlame(editor, baseDeps({
+      probe: async () => ({ status: 'ok', target: { ...target, sizeBytes } }),
+      blame: async () => {
+        blameCalls += 1;
+        return blameReady();
+      },
+    }));
+    expect(isInlineBlameEnabled()).toBe(true);
+    expect(blameCalls).toBe(1);
+
+    // 修复前保存处理按开启时冻结的 availability=auto 自动重跑 blame。
+    sizeBytes = INLINE_BLAME_DISABLE_MAX_BYTES + 1;
+    vscodeMock.saveHandlers[0]?.({ uri: { toString: () => 'file:///repo/file.txt' } });
+    await flushAsync();
+    expect(isInlineBlameEnabled()).toBe(false);
+    expect(blameCalls).toBe(1);
+    expect(calls.at(-1)?.options).toEqual([]);
+    expect(vscodeMock.decorationTypes[0]?.disposed).toBe(true);
+    expect(vscodeMock.warning).toContain(strings.editor.inlineBlameTooLarge);
+    expect(vscodeMock.saveHandlers).toHaveLength(0);
+    expect(vscodeMock.activeEditorHandlers).toHaveLength(0);
+  });
+
+  it('保存时文件增长跨过 10 MiB 或 100k 行：不再自动 blame，只弹「立即刷新」', async () => {
+    const { editor } = createFakeEditor('/repo/file.txt', 3);
+    let sizeBytes = 100;
+    let blameCalls = 0;
+    const notifications: string[] = [];
+    await toggleInlineBlame(editor, baseDeps({
+      probe: async () => ({ status: 'ok', target: { ...target, sizeBytes } }),
+      blame: async () => {
+        blameCalls += 1;
+        return blameReady();
+      },
+      notify: async (message) => {
+        notifications.push(message);
+        return undefined;
+      },
+    }));
+    sizeBytes = INLINE_BLAME_AUTO_REFRESH_MAX_BYTES + 1;
+    vscodeMock.saveHandlers[0]?.({ uri: { toString: () => 'file:///repo/file.txt' } });
+    await flushAsync();
+    // 修复前保存分支只看开启时冻结的 availability=auto，会直接重跑 blame。
+    expect(blameCalls).toBe(1);
+    expect(notifications).toEqual([strings.editor.inlineBlameManualRefresh]);
+    expect(isInlineBlameEnabled()).toBe(true);
+
+    // 行数增长跨过 100k 同样转为按需刷新（大小已回落）。
+    sizeBytes = 100;
+    (editor.document as unknown as { lineCount: number }).lineCount = INLINE_BLAME_AUTO_REFRESH_MAX_LINES + 1;
+    vscodeMock.saveHandlers[0]?.({ uri: { toString: () => 'file:///repo/file.txt' } });
+    await flushAsync();
+    expect(blameCalls).toBe(1);
+    expect(notifications).toHaveLength(2);
+  });
+
+  it('refreshInlineBlame 开头按最新探测重算：文件已超 16 MiB 时关闭会话并提示', async () => {
+    const { editor } = createFakeEditor('/repo/file.txt', 3);
+    let sizeBytes = 100;
+    let blameCalls = 0;
+    await toggleInlineBlame(editor, baseDeps({
+      probe: async () => ({ status: 'ok', target: { ...target, sizeBytes } }),
+      blame: async () => {
+        blameCalls += 1;
+        return blameReady();
+      },
+    }));
+    expect(isInlineBlameEnabled()).toBe(true);
+
+    sizeBytes = INLINE_BLAME_DISABLE_MAX_BYTES + 1;
+    await refreshInlineBlame(baseDeps({
+      probe: async () => ({ status: 'ok', target: { ...target, sizeBytes } }),
+      blame: async () => {
+        blameCalls += 1;
+        return blameReady();
+      },
+    }));
+    expect(blameCalls).toBe(1);
+    expect(isInlineBlameEnabled()).toBe(false);
+    expect(vscodeMock.decorationTypes[0]?.disposed).toBe(true);
+    expect(vscodeMock.warning).toContain(strings.editor.inlineBlameTooLarge);
+  });
+
+  it('并发开启：先发调用被取代，不残留装饰类型与监听', async () => {
+    const first = createFakeEditor('/repo/first.txt', 3);
+    const second = createFakeEditor('/repo/second.txt', 3);
+    let releaseFirst: (() => void) | undefined;
+    const gate = new Promise<void>((resolveGate) => {
+      releaseFirst = resolveGate;
+    });
+    const pendingFirst = toggleInlineBlame(first.editor, baseDeps({
+      probe: async () => {
+        await gate;
+        return { status: 'ok', target: { ...target, fsPath: '/repo/first.txt', relPath: 'first.txt' } };
+      },
+    }));
+    const pendingSecond = toggleInlineBlame(second.editor, baseDeps({
+      probe: async () => ({
+        status: 'ok',
+        target: { ...target, fsPath: '/repo/second.txt', relPath: 'second.txt' },
+      }),
+    }));
+    await expect(pendingSecond).resolves.toEqual({ status: 'enabled', availability: 'auto', lineCount: 3 });
+    releaseFirst?.();
+    await expect(pendingFirst).resolves.toEqual({ status: 'superseded' });
+    expect(first.calls).toHaveLength(0);
+    expect(second.calls).toHaveLength(1);
+    expect(vscodeMock.decorationTypes).toHaveLength(1);
+    expect(vscodeMock.decorationTypes[0]?.disposed).toBe(false);
+    expect(vscodeMock.saveHandlers).toHaveLength(1);
+    expect(vscodeMock.activeEditorHandlers).toHaveLength(1);
+  });
+
+  it('开启在途时执行关闭：开启结果过期，不重新点亮会话', async () => {
+    const { editor, calls } = createFakeEditor('/repo/file.txt', 3);
+    let releaseProbe: (() => void) | undefined;
+    const gate = new Promise<void>((resolveGate) => {
+      releaseProbe = resolveGate;
+    });
+    const pending = toggleInlineBlame(editor, baseDeps({
+      probe: async () => {
+        await gate;
+        return { status: 'ok', target };
+      },
+    }));
+    disableInlineBlame();
+    releaseProbe?.();
+    await expect(pending).resolves.toEqual({ status: 'superseded' });
+    expect(isInlineBlameEnabled()).toBe(false);
+    expect(calls).toHaveLength(0);
+    expect(vscodeMock.decorationTypes).toHaveLength(0);
+    expect(vscodeMock.saveHandlers).toHaveLength(0);
   });
 });

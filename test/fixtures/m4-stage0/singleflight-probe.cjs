@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// M4 阶段0 V1：host 级认证单飞协调器原型验证（不弹真实凭据框，用受控 Promise 模拟）
+// host 级认证单飞协调器原型验证（不弹真实凭据框，用受控 Promise 模拟）
 // 语义：按 scheme+host+port 共享一次凭据 Promise；并发失败请求共享同一次补录；
 //       取消则同源等待者统一失败；成功则各自重试原路径；不同源独立补录。
 'use strict';

@@ -71,7 +71,7 @@ export function render(state: PanelState): string {
     renderSteps(state),
     renderSuccessCard(state),
     state.hint ? `<div class="hint">${escapeHtml(state.hint)}</div>` : '',
-    renderBanners(state.banners),
+    renderBanners(state),
     renderMetrics(state),
     renderSpaceBar(state),
     renderTabs(state),
@@ -204,16 +204,30 @@ function renderSuccessCard(state: PanelState): string {
   );
 }
 
-function renderBanners(banners: BannerSpec[]): string {
+/**
+ * 页脚/横幅/确认框等结构性动作的占用态禁用：只对携带放行视图
+ * （state.gate）的面板按同一张表判定，与宿主守卫同源；未携带放行
+ * 视图的面板（M2 提交/忽略）保持既有渲染，不改变「守卫拒绝、视图
+ * 不额外猜测」的现状。
+ */
+function gateViewDisabled(
+  state: Pick<PanelState, 'busy' | 'writeLocked' | 'gate'>,
+  action: string,
+): boolean {
+  return state.gate !== undefined && actionGated(state, action);
+}
+
+function renderBanners(state: PanelState): string {
+  const banners = state.banners;
   const rest = banners.filter((banner) => !(banner.id === 'commitSuccess' && banner.level === 'success'));
   if (rest.length === 0) {
     return '';
   }
-  const items = rest.map((banner) => renderBanner(banner));
+  const items = rest.map((banner) => renderBanner(banner, state));
   return `<div class="banners">${items.join('')}</div>`;
 }
 
-function renderBanner(banner: BannerSpec): string {
+function renderBanner(banner: BannerSpec, state: PanelState): string {
   const detailHtml = !banner.detail
     ? ''
     : banner.preformatted
@@ -225,17 +239,20 @@ function renderBanner(banner: BannerSpec): string {
       argName: 'data-banner-id',
       argValue: banner.id,
       extraId: action.id,
+      // 横幅动作按 actionId 查同一张放行表（gateActionOf 口径）。
+      gated: gateViewDisabled(state, action.id),
     }))
     .join('');
   const dismissLabel = strings.panel.dismiss;
   // dismissable:false 的横幅不渲染 ×（判定性持久提示，无关闭需求）；
-  // 其余横幅保持默认渲染（M2 既有行为不变）。
+  // 其余横幅保持默认渲染（M2 既有行为不变）；携带放行视图的面板在
+  // 占用态按表禁用 ×（dismissBanner 不在 P6/P7 放行集内，避免可点被拒）。
   const dismissHtml = banner.dismissable === false
     ? ''
     : [
       '<button type="button" class="row-act" data-intent="dismissBanner"',
       ` data-banner-id="${escapeHtml(banner.id)}"`,
-      ` aria-label="${escapeHtml(dismissLabel)}" title="${escapeHtml(dismissLabel)}">×</button>`,
+      ` aria-label="${escapeHtml(dismissLabel)}" title="${escapeHtml(dismissLabel)}"${lockedDisabled(gateViewDisabled(state, 'dismissBanner'))}>×</button>`,
     ].join('');
   const role = banner.level === 'error' ? 'alert' : 'status';
   return [
@@ -873,7 +890,13 @@ function renderConfirmDialog(state: PanelState): string {
     `<h2 id="${escapeHtml(titleId)}">${escapeHtml(dialog.title)}</h2>${detail}` +
     `<div class="confirm-actions">` +
     `<button type="button" class="row-act" data-dialog-dismiss="${escapeHtml(dialog.id)}" data-focus="dialog-cancel-${escapeHtml(dialog.id)}">${escapeHtml(cancelLabel)}</button>` +
-    `${renderActionButton(dialog.confirm, { intent: dialog.confirm.id, argName: '', argValue: '', extraId: '' })}` +
+    `${renderActionButton(dialog.confirm, {
+      intent: dialog.confirm.id,
+      argName: '',
+      argValue: '',
+      extraId: '',
+      gated: gateViewDisabled(state, dialog.confirm.id),
+    })}` +
     `</div></section></div>`
   );
 }
@@ -1393,6 +1416,8 @@ export type TableRenderState = Pick<PanelState, 'busy' | 'writeLocked' | 'gate'>
 /**
  * 渲染表格行集合（整表 body 与 append 增量片段共用）：行点击只更新详情、
  * 勾选列只在 selection 存在时渲染；行内动作与行选中意图只带稳定行 ID。
+ * 行选中意图只在表格显式声明 rowSelectIntent 时渲染——未声明的表格
+ * （导入预览、大文件表等既有面板）不注入其他面板的行点击语义。
  */
 function renderTableRows(state: TableRenderState, table: TableSpec, rows: TableRowSpec[]): string {
   const selectionEnabled = table.selection !== undefined;
@@ -1414,10 +1439,10 @@ function renderTableRows(state: TableRenderState, table: TableSpec, rows: TableR
     ).join('');
     const rowClass = row.selected ? ' class="selected"' : '';
     const ariaSelected = selectionEnabled ? ` aria-selected="${row.selected ? 'true' : 'false'}"` : '';
-    const rowSelectIntent = table.rowSelectIntent ?? 'selectHistoryRevision';
-    const selectIntent = actionGated(state, rowSelectIntent)
-      ? ''
-      : ` data-intent="${escapeHtml(rowSelectIntent)}" data-focus="table-row-${escapeHtml(row.id)}"`;
+    const rowSelectIntent = table.rowSelectIntent;
+    const selectIntent = rowSelectIntent !== undefined && !actionGated(state, rowSelectIntent)
+      ? ` data-intent="${escapeHtml(rowSelectIntent)}" data-focus="table-row-${escapeHtml(row.id)}"`
+      : '';
     return `<tr data-row-id="${escapeHtml(row.id)}"${rowClass}${ariaSelected}${selectIntent}>${selectionCell}${cells}${actions ? `<td class="col acts">${actions}</td>` : ''}</tr>`;
   }).join('');
 }
@@ -1745,10 +1770,16 @@ function renderActionButton(action: ActionSpec, binding: ActionBinding): string 
 function renderFooter(state: PanelState, locked: boolean): string {
   if (state.footer) {
     const secondary = (state.footer.secondary ?? [])
-      .map((action) => renderActionButton(action, { intent: action.id, argName: 'data-footer', argValue: action.id, extraId: '' }))
+      .map((action) => renderActionButton(action, {
+        intent: action.id,
+        argName: 'data-footer',
+        argValue: action.id,
+        extraId: '',
+        gated: gateViewDisabled(state, action.id),
+      }))
       .join('');
     const primary = state.footer.primary
-      ? renderPrimaryButton(state.footer.primary)
+      ? renderPrimaryButton(state, state.footer.primary)
       : '';
     return `<footer class="footer"><span class="summary" aria-live="polite">${escapeHtml(state.footer.summary)}</span><div class="footer-actions">${secondary}${primary}</div></footer>`;
   }
@@ -1757,8 +1788,11 @@ function renderFooter(state: PanelState, locked: boolean): string {
   return `<footer class="footer"><span class="summary">${summary}</span><div class="footer-actions">${refresh}</div></footer>`;
 }
 
-function renderPrimaryButton(action: ActionSpec): string {
-  const disabled = action.disabled ? ' disabled' : '';
+function renderPrimaryButton(
+  state: Pick<PanelState, 'busy' | 'writeLocked' | 'gate'>,
+  action: ActionSpec,
+): string {
+  const disabled = action.disabled || gateViewDisabled(state, action.id) ? ' disabled' : '';
   const title = action.disabledReason ?? action.label;
   return `<button type="button" class="primary" data-intent="${escapeHtml(action.id)}" data-focus="submit" title="${escapeHtml(title)}"${disabled}>${escapeHtml(action.label)}</button>`;
 }

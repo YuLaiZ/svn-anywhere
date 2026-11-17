@@ -1,8 +1,8 @@
 #!/bin/bash
-# V6-1 错误路径与 HTTP 认证矩阵：不存在/已删除路径、peg、非法 revision、
+# 错误路径与 HTTP 认证矩阵：不存在/已删除路径、peg、非法 revision、
 # 文件当目录、目录 blame、二进制 blame、diff/cat 缺失目标、认证三态、四命令认证一致性。
 set -u
-source "$(dirname "$0")/env-v6.sh"
+source "$(dirname "$0")/env.sh"
 mkdir -p "$WORK_DIR/cfg-empty"
 for n in svn16 svn18 svn110 svn114; do
   url=$(url_of "$n")

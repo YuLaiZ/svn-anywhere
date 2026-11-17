@@ -1,11 +1,12 @@
 /**
- * mock 宿主的编辑器装饰、保存事件与 P5 只读内容 API 语义（M4 阶段 4
- * F107/F108 验收与阶段 2 P5 场景依赖）。fakeVscode 按 VS Code API 契约提供
+ * mock 宿主的编辑器装饰、保存事件与 P5 只读内容 API 语义（快速差异/
+ * 行内追溯的编辑器验收与 P5 浏览场景依赖）。fakeVscode 按 VS Code API 契约提供
  * OverviewRulerLane、createTextEditorDecorationType、setDecorations、
  * onDidSaveTextDocument，以及 Uri.from、registerTextDocumentContentProvider、
  * env.clipboard/openExternal；本测试锁定这些替身语义，避免 mock-host 场景
  * 建立在与真实宿主不同的行为上。
  */
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { beforeEach, describe, expect, it } from 'vitest';
@@ -63,6 +64,7 @@ interface FakeVscode {
     showTextDocument(document: unknown, options?: unknown): Promise<FakeEditor>;
   };
   workspace: {
+    getConfiguration(section?: string): { get(key: string, fallback: unknown): unknown };
     openTextDocument(arg: unknown): Promise<FakeEditor['document']>;
     onDidSaveTextDocument(handler: (document: FakeEditor['document']) => unknown): { dispose(): void };
     registerTextDocumentContentProvider(
@@ -87,6 +89,8 @@ interface FakeState {
   contentProviders: Map<string, { provideTextDocumentContent(uri: unknown): string }>;
   clipboard: string[];
   openedExternal: string[];
+  configOverrides: { [section: string]: Record<string, unknown> } | undefined;
+  configurationSections: Array<string | undefined>;
 }
 
 const requireFromRoot = createRequire(join(process.cwd(), 'package.json'));
@@ -113,6 +117,8 @@ beforeEach(() => {
   state.contentProviders.clear();
   state.clipboard.length = 0;
   state.openedExternal.length = 0;
+  state.configOverrides = undefined;
+  state.configurationSections.length = 0;
   fakeVscode.window.activeTextEditor = undefined;
 });
 
@@ -131,7 +137,7 @@ describe('fakeVscode 装饰枚举', () => {
 });
 
 describe('createTextEditorDecorationType', () => {
-  it('返回唯一 key，并接受 F107/F108 用到的完整选项形态', () => {
+  it('返回唯一 key，并接受快速差异/行内追溯用到的完整选项形态', () => {
     const first = fakeVscode.window.createTextEditorDecorationType({
       backgroundColor: 'rgba(255, 200, 0, 0.20)',
       overviewRulerColor: 'rgba(255, 200, 0, 0.80)',
@@ -289,5 +295,32 @@ describe('Uri.from / 内容 provider / env（P5 远端只读内容依赖）', ()
     const opened = await fakeVscode.env.openExternal(fakeVscode.Uri.file('/tmp/mock-open.txt'));
     expect(opened).toBe(true);
     expect(state.openedExternal).toEqual(['file:///tmp/mock-open.txt']);
+  });
+});
+
+describe('workspace.getConfiguration 配置段语义', () => {
+  it('覆盖值只在对应 section 可见：section 误用或未指定时只拿到 fallback', () => {
+    state.configOverrides = { svnAnywhere: { historyPageSize: 20 } };
+    expect(fakeVscode.workspace.getConfiguration('svnAnywhere').get('historyPageSize', 50)).toBe(20);
+    // 误写配置段（含未指定 section）：真实宿主读不到扩展配置，mock 同样回退，
+    // 避免场景建立在这种误用仍能拿到覆盖值的假行为上。
+    expect(fakeVscode.workspace.getConfiguration('svn').get('historyPageSize', 50)).toBe(50);
+    expect(fakeVscode.workspace.getConfiguration().get('historyPageSize', 50)).toBe(50);
+    // 同一 section 下未覆盖的键按各次调用的 fallback 返回。
+    expect(fakeVscode.workspace.getConfiguration('svnAnywhere').get('svnPath', 'svn')).toBe('svn');
+    // 调用记录用于断言产品配置读取路径的 section 参数。
+    expect(state.configurationSections).toEqual(['svnAnywhere', 'svn', undefined, 'svnAnywhere']);
+  });
+});
+
+describe('extension-host-test 结果新鲜度自测', () => {
+  it('--self-test：旧 result.json 判 stale、本次结果接受、缺失等到超时', () => {
+    const output = execFileSync(
+      process.execPath,
+      [join(process.cwd(), 'scripts', 'extension-host-test.mjs'), '--self-test'],
+      { encoding: 'utf8', timeout: 30_000 },
+    );
+    expect(output).toContain('旧 result.json（runId 不匹配）判为 stale');
+    expect(output).toContain('self-test PASS');
   });
 });

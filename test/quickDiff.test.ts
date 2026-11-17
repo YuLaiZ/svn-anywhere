@@ -1,5 +1,5 @@
 /**
- * F107 快速差异测试（M4 阶段 4 任务 2，host/quickDiff）：
+ * 快速差异测试（host/quickDiff）：
  * - 零上下文 hunk 解析与行号映射（修改/新增/纯删除、count 缺省、clamp）；
  * - 命令参数：`--internal-diff`（覆盖 external diff 配置）、
  *   `--ignore-properties`、`-r BASE`、`-x -U0`、`--` 与原始字面路径
@@ -108,16 +108,19 @@ import {
   collectQuickDiffHunks,
   createQuickDiffDecorationTypes,
   disableQuickDiff,
+  getLastQuickDiffRefresh,
   isQuickDiffEnabled,
   mapQuickDiffHunksToLines,
   parseZeroContextDiffHunks,
   probeLocalEditorTarget,
+  refreshQuickDiff,
   toggleQuickDiff,
   QUICK_DIFF_BASE_ARGS,
   type LocalEditorTarget,
   type QuickDiffDeps,
   type QuickDiffHunk,
 } from '../src/host/quickDiff';
+import { strings } from '../src/host/i18n';
 import { disposeOutputChannel, resetOutputState } from '../src/host/output';
 import { createSvnLab, writeFile, type SvnLab } from './helpers';
 
@@ -511,5 +514,85 @@ describe('quickDiff：开关状态机', () => {
     await flushAsync();
     expect(isQuickDiffEnabled()).toBe(true);
     expect(calls).toHaveLength(6);
+  });
+
+  it('并发开启：先发调用被取代，结果丢弃且不残留装饰类型与监听', async () => {
+    const first = createFakeEditor('/repo/first.txt', 10);
+    const second = createFakeEditor('/repo/second.txt', 10);
+    let releaseFirst: (() => void) | undefined;
+    const firstProbeGate = new Promise<void>((resolveGate) => {
+      releaseFirst = resolveGate;
+    });
+    const pendingFirst = toggleQuickDiff(first.editor, baseDeps({
+      probe: async () => {
+        await firstProbeGate;
+        return { status: 'ok', target: { ...target, fsPath: '/repo/first.txt', relPath: 'first.txt' } };
+      },
+    }));
+    // 第一次探测仍挂起时再次触发：后发者胜出，先发结果必须丢弃。
+    const pendingSecond = toggleQuickDiff(second.editor, baseDeps({
+      probe: async () => ({
+        status: 'ok',
+        target: { ...target, fsPath: '/repo/second.txt', relPath: 'second.txt' },
+      }),
+    }));
+    await expect(pendingSecond).resolves.toEqual({ status: 'enabled', markerCount: 1 });
+    releaseFirst?.();
+    await expect(pendingFirst).resolves.toEqual({ status: 'superseded' });
+    expect(isQuickDiffEnabled()).toBe(true);
+    // 修复前两次调用各建会话：先完成的装饰类型与监听永不释放、装饰无法撤销。
+    expect(first.calls).toHaveLength(0);
+    expect(second.calls).toHaveLength(3);
+    expect(vscodeMock.decorationTypes).toHaveLength(3);
+    expect(vscodeMock.decorationTypes.every((type) => !type.disposed)).toBe(true);
+    expect(vscodeMock.saveHandlers).toHaveLength(1);
+    expect(vscodeMock.activeEditorHandlers).toHaveLength(1);
+  });
+
+  it('开启在途时执行关闭：开启结果过期，不重新点亮会话', async () => {
+    const { editor, calls } = createFakeEditor('/repo/file.txt', 10);
+    let releaseProbe: (() => void) | undefined;
+    const gate = new Promise<void>((resolveGate) => {
+      releaseProbe = resolveGate;
+    });
+    const pending = toggleQuickDiff(editor, baseDeps({
+      probe: async () => {
+        await gate;
+        return { status: 'ok', target };
+      },
+    }));
+    disableQuickDiff();
+    releaseProbe?.();
+    await expect(pending).resolves.toEqual({ status: 'superseded' });
+    expect(isQuickDiffEnabled()).toBe(false);
+    expect(calls).toHaveLength(0);
+    expect(vscodeMock.decorationTypes).toHaveLength(0);
+    expect(vscodeMock.saveHandlers).toHaveLength(0);
+    expect(vscodeMock.activeEditorHandlers).toHaveLength(0);
+  });
+
+  it('最近刷新结果可回读：保存刷新后更新、失败记录错误、关闭清空（编辑器冒烟依赖）', async () => {
+    const { editor } = createFakeEditor('/repo/file.txt', 10);
+    await toggleQuickDiff(editor, baseDeps());
+    expect(getLastQuickDiffRefresh()).toEqual({ uriKey: 'file:///repo/file.txt', markerCount: 1 });
+
+    const before = getLastQuickDiffRefresh();
+    const saveHandler = vscodeMock.saveHandlers[0];
+    saveHandler?.({ uri: { toString: () => 'file:///repo/file.txt' } });
+    await flushAsync();
+    const after = getLastQuickDiffRefresh();
+    expect(after).not.toBe(before);
+    expect(after).toEqual({ uriKey: 'file:///repo/file.txt', markerCount: 1 });
+
+    // 刷新命中拒绝（如文件变为未版本控制）：清空装饰并记录原因。
+    await refreshQuickDiff(baseDeps({ probe: async () => ({ status: 'rejected', reason: 'unversioned' }) }));
+    expect(getLastQuickDiffRefresh()).toEqual({
+      uriKey: 'file:///repo/file.txt',
+      markerCount: null,
+      error: strings.editor.reasonUnversioned,
+    });
+
+    disableQuickDiff();
+    expect(getLastQuickDiffRefresh()).toBeUndefined();
   });
 });

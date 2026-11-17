@@ -2,7 +2,7 @@
  * F107 快速差异（M4 阶段 4 任务 2）：只对用户显式开启的当前活动文本文件
  * 工作，用编辑器装饰显示修改/新增/删除行，不新建业务面板、不后台轮询。
  *
- * 口径（技术方案 §4.7 与阶段 0 V5 实测）：
+ * 口径（本地 SVN 实测）：
  * - 先判定本地/已版本控制/存在/非目录/非二进制；未版本控制（E155010）、
  *   missing（`svn diff -r BASE -x -U0` 静默 exit 0 且输出全空）与二进制
  *   必须在入口用 status/info + mime/NUL 分类挡住，不能靠 diff 输出判定。
@@ -212,7 +212,7 @@ function safeRealpath(fsPath: string): string {
 
 /** 本地目标拒绝原因的中文短语（刷新停止等日志用，命令提示走 editor.ts）。 */
 export function localRejectReasonLabel(
-  reason: LocalEditorRejectReason | 'tooLarge' | 'error',
+  reason: LocalEditorRejectReason | 'tooLarge' | 'noCommittedRevision' | 'error',
 ): string {
   switch (reason) {
     case 'noActiveEditor':
@@ -233,6 +233,8 @@ export function localRejectReasonLabel(
       return strings.editor.reasonBinary;
     case 'tooLarge':
       return strings.editor.reasonTooLarge;
+    case 'noCommittedRevision':
+      return strings.blamePanel.noCommittedRevision;
     case 'error':
       return strings.editor.reasonUnknown;
   }
@@ -455,6 +457,8 @@ export async function collectQuickDiffHunks(
 export type QuickDiffOutcome =
   | { status: 'enabled'; markerCount: number }
   | { status: 'disabled' }
+  /** 开启流程在途期间又被 toggle/关闭取代：本次结果丢弃，不创建会话。 */
+  | { status: 'superseded' }
   | { status: 'rejected'; reason: LocalEditorRejectReason }
   | { status: 'failed'; error: unknown };
 
@@ -475,6 +479,36 @@ interface QuickDiffSession {
 }
 
 let quickDiffSession: QuickDiffSession | undefined;
+
+/**
+ * 开关代次（并发保护）：每次 toggle 进入与 disable 时递增。开启流程的
+ * await 返回后校验代次，过期（期间又发生 toggle/关闭）则丢弃结果，
+ * 不创建装饰类型、不登记监听——否则两次并发开启各自建立会话，
+ * 先完成的装饰类型与事件监听会被后一次覆盖而永不释放，
+ * 其 setDecorations 结果也无法被后续关闭清除。
+ */
+let quickDiffGeneration = 0;
+
+/**
+ * 最近一次装饰应用结果（会话被关闭时清空）。真实 Extension Host 冒烟用：
+ * 装饰内容无法经 vscode 公开 API 回读，用「最近刷新是否产出行标记」证明
+ * 保存触发的自动刷新真正完成，而非只证明会话仍开启。
+ */
+export interface QuickDiffLastRefresh {
+  /** 会话文档 URI（editor.document.uri.toString()）。 */
+  uriKey: string;
+  /** 最近一次应用的行标记数；刷新被停止/失败时为 null。 */
+  markerCount: number | null;
+  /** 刷新被停止或失败的原因（成功时缺省）。 */
+  error?: string;
+}
+
+let quickDiffLastRefresh: QuickDiffLastRefresh | undefined;
+
+/** 当前（或最近一次）快速差异装饰应用结果；会话关闭后返回 undefined。 */
+export function getLastQuickDiffRefresh(): QuickDiffLastRefresh | undefined {
+  return quickDiffLastRefresh;
+}
 
 /** 当前是否有文档处于快速差异开启状态（测试/命令入口断言用）。 */
 export function isQuickDiffEnabled(): boolean {
@@ -546,8 +580,13 @@ export async function toggleQuickDiff(
     return { status: 'disabled' };
   }
   disableQuickDiff();
+  const generation = quickDiffGeneration;
   const fullDeps = buildDeps(deps);
   const computed = await computeDecorations(fullDeps, editor);
+  if (generation !== quickDiffGeneration) {
+    // 期间又发生 toggle/关闭：本次开启已过期，结果丢弃（不建会话、不建装饰类型）。
+    return { status: 'superseded' };
+  }
   if (computed.status === 'rejected') {
     return computed;
   }
@@ -563,6 +602,7 @@ export async function toggleQuickDiff(
   };
   quickDiffSession = session;
   applyQuickDiffDecorations(session.editor, session.types, computed.decorations);
+  quickDiffLastRefresh = { uriKey, markerCount: computed.markerCount };
   watchQuickDiffSession(session, fullDeps);
   logLine(format(strings.editor.quickDiffEnabled, {
     path: editor.document.uri.fsPath,
@@ -616,17 +656,22 @@ export async function refreshQuickDiff(deps: QuickDiffDeps = {}): Promise<void> 
     }
     if (computed.status === 'ok') {
       applyQuickDiffDecorations(session.editor, session.types, computed.decorations);
+      quickDiffLastRefresh = { uriKey: session.uriKey, markerCount: computed.markerCount };
       return;
     }
     clearQuickDiffDecorations(session.editor, session.types);
     if (computed.status === 'rejected') {
+      const reason = localRejectReasonLabel(computed.reason);
+      quickDiffLastRefresh = { uriKey: session.uriKey, markerCount: null, error: reason };
       logLine(format(strings.editor.quickDiffRefreshStopped, {
         path: session.editor.document.uri.fsPath,
-        reason: localRejectReasonLabel(computed.reason),
+        reason,
       }));
     } else {
+      const message = computed.error instanceof Error ? computed.error.message : String(computed.error);
+      quickDiffLastRefresh = { uriKey: session.uriKey, markerCount: null, error: message };
       logLine(format(strings.error.failed, {
-        message: computed.error instanceof Error ? computed.error.message : String(computed.error),
+        message,
       }));
     }
   } catch (err) {
@@ -634,14 +679,19 @@ export async function refreshQuickDiff(deps: QuickDiffDeps = {}): Promise<void> 
       return;
     }
     clearQuickDiffDecorations(session.editor, session.types);
+    const message = err instanceof Error ? err.message : String(err);
+    quickDiffLastRefresh = { uriKey: session.uriKey, markerCount: null, error: message };
     logLine(format(strings.error.failed, {
-      message: err instanceof Error ? err.message : String(err),
+      message,
     }));
   }
 }
 
 /** 关闭快速差异：清空装饰、释放事件监听与装饰类型，不留残留状态。 */
 export function disableQuickDiff(): void {
+  // 关闭也是状态变更：让在途开启流程变为过期（避免关闭后又被迟到结果点亮）。
+  quickDiffGeneration += 1;
+  quickDiffLastRefresh = undefined;
   const session = quickDiffSession;
   if (session === undefined) {
     return;

@@ -200,6 +200,32 @@ describe('打开与根身份', () => {
     }
   });
 
+  it('文件入口：根 info 的 sizeBytes 进入详情与行元数据（不再恒「—」）', () => {
+    const fileRef = rootRef({
+      rawUrl: 'https://example.com/repo/trunk/a.txt',
+      relativePath: 'trunk/a.txt',
+      kind: 'file',
+      lastChangedRevision: 41,
+    });
+    const model = new BrowseModel();
+    model.beginOpen('https://example.com/repo/trunk/a.txt');
+    model.applyRootInfo(fileRef, 2048);
+    const detail = model.buildPanelState('s1').detail;
+    const kv = detail?.sections.find((section) => section.kind === 'kv');
+    expect(kv?.kind === 'kv'
+      ? kv.entries.find((entry) => entry.label === '文件大小')?.value
+      : undefined).toBe('2.0 KiB');
+    expect(model.buildTreeRows()[0]?.metaText).toBe('2.0 KiB');
+
+    // 根刷新（HEAD 变化）同样按新回包更新大小；目录根不显示文件大小。
+    model.applyRootRefresh(fileRef, 4096);
+    const refreshed = model.buildPanelState('s1').detail;
+    const refreshedKv = refreshed?.sections.find((section) => section.kind === 'kv');
+    expect(refreshedKv?.kind === 'kv'
+      ? refreshedKv.entries.find((entry) => entry.label === '文件大小')?.value
+      : undefined).toBe('4.0 KiB');
+  });
+
   it('根刷新：清空全部后代与选中，重新排队读取根目录', () => {
     const model = openDir();
     loadRootAsXml(model, listingOf([{ name: 'dir', kind: 'dir' }, { name: 'a.txt' }]));
@@ -691,6 +717,35 @@ describe('关闭重开恢复（可浏览状态）', () => {
     expect(model.restoreRevision).toBe(30);
     model.applyRootInfo(rootRef({ snapshotRevision: 42 }));
     expect(model.snapshotRevisionValue).toBe(42);
+  });
+
+  it('恢复展开路径扩大可见片时入队新增片元数据（补全进度不脱节）', () => {
+    const model = new BrowseModel({ threshold: 1, firstBatch: 2 });
+    model.beginOpen(ROOT_URL, {
+      entryUrl: ROOT_URL,
+      snapshotRevision: 41,
+      expandedPaths: ['docs'],
+    });
+    model.applyRootInfo(rootRef({ snapshotRevision: 41 }));
+    const requestSeq = model.beginNodeLoad(ROOT_URL) as number;
+    // 名称模式：首批可见片为前 2 条，'docs' 在索引 3（可见片之外）。
+    expect(model.completeNodeNames(ROOT_URL, requestSeq, namesOf([
+      { name: 'a.txt' },
+      { name: 'b.txt' },
+      { name: 'c.txt' },
+      { name: 'docs', kind: 'dir' },
+    ]))).toBe('done');
+    const dir = rootDir(model);
+    expect(dir.visible).toBe(2);
+    expect(dir.metadataQueue).toEqual([0, 1]);
+
+    // 恢复展开 docs：可见片扩大到命中索引，新增片与「加载更多」同口径
+    // 进入补全队列，进度总数随可见片增长（而不是停留在旧批次数）。
+    model.advanceRestore();
+    expect(dir.visible).toBe(4);
+    expect(dir.metadataProgress.total).toBe(4);
+    expect(dir.metadataQueue).toEqual([0, 1, 2, 3]);
+    expect(model.metadataTasks().length).toBe(4);
   });
 });
 

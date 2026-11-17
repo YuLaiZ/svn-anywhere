@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 真实 VS Code Extension Host 冒烟测试入口（M4 阶段 4 编辑器装饰验收复用）。
+ * 真实 VS Code Extension Host 冒烟测试入口（编辑器装饰验收复用）。
  *
  * 做两件事：
  * 1. 生成一个最小扩展包 + 测试入口（未指定 --extension/--tests 时），
@@ -10,11 +10,16 @@
  *
  * 默认冒烟覆盖：OverviewRulerLane / DecorationRangeBehavior 枚举、
  * createTextEditorDecorationType、setDecorations 更新与清空、
- * onDidSaveTextDocument 触发与退订。阶段 4 的快速差异/行内追溯验收可复用
+ * onDidSaveTextDocument 触发与退订。快速差异/行内追溯的编辑器验收可复用
  * 本脚本的启动链路：--extension <项目根> --tests <验收测试入口>。
  *
- * 与阶段 0 PoC（test/fixtures/m4-stage0/v5-vscode-poc/run-vscode-poc.sh）
+ * 与本地 VS Code CLI 直启 PoC（test/fixtures/m4-stage0/v5-vscode-poc/run-vscode-poc.sh）
  * 使用同一 VS Code CLI 直启方式，不新增 @vscode/test-electron 依赖。
+ *
+ * 结果防假通过：运行前删除上一次的 result.json，并在启动子进程前
+ * 生成 runId，经 M4_EXT_HOST_RUN_ID 传给测试入口；结果必须带本次 runId
+ * 才会被接受（复用 --out 目录不会读到旧结果）。自定义 --tests 入口需把
+ * 该环境变量写入结果的 runId 字段。
  */
 import {
   accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
@@ -22,6 +27,7 @@ import {
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const RESULT_NAME = 'result.json';
 const DEFAULT_TIMEOUT_MS = 180_000;
@@ -38,6 +44,7 @@ const path = require('path');
 
 const OUTPUT_DIR = process.env.M4_EXT_HOST_OUT;
 const RESULT_FILE = OUTPUT_DIR ? path.join(OUTPUT_DIR, 'result.json') : null;
+const RUN_ID = process.env.M4_EXT_HOST_RUN_ID || null;
 const checks = [];
 
 function check(name, condition, detail) {
@@ -48,11 +55,15 @@ function check(name, condition, detail) {
   }
 }
 
-function writeResult(result) {
+function writeResult(result, startedAt) {
   if (!RESULT_FILE) {
     return;
   }
-  fs.writeFileSync(RESULT_FILE, JSON.stringify(Object.assign({ checks }, result), null, 2));
+  fs.writeFileSync(RESULT_FILE, JSON.stringify(Object.assign({
+    runId: RUN_ID,
+    startedAt,
+    checks,
+  }, result), null, 2));
 }
 
 function sleep(ms) {
@@ -127,9 +138,9 @@ exports.run = async function run() {
     check('dispose 后保存事件不再触发', savedPaths.length === 1, JSON.stringify(savedPaths));
 
     decorationType.dispose();
-    writeResult({ ok: true, phase: 'editor-decorations-smoke', vscodeVersion: vscode.version, elapsedMs: Date.now() - startedAt });
+    writeResult({ ok: true, phase: 'editor-decorations-smoke', vscodeVersion: vscode.version, elapsedMs: Date.now() - startedAt }, startedAt);
   } catch (err) {
-    writeResult({ ok: false, phase: 'editor-decorations-smoke', elapsedMs: Date.now() - startedAt, error: String((err && err.stack) || err) });
+    writeResult({ ok: false, phase: 'editor-decorations-smoke', elapsedMs: Date.now() - startedAt, error: String((err && err.stack) || err) }, startedAt);
     process.exitCode = 1;
   } finally {
     if (tempDir) {
@@ -158,6 +169,7 @@ function printUsage() {
   --timeout <毫秒>    子进程超时（默认 ${DEFAULT_TIMEOUT_MS}）
   --keep              未指定 --out 时保留临时产物目录（成功时默认删除）
   --verbose           输出 VS Code 子进程的完整 stdout/stderr
+  --self-test         只运行结果新鲜度自测（不启动 VS Code；test/mockHost.test.ts 复用）
   -h, --help          显示本帮助
 
 前置条件：
@@ -166,7 +178,7 @@ function printUsage() {
     其他平台用 VSCODE_BIN 或 --vscode 指定 CLI。
   - 每次运行使用隔离的 user-data/extensions 目录，不修改本机 VS Code 配置。
 
-阶段 4 复用示例（先 pnpm run build）：
+编辑器冒烟复用示例（先 pnpm run build）：
   node scripts/extension-host-test.mjs --extension . --tests test/ext-host/editor-smoke.cjs
 `);
 }
@@ -309,15 +321,28 @@ function printTail(label, text) {
   console.log(tail.join('\n'));
 }
 
-/** macOS 的 code CLI 启动应用后立即返回：以 result.json 出现为测试完成信号。 */
-async function waitForResult(resultPath, deadline) {
-  while (!existsSync(resultPath)) {
-    if (Date.now() >= deadline) {
-      return false;
+/**
+ * macOS 的 code CLI 启动应用后立即返回：以 result.json 出现为测试完成信号。
+ * 除文件存在外还校验 runId 与本次运行一致（复用 --out 目录时不能
+ * 把上一次的 result.json 当成本次结果）；JSON 未写完时继续等待。
+ * 返回 { completed, stale }：stale 表示文件存在但 runId 不匹配。
+ */
+async function waitForResult(resultPath, deadline, runId) {
+  while (Date.now() < deadline) {
+    if (existsSync(resultPath)) {
+      let report;
+      try {
+        report = JSON.parse(readFileSync(resultPath, 'utf8'));
+      } catch {
+        report = undefined;
+      }
+      if (report !== undefined && report !== null && typeof report === 'object') {
+        return { completed: true, stale: report.runId !== runId };
+      }
     }
     await new Promise((resolveWait) => setTimeout(resolveWait, 200));
   }
-  return true;
+  return { completed: false, stale: false };
 }
 
 async function main() {
@@ -353,6 +378,12 @@ async function main() {
   console.log(`  测试入口：${testsPath}`);
   console.log(`  产物目录：${outDir}`);
 
+  const resultPath = join(outDir, RESULT_NAME);
+  // 运行前无条件删除上一次的结果：--out 复用目录且 macOS 的 code
+  // CLI 启动后立即返回时，旧 result.json 会让本次测试假通过。
+  rmSync(resultPath, { force: true });
+  // 每次运行的唯一标识：测试入口经 M4_EXT_HOST_RUN_ID 写入结果，脚本比对后才接受。
+  const runId = `${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
   const cliArgs = [
     `--extensionDevelopmentPath=${extensionPath}`,
     `--extensionTestsPath=${testsPath}`,
@@ -369,11 +400,10 @@ async function main() {
     encoding: 'utf8',
     timeout: options.timeoutMs,
     maxBuffer: 32 * 1024 * 1024,
-    env: { ...process.env, M4_EXT_HOST_OUT: outDir },
+    env: { ...process.env, M4_EXT_HOST_OUT: outDir, M4_EXT_HOST_RUN_ID: runId },
   });
-  const resultPath = join(outDir, RESULT_NAME);
   // CLI 已返回不代表测试结束（macOS 上通常是异步执行），轮询到总超时预算耗尽。
-  const completed = await waitForResult(resultPath, startedAt + options.timeoutMs);
+  const wait = await waitForResult(resultPath, startedAt + options.timeoutMs, runId);
   const elapsedMs = Date.now() - startedAt;
 
   const failures = [];
@@ -386,8 +416,13 @@ async function main() {
   if (typeof child.status === 'number' && child.status !== 0) {
     failures.push(`VS Code 子进程退出码 ${child.status}`);
   }
-  if (!completed) {
+  if (!wait.completed) {
     failures.push(`等待测试结果超时（${options.timeoutMs} ms）：${resultPath} 未出现`);
+  } else if (wait.stale) {
+    failures.push(
+      `测试结果不是本次运行写入（result.json 的 runId 与本次 ${runId} 不一致）：`
+      + '测试入口需把环境变量 M4_EXT_HOST_RUN_ID 写入结果的 runId 字段',
+    );
   }
 
   let report;
@@ -444,7 +479,57 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+/**
+ * 自测（`node scripts/extension-host-test.mjs --self-test`，由
+ * test/mockHost.test.ts 调用）：不启动 VS Code，只验证结果新鲜度判定——
+ * 旧 result.json（runId 不匹配）必须判为 stale，本次结果才被接受。
+ */
+async function selfTest() {
+  const dir = mkdtempSync(join(tmpdir(), 'svn-anywhere-ext-host-selftest-'));
+  const assertSelf = (condition, message) => {
+    if (!condition) {
+      throw new Error(`self-test failed: ${message}`);
+    }
+    console.log(`  PASS ${message}`);
+  };
+  try {
+    const resultPath = join(dir, RESULT_NAME);
+    const runId = 'self-test-run';
+    // 旧结果：文件存在但 runId 为上一次运行 → stale（修复前会被直接接受）。
+    writeFileSync(resultPath, JSON.stringify({ ok: true, runId: 'previous-run', checks: [] }));
+    assertSelf(
+      JSON.stringify(await waitForResult(resultPath, Date.now() + 2000, runId)) === JSON.stringify({ completed: true, stale: true }),
+      '旧 result.json（runId 不匹配）判为 stale',
+    );
+    // 本次结果：runId 匹配 → 接受。
+    writeFileSync(resultPath, JSON.stringify({ ok: true, runId, checks: [] }));
+    assertSelf(
+      JSON.stringify(await waitForResult(resultPath, Date.now() + 2000, runId)) === JSON.stringify({ completed: true, stale: false }),
+      'runId 匹配的结果被接受',
+    );
+    // 文件不存在：等到 deadline 后报超时。
+    rmSync(resultPath, { force: true });
+    assertSelf(
+      JSON.stringify(await waitForResult(resultPath, Date.now() + 300, runId)) === JSON.stringify({ completed: false, stale: false }),
+      '结果缺失等到超时',
+    );
+    console.log('[ext-host-test] self-test PASS');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** 直接运行时执行 main（或其他入口）；被测试导入时不启动自动化流程。 */
+const isMainEntry = process.argv[1] !== undefined
+  && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+if (isMainEntry && process.argv.includes('--self-test')) {
+  selfTest().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+} else if (isMainEntry) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

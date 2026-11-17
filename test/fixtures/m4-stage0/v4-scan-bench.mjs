@@ -1,4 +1,4 @@
-// M4 阶段 0 / V4 扫描性能实测：status + 32 路径批量 info + 4 路逐项补偿。
+// 扫描性能实测：status + 32 路径批量 info + 4 路逐项补偿。
 // 自建 svnadmin + file:// 临时仓库，不访问远端服务器。
 // 用法：node test/fixtures/m4-stage0/v4-scan-bench.mjs [冲突文件数=120] [--keep]
 import { execFile, execFileSync } from 'node:child_process';

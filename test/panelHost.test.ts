@@ -751,7 +751,7 @@ describe('panelHtmlTemplate', () => {
   });
 });
 
-/* ---------------- M4：读请求代次（技术方案 §2.3） ---------------- */
+/* ---------------- M4：读请求代次 ---------------- */
 
 describe('读请求代次：targetKey + requestSeq + viewEpoch', () => {
   it('beginReadRequest 递增代次并携带会话/目标/视图代次；新请求使旧票据过期', () => {

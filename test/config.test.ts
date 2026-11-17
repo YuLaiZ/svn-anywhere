@@ -6,13 +6,18 @@
 import { describe, expect, it, vi } from 'vitest';
 
 const configValues = vi.hoisted(() => new Map<string, unknown>());
+/** 每次 getConfiguration 收到的 section 参数（断言用：误用 'svn' 会让配置静默失效）。 */
+const configSections = vi.hoisted(() => [] as Array<string | undefined>);
 
 vi.mock('vscode', () => ({
   workspace: {
-    getConfiguration: () => ({
-      get: (key: string, fallback: unknown) =>
-        configValues.has(key) ? configValues.get(key) : fallback,
-    }),
+    getConfiguration: (section?: string) => {
+      configSections.push(section);
+      return {
+        get: (key: string, fallback: unknown) =>
+          configValues.has(key) ? configValues.get(key) : fallback,
+      };
+    },
   },
 }));
 
@@ -20,6 +25,14 @@ import { DEFAULT_HISTORY_PAGE_SIZE } from '../src/core/history';
 import { readHistoryPageSize } from '../src/host/config';
 
 describe('readHistoryPageSize', () => {
+  it('读取使用 svnAnywhere 配置段（冻结键 svnAnywhere.historyPageSize）', () => {
+    // 缺陷复现：vscode 替身若忽略 getConfiguration 的 section 参数，
+    // getConfiguration('svn') 这类误用不会被发现（真实宿主配置静默失效）。
+    configSections.length = 0;
+    readHistoryPageSize();
+    expect(configSections).toEqual(['svnAnywhere']);
+  });
+
   it('合法值 20/50/100 原样返回', () => {
     for (const value of [20, 50, 100]) {
       configValues.set('historyPageSize', value);

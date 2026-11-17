@@ -1,14 +1,14 @@
 /**
- * V5-3 编辑器集成 PoC：在真实 VS Code Extension Host 中验证
- * F107/F108 依赖的装饰、概览标尺、保存事件、活动编辑器切换与清理语义。
- * 结果以 JSONL 追加写入 /tmp/m4-stage0-v5/poc-result.jsonl，写完即退出进程。
+ * 编辑器集成 PoC：在真实 VS Code Extension Host 中验证
+ * 快速差异/行内追溯依赖的装饰、概览标尺、保存事件、活动编辑器切换与清理语义。
+ * 结果以 JSONL 追加写入 /tmp/svn-anywhere-vscode-poc/poc-result.jsonl，写完即退出进程。
  */
 const vscode = require('vscode');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const OUT_DIR = process.env.M4_V5_OUT || '/tmp/m4-stage0-v5';
+const OUT_DIR = process.env.VSCODE_POC_OUT || '/tmp/svn-anywhere-vscode-poc';
 function log(obj) {
   fs.appendFileSync(path.join(OUT_DIR, 'poc-result.jsonl'), JSON.stringify(obj) + '\n');
 }
@@ -20,7 +20,7 @@ function sleep(ms) {
 exports.run = async function run() {
   const startedAt = Date.now();
   try {
-    // 1. API 存在性（F107/F108 所需面）
+    // 1. API 存在性（快速差异/行内追溯所需面）
     const api = {
       createTextEditorDecorationType: typeof vscode.window.createTextEditorDecorationType,
       setDecorationsOnEditor: typeof vscode.window.activeTextEditor?.setDecorations,

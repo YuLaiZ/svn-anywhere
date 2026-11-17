@@ -1,5 +1,5 @@
 /**
- * P5 远端只读内容（M4 阶段 2 任务 3 的宿主内容部分）：
+ * P5 远端只读内容（M4 阶段 2 的宿主内容部分）：
  * - 注册带仓库身份/revision 的 TextDocumentContentProvider（自定义 scheme），
  *   只读文本 ≤16 MiB 内嵌；URI 含仓库 UUID、原始 URL、revision 与一次性
  *   内容键，不回写工作副本、不产生工作副本文件；
@@ -12,10 +12,13 @@
  *
  * 只读保障：provider 只提供内容，不注册 FileSystemProvider、不提供写盘
  * 通道；文档不能被保存回任何位置（provider 文档的编辑只停留在内存模型，
- * 技术方案 §3.4 已知边界，由 UI 与命令入口约束）。
+ * 已知边界，由 UI 与命令入口约束）。
  *
  * 内容分类沿用 core/remoteContent：先读 `svn:mime-type`（缺失视为无
  * mime），再读前 8 KiB 判 NUL；MIME 非 `text/*` 或含 NUL 即二进制。
+ * 文本候选打开前再探测 `svn:special`：符号链接的 cat 内容是
+ * `link <target>` 原文（无 mime、无 NUL），命中时返回显式 special 状态，
+ * 不把链接原文送进内嵌文本预览。
  * 每次内容读取都经 core 原语的 `--non-interactive` 与 authScope /
  * credentialProvider 链（RunOptions 由调用方传入）。
  */
@@ -36,6 +39,7 @@ import {
 import type { RunOptions } from '../core/svnCli';
 import { format, strings } from './i18n';
 import { logLine } from './output';
+import { probeSnapshotSpecial } from './panel/snapshotModel';
 
 // ---------------------------------------------------------------------------
 // 常量与类型
@@ -326,6 +330,11 @@ export type RemoteContentOpenOutcome =
     }
   /** 已下载到临时文件但系统默认应用拒绝打开（文件保留供手动打开）。 */
   | { status: 'externalOpenFailed'; filePath: string; bytesWritten: number }
+  /**
+   * svn:special 符号链接：不进入内嵌文本预览（cat 输出为 `link <target>`
+   * 原文）；调用方按此状态给出提示，可导出或外部打开。
+   */
+  | { status: 'special' }
   | { status: 'tooLarge'; sizeBytes: number; limitBytes: number }
   | { status: 'insufficientDisk'; message: string }
   | { status: 'notFound'; error: BrowserError }
@@ -423,13 +432,15 @@ async function downloadAndOpenExternal(
 /**
  * 打开远端文件内容（P5 节点只读打开的唯一宿主入口）。
  *
- * 决策顺序（技术方案 §3.4）：
+ * 决策顺序：
  * 1. `svn:mime-type` + 前 8 KiB NUL 探测分类；
  * 2. 已知大小 > 2 GiB → tooLarge（不启动 cat）；
  * 3. 二进制（任意大小）→ runToFile 临时资源 + 系统默认应用；
- * 4. 文本大小未知或 ≤16 MiB → 流式读取（16 MiB 上限兜底）后经只读
+ * 4. 文本候选 → 探测 `svn:special`：符号链接返回显式 special 状态，
+ *    不进入内嵌文本预览；
+ * 5. 文本大小未知或 ≤16 MiB → 流式读取（16 MiB 上限兜底）后经只读
  *    provider 打开；
- * 5. 文本实际超过内嵌上限（大小未知情形）→ 降级为临时资源外部打开，
+ * 6. 文本实际超过内嵌上限（大小未知情形）→ 降级为临时资源外部打开，
  *    reason='textTooLarge'（页面文案「文件过大，未使用内置文本预览」由
  *    P5 控制器按该状态展示）。
  *
@@ -470,6 +481,12 @@ export async function openRemoteContent(
     return downloadAndOpenExternal(svnPath, node, revision, runOptions, sizeBytes, plan.reason);
   }
 
+  // 文本候选先探测 svn:special：符号链接的 cat 输出是 `link <target>`
+  // 原文，MIME/NUL 分类会误判为普通文本；命中时不进入内嵌文本预览。
+  if (await probeSnapshotSpecial(svnPath, node.rawUrl, revision, runOptions)) {
+    return { status: 'special' };
+  }
+
   const text = await readRemoteText(svnPath, node.rawUrl, {
     ...runOptions,
     revision,
@@ -500,7 +517,19 @@ export async function openRemoteContent(
     displayNameOfNode(node),
     contentKey,
   );
-  await vscode.window.showTextDocument(uri, { preview: false, preserveFocus: false });
+  try {
+    await vscode.window.showTextDocument(uri, { preview: false, preserveFocus: false });
+  } catch (err) {
+    // 文档从未打开时 onDidCloseTextDocument 不会触发：必须立即回收内容键，
+    // 否则每次失败都滞留一份 ≤16 MiB 文本直到停用/进程退出。
+    documentContents.delete(contentKey);
+    const message = err instanceof Error ? err.message : String(err);
+    logLine(format(strings.error.failed, { message }), 'browse');
+    return {
+      status: 'error',
+      error: { kind: 'unknown', message: `Cannot open read-only document: ${message}`, codes: [] },
+    };
+  }
   logLine(format(strings.browse.openTextLog, {
     url: node.rawUrl,
     revision: String(revision),

@@ -21,6 +21,7 @@ import {
 } from '../src/core/conflict';
 import { createSvnLab, writeFile, type SvnLab } from './helpers';
 import { render } from '../src/host/panel/view';
+import type { ActionSpec } from '../src/host/panel/state';
 import { resetM4SessionStore } from '../src/host/sessionResults';
 import { strings } from '../src/host/i18n';
 import {
@@ -34,6 +35,7 @@ import {
   buildConflictDetail,
   classifyWorkingCopyContent,
   conflictScopeOf,
+  conflictText,
   createRemoteAuthorizer,
   createWorkingCopyContentClassifier,
   describePropertyValue,
@@ -558,6 +560,71 @@ describe('冲突详情', () => {
     expect(describePropertyValue({ exists: true, value: Buffer.from('x'.repeat(500)) })).toContain('已截断');
   });
 
+  it('纯属性记录：全部属性选择完成后渲染 working 入口，未选完禁用并给原因', () => {
+    const record = makeRecord({
+      path: 'prop-only.txt',
+      kinds: ['property'],
+      contentKind: 'unknown',
+      propertyConflicts: [
+        property('k1', 'l1', 'b1', 'i1'),
+        property('k2', 'l2', 'b2', 'i2'),
+      ],
+    });
+    const row = { key: record.id, path: record.path, kinds: record.kinds, status: 'unresolved' as const, record };
+    const actionsOf = (detail: ReturnType<typeof buildConflictDetail>): ActionSpec[] =>
+      detail.sections.flatMap((section) => (section.kind === 'actions' ? section.actions : []));
+
+    // 未选择：入口存在但禁用（compareNeedsTwo 同型：动作稳定、可用性跟选择走）。
+    const incomplete = buildConflictDetail({
+      row,
+      propertyChoices: { k1: 'local' },
+      propertySelectionComplete: false,
+    });
+    const partial = actionsOf(incomplete).find((action) => action.id === 'applyConflictResolution');
+    expect(partial).toMatchObject({ label: conflictText('detailApplyPropertyWorking'), disabled: true });
+    expect(partial?.disabledReason).toBe(conflictText('detailPropertyIncomplete'));
+
+    const complete = buildConflictDetail({
+      row,
+      propertyChoices: { k1: 'local', k2: 'incoming' },
+      propertySelectionComplete: true,
+    });
+    expect(actionsOf(complete).find((action) => action.id === 'applyConflictResolution')).toMatchObject({
+      label: conflictText('detailApplyPropertyWorking'),
+      disabled: false,
+    });
+  });
+
+  it('纯属性记录（模型）：choosePropertyValue 意图全部选完后 detail 入口启用（同源 propertySelectionComplete）', () => {
+    const record = makeRecord({
+      path: 'prop-model.txt',
+      kinds: ['property'],
+      contentKind: 'unknown',
+      propertyConflicts: [
+        property('k1', 'l1', 'b1', 'i1'),
+        property('k2', 'l2', 'b2', 'i2'),
+      ],
+    });
+    const model = modelWith([record]);
+    model.select(record.id);
+    expect(model.propertySelectionComplete(record.id)).toBe(false);
+    const before = model.detail()!;
+    const beforeActions = before.sections.flatMap((section) => (section.kind === 'actions' ? section.actions : []));
+    expect(beforeActions.find((action) => action.id === 'applyConflictResolution')?.disabled).toBe(true);
+
+    expect(model.selectPropertyValue(record.id, 'k1', 'local')).toBe('selected');
+    expect(model.propertySelectionComplete(record.id)).toBe(false);
+    expect(model.selectPropertyValue(record.id, 'k2', 'incoming')).toBe('selected');
+    expect(model.propertySelectionComplete(record.id)).toBe(true);
+
+    const after = model.detail()!;
+    const afterActions = after.sections.flatMap((section) => (section.kind === 'actions' ? section.actions : []));
+    expect(afterActions.find((action) => action.id === 'applyConflictResolution')).toMatchObject({
+      label: conflictText('detailApplyPropertyWorking'),
+      disabled: false,
+    });
+  });
+
   it('树冲突：元数据 + 确认状态切换动作可用性', () => {
     const record = makeRecord({
       path: 'tree-del.txt',
@@ -627,6 +694,34 @@ describe('冲突详情', () => {
     expect(text).toContain('theirs-full');
     expect(text).toContain('op-42');
     expect(text).toContain('已解决');
+  });
+
+  it('属性值补查失败：详情渲染「补齐认证」入口（authenticateConflictSource）', () => {
+    // 属性冲突值缺失（propertyConflicts 为空）是远端补查失败/未认证的降级形态。
+    const unavailable = makeRecord({ path: 'prop-unavailable.txt', kinds: ['property'], contentKind: 'unknown' });
+    const actionsOf = (detail: ReturnType<typeof buildConflictDetail>): ActionSpec[] =>
+      detail.sections.flatMap((section) => (section.kind === 'actions' ? section.actions : []));
+    const detail = buildConflictDetail({
+      row: { key: unavailable.id, path: unavailable.path, kinds: unavailable.kinds, status: 'unresolved', record: unavailable },
+    });
+    const authAction = actionsOf(detail).find((action) => action.id === 'authenticateConflictSource');
+    expect(authAction).toMatchObject({ label: conflictText('detailAuthenticateSource') });
+    expect(authAction?.disabled).not.toBe(true);
+    // 属性段仍有「补查失败」提示（动作与说明同源）。
+    const properties = detail.sections.find((section) => section.kind === 'properties');
+    expect(properties?.kind === 'properties' ? properties.note : undefined).toBe(conflictText('propertyUnavailableNotice'));
+
+    // 属性值完整时没有认证入口（不制造无意义动作）。
+    const available = makeRecord({
+      path: 'prop-ok.txt',
+      kinds: ['property'],
+      contentKind: 'unknown',
+      propertyConflicts: [property('m', 'l', 'b', 'i')],
+    });
+    const okDetail = buildConflictDetail({
+      row: { key: available.id, path: available.path, kinds: available.kinds, status: 'unresolved', record: available },
+    });
+    expect(actionsOf(okDetail).some((action) => action.id === 'authenticateConflictSource')).toBe(false);
   });
 });
 
@@ -730,6 +825,79 @@ describe('扫描代次与关闭重开恢复', () => {
     expect(restoreConflictSession(other, { wcRoot: '/other', scopeRelPath: '.' })).toBe(false);
     resetM4SessionStore();
   });
+
+  it('adoptScope：同一工作副本换范围保留台账/推迟，换工作副本全部清空', () => {
+    const taskScope = { wcRoot: '/wc', scopeRelPath: 'src' };
+    const model = new ConflictModel();
+    model.adoptScope(taskScope);
+    const record = makeRecord({ path: 'src/a.txt' });
+    const epoch = model.beginScan();
+    expect(model.applyScan(epoch, makeOutcome([record], { scope: taskScope }))).toBe(true);
+    model.postpone(record.id);
+    model.setTab('text');
+    model.select(record.id);
+    model.recordResolved({
+      fingerprint: 'fp-done',
+      path: 'src/done.txt',
+      kinds: ['text'],
+      strategy: 'mine-full',
+      operationId: 'op-done',
+      resolvedAt: 5,
+    });
+
+    // 同一工作副本：台账/推迟保留（切换范围不丢已解决状态）；筛选/快照
+    // 等展示态由新范围扫描/恢复重建。
+    model.adoptScope({ wcRoot: '/wc', scopeRelPath: '.' });
+    expect(model.ledger().map((entry) => entry.path)).toEqual(['src/done.txt']);
+    expect(model.postponed()).toHaveLength(1);
+    expect(model.tab()).toBe('all');
+    expect(model.records()).toHaveLength(0);
+    expect(model.phase()).toBe('idle');
+
+    // 换工作副本：台账与推迟随作用域项淘汰。
+    model.adoptScope({ wcRoot: '/other', scopeRelPath: '.' });
+    expect(model.ledger()).toHaveLength(0);
+    expect(model.postponed()).toHaveLength(0);
+    expect(model.tab()).toBe('all');
+  });
+
+  it('任务范围 resolve 后切整副本仍显示已解决（台账跨范围页移交，真实新冲突优先）', () => {
+    resetM4SessionStore();
+    const taskScope = { wcRoot: '/wc', scopeRelPath: 'src/sub' };
+    const taskModel = new ConflictModel();
+    taskModel.adoptScope(taskScope);
+    const taskEpoch = taskModel.beginScan();
+    expect(taskModel.applyScan(taskEpoch, makeOutcome([], { scope: taskScope }))).toBe(true);
+    taskModel.recordResolved({
+      fingerprint: 'fp-a',
+      path: 'src/sub/a.txt',
+      kinds: ['text'],
+      strategy: 'mine-full',
+      operationId: 'op-a',
+      resolvedAt: 3,
+    });
+    expect(persistConflictSession(taskModel)).toBeDefined();
+
+    // 切整副本：'.' 页无本页快照（恢复返回 false → 控制器照常 fresh 扫描），
+    // 但任务范围页的台账已移交进模型。
+    const whole = new ConflictModel();
+    expect(restoreConflictSession(whole, { wcRoot: '/wc', scopeRelPath: '.' })).toBe(false);
+    expect(whole.ledger().map((entry) => entry.path)).toEqual(['src/sub/a.txt']);
+    const scan = whole.beginScan();
+    expect(whole.applyScan(scan, makeOutcome([], { scope: { wcRoot: '/wc', scopeRelPath: '.' } }))).toBe(true);
+    const resolvedRow = whole.rows().find((row) => row.path === 'src/sub/a.txt');
+    expect(resolvedRow?.status).toBe('resolved');
+    expect(whole.summary().total).toBe(0);
+
+    // 真实扫描仍报告同一路径 + 类型冲突时以未解决为准（真实新冲突优先）。
+    const rescan = whole.beginScan();
+    const conflictedAgain = makeRecord({ path: 'src/sub/a.txt' });
+    expect(whole.applyScan(rescan, makeOutcome([conflictedAgain], {
+      scope: { wcRoot: '/wc', scopeRelPath: '.' },
+    }))).toBe(true);
+    expect(whole.rows().find((row) => row.path === 'src/sub/a.txt')?.status).toBe('unresolved');
+    resetM4SessionStore();
+  });
 });
 
 /* ---------------------------------------------------------------------------
@@ -763,6 +931,29 @@ describe('buildPanelState', () => {
     expect(state.conflictList?.kindLabels?.text).toBeTruthy();
     expect(state.detail?.title).toContain('选择冲突');
     expect(state.banners.some((banner) => banner.id === 'conflictExternalBoundary')).toBe(true);
+  });
+
+  it('扫描进度区的关闭/查看日志动作复用 i18n.panel 键（不硬编码文案）', () => {
+    const model = new ConflictModel();
+    model.adoptScope({ wcRoot: '/wc', scopeRelPath: '.' });
+    model.beginScan();
+    const progress = model.buildPanelState('s1').progress;
+    expect(progress?.actions).toEqual([
+      { id: 'closePanel', label: strings.panel.taskProgressClose },
+      { id: 'viewTaskLog', label: strings.panel.taskProgressLog },
+    ]);
+  });
+
+  it('属性值补查失败路径渲染面板级「补齐认证」横幅（authenticateConflictSource）', () => {
+    const record = makeRecord({ path: 'p.txt' });
+    const model = new ConflictModel();
+    model.adoptScope({ wcRoot: '/wc', scopeRelPath: '.' });
+    const epoch = model.beginScan();
+    expect(model.applyScan(epoch, makeOutcome([record], { propertyValueFailures: ['p.txt'] }))).toBe(true);
+    const banner = model.buildPanelState('s1').banners.find((candidate) => candidate.id === 'conflictPropertyValueFailures');
+    expect(banner).toBeDefined();
+    expect(banner?.detail).toContain('p.txt');
+    expect(banner?.actions?.map((action) => action.id)).toEqual(['authenticateConflictSource']);
   });
 
   it('external 边界横幅可关闭：会话内保持关闭，切换目标后恢复', () => {

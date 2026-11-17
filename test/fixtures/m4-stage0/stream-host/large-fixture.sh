@@ -1,22 +1,22 @@
 #!/bin/bash
-# M4 阶段 0 / V3 可复跑大目录 fixture：50k 条目（短名）与 >64MiB XML（深长路径）。
-# 大目录只落在实验根（默认 /tmp/m4-stage0-V3/large），不进入仓库。
-# 用法：M4_STAGE0_ROOT=/tmp/m4-stage0-V3 ./large-fixture.sh
+# 可复跑大目录 fixture：50k 条目（短名）与 >64MiB XML（深长路径）。
+# 大目录只落在实验根（默认 /tmp/svn-anywhere-stream-host/large），不进入仓库。
+# 用法：FIXTURE_ROOT=/tmp/svn-anywhere-stream-host ./large-fixture.sh
 set -euo pipefail
 export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
-ROOT=${M4_STAGE0_ROOT:-/tmp/m4-stage0-V3}
-export M4_STAGE0_ROOT="$ROOT"
+ROOT=${FIXTURE_ROOT:-/tmp/svn-anywhere-stream-host}
+export FIXTURE_ROOT="$ROOT"
 URL="file://$ROOT/fixture01/repo"
 TREE=$ROOT/large/tree
 mkdir -p "$ROOT/logs"
-exec > >(tee "$ROOT/logs/v3-large-fixture.log") 2>&1
-echo "== V3 大目录构造 $(date -u +%FT%TZ) =="
+exec > >(tee "$ROOT/logs/stream-large-fixture.log") 2>&1
+echo "== 大目录构造 $(date -u +%FT%TZ) =="
 rm -rf "$TREE"
 mkdir -p "$TREE/large/empty" "$TREE/large/dir50k"
 
 python3 -I - <<'PY'
 import os
-root = os.environ.get('M4_STAGE0_LARGE_DIR') or (os.environ.get('M4_STAGE0_ROOT') or '/tmp/m4-stage0-V3') + '/large/tree'
+root = os.environ.get('FIXTURE_LARGE_DIR') or (os.environ.get('FIXTURE_ROOT') or '/tmp/svn-anywhere-stream-host') + '/large/tree'
 root = root + '/large/dir50k'
 for i in range(50000):
     with open(os.path.join(root, f'f{i:05d}.txt'), 'wb') as f:
@@ -29,7 +29,7 @@ time svn import -q --non-interactive -m 'large/empty + large/dir50k (50k files)'
 
 python3 -I - <<'PY'
 import os
-root = (os.environ.get('M4_STAGE0_ROOT') or '/tmp/m4-stage0-V3') + '/large/tree/large/dir64m'
+root = (os.environ.get('FIXTURE_ROOT') or '/tmp/svn-anywhere-stream-host') + '/large/tree/large/dir64m'
 seg = 'd' * 200
 fname = 'f' * 200 + '.txt'
 for a in range(20):

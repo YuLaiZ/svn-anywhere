@@ -19,6 +19,7 @@ import type {
   TableRowSpec,
   TableSpec,
 } from '../src/host/panel/state';
+import { createP6Gates, createP7Gates, allowedActions } from '../src/host/panel/gates';
 import { strings, format } from '../src/host/i18n';
 
 function baseState(patch: Partial<PanelState> = {}): PanelState {
@@ -850,6 +851,7 @@ describe('render：P6 表格选择与 append 分页', () => {
         sort: { key: 'revision', direction: 'desc' },
         pagination: { page: 1, pageSize: 2, total: 50, pageCount: 1, mode: 'append' },
         selection: { mode: 'revision', maxSelected: 2, ariaLabel: '选择要比较的 revision' },
+        rowSelectIntent: 'selectHistoryRevision',
         rows: [
           {
             id: 'r9',
@@ -919,6 +921,17 @@ describe('render：P6 表格选择与 append 分页', () => {
     expect(html).not.toContain('data-intent="selectHistoryRevision"');
   });
 
+  it('未声明 rowSelectIntent 的表格（导入预览/大文件表）：行上不注入历史行意图', () => {
+    const html = render(historyState({
+      id: 'importPreview',
+      rowSelectIntent: undefined,
+      selection: undefined,
+    }));
+    expect(html).toContain('<tr data-row-id="r9"');
+    expect(html).not.toMatch(/<tr data-row-id="r9"[^>]*data-intent/);
+    expect(html).not.toContain('data-intent="selectHistoryRevision"');
+  });
+
   it('占用态无放行视图时勾选与行选中一并禁用', () => {
     const html = render(historyState({}, { busy: true }));
     expect(html).toMatch(/data-intent="toggleHistoryRevision"[^>]*disabled/);
@@ -940,6 +953,7 @@ describe('render：P6 历史表格（行、append 页脚与增量行片段）', 
       sort: { key: 'revision', direction: 'desc' },
       pagination: { page: 1, pageSize: 2, total: 80, pageCount: 1, mode: 'append' },
       selection: { mode: 'revision', maxSelected: 2, ariaLabel: '选择要比较的 revision' },
+      rowSelectIntent: 'selectHistoryRevision',
       rows: [
         {
           id: 'r1280',
@@ -2180,5 +2194,123 @@ describe('render：P7 窄面板 CSS 契约（294/400）', () => {
     const narrowConflictActs = css.indexOf('.conflict-item .acts { margin-left: 0; }');
     expect(narrowConflictActs).toBeGreaterThan(baseConflictActs);
     expect(css).toContain('.confirm-dialog { width: 100%; padding: 12px; }');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 占用态页脚/横幅/确认框禁用与放行表同源
+// ---------------------------------------------------------------------------
+
+describe('render：占用态页脚/横幅/确认框按放行表同源禁用', () => {
+  /** 取 data-intent（可选 data-action-id）对应的按钮开标签。 */
+  function buttonTag(html: string, intent: string, actionId?: string): string {
+    const extra = actionId === undefined ? '' : `[^>]*data-action-id="${actionId}"`;
+    const match = new RegExp(`<button[^>]*data-intent="${intent}"${extra}[^>]*>`).exec(html);
+    expect(match, `button ${intent}${actionId === undefined ? '' : `/${actionId}`}`).not.toBeNull();
+    return match![0];
+  }
+
+  /** 携带放行视图的渲染状态：gate 由同一张表求值（与宿主 renderStateOf 同源）。 */
+  function gatedState(patch: Partial<PanelState>): PanelState {
+    return baseState(patch);
+  }
+
+  it('P6 busy：页脚 loadMore/refresh/reset 禁用，横幅日志/关闭放行，× 禁用（与 P6 表同源）', () => {
+    const gates = createP6Gates();
+    const state = gatedState({
+      busy: true,
+      gate: { busy: allowedActions(gates.busy), writeLocked: allowedActions(gates.writeLocked) },
+      footer: {
+        summary: '目标历史 3 条',
+        primary: { id: 'loadMoreHistory', label: '加载更多' },
+        secondary: [
+          { id: 'refreshHistoryUpper', label: '刷新 HEAD' },
+          { id: 'resetHistorySession', label: '重置会话' },
+        ],
+      },
+      banners: [{
+        id: 'historyUpdate',
+        level: 'info',
+        title: '正在更新',
+        actions: [
+          { id: 'viewTaskLog', label: '查看日志' },
+          { id: 'closePanel', label: '关闭面板' },
+        ],
+        dismissable: true,
+      }],
+    });
+    const html = render(state);
+    // P6 busy 行不含写意图（loadMore/refresh/reset 均属等待集）。
+    expect(buttonTag(html, 'loadMoreHistory')).toContain(' disabled');
+    expect(buttonTag(html, 'refreshHistoryUpper')).toContain(' disabled');
+    expect(buttonTag(html, 'resetHistorySession')).toContain(' disabled');
+    // 放行集内的横幅动作：与宿主守卫同表，DOM 可点。
+    expect(buttonTag(html, 'bannerAction', 'viewTaskLog')).not.toContain(' disabled');
+    expect(buttonTag(html, 'bannerAction', 'closePanel')).not.toContain(' disabled');
+    // dismissBanner 不在 P6 放行集：× 同源禁用，不出现可点被拒。
+    expect(buttonTag(html, 'dismissBanner')).toContain(' disabled');
+  });
+
+  it('P7 writeLocked：写/批量与确认框禁用，回扫与日志放行，× 禁用（与 P7 表同源）', () => {
+    const gates = createP7Gates();
+    const state = gatedState({
+      writeLocked: true,
+      gate: { busy: allowedActions(gates.busy), writeLocked: allowedActions(gates.writeLocked) },
+      footer: {
+        summary: '冲突 2 项',
+        primary: { id: 'planConflictBatch', label: '批量处理' },
+        secondary: [
+          { id: 'rescanConflicts', label: '重新扫描' },
+          { id: 'startConflictBatch', label: '开始批量' },
+        ],
+      },
+      banners: [{
+        id: 'conflictExternalBoundary',
+        level: 'warn',
+        title: '外部副本成员不进入本副本冲突列表',
+        actions: [{ id: 'viewTaskLog', label: '查看日志' }],
+        dismissable: true,
+      }],
+      confirmDialog: {
+        id: 'dialog-1',
+        title: '确认应用？',
+        confirm: { id: 'applyConflictResolution', label: '应用所选处理结果' },
+      },
+    });
+    const html = render(state);
+    // writeLocked 行只放行回扫与只读查看，写/批量必须等待。
+    expect(buttonTag(html, 'planConflictBatch')).toContain(' disabled');
+    expect(buttonTag(html, 'startConflictBatch')).toContain(' disabled');
+    expect(buttonTag(html, 'rescanConflicts')).not.toContain(' disabled');
+    expect(buttonTag(html, 'bannerAction', 'viewTaskLog')).not.toContain(' disabled');
+    expect(buttonTag(html, 'dismissBanner')).toContain(' disabled');
+    // 确认框确认按钮与守卫同源：占用态不可点。
+    expect(buttonTag(html, 'applyConflictResolution')).toContain(' disabled');
+    // 对话框内的取消是纯 Webview 瞬时关闭（不发意图），不受放行表约束。
+    expect(html).toContain('data-dialog-dismiss="dialog-1"');
+  });
+
+  it('未携带放行视图的面板（M2）保持既有渲染：页脚/横幅动作不额外禁用', () => {
+    const state = baseState({
+      busy: true,
+      footer: {
+        summary: '待核实',
+        primary: { id: 'commit', label: '提交' },
+        secondary: [{ id: 'resolveUnknown', label: '核实' }],
+      },
+      banners: [{
+        id: 'notice',
+        level: 'info',
+        title: '提示',
+        actions: [{ id: 'viewTaskLog', label: '查看日志' }],
+        dismissable: true,
+      }],
+    });
+    const html = render(state);
+    // 未携带 gate：视图不猜测放行集，保持 M2 现状（守卫仍会拒绝）。
+    expect(buttonTag(html, 'commit')).not.toContain(' disabled');
+    expect(buttonTag(html, 'resolveUnknown')).not.toContain(' disabled');
+    expect(buttonTag(html, 'bannerAction', 'viewTaskLog')).not.toContain(' disabled');
+    expect(buttonTag(html, 'dismissBanner')).not.toContain(' disabled');
   });
 });

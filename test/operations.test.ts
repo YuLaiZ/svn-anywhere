@@ -22,7 +22,18 @@ import {
   type OperationRecord,
   type OperationStore,
   type ResolveIntent,
+  type ResolveIntentTarget,
 } from '../src/core/operations';
+// 意图类型的单一权威定义在 core/operations；historyUpdate/resolve
+// 只重导出。下面两个导入用于断言两侧类型完全一致（漂移时本文件编译失败）。
+import type { HistoryUpdateIntent as ModuleHistoryUpdateIntent } from '../src/core/historyUpdate';
+import type {
+  ResolveIntent as ModuleResolveIntent,
+  ResolveIntentTarget as ModuleResolveIntentTarget,
+} from '../src/core/resolve';
+
+/** 严格类型相等判定（若两侧不一致，赋值 true 会在 typecheck 失败）。 */
+type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false;
 
 // 运行登记是模块级单例：每个用例前清空，防失败路径残留键污染 loadPending 分诊。
 beforeEach(() => {
@@ -968,6 +979,28 @@ const m4RecordOf = (phase: OperationPhase, kind: OperationKind): OperationRecord
   knownRevisions: [],
   updatedAt: 0,
   kind,
+});
+
+describe('意图类型单一权威', () => {
+  it('HistoryUpdateIntent/ResolveIntent/ResolveIntentTarget 与 operations 定义严格一致', () => {
+    // 若 historyUpdate/resolve 的声明与 operations 漂移，下面的类型赋值会
+    // 编译失败（pnpm run typecheck 覆盖 test/）；运行时断言保证用例被执行。
+    const historyUpdateIntentSame: Equal<HistoryUpdateIntent, ModuleHistoryUpdateIntent> = true;
+    const resolveIntentSame: Equal<ResolveIntent, ModuleResolveIntent> = true;
+    const resolveTargetSame: Equal<ResolveIntentTarget, ModuleResolveIntentTarget> = true;
+    expect(historyUpdateIntentSame).toBe(true);
+    expect(resolveIntentSame).toBe(true);
+    expect(resolveTargetSame).toBe(true);
+
+    // 运行时形状：重导出的类型对应的字面量仍满足权威定义（同一持久契约）。
+    const intent: ModuleHistoryUpdateIntent = HISTORY_UPDATE_INTENT;
+    const resolveIntent: ModuleResolveIntent = RESOLVE_INTENT;
+    expect(intent.requestedRevision).toBe(1281);
+    expect(resolveIntent.targets.map((target) => target.conflictKinds)).toEqual([
+      ['text'],
+      ['property', 'tree'],
+    ]);
+  });
 });
 
 describe('M4 kind×phase 矩阵：history-update / resolve', () => {

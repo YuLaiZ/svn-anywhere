@@ -4,14 +4,14 @@
  * 5,000/100,000 上限与 historyLimitState.reasons、upper 状态语义与
  * resetHistorySession/refreshHistoryUpper、实际节点映射与 notFoundAtRevision。
  *
- * 期望值来源（M4 阶段 0 V2 实测，均已回填技术方案 §4.1/§4.3）：
- * - B6：「500 扫描 80 匹配 50 展示 30 pending、next cursor=60」；
- * - C12：同构小参数（pageSize=2、matched limit=2、scanned limit=6、
+ * 期望值来源（真实 svn 实测，与历史分页/节点解析契约一致）：
+ * - 500 条扫描预算：「500 扫描 80 匹配 50 展示 30 pending、next cursor=60」；
+ * - 同构小参数（pageSize=2、matched limit=2、scanned limit=6、
  *   单轮预算 6）验证到达上限停止请求、最后一批越过完整保留、双 reason
  *   并存、pending 清空后 hasMore 转 false；
- * - C9：连续两轮各 500 条独立预算、跨源同 revision 去重、累计计数；
- * - C7/C8：ancestor-filter 严格规则与「同名来源路径不误归因」；
- * - C11：info absent 判定只认 W170000+E200009+空 entry。
+ * - 连续两轮各 500 条独立预算、跨源同 revision 去重、累计计数；
+ * - ancestor-filter 严格规则与「同名来源路径不误归因」；
+ * - info absent 判定只认 W170000+E200009+空 entry。
  * svn 命令用 mock（vi.mock ../src/core/svnCli 的 run），XML 全部内联；
  * 不访问真实 SVN。
  */
@@ -295,6 +295,33 @@ describe('parseLogXml', () => {
       propMods: undefined,
     });
   });
+
+  it('畸形/截断/非 XML 输出抛 XML_PARSE，不静默返回空历史', () => {
+    // fast-xml-parser 的 XMLParser 对截断文档会静默产出空对象，
+    // 旧实现 catch 返回 []，宿主按 empty/noMatch 呈现；修复后必须抛
+    // SvnError(code=XML_PARSE)，与 snapshot/blame 的解析失败口径一致。
+    const malformed = [
+      '<log><logentry revision="1">', // 截断：未闭合标签
+      '<log', // 未闭合起始标签
+      'not xml at all', // 非 XML 文本
+      '<log></log><extra>', // 尾部未闭合
+    ];
+    for (const xml of malformed) {
+      let caught: unknown;
+      try {
+        parseLogXml(xml);
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught, xml).toBeInstanceOf(SvnError);
+      expect((caught as SvnError).code).toBe('XML_PARSE');
+      // 原始输出保留在 stderr 供诊断；message 不含凭据（此处也无）。
+      expect((caught as SvnError).stderr.length).toBeGreaterThan(0);
+      // core 不返回面向用户的中文叙述句（与 snapshot/blame 同口径）。
+      expect((caught as Error).message).not.toMatch(/[一-鿿]/);
+      expect((caught as Error).message).toContain('svn log XML parse failed');
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -380,7 +407,7 @@ describe('urlForRepositoryPath', () => {
 });
 
 // ---------------------------------------------------------------------------
-// ancestor-filter 严格命中规则（阶段 0 C7/C8）
+// ancestor-filter 严格命中规则（本地实测口径）
 // ---------------------------------------------------------------------------
 
 describe('revisionMatchesHistoryTrackedPath 严格规则', () => {
@@ -409,7 +436,7 @@ describe('revisionMatchesHistoryTrackedPath 严格规则', () => {
       tracked,
       'file',
     )).toBe(true);
-    // C8：祖先目录首次创建（A 无 copyfrom、同 revision 未添加目标路径）不得命中，
+    // 祖先目录首次创建（A 无 copyfrom、同 revision 未添加目标路径）不得命中，
     // 否则「目标从未存在」会被误判为有历史。
     expect(revisionMatchesHistoryTrackedPath(
       makeEntry(1, { paths: [{ path: '/trunk', action: 'A' }] }),
@@ -445,7 +472,7 @@ describe('revisionMatchesHistoryTrackedPath 严格规则', () => {
     )).toBe(false);
   });
 
-  it('C7：来源目录里的同名相对路径不误归给目标（按完整仓库路径前缀）', () => {
+  it('来源目录里的同名相对路径不误归给目标（按完整仓库路径前缀）', () => {
     const branchRecord = makeEntry(1, {
       paths: [{ path: '/branches/base/x.txt', action: 'M' }],
     });
@@ -464,7 +491,7 @@ describe('revisionMatchesHistoryTrackedPath 严格规则', () => {
 });
 
 describe('findCopySource 复制边界', () => {
-  it('C7：优先最具体（文件级）复制记录并把相对后缀带到来源', () => {
+  it('优先最具体（文件级）复制记录并把相对后缀带到来源', () => {
     const entries = [
       makeEntry(3, {
         paths: [
@@ -486,7 +513,7 @@ describe('findCopySource 复制边界', () => {
     });
   });
 
-  it('目录目标的祖先复制按相对后缀映射来源（C7：/branches/base + x.txt）', () => {
+  it('目录目标的祖先复制按相对后缀映射来源（如 /branches/base + x.txt）', () => {
     const entries = [
       makeEntry(3, {
         paths: [{ path: '/trunk', action: 'A', copyfromPath: '/branches/base', copyfromRevision: 1 }],
@@ -499,7 +526,7 @@ describe('findCopySource 复制边界', () => {
     });
   });
 
-  it('B5：目录自身复制（A /C copyfrom /B@4）', () => {
+  it('目录自身复制（A /C copyfrom /B@4）', () => {
     const entries = [
       makeEntry(5, {
         paths: [{ path: '/C', action: 'A', copyfromPath: '/B', copyfromRevision: 4 }],
@@ -523,7 +550,7 @@ describe('findCopySource 复制边界', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 身份链终止（无 copyfrom 的首次 A/R，§4.1）
+// 身份链终止（无 copyfrom 的首次 A/R）
 // ---------------------------------------------------------------------------
 
 describe('身份链终止（无 copyfrom 的首次 A/R）', () => {
@@ -757,10 +784,10 @@ describe('单源 cursor 与批次', () => {
 });
 
 // ---------------------------------------------------------------------------
-// B6：500 条扫描预算 → 80 匹配 → 50 展示 / 30 pending / next cursor=60
+// 500 条扫描预算 → 80 匹配 → 50 展示 / 30 pending / next cursor=60
 // ---------------------------------------------------------------------------
 
-describe('500 条扫描预算（阶段 0 B6 fixture）', () => {
+describe('500 条扫描预算（同构 fixture）', () => {
   /** budget 仓库：r560 删除目标；r481..r559 共 79 次修改；r1 创建。 */
   function buildBudgetRows(): HistoryEntry[] {
     const rows: HistoryEntry[] = [
@@ -840,7 +867,7 @@ describe('500 条扫描预算（阶段 0 B6 fixture）', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 上限语义（阶段 0 C12 同构小参数）
+// 上限语义（同构小参数）
 // ---------------------------------------------------------------------------
 
 describe('5,000 命中 / 100,000 扫描上限语义（同构小参数）', () => {
@@ -958,15 +985,15 @@ describe('5,000 命中 / 100,000 扫描上限语义（同构小参数）', () =>
 });
 
 // ---------------------------------------------------------------------------
-// 六类计数、跨源去重与连续两轮独立预算（阶段 0 C9 同构）
+// 六类计数、跨源去重与连续两轮独立预算（同构 fixture）
 // ---------------------------------------------------------------------------
 
-describe('多源源栈、六类计数与连续两轮预算独立（阶段 0 C9）', () => {
+describe('多源源栈、六类计数与连续两轮预算独立（同构 fixture）', () => {
   const pageSize = 50;
   const limits = DEFAULT_HISTORY_LIMITS;
 
   /**
-   * 阶段 0 gen-counts-fixture 的合成回包（直接注入，不经分页模拟）：
+   * gen-counts-fixture 生成的合成回包（直接注入，不经分页模拟）：
    * 第 1 轮祖先源 1397..901（497 条）+ copyfrom 源 903,902,901（与祖先
    * 重复）→ raw=500、唯一 497；第 2 轮祖先源 900..404（497 条）+
    * copyfrom 源 406,405,404（与祖先重复）→ 本轮 raw=500；累计 raw=1000、
@@ -1006,7 +1033,7 @@ describe('多源源栈、六类计数与连续两轮预算独立（阶段 0 C9�
     }));
   }
 
-  function newC9Session(): HistorySession {
+  function newCountsSession(): HistorySession {
     return createHistorySession({
       upperRevision: 1397,
       upperSource: 'live-head',
@@ -1018,7 +1045,7 @@ describe('多源源栈、六类计数与连续两轮预算独立（阶段 0 C9�
   }
 
   it('每轮 500 条独立预算、同 revision 去重、累计与会话唯一计数分离', () => {
-    const session = newC9Session();
+    const session = newCountsSession();
 
     // 第 1 轮：祖先页 → 压入来源源 → copyfrom 页。
     expect(beginHistoryLoadMore(session, limits)).toBe('network');
@@ -1099,7 +1126,7 @@ describe('多源源栈、六类计数与连续两轮预算独立（阶段 0 C9�
   });
 
   it('pending-only 轮不改变累计计数也不进网络', () => {
-    const session = newC9Session();
+    const session = newCountsSession();
     expect(beginHistoryLoadMore(session, limits)).toBe('network');
     applyHistoryLogPage(session, FILE_TARGET, {
       sourceId: 'ancestor-filter',
@@ -1126,7 +1153,7 @@ describe('多源源栈、六类计数与连续两轮预算独立（阶段 0 C9�
 });
 
 // ---------------------------------------------------------------------------
-// 筛选（§4.2，阶段 0 C10）
+// 筛选（作者口径，实测日期边界）
 // ---------------------------------------------------------------------------
 
 describe('筛选语义', () => {
@@ -1239,6 +1266,61 @@ describe('筛选语义', () => {
       makeEntry(3, { author: 'bob' }),
       makeEntry(2),
     ])).toEqual(['bob', 'alice']);
+  });
+
+  it('会话累计扫描作者：未命中提交的作者也进入 scannedAuthors，按首次出现顺序去重', () => {
+    // ancestor-filter 源：目标自身路径记录命中，普通兄弟路径记录不命中。
+    // 作者下拉口径是「已扫描原始批次中的实际作者」，命中过滤不影响作者收集。
+    const session = createHistorySession({
+      upperRevision: 10,
+      upperSource: 'live-head',
+      followCopies: true,
+      targetPresentAtUpper: false,
+      nearestExistingAncestor: 'trunk',
+      target: FILE_TARGET,
+    });
+    const sourceId = session.sources[0]?.id ?? '';
+    applyHistoryLogPage(session, FILE_TARGET, {
+      sourceId,
+      entries: [
+        hitEntry(5, { author: 'alice' }),
+        makeEntry(4, { author: 'bob', paths: [{ path: '/trunk/other.txt', action: 'M' }] }),
+        hitEntry(3, { author: 'alice' }),
+        makeEntry(2, { author: 'carol', paths: [{ path: '/trunk/other.txt', action: 'M' }] }),
+        hitEntry(1),
+      ],
+      requestedLimit: 6,
+    });
+    // r5/r3/r1 命中（r1 无作者），r4/r2 未命中。
+    expect(session.entriesByRevision.size).toBe(3);
+    expect(session.scannedAuthors).toEqual(['alice', 'bob', 'carol']);
+    // 跨页继续追加新作者；重复作者不重复收录。
+    applyHistoryLogPage(session, FILE_TARGET, {
+      sourceId,
+      entries: [makeEntry(100, { author: 'dave', paths: [{ path: '/trunk/other.txt', action: 'M' }] })],
+      requestedLimit: 6,
+    });
+    expect(session.scannedAuthors).toEqual(['alice', 'bob', 'carol', 'dave']);
+  });
+
+  it('resetHistorySession 清空 scannedAuthors（upper 三字段保留）', () => {
+    const session = createHistorySession({
+      upperRevision: 10,
+      upperSource: 'live-head',
+      followCopies: true,
+      targetPresentAtUpper: true,
+      target: FILE_TARGET,
+    });
+    applyHistoryLogPage(session, FILE_TARGET, {
+      sourceId: session.sources[0]?.id ?? '',
+      entries: [hitEntry(3, { author: 'alice' })],
+      requestedLimit: 2,
+    });
+    expect(session.scannedAuthors).toEqual(['alice']);
+    expect(resetHistorySession(session)).toBe(true);
+    expect(session.scannedAuthors).toEqual([]);
+    expect(session.upperRevision).toBe(10);
+    expect(session.upperSource).toBe('live-head');
   });
 
   it('空筛选字段视为未启用', () => {
@@ -1386,28 +1468,13 @@ describe('upper 状态语义', () => {
     expect(fallback.rawFetchedTotal).toBe(0);
   });
 
-  it('refresh base-fallback：成功固定 base-fallback/unavailable；失败分支不改变三字段与已加载数据', () => {
+  it('refresh base-fallback：成功固定 base-fallback/unavailable；失败时不应用成功路径', () => {
+    // 失败分支不发 core 命令（BASE 上限 log 探测失败由宿主在调用
+    // applyHistoryUpperRefresh 之前分流），本用例只断言 core 成功路径的
+    // 固定三字段与数据重置；失败语义由 historyModel/panel 层用失败 log
+    // mock 断言（宿主测试域）。
     const fallback = resolvedSession('base-fallback');
     fillSession(fallback);
-    const before = {
-      upperRevision: fallback.upperRevision,
-      upperSource: fallback.upperSource,
-      headState: fallback.headState,
-      rawFetchedTotal: fallback.rawFetchedTotal,
-      entries: fallback.entriesByRevision.size,
-    };
-    // 模拟 BASE 上限 log 探测失败：调用方不应用成功路径，三字段与数据不变。
-    const logSucceeded = false;
-    if (logSucceeded) {
-      applyHistoryUpperRefresh(fallback, 'base-fallback', 7);
-    }
-    expect({
-      upperRevision: fallback.upperRevision,
-      upperSource: fallback.upperSource,
-      headState: fallback.headState,
-      rawFetchedTotal: fallback.rawFetchedTotal,
-      entries: fallback.entriesByRevision.size,
-    }).toEqual(before);
 
     expect(applyHistoryUpperRefresh(fallback, 'base-fallback', 7)).toBe('updated');
     expect(fallback.upperRevision).toBe(7);
@@ -1495,6 +1562,66 @@ describe('resolveHistoryNodeAtRevision', () => {
       entries: [],
     });
     expect(resolution).toMatchObject({ status: 'present', url: 'https://svn.example.com/repo/a.txt?x=1&y=2' });
+  });
+
+  it('认证失败（E170001）经统一补录重试一次，补录后成功回到 present', async () => {
+    // resolveHistoryNodeAtRevision 旧实现直接 run、不消费
+    // getCredentials，凭据失效时只报错不弹补录框；修复后走
+    // runOrThrowWithRunner 的认证补录原语。
+    vi.mocked(run)
+      .mockResolvedValueOnce({ stdout: '', stderr: 'svn: E170001: Authentication failed', exitCode: 1 })
+      .mockResolvedValueOnce(infoOk('https://svn.example.com/repo/trunk/target.txt'));
+    const getCredentials = vi.fn().mockResolvedValue({ username: 'yu', password: 's3cret' });
+
+    const resolution = await resolveHistoryNodeAtRevision('svn', {
+      target: FILE_TARGET,
+      revision: 7,
+      entries: [],
+    }, { getCredentials });
+
+    expect(resolution).toMatchObject({ status: 'present', revision: 7 });
+    expect(getCredentials).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(run)).toHaveBeenCalledTimes(2);
+    // 重试参数在 `--` 之前插入凭据（`--` 及其后位置参数保持尾部）。
+    expect(vi.mocked(run).mock.calls[1][1]).toEqual([
+      'info',
+      '--xml',
+      '--non-interactive',
+      '--username',
+      'yu',
+      '--password',
+      's3cret',
+      '--',
+      'https://svn.example.com/repo/trunk/target.txt@7',
+    ]);
+  });
+
+  it('补录取消：按原认证错误抛出，不重试', async () => {
+    vi.mocked(run).mockResolvedValueOnce({
+      stdout: '',
+      stderr: 'svn: E215004: No more credentials or we tried too many times',
+      exitCode: 1,
+    });
+    const getCredentials = vi.fn().mockResolvedValue(undefined);
+    await expect(resolveHistoryNodeAtRevision('svn', {
+      target: FILE_TARGET,
+      revision: 7,
+      entries: [],
+    }, { getCredentials })).rejects.toBeInstanceOf(SvnError);
+    expect(getCredentials).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(run)).toHaveBeenCalledTimes(1);
+  });
+
+  it('absent（W170000+E200009）不触发认证补录，直接进入复制窗口映射', async () => {
+    vi.mocked(run).mockResolvedValueOnce(absentResult());
+    const getCredentials = vi.fn();
+    const resolution = await resolveHistoryNodeAtRevision('svn', {
+      target: FILE_TARGET,
+      revision: 2,
+      entries: [],
+    }, { getCredentials });
+    expect(resolution).toEqual({ status: 'notFoundAtRevision' });
+    expect(getCredentials).not.toHaveBeenCalled();
   });
 
   it('文件复制：所选 revision 早于复制 revision 时切换到 copyfrom 来源', async () => {

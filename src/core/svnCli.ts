@@ -36,7 +36,7 @@ export interface AuthCredentials {
 }
 
 /**
- * 凭据补录的作用域（技术方案 §3.4 冻结契约）：host 级单飞协调器按
+ * 凭据补录的作用域：host 级单飞协调器按
  * scheme + host + port 共享同一凭据 Promise，同源并发失败只弹一次框。
  * port 为显式或协议默认端口（见 authScopeOfUrl），保证同源 key 稳定。
  */
@@ -458,7 +458,7 @@ async function availableDiskBytes(dir: string): Promise<number | undefined> {
 /**
  * 直接写目标文件的流式执行原语（远端 `svn cat` 等二进制内容下载）。
  *
- * 资源纪律（技术方案 §3.4）：
+ * 资源纪律：
  * - 已知 expectedBytes 时先做预算（> maxBytes）与磁盘余量预检
  *   （可用空间 < expectedBytes + headroom），任一不足都不启动 svn，
  *   错误码分别为 OUTPUT_TOO_LARGE / INSUFFICIENT_DISK；
@@ -490,7 +490,7 @@ export async function runToFile(
   // 实际大小由运行中的字节计数与写盘错误兜底。
   if (options.expectedBytes !== undefined && options.expectedBytes > maxBytes) {
     throw new SvnError({
-      message: `预期输出 ${options.expectedBytes} 字节超过 ${maxBytes} 字节上限，未启动 svn`,
+      message: `expected output size ${options.expectedBytes} exceeds limit ${maxBytes}; svn was not started`,
       command: args,
       cwd: options.cwd,
       code: OUTPUT_TOO_LARGE,
@@ -500,7 +500,7 @@ export async function runToFile(
   const freeBytes = await availableDiskBytes(targetDir);
   if (freeBytes !== undefined && freeBytes < requiredBytes) {
     throw new SvnError({
-      message: `目标目录可用空间不足：需要至少 ${requiredBytes} 字节，剩余 ${freeBytes} 字节`,
+      message: `insufficient disk space in target directory: need at least ${requiredBytes} bytes, ${freeBytes} available`,
       command: args,
       cwd: options.cwd,
       code: INSUFFICIENT_DISK,
@@ -514,7 +514,7 @@ export async function runToFile(
   } catch (err) {
     const e = err as NodeJS.ErrnoException;
     throw new SvnError({
-      message: `无法创建临时文件 ${partPath}：${e.message}`,
+      message: `failed to create temporary file ${partPath}: ${e.message}`,
       command: args,
       cwd: options.cwd,
       stderr: String(err),
@@ -542,7 +542,7 @@ export async function runToFile(
       onStdoutChunk: (chunk: Buffer) => {
         if (bytesWritten + chunk.length > maxBytes) {
           throw new SvnError({
-            message: `svn ${redactArgs(args).join(' ')} 输出超过 ${maxBytes} 字节上限，已终止并删除临时文件`,
+            message: `svn output exceeds limit ${maxBytes} bytes; process terminated and temporary file removed`,
             command: args,
             cwd: options.cwd,
             code: OUTPUT_TOO_LARGE,
@@ -553,7 +553,7 @@ export async function runToFile(
         } catch (err) {
           const e = err as NodeJS.ErrnoException;
           throw new SvnError({
-            message: `写入临时文件失败（${e.code ?? 'UNKNOWN'}）：${e.message}`,
+            message: `failed to write temporary file (${e.code ?? 'UNKNOWN'}): ${e.message}`,
             command: args,
             cwd: options.cwd,
             stderr: String(err),
@@ -593,7 +593,7 @@ const DEFAULT_SCHEME_PORTS: Record<AuthScope['scheme'], number> = {
 };
 
 /**
- * 从远端 URL 构造凭据作用域（技术方案 §3.4 冻结契约 AuthScope）。
+ * 从远端 URL 构造凭据作用域（AuthScope）。
  * 只支持 http/https/svn 三种可补录凭据的协议；file/svn+ssh 返回
  * undefined（file 走文件系统权限，svn+ssh 的认证由 SSH 配置承载）。
  * host 统一小写，端口取显式值或协议默认端口（http 80 / https 443 /
@@ -642,20 +642,21 @@ export function authScopeOfUrl(url: string): AuthScope | undefined {
 }
 
 /**
- * 统一 URL peg 构造（技术方案 §2.2 冻结规则）：固定 `url + '@' + (peg ?? '')`。
+ * 统一 URL peg 构造：固定 `url + '@' + (peg ?? '')`。
  *
  * - 任何含字面 `@` 或 `%40` 的 URL 直接执行会被 svn 按 peg 分隔符解析并
- *   报 `E205000: Syntax error parsing peg revision`（阶段 0 实测），因此
+ *   报 `E205000: Syntax error parsing peg revision`（实测），因此
  *   M4 起所有远端命令都经本函数拼接，禁止调用点手写 `@`；
  * - 无 revision 时必须追加空 peg（`…/trunk@`），不得裸露用户 URL；
- * - 输入末尾已有的单个 `@` 先剥除再统一拼接，幂等（`urlWithPeg(urlWithPeg(u))`
- *   与 `urlWithPeg(u)` 相同，不产生 `@@`）。本地文件系统路径不要用本函数，
- *   用 core/workspace.escapePeg。
+ * - 以字面 `@` 结尾的合法节点名（如 `…/tail@`）不剥除：svn 的 `<url>`
+ *   原样回显该 `@`，固定拼接为 `…/tail@@<rev>` 才能定位节点本身；
+ * - 调用点保证传入的 rawUrl 不含 peg（不把本函数输出再次传入），
+ *   幂等由调用点负责。本地文件系统路径不要用本函数，用
+ *   core/workspace.escapePeg。
  */
 export function urlWithPeg(url: string, peg?: number | string | null): string {
-  const base = url.endsWith('@') ? url.slice(0, -1) : url;
   const suffix = peg === undefined || peg === null ? '' : String(peg);
-  return `${base}@${suffix}`;
+  return `${url}@${suffix}`;
 }
 
 /**
@@ -663,7 +664,7 @@ export function urlWithPeg(url: string, peg?: number | string | null): string {
  *
  * `node:string_decoder` 的 StringDecoder 会保留分块边界上不完整的多字节
  * 序列，直到下一块补齐；逐块 `Buffer.toString('utf8')` 会把中文/emoji 在
- * 分块处解码成 U+FFFD（阶段 0 实测）。所有 runStream 的 XML 调用侧都必须
+ * 分块处解码成 U+FFFD（实测）。所有 runStream 的 XML 调用侧都必须
  * 先用本解码器转成字符串再喂 SAX，flush 时调用 end() 取回尾段。
  */
 export class Utf8StreamDecoder {

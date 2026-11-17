@@ -3,7 +3,7 @@
  * 文件/属性/树 tab 与计数、详情、动作矩阵、resolvedLedger 会话合并。
  * 纯模型，不依赖 vscode（宿主控制器与任务执行器共用本模块）。
  *
- * 职责边界（技术方案 §5.1/§5.2/§5.3/§5.5，阶段 0 V4 实测回填）：
+ * 职责边界（本地 SVN 实测回填）：
  * - 扫描以工作副本根为互斥与缓存范围：`scanConflictScope` 复用
  *   core/conflict 的 status 三判据、批量 info + 逐项补偿、external 边界
  *   过滤、重复节点去重、树冲突三形态容错与缺失路径最近存在祖先范围
@@ -88,8 +88,10 @@ import {
   type ConflictBatchResult,
 } from './conflictBatchModel';
 import {
+  listM4ScopeSessions,
   putM4ScopeSession,
   readM4ScopeSession,
+  sameM4SessionScope,
   type M4ScopePutResult,
   type M4SessionStoreContext,
 } from '../sessionResults';
@@ -170,6 +172,9 @@ export const CONFLICT_TEXT_DEFAULTS = {
   rowStatusPostponed: '已推迟',
   emptyTitle: '没有冲突',
   emptyDetail: '当前范围内没有需要处理的冲突。',
+  scanFailedEmptyTitle: '扫描失败，未取得冲突快照',
+  scanFailedEmptyDetail: '冲突扫描失败，当前没有可展示的冲突数据；请重新扫描或查看日志。',
+  summaryScanFailed: '扫描失败',
   filterEmptyTitle: '该分类没有冲突',
   filterEmptyDetail: '切换到其他分类查看。',
   detailEmptyTitle: '选择冲突查看详情',
@@ -235,10 +240,14 @@ export const CONFLICT_TEXT_DEFAULTS = {
   detailOpenDiff: '打开差异',
   detailOpenEditor: '打开编辑器',
   detailOpenVersion: '打开版本',
+  detailOpenTerminal: '工作副本终端',
+  detailAuthenticateSource: '补齐认证并重试属性值读取',
   detailCopyPath: '复制路径',
   detailPostpone: '推迟',
   detailPrepareTree: '确认节点已处理',
   detailApplyWorking: '采用当前工作内容',
+  detailApplyPropertyWorking: '应用所选属性值',
+  detailPropertyIncomplete: '请为每个属性选择本地、基线或传入值。',
   detailResolvedHeading: '已解决',
   detailResolvedStrategy: '策略',
   detailResolvedOperation: '操作编号',
@@ -267,6 +276,9 @@ export const CONFLICT_TEXT_DEFAULTS = {
   failuresTitle: '{count} 个路径的详情读取失败',
   failuresDetail: '已保留状态中的冲突类型与路径，未读取到完整详情：{paths}',
   propertyUnavailableNotice: '属性值读取不完整（可能需要在远端来源补查时认证），该记录不提供自动处理。',
+  propertyFailuresTitle: '{count} 个路径的属性值补查不完整',
+  propertyFailuresDetail: '远端来源可能需要在补查时认证；可补齐认证并重新扫描：{paths}',
+  propertyFailuresAction: '补齐认证并重新扫描',
   rescanAction: '重新扫描',
   rescanWholeAction: '扫描整个工作副本',
   /* ---------------- P7 专用组件（冲突列表/属性选择/确认对话框） ---------------- */
@@ -394,22 +406,52 @@ export function persistConflictSession(
  * 面板重开恢复：先 adoptScope，再按 m4SessionStore 当前作用域读取快照/
  * 台账/推迟/browsable。仅恢复缓存；真实 SVN 状态仍以重新扫描为准，冲突
  * 快照缺失时回到 fresh。
+ *
+ * 同一工作副本的其它范围页（如 P6 更新任务范围页）在恢复时把台账/推迟
+ * 移交进当前模型：整副本扫描不丢本次会话已解决的项；合并
+ * 时当前页与真实扫描记录优先。移交不改变「本页是否已恢复」的返回值——
+ * 无本页快照时仍按 fresh 重新扫描，真实 SVN 是唯一真相。
  */
 export function restoreConflictSession(
   model: ConflictModel,
   scope: ConflictScopeTarget,
 ): boolean {
   model.adoptScope(scope);
-  const entry = readM4ScopeSession(conflictResultScopeOf(scope));
-  if (!entry) {
+  const current = conflictResultScopeOf(scope);
+  const entry = readM4ScopeSession(current);
+  const restored = entry !== undefined
+    && model.restore({
+      browsable: entry.browsable,
+      conflictSnapshot: entry.conflictSnapshot,
+      resolvedLedger: entry.resolvedLedger,
+      postponed: entry.postponed,
+    });
+  for (const candidate of listM4ScopeSessions()) {
+    if (candidate.scopeKind !== 'conflicts'
+      || candidate.wcRoot !== scope.wcRoot
+      || sameM4SessionScope(candidate, current)
+      || !scopeContains(scope, candidate)) {
+      continue;
+    }
+    const other = readM4ScopeSession(candidate);
+    if (other === undefined) {
+      continue;
+    }
+    model.inheritWorkCopySession(other.resolvedLedger, other.postponed);
+  }
+  return restored;
+}
+
+/** 外层范围是否覆盖内层范围（同副本；'.' 覆盖全部，其余按路径前缀）。 */
+function scopeContains(outer: ConflictScopeTarget, inner: ConflictsResultScope): boolean {
+  if (outer.wcRoot !== inner.wcRoot) {
     return false;
   }
-  return model.restore({
-    browsable: entry.browsable,
-    conflictSnapshot: entry.conflictSnapshot,
-    resolvedLedger: entry.resolvedLedger,
-    postponed: entry.postponed,
-  });
+  if (outer.scopeRelPath === '.') {
+    return true;
+  }
+  return inner.scopeRelPath === outer.scopeRelPath
+    || inner.scopeRelPath.startsWith(`${outer.scopeRelPath}/`);
 }
 
 /* ---------------------------------------------------------------------------
@@ -488,7 +530,7 @@ export interface ConflictScanOutcome extends ConflictScanResult {
 }
 
 /**
- * 完整扫描编排（技术方案 §5.1）：
+ * 完整扫描编排：
  * 1. core `scanConflicts`：status 三判据 + external 过滤 + 批量 info +
  *    逐项补偿 + 归一化（不读取属性值，避免远端读取带不上按 URL 的认证）；
  * 2. 属性三值补查：本地读取失败且存在可认证远端来源时才调用
@@ -551,8 +593,10 @@ async function applyPropertyValues(
  * - 先以本地只读选项读取本地/基线/传入三值；
  * - 失败时只对可认证的远端 source URL 走 authorizeRemote，再重试一次；
  * - 成功后用与扫描同一归一化口径重算记录（指纹 id 与执行前重读一致）。
+ * 导出供执行前指纹重读复用（认证远端来源下必须与扫描同口径读取，
+ * 否则属性名集合缺失会让指纹误报变化）。
  */
-async function readRecordPropertyValues(
+export async function readRecordPropertyValues(
   runtime: ConflictScanRuntime,
   target: ConflictScopeTarget,
   record: ConflictRecord,
@@ -735,6 +779,11 @@ export function classifyWorkingCopyContent(
  * 入口先对 wcRoot 做 realpath 归一：调用方可能传入符号链接形态（如
  * macOS 的 /tmp、/var），祖先 realpath 与原始 fsPath 混算会得到无效
  * 后缀并误判为空范围。
+ *
+ * 宿主侧过滤参考实现：生产扫描的范围已由 scanConflicts(scope) 的 status
+ * 目标限定，本函数尚未接入生产路径；接线时须与 core/resolve 的范围裁决
+ * 同一口径（resolveRealPathWithSuffix / isRelPathWithinScope）。当前仅
+ * 供范围语义参考与单测使用。
  */
 export function filterRecordsToConflictScope(
   target: ConflictScopeTarget,
@@ -1145,6 +1194,11 @@ export function buildConflictDetail(input: {
   treePrepared?: boolean;
   /** 属性逐项选择（属性名 → 选择侧）；缺省未选择。 */
   propertyChoices?: Readonly<Record<string, 'local' | 'base' | 'incoming'>>;
+  /**
+   * 属性选择是否覆盖全部可自动处理的冲突属性（宿主模型求值；
+   * `propertySelectionComplete` 同源）。纯属性记录的 working 入口据此启用。
+   */
+  propertySelectionComplete?: boolean;
   /** 当前整文件变体选择（applyConflictResolution 的待执行策略）。 */
   selectedVariant?: SvnAcceptValue;
 }): DetailSpec {
@@ -1284,6 +1338,25 @@ export function buildConflictDetail(input: {
       disabled: !hasVariant,
       ...(hasVariant ? {} : { disabledReason: conflictText('detailSelectVariantFirst') }),
     });
+  } else if (record.kinds.includes('property') && !matrix.mixedPath && matrix.propertySelection) {
+    // 纯属性冲突：逐属性选择全部完成后，把所选值写回
+    // 工作属性再执行一次路径级 working；未选完时入口禁用并提示原因。
+    const complete = input.propertySelectionComplete === true;
+    actions.push({
+      id: 'applyConflictResolution',
+      label: conflictText('detailApplyPropertyWorking'),
+      disabled: !complete,
+      ...(complete ? {} : { disabledReason: conflictText('detailPropertyIncomplete') }),
+    });
+  }
+  if (matrix.propertyValuesUnavailable) {
+    // 属性值补查失败（多为远端来源未认证）：渲染冻结动作
+    // authenticateConflictSource（冻结动作），点击重新
+    // 扫描并经 authorizeRemote 单飞补录，不再只能靠整次重新扫描间接触发。
+    actions.push({
+      id: 'authenticateConflictSource',
+      label: conflictText('detailAuthenticateSource'),
+    });
   }
   actions.push(
     { id: 'openConflictDiff', label: conflictText('detailOpenDiff') },
@@ -1303,7 +1376,7 @@ export function buildConflictDetail(input: {
       label: `${conflictText('detailOpenVersion')}：${conflictText('detailVersionIncoming')}`,
       payload: { role: 'incoming' },
     },
-    { id: 'openWorkCopyTerminal', label: '工作副本终端' },
+    { id: 'openWorkCopyTerminal', label: conflictText('detailOpenTerminal') },
     { id: 'inspectConflict', label: conflictText('detailInspector') },
     { id: 'copyConflictPath', label: conflictText('detailCopyPath') },
     { id: 'postponeConflict', label: conflictText('detailPostpone') },
@@ -1480,7 +1553,17 @@ export class ConflictModel {
       const same = this.scopeValue.wcRoot === target.wcRoot
         && this.scopeValue.scopeRelPath === target.scopeRelPath;
       if (!same) {
+        // 台账/推迟按 wcRoot 跨 scopeRelPath 保留（「整副本扫描
+        // 保留已解决状态」）：同一工作副本从更新任务范围切到整副本时，
+        // 本次会话已解决的项不丢；其余展示态由新范围扫描/恢复重建。
+        const keepWorkCopySession = this.scopeValue.wcRoot === target.wcRoot;
+        const ledger = this.ledgerValue;
+        const postponed = this.postponedValue;
         this.resetSessionState();
+        if (keepWorkCopySession) {
+          this.ledgerValue = ledger;
+          this.postponedValue = postponed;
+        }
       }
     }
     this.scopeValue = { ...target };
@@ -1729,6 +1812,48 @@ export class ConflictModel {
   }
 
   /**
+   * 同一工作副本其它范围页的台账/推迟移交（恢复其它作用域会话时调用）：
+   * 已存在的同路径 + 类型条目以当前会话为准（当前页优先），真实扫描记录
+   * 仍由 rows() 的 mergeResolvedLedger 优先覆盖台账；返回是否发生合并。
+   * 输入从 m4SessionStore 读出，形状非法项按丢弃处理。
+   */
+  inheritWorkCopySession(resolvedLedger: unknown, postponed: unknown): boolean {
+    let inherited = false;
+    if (Array.isArray(resolvedLedger)) {
+      for (const raw of resolvedLedger) {
+        if (!isLedgerEntry(raw)) {
+          continue;
+        }
+        const covered = this.ledgerValue.some((existing) => existing.path === raw.path
+          && existing.kinds.some((kind) => raw.kinds.includes(kind)));
+        if (covered) {
+          continue;
+        }
+        this.ledgerValue.push({ ...raw, kinds: [...raw.kinds] });
+        inherited = true;
+      }
+    }
+    if (Array.isArray(postponed)) {
+      for (const raw of postponed) {
+        if (!isPostponedEntry(raw)) {
+          continue;
+        }
+        const covered = this.postponedValue.some((existing) => existing.fingerprint === raw.fingerprint
+          || (existing.path === raw.path && existing.kinds.some((kind) => raw.kinds.includes(kind))));
+        if (covered) {
+          continue;
+        }
+        this.postponedValue.push({ ...raw, kinds: [...raw.kinds] });
+        inherited = true;
+      }
+    }
+    if (inherited) {
+      this.pruneSelection();
+    }
+    return inherited;
+  }
+
+  /**
    * 推迟：只改面板状态，不写 SVN；按冲突指纹保留到同一会话。对已解决
    * 行拒绝；重复推迟幂等。
    */
@@ -1780,7 +1905,7 @@ export class ConflictModel {
 
   /**
    * 树冲突节点确认：绑定「记录指纹 + 扫描代次」。节点内容/扫描代次
-   * 变化后必须重新确认（技术方案 §5.3「树冲突的最终确认使用当前工作
+   * 变化后必须重新确认（「树冲突的最终确认使用当前工作
    * 副本的节点状态」）。
    */
   prepareTreeConflict(key: string): 'prepared' | 'already' | 'not-found' | 'not-tree' | 'resolved' {
@@ -1978,13 +2103,19 @@ export class ConflictModel {
       row,
       treePrepared: this.isTreePrepared(row.key),
       propertyChoices: this.propertyChoices(row.key),
+      propertySelectionComplete: this.propertySelectionComplete(row.key),
       ...(this.variantSelections.has(row.key)
         ? { selectedVariant: this.variantSelections.get(row.key) }
         : {}),
     });
   }
 
-  /** 树确认/working 二次确认对话框（控制器决定展示时机与请求编号）。 */
+  /**
+   * 树确认/working 二次确认对话框：确认规格的契约参考实现与单测基线。
+   * 生产确认流程由控制器自建横幅承载（panels/conflicts.ts 的
+   * confirmTreePrepared / confirmWorkingApply，requestId 由控制器生成），
+   * 本方法不参与面板推送；若后续改为模型驱动确认，应删除控制器双实现。
+   */
   confirmDialog(
     key: string,
     kind: 'tree' | 'working',
@@ -2051,7 +2182,7 @@ export class ConflictModel {
   /**
    * 关闭重开恢复：只接受同一作用域、同版本形状的数据；冲突快照缺失时
    * 回到 fresh（真实 SVN 是唯一真相，不从台账反推未解决项）。切换工作
-   * 副本后旧作用域的台账/推迟一律丢弃（技术方案 §5.5：随作用域项淘汰）。
+   * 副本后旧作用域的台账/推迟一律丢弃（随作用域项淘汰）。
    */
   restore(input: ConflictModelRestoreInput | undefined): boolean {
     if (!input) {
@@ -2204,11 +2335,13 @@ export class ConflictModel {
   private buildHeaderBadges(): NonNullable<PanelState['headerBadges']> {
     const badges: NonNullable<PanelState['headerBadges']> = [];
     const summary = this.summary();
-    badges.push({ text: summary.total === 0 ? conflictText('summaryNone') : conflictText('summaryLabel', {
-      text: String(summary.text),
-      property: String(summary.property),
-      tree: String(summary.tree),
-    }) });
+    badges.push({ text: this.scanFailedWithoutSnapshot()
+      ? conflictText('summaryScanFailed')
+      : summary.total === 0 ? conflictText('summaryNone') : conflictText('summaryLabel', {
+        text: String(summary.text),
+        property: String(summary.property),
+        tree: String(summary.tree),
+      }) });
     if (this.wcLocked()) {
       badges.push({ text: conflictText('wcLockedTitle'), warn: true });
     }
@@ -2249,6 +2382,23 @@ export class ConflictModel {
           paths: failures.slice(0, 5).map((failure) => failure.path).join('、'),
         }),
         dismissable: false,
+      });
+    }
+    // 属性值补查失败的路径：面板级「补齐认证」入口（单飞认证后重新扫描），
+    // 与行级 authenticateConflictSource 动作同源（冻结动作）。
+    const propertyFailures = this.propertyValueFailures();
+    if (propertyFailures.length > 0) {
+      banners.push({
+        id: 'conflictPropertyValueFailures',
+        level: 'warn',
+        title: format(conflictText('propertyFailuresTitle'), { count: String(propertyFailures.length) }),
+        detail: format(conflictText('propertyFailuresDetail'), {
+          paths: propertyFailures.slice(0, 5).join('、'),
+        }),
+        dismissable: false,
+        actions: [
+          { id: 'authenticateConflictSource', label: conflictText('propertyFailuresAction') },
+        ],
       });
     }
     if (this.externals().length > 0 && !this.dismissedBanners.has('conflictExternalBoundary')) {
@@ -2294,6 +2444,9 @@ export class ConflictModel {
   private buildConflictList(): ConflictListSpec {
     const rows = this.visibleRows();
     const listRows: ConflictRowSpec[] = rows.map((row) => this.conflictRow(row));
+    // 首次扫描即失败（error 且没有旧快照）：失败态优先于「没有冲突」空态，
+    // 与顶部冲突扫描失败横幅保持同一事实，不给出互斥断言。
+    const failed = this.scanFailedWithoutSnapshot();
     return {
       id: CONFLICT_TABLE_ID,
       ariaLabel: conflictText('conflictListAriaLabel'),
@@ -2305,8 +2458,12 @@ export class ConflictModel {
       rows: listRows,
       selectIntent: 'selectConflict',
       empty: {
-        title: this.tabValue === 'all' ? conflictText('emptyTitle') : conflictText('filterEmptyTitle'),
-        detail: this.tabValue === 'all' ? conflictText('emptyDetail') : conflictText('filterEmptyDetail'),
+        title: failed
+          ? conflictText('scanFailedEmptyTitle')
+          : this.tabValue === 'all' ? conflictText('emptyTitle') : conflictText('filterEmptyTitle'),
+        detail: failed
+          ? conflictText('scanFailedEmptyDetail')
+          : this.tabValue === 'all' ? conflictText('emptyDetail') : conflictText('filterEmptyDetail'),
         action: { id: 'rescanConflicts', label: conflictText('rescanAction'), payload: { scope: 'task' } },
       },
     };
@@ -2371,9 +2528,19 @@ export class ConflictModel {
       secondary.push({ id: 'showConflictBatchResults', label: conflictBatchText('batchShowResults') });
     }
     return {
-      summary: parts.length === 0 ? conflictText('summaryNone') : parts.join(' · '),
+      summary: this.scanFailedWithoutSnapshot()
+        ? conflictText('summaryScanFailed')
+        : parts.length === 0 ? conflictText('summaryNone') : parts.join(' · '),
       secondary,
     };
+  }
+
+  /**
+   * 首次扫描即失败（error 相位且没有旧快照）：列表空态、页脚摘要与头部
+   * 徽标统一按失败态呈现，不与「没有冲突」互斥。
+   */
+  private scanFailedWithoutSnapshot(): boolean {
+    return this.phaseValue === 'error' && this.snapshotValue === undefined;
   }
 
   private buildProgress(): ProgressState | undefined {
@@ -2393,8 +2560,8 @@ export class ConflictModel {
           }
         : {}),
       actions: [
-        { id: 'closePanel', label: '关闭' },
-        { id: 'viewTaskLog', label: '查看日志' },
+        { id: 'closePanel', label: strings.panel.taskProgressClose },
+        { id: 'viewTaskLog', label: strings.panel.taskProgressLog },
       ],
     };
     return state;

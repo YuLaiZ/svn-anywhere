@@ -93,6 +93,7 @@ import {
   pickDirectDir,
   pickParentDir,
   pickSourceDirReducer,
+  reapplyHistoryPrefill,
   retryImportReducer,
   selectHistoryUrl,
   setConfirmState,
@@ -448,6 +449,16 @@ function switchNeedsConfirm(): boolean {
   return session.result !== null || (session.step !== 'running' && draftDiffers(session));
 }
 
+/** 两次 P6 交接预填是否为同一目标（URL + revision）；无旧预填视为不同。 */
+function sameHandoffPrefill(
+  previous: CheckoutHistoryPrefill | undefined,
+  incoming: CheckoutHistoryPrefill,
+): boolean {
+  return previous !== undefined
+    && previous.url === incoming.url
+    && previous.revision === incoming.revision;
+}
+
 /**
  * 打开 P3 面板（命令入口在阶段 1 任务 9 接入）：单实例与目标切换按 M2 口径——
  * 同入口同模式 reveal；新入口/模式切换在运行中（taskRegistry 任务）拒绝，
@@ -462,6 +473,17 @@ export async function openCheckoutPanel(entry: CheckoutOpenEntry): Promise<void>
   if (handle && session) {
     if (session.entry.entryKey === entryKey && session.mode === entry.mode) {
       // 同目标复用：reveal 即可（表单/任务态/结果页照常呈现）。
+      // 例外：P6→P3 交接的 entryKey 只由 URL 组成，同 URL 换 revision 的
+      // 再次交接不能静默保留旧表单值——表单步且无任务时重应用新预填。
+      const incoming = entry.prefill;
+      if (incoming !== undefined && !sameHandoffPrefill(session.entry.prefill, incoming)) {
+        const next = reapplyHistoryPrefill(session, incoming);
+        if (next !== session) {
+          session = next;
+          formRevision += 1;
+          pushRender();
+        }
+      }
       handle.reveal();
       return;
     }
@@ -516,7 +538,7 @@ export async function openCheckoutPanel(entry: CheckoutOpenEntry): Promise<void>
 }
 
 /**
- * P6→P3 交接入口（技术方案 §4.5）：把「检出此版本」的历史目录目标交给
+ * P6→P3 交接入口：把「检出此版本」的历史目录目标交给
  * 检出向导。
  * - 宿主入口直接拒绝文件目标、非目录、非法 revision 与空/非法 URL；
  * - 只预填已解析的实际目录 URL 与数字 revision；P3 仍重新执行 URL 校验、

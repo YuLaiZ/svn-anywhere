@@ -5,7 +5,7 @@
  * - 本地入口：HEAD → 目标存在性 → 首批 log；请求参数（-l pageSize+1、
  *   -r upper:1、URL@upper）与请发命令次序；
  * - HEAD 失败且有本地 BASE → unresolved（HEAD 暂不可用 + BASE 上限入口）；
- * - base-fallback 成功进入结果、log 失败保留三字段与已加载数据（HLS-6）；
+ * - base-fallback 成功进入结果、log 失败保留三字段与已加载数据（会话重置语义）；
  * - reset：live-head 保持 available 且不重读 HEAD、重读首批；unresolved 被拒；
  * - refresh head：已最新保留数据、前进重读、失败保留数据、来源恢复；
  * - P5 快照会话不读 HEAD、reset 不收新 HEAD、refresh 被模型校验拒绝；
@@ -14,6 +14,7 @@
  * 传入的 revision/cursor 与命令形态。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { join } from 'node:path';
 import type * as vscode from 'vscode';
 
 /* ------------------------------ vscode 替身 ------------------------------ */
@@ -36,8 +37,43 @@ const vscodeMock: VscodeMockState = {
   config: {},
 };
 
+/* ---------------- P6 逐行追溯（F46）装饰替身 ---------------- */
+
+interface FakeDecorationOption {
+  range?: unknown;
+  renderOptions?: { after?: { contentText?: string } };
+}
+
+interface FakeTextEditor {
+  /** 每次 setDecorations 的入参（type + options）。 */
+  decorations: Array<{ type: unknown; options: FakeDecorationOption[] }>;
+  setDecorations(type: unknown, options: FakeDecorationOption[]): void;
+}
+
+const blameMock: {
+  editor?: FakeTextEditor;
+  closeHandlers: Array<(document: { uri: { toString(): string } }) => void>;
+  decorationDisposed: number;
+  openedDocuments: string[];
+} = {
+  closeHandlers: [],
+  decorationDisposed: 0,
+  openedDocuments: [],
+};
+
+function makeFakeBlameEditor(): FakeTextEditor {
+  const editor: FakeTextEditor = {
+    decorations: [],
+    setDecorations(type, options) {
+      editor.decorations.push({ type, options });
+    },
+  };
+  return editor;
+}
+
 vi.mock('vscode', () => ({
   ViewColumn: { Active: 1, Beside: 2 },
+  DecorationRangeBehavior: { ClosedClosed: 1, OpenOpen: 2, OpenClosed: 3, ClosedOpen: 4 },
   ThemeIcon: class {
     constructor(public id: string) {}
   },
@@ -70,7 +106,12 @@ vi.mock('vscode', () => ({
     },
     showInputBox: () => Promise.resolve(undefined),
     showQuickPick: () => Promise.resolve(undefined),
-    showTextDocument: () => Promise.resolve(undefined),
+    showTextDocument: () => Promise.resolve(blameMock.editor),
+    createTextEditorDecorationType: () => ({
+      dispose: () => {
+        blameMock.decorationDisposed += 1;
+      },
+    }),
     createWebviewPanel: (_viewType: string, title: string) => {
       const panel = makeFakePanel(title);
       vscodeMock.panels.push(panel);
@@ -87,7 +128,25 @@ vi.mock('vscode', () => ({
     get workspaceFolders() {
       return [];
     },
-    onDidCloseTextDocument: () => ({ dispose() {} }),
+    openTextDocument: (uri: { toString(): string }) => {
+      blameMock.openedDocuments.push(uri.toString());
+      return Promise.resolve({
+        uri,
+        lineCount: 10_000,
+        lineAt: (line: number) => ({ range: { start: { line }, end: { line } } }),
+      });
+    },
+    onDidCloseTextDocument: (handler: (document: { uri: { toString(): string } }) => void) => {
+      blameMock.closeHandlers.push(handler);
+      return {
+        dispose() {
+          const index = blameMock.closeHandlers.indexOf(handler);
+          if (index >= 0) {
+            blameMock.closeHandlers.splice(index, 1);
+          }
+        },
+      };
+    },
     registerTextDocumentContentProvider: () => ({ dispose() {} }),
   },
   env: {
@@ -138,6 +197,12 @@ vi.mock('../src/host/diffView', async (importOriginal) => {
   };
 });
 
+// 逐行追溯入口的内容类型探测：默认文本；二进制入口禁用用例按需切换。
+vi.mock('../src/core/remoteContent', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/core/remoteContent')>();
+  return { ...actual, probeRemoteContent: vi.fn() };
+});
+
 vi.mock('../src/host/panel/panels/checkout', () => ({
   openCheckoutPanelFromHistory: vi.fn(),
 }));
@@ -165,8 +230,21 @@ vi.mock('../src/host/commands/conflicts', async (importOriginal) => {
   return { ...actual, openConflictTarget: vi.fn() };
 });
 
+vi.mock('../src/host/output', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/host/output')>();
+  return {
+    ...actual,
+    showOutput: vi.fn(),
+    // 频道断言：保留真实实现，仅记录调用参数供用例核对频道。
+    decodingRunOptions: vi.fn(actual.decodingRunOptions),
+    logCommand: vi.fn(actual.logCommand),
+    logLine: vi.fn(actual.logLine),
+  };
+});
+
 import { run, runOrThrow } from '../src/core/svnCli';
 import { SvnError, extractSvnErrorCodes } from '../src/core/errors';
+import { strings } from '../src/host/i18n';
 import type { ConflictRecord } from '../src/core/conflict';
 import { historyTargetKey } from '../src/host/panel/historyModel';
 import {
@@ -189,13 +267,16 @@ import {
 import { getActiveTask, resetTaskRegistry } from '../src/host/taskRegistry';
 import { confirmModal } from '../src/host/ui/confirm';
 import { openConflictTarget } from '../src/host/commands/conflicts';
-import { openSnapshotBaseCompareEntry } from '../src/host/diffView';
+import { openSnapshotBaseCompareEntry, openSnapshotNodeContent, openSnapshotTextDiff } from '../src/host/diffView';
 import { openCheckoutPanelFromHistory } from '../src/host/panel/panels/checkout';
-import { planSnapshotBaseCompare } from '../src/host/panel/snapshotModel';
+import { loadSnapshotCompare, planSnapshotBaseCompare } from '../src/host/panel/snapshotModel';
+import { probeRemoteContent } from '../src/core/remoteContent';
+import { createSvnLab, writeFile as writeLabFile, type SvnLab } from './helpers';
 import { resetPanelRegistry } from '../src/host/panel/host';
 import { readM4ScopeSession, resetM4SessionStore } from '../src/host/sessionResults';
-import { resetOutputState } from '../src/host/output';
+import { decodingRunOptions, logCommand, logLine, resetOutputState, showOutput } from '../src/host/output';
 import {
+  historyCompareForTest,
   historyModelForTest,
   historySessionSnapshot,
   openHistoryPanel,
@@ -356,7 +437,7 @@ function parseCommand(args: string[]): ParsedCommand {
 type Reply = { ok: true; xml: string } | { ok: false; stderr: string };
 
 const svnCalls: ParsedCommand[] = [];
-let infoHandler: (request: ParsedCommand) => Reply;
+let infoHandler: (request: ParsedCommand) => Reply | Promise<Reply>;
 let logHandler: (request: ParsedCommand) => Reply | Promise<Reply>;
 let detailInfoHandler: (request: ParsedCommand) => Reply | Promise<Reply>;
 
@@ -382,7 +463,7 @@ function resetSvnStub(): void {
   vi.mocked(runOrThrow).mockImplementation(async (_svnPath, args) => {
     const request = parseCommand(args);
     svnCalls.push(request);
-    const reply = request.kind === 'info' ? infoHandler(request) : await logHandler(request);
+    const reply = request.kind === 'info' ? await infoHandler(request) : await logHandler(request);
     if (!reply.ok) {
       throw svnError(args, reply.stderr);
     }
@@ -402,10 +483,10 @@ function resetSvnStub(): void {
 const ROOT = 'https://example.com/repo';
 const NODE = `${ROOT}/trunk/a.txt`;
 
-function infoXml(url: string, revision: number, kind: 'file' | 'dir' = 'file'): string {
+function infoXml(url: string, revision: number, kind: 'file' | 'dir' = 'file', root = ROOT): string {
   return `<info><entry kind="${kind}" path="x" revision="${revision}">` +
     `<url>${url}</url>` +
-    `<repository><root>${ROOT}</root><uuid>uuid-1</uuid></repository>` +
+    `<repository><root>${root}</root><uuid>uuid-1</uuid></repository>` +
     `<commit revision="${revision}"><author>alice</author><date>2026-11-01T10:00:00.000000Z</date></commit>` +
     `</entry></info>`;
 }
@@ -510,6 +591,16 @@ beforeEach(() => {
   vscodeMock.clipboard.length = 0;
   vscodeMock.panels.length = 0;
   vscodeMock.config = {};
+  blameMock.editor = undefined;
+  blameMock.closeHandlers.length = 0;
+  blameMock.decorationDisposed = 0;
+  blameMock.openedDocuments.length = 0;
+  vi.mocked(probeRemoteContent).mockReset();
+  vi.mocked(probeRemoteContent).mockResolvedValue({
+    status: 'probed',
+    classification: { kind: 'text', reason: 'none' },
+    headBytes: 0,
+  });
   resetSvnStub();
   vi.mocked(planSnapshotBaseCompare).mockReset();
   vi.mocked(openSnapshotBaseCompareEntry).mockReset();
@@ -519,6 +610,7 @@ beforeEach(() => {
   vi.mocked(checkHistoryUpdatePreconditions).mockReset();
   vi.mocked(runHistoryUpdate).mockReset();
   vi.mocked(rescanHistoryUpdate).mockReset();
+  vi.mocked(showOutput).mockReset();
   vi.mocked(confirmModal).mockReset();
   vi.mocked(confirmModal).mockResolvedValue(true);
   vi.mocked(openConflictTarget).mockReset();
@@ -572,6 +664,22 @@ describe('本地入口打开', () => {
     expect(html).toContain(`data-intent="loadMoreHistory"`);
   });
 
+  it('P6 只读历史的运行选项与命令日志走 history 频道（不再复用 browse）', async () => {
+    infoHandler = standardInfo(42);
+    logHandler = () => ({ ok: true, xml: logXml([{ revision: 41 }]) });
+    vi.mocked(decodingRunOptions).mockClear();
+    vi.mocked(logCommand).mockClear();
+    vi.mocked(logLine).mockClear();
+    await openHistoryPanel(localTarget());
+    await waitFor(() => historySessionSnapshot().hasLoadedData === true);
+    // 解码提示与凭据重试回显的频道全部是 history；不得再写 P5 浏览频道。
+    const decodingKinds = vi.mocked(decodingRunOptions).mock.calls.map((call) => call[0]);
+    expect(decodingKinds.length).toBeGreaterThan(0);
+    expect(decodingKinds.filter((kind) => kind !== 'history')).toEqual([]);
+    const logKinds = vi.mocked(logCommand).mock.calls.map((call) => call[3]);
+    expect(logKinds.filter((kind) => kind !== 'history')).toEqual([]);
+  });
+
   it('空历史（目标存在、log 成功但零记录）显示空态', async () => {
     infoHandler = standardInfo(42);
     logHandler = () => ({ ok: true, xml: logXml([]) });
@@ -606,7 +714,7 @@ describe('本地入口打开', () => {
   });
 });
 
-describe('base-fallback（HLS-6）', () => {
+describe('base-fallback', () => {
   it('成功：三字段固定 BASEr/unavailable 并进入结果', async () => {
     infoHandler = (request) => {
       if (request.url === ROOT) {
@@ -664,6 +772,40 @@ describe('base-fallback（HLS-6）', () => {
     expect(after.hasLoadedData).toBe(true);
   });
 
+  it('base-fallback 的 log 回包为畸形 XML：toast 错误、三字段与已扫描数据不变、不再续发请求', async () => {
+    let logMode: 'ok' | 'malformed' = 'ok';
+    infoHandler = (request) => {
+      if (request.url === ROOT) {
+        return { ok: false, stderr: failStderr(['E170013', 'E120108']) };
+      }
+      return { ok: true, xml: infoXml(NODE, request.revision ?? 40) };
+    };
+    logHandler = () => (logMode === 'ok'
+      ? { ok: true, xml: logXml([{ revision: 39 }, { revision: 38 }]) }
+      : { ok: true, xml: '<log><logentry revision="41"><author>alice</author>' });
+    await openHistoryPanel(localTarget());
+    await waitFor(() => historySessionSnapshot().phase === 'ready');
+    fakePanel().sendIntent({ kind: 'refreshHistoryUpper', mode: 'base-fallback' });
+    await waitFor(() => historySessionSnapshot().hasLoadedData === true);
+    const before = historySessionSnapshot();
+    const logCallsBefore = svnCalls.filter((call) => call.kind === 'log').length;
+
+    logMode = 'malformed';
+    fakePanel().sendIntent({ kind: 'refreshHistoryUpper', mode: 'base-fallback' });
+    await waitFor(() => fakePanel().toasts().some((message) => message.includes('按 BASE 上限读取失败')));
+
+    const after = historySessionSnapshot();
+    expect(after.upperRevision).toBe(before.upperRevision);
+    expect(after.upperSource).toBe(before.upperSource);
+    expect(after.headState).toBe(before.headState);
+    expect(after.loadedMatchedCount).toBe(before.loadedMatchedCount);
+    expect(after.displayedCount).toBe(before.displayedCount);
+    expect(after.scannedUniqueRevisions).toBe(before.scannedUniqueRevisions);
+    // 畸形回包只发那一次请求：不进入 startLoadMore/pumpNetwork 续发。
+    await flush();
+    expect(svnCalls.filter((call) => call.kind === 'log')).toHaveLength(logCallsBefore + 1);
+  });
+
   it('live-head 会话拒绝 base-fallback（不发 info/log）', async () => {
     infoHandler = standardInfo(42);
     logHandler = () => ({ ok: true, xml: logXml([{ revision: 41 }]) });
@@ -678,7 +820,7 @@ describe('base-fallback（HLS-6）', () => {
   });
 });
 
-describe('resetHistorySession（HLS-6）', () => {
+describe('resetHistorySession', () => {
   it('live-head reset：headState=available 保持、不重读 HEAD、重读首批', async () => {
     infoHandler = standardInfo(42);
     logHandler = () => ({ ok: true, xml: logXml([{ revision: 41 }, { revision: 40 }]) });
@@ -804,6 +946,98 @@ describe('refreshHistoryUpper（head）', () => {
   });
 });
 
+describe('占用态：刷新在途与更新确认窗口', () => {
+  it('刷新在途：加载更多与更新被占用态拒绝且刷新结果不被中止', async () => {
+    let head = 42;
+    let refreshPending = false;
+    let releaseRefresh: (() => void) | undefined;
+    infoHandler = (request) => {
+      if (request.url === ROOT) {
+        if (head === 45) {
+          // 刷新 HEAD 探测挂起：模拟慢网络下刷新在途的窗口。
+          refreshPending = true;
+          return new Promise<Reply>((resolve) => {
+            releaseRefresh = () => resolve({ ok: true, xml: infoXml(ROOT, 45, 'dir') });
+          });
+        }
+        return { ok: true, xml: infoXml(ROOT, head, 'dir') };
+      }
+      return { ok: true, xml: infoXml(NODE, request.revision ?? head) };
+    };
+    logHandler = () => ({ ok: true, xml: logXml([{ revision: 41 }]) });
+    await openHistoryPanel(localTarget());
+    await waitFor(() => historySessionSnapshot().hasLoadedData === true);
+    const logsBefore = svnCalls.filter((call) => call.kind === 'log').length;
+
+    head = 45;
+    fakePanel().sendIntent({ kind: 'refreshHistoryUpper', mode: 'head' });
+    await waitFor(() => refreshPending);
+    await flush();
+
+    // 刷新在途进入占用态：刷新按钮本身与加载更多按同一张放行表禁用。
+    const refreshButton = (): string =>
+      /<button[^>]*data-intent="refreshHistoryUpper"[^>]*>/.exec(fakePanel().latestRenderHtml())?.[0] ?? '';
+    expect(refreshButton()).toContain('disabled');
+
+    // 加载更多被宿主门禁拒绝（明确提示），不中止刷新、不发多余 log。
+    fakePanel().sendIntent({ kind: 'loadMoreHistory' });
+    await waitFor(() => fakePanel().toasts().some((message) => message.includes(strings.panel.toastBusyRejected)));
+    expect(svnCalls.filter((call) => call.kind === 'log').length).toBe(logsBefore);
+
+    // 更新开始同样被占用态拒绝：不进入写前检查。
+    fakePanel().sendIntent({ kind: 'updateToHistoryRevision' });
+    await flush();
+    expect(vi.mocked(prepareHistoryUpdate)).not.toHaveBeenCalled();
+
+    // 释放 HEAD：刷新继续完成（未被加载更多静默丢弃），数据按新 HEAD 重读。
+    releaseRefresh?.();
+    await waitFor(() => historySessionSnapshot().upperRevision === 45);
+    expect(fakePanel().toasts().some((message) => message.includes('已按 HEAD 刷新'))).toBe(true);
+    // 刷新链收尾（重读首批的 log 完成 + finally 恢复占用态）后，加载更多
+    // 不再命中 busy 门禁。
+    await waitFor(() => svnCalls.filter((call) => call.kind === 'log').length === logsBefore + 1);
+    await flush();
+    const busyToasts = (): number => fakePanel().toasts()
+      .filter((message) => message.includes(strings.panel.toastBusyRejected)).length;
+    const busyBefore = busyToasts();
+    fakePanel().sendIntent({ kind: 'loadMoreHistory' });
+    await flush();
+    await flush();
+    expect(busyToasts()).toBe(busyBefore);
+  });
+
+  it('更新确认窗口在途：刷新被占用态拒绝且已确认的更新继续执行', async () => {
+    await openWithDetail();
+    let preparePending = false;
+    let releasePrepare: (() => void) | undefined;
+    vi.mocked(prepareHistoryUpdate).mockImplementation(() => new Promise((resolve) => {
+      preparePending = true;
+      releasePrepare = () => resolve({ ok: true, intent: updateIntent() });
+    }));
+    vi.mocked(checkHistoryUpdatePreconditions).mockResolvedValue({ ok: true });
+    vi.mocked(runHistoryUpdate).mockResolvedValue(updateResult());
+    const headInfoBefore = svnCalls.filter((call) => call.kind === 'info' && call.url === ROOT).length;
+
+    fakePanel().sendIntent({ kind: 'updateToHistoryRevision' });
+    await waitFor(() => preparePending);
+    await flush();
+
+    // 写前检查/确认窗口在途：刷新被 busy 门禁拒绝并提示，不发起 HEAD 探测。
+    fakePanel().sendIntent({ kind: 'refreshHistoryUpper', mode: 'head' });
+    await waitFor(() => fakePanel().toasts().some((message) =>
+      message.includes(strings.panel.toastBusyRejected)
+      || message.includes(strings.historyPanel.updateConfirmInProgress)));
+    expect(svnCalls.filter((call) => call.kind === 'info' && call.url === ROOT).length).toBe(headInfoBefore);
+
+    // 释放写前检查：确认后更新照常执行（不因刷新推进票据被静默丢弃）。
+    releasePrepare?.();
+    await waitFor(() => historySessionSnapshot().updatePhase === 'updated');
+    await waitFor(() => getActiveTask('history') === undefined);
+    expect(vi.mocked(confirmModal)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(runHistoryUpdate)).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('P5 快照交接', () => {
   it('固定 snapshotRevision、不读 HEAD；footer 无 refreshHistoryUpper', async () => {
     infoHandler = (request) => {
@@ -925,6 +1159,30 @@ describe('筛选、勾选与详情', () => {
     expect(html).toContain('data-intent="comparePreviousVisible"');
     expect(html).toContain('data-intent="copyHistoryText"');
   });
+
+  it('每批条数下拉选择不被配置值覆盖：一次 push 后仍保留用户选择', async () => {
+    vscodeMock.config['historyPageSize'] = 50;
+    await openWithEntries();
+    expect(historyModelForTest()?.pageSize).toBe(50);
+
+    fakePanel().sendIntent({ kind: 'setHistoryFilter', id: 'pageSize', value: '20' });
+    await flush();
+    expect(historyModelForTest()?.pageSize).toBe(20);
+
+    // 任意后续 push（关键词筛选重算整帧）：用户选择不被配置值静默回退。
+    fakePanel().sendIntent({ kind: 'setHistoryFilter', id: 'keyword', value: '初始化' });
+    await flush();
+    expect(historyModelForTest()?.pageSize).toBe(20);
+    const state = historyModelForTest()!.buildPanelState('t');
+    const pageSizeField = state.filterPanel?.fields.find((field) => field.id === 'pageSize');
+    expect(pageSizeField?.value).toBe('20');
+
+    // 配置值本身变化时才重新应用到模型。
+    vscodeMock.config['historyPageSize'] = 100;
+    fakePanel().sendIntent({ kind: 'setHistoryFilter', id: 'keyword', value: '目标' });
+    await flush();
+    expect(historyModelForTest()?.pageSize).toBe(100);
+  });
 });
 
 /** 模型详情 revision（测试辅助；读取模型当前详情状态）。 */
@@ -955,6 +1213,31 @@ describe('复制与比较接线', () => {
     expect(vscodeMock.clipboard[2]).toBe(NODE);
   });
 
+  it('详情复制在展示前缀缩小后仍生效：按稳定 ID 从会话数据取，不被宿主丢弃', async () => {
+    infoHandler = standardInfo(42);
+    // 25 条记录：展示全部时选中较深的 r17，再缩小每批条数让其离开展示前缀。
+    const revisions = Array.from({ length: 25 }, (_, index) => 41 - index);
+    logHandler = () => ({ ok: true, xml: logXml(revisions.map((revision) => ({ revision }))) });
+    detailInfoHandler = () => ({ ok: true, xml: infoXml(NODE, 17) });
+    await openHistoryPanel(localTarget());
+    await waitFor(() => historySessionSnapshot().hasLoadedData === true);
+
+    fakePanel().sendIntent({ kind: 'setHistoryFilter', id: 'pageSize', value: '100' });
+    await flush();
+    fakePanel().sendIntent({ kind: 'selectHistoryRevision', id: 'r17' });
+    await waitFor(() => historyModelDetailRevision() === 17);
+    fakePanel().sendIntent({ kind: 'setHistoryFilter', id: 'pageSize', value: '20' });
+    await flush();
+    expect(historySessionSnapshot().displayedCount).toBe(20);
+
+    // 详情仍渲染（独立于表格展示前缀存活）：复制动作按稳定 ID 从已加载
+    // 会话数据解析，宿主不因行不在展示前缀而静默丢弃意图。
+    expect(fakePanel().latestRenderHtml()).toContain('data-intent="copyHistoryText"');
+    fakePanel().sendIntent({ kind: 'copyHistoryText', copyKind: 'message', id: 'r17' });
+    await waitFor(() => vscodeMock.clipboard.length === 1);
+    expect(vscodeMock.clipboard[0]).toBe('提交 r17');
+  });
+
   it('comparePreviousVisible：执行器收到下一条可见记录版本对', async () => {
     await openLive();
     fakePanel().sendIntent({ kind: 'selectHistoryRevision', id: 'r41' });
@@ -976,6 +1259,9 @@ describe('复制与比较接线', () => {
 
   it('compareHistoryRevisions：勾选两项后执行器收到手动勾选对', async () => {
     await openLive();
+    // 冻结动作有稳定 DOM 入口（页脚「比较所选版本」），不是仅协议可达。
+    expect(fakePanel().latestRenderHtml()).toContain('data-intent="compareHistoryRevisions"');
+    expect(fakePanel().latestRenderHtml()).toContain('比较所选版本');
     const runner = vi.fn();
     setHistoryComparisonRunner(runner);
     fakePanel().sendIntent({ kind: 'compareHistoryRevisions' });
@@ -986,6 +1272,59 @@ describe('复制与比较接线', () => {
     fakePanel().sendIntent({ kind: 'compareHistoryRevisions' });
     await waitFor(() => runner.mock.calls.length === 1);
     expect(runner.mock.calls[0][0]).toEqual({ origin: 'selected', revisions: [41, 40] });
+  });
+
+  it('比较候选打开差异与详情标题使用复制窗口映射后的实际 revision', async () => {
+    await openLive();
+    // 复制窗口场景：用户选择 r40（compare.leftRevision），左端实际节点经
+    // 复制解析落在另一来源路径的 r4（candidate.leftRevision）。
+    vi.mocked(loadSnapshotCompare).mockReset();
+    vi.mocked(loadSnapshotCompare).mockImplementation(async (_svnPath, state) => ({
+      ...state,
+      phase: 'ready',
+      candidates: [{
+        id: 'c0',
+        relativePath: 'trunk/a.txt',
+        displayPath: 'trunk/a.txt',
+        item: 'modified',
+        props: 'none',
+        kind: 'file',
+        leftPresent: true,
+        rightPresent: true,
+        leftUrl: `${ROOT}/branches/b.txt`,
+        rightUrl: NODE,
+        leftRevision: 4,
+        rightRevision: 41,
+        status: 'modified',
+        canOpenTextDiff: true,
+        canExport: true,
+      }],
+      filteredIndexes: [0],
+      selectedId: 'c0',
+    }));
+    fakePanel().sendIntent({ kind: 'toggleHistoryRevision', id: 'r41' });
+    fakePanel().sendIntent({ kind: 'toggleHistoryRevision', id: 'r40' });
+    await waitFor(() => historySessionSnapshot().selection.length === 2);
+    fakePanel().sendIntent({ kind: 'compareHistoryRevisions' });
+    await waitFor(() => historyCompareForTest()?.phase === 'ready');
+    expect(historyCompareForTest()?.leftRevision).toBe(40);
+    expect(historyCompareForTest()?.selectedId).toBe('c0');
+
+    // 详情标题按候选实际 revision 呈现（左端 r4，而不是用户选择的 r40）。
+    const html = fakePanel().latestRenderHtml();
+    expect(html).toContain('左端 r4');
+    expect(html).not.toContain('左端 r40');
+
+    vi.mocked(openSnapshotTextDiff).mockReset();
+    vi.mocked(openSnapshotTextDiff).mockResolvedValue({ status: 'opened' } as never);
+    fakePanel().sendIntent({ kind: 'openHistoryDiff' });
+    await waitFor(() => vi.mocked(openSnapshotTextDiff).mock.calls.length === 1);
+    const request = vi.mocked(openSnapshotTextDiff).mock.calls[0][0];
+    expect(request.left).toMatchObject({
+      rawUrl: `${ROOT}/branches/b.txt`,
+      revision: 4,
+    });
+    expect(request.right).toMatchObject({ rawUrl: NODE, revision: 41 });
   });
 });
 
@@ -1025,6 +1364,21 @@ describe('加载更多', () => {
     expect(logCalls).toHaveLength(2);
     expect(html).toContain('data-intent="loadMoreHistory"');
     expect(fakePanel().latestRenderHtml()).toContain('disabled');
+  });
+
+  it('log 回包畸形 XML：进入错误态（可重试横幅）而非空历史，不续发请求', async () => {
+    infoHandler = standardInfo(42);
+    logHandler = () => ({ ok: true, xml: '<log><logentry revision="41"><author>alice</author>' });
+    await openHistoryPanel(localTarget());
+    await waitFor(() => historyModelForTest()?.loadFailure() !== undefined);
+    const failure = historyModelForTest()!.loadFailure();
+    expect(failure?.message).toContain('XML');
+    expect(historySessionSnapshot().hasLoadedData).toBe(false);
+    expect(historySessionSnapshot().phase).toBe('ready');
+    // 错误态呈现（可重试横幅），不是「空历史」。
+    expect(fakePanel().latestRenderHtml()).toContain('data-banner-id="historyLoadError"');
+    await flush();
+    expect(svnCalls.filter((call) => call.kind === 'log')).toHaveLength(1);
   });
 
   it('网络轮加载更多使用 append 增量（只追加新增行片段，不分片超页大小）', async () => {
@@ -1108,6 +1462,64 @@ describe('详情动作接线：检出交接与 BASE 比较', () => {
       relPath: 'trunk/a.txt',
       kind: 'file',
     });
+    // 单条目目标保持直接打开，不弹汇总确认。
+    expect(vi.mocked(confirmModal)).not.toHaveBeenCalled();
+  });
+
+  it('目录 BASE 比较超过上限：汇总确认后只打开前 10 个差异并提示其余未打开', async () => {
+    infoHandler = standardInfo(42);
+    logHandler = () => ({ ok: true, xml: logXml([{ revision: 41 }, { revision: 40 }]) });
+    detailInfoHandler = () => ({ ok: true, xml: infoXml(`${ROOT}/trunk`, 41, 'dir') });
+    await openHistoryPanel(localTarget());
+    await waitFor(() => historySessionSnapshot().hasLoadedData === true);
+    fakePanel().sendIntent({ kind: 'selectHistoryRevision', id: 'r41' });
+    await waitFor(() => historyModelForTest()?.detailState()?.resolution.status === 'present');
+
+    vi.mocked(planSnapshotBaseCompare).mockResolvedValue({
+      status: 'ready',
+      entries: Array.from({ length: 12 }, (_, index) => ({
+        relPath: `trunk/f${index}.txt`,
+        wcStatus: 'modified',
+        props: 'none',
+        kind: 'file',
+      })),
+    });
+    vi.mocked(openSnapshotBaseCompareEntry).mockResolvedValue('diffed');
+    fakePanel().sendIntent({ kind: 'compareBase' });
+    await waitFor(() => vi.mocked(openSnapshotBaseCompareEntry).mock.calls.length === 10);
+
+    // 汇总确认先于打开：消息含总项数与一次打开上限。
+    expect(vi.mocked(confirmModal)).toHaveBeenCalledTimes(1);
+    const message = String(vi.mocked(confirmModal).mock.calls[0][0]);
+    expect(message).toContain('12');
+    expect(message).toContain('10');
+    // 汇总提示与截断提示均可见；打开数被上限锁定。
+    expect(fakePanel().toasts().some((toast) => toast.includes('本地实际变化 12 项'))).toBe(true);
+    expect(fakePanel().toasts().some((toast) => toast.includes('其余未打开'))).toBe(true);
+    await flush();
+    expect(vi.mocked(openSnapshotBaseCompareEntry)).toHaveBeenCalledTimes(10);
+  });
+
+  it('目录 BASE 比较取消确认：不打开任何差异并提示已取消', async () => {
+    infoHandler = standardInfo(42);
+    logHandler = () => ({ ok: true, xml: logXml([{ revision: 41 }, { revision: 40 }]) });
+    detailInfoHandler = () => ({ ok: true, xml: infoXml(`${ROOT}/trunk`, 41, 'dir') });
+    await openHistoryPanel(localTarget());
+    await waitFor(() => historySessionSnapshot().hasLoadedData === true);
+    fakePanel().sendIntent({ kind: 'selectHistoryRevision', id: 'r41' });
+    await waitFor(() => historyModelForTest()?.detailState()?.resolution.status === 'present');
+
+    vi.mocked(planSnapshotBaseCompare).mockResolvedValue({
+      status: 'ready',
+      entries: [
+        { relPath: 'trunk/a.txt', wcStatus: 'modified', props: 'none', kind: 'file' },
+        { relPath: 'trunk/b.txt', wcStatus: 'modified', props: 'none', kind: 'file' },
+      ],
+    });
+    vi.mocked(confirmModal).mockResolvedValue(false);
+    fakePanel().sendIntent({ kind: 'compareBase' });
+    await waitFor(() => fakePanel().toasts().some((message) => message.includes('已取消打开 BASE 差异')));
+    expect(vi.mocked(openSnapshotBaseCompareEntry)).not.toHaveBeenCalled();
   });
 });
 
@@ -1428,6 +1840,58 @@ describe('P6 更新：执行链与状态机', () => {
     expect(fakePanel().latestRenderHtml()).toContain('回读节点 BASE r41');
   });
 
+  it('updating 横幅出口：「查看日志」打开 history 频道，「关闭面板」关闭界面且任务继续', async () => {
+    await openWithDetail();
+    vi.mocked(prepareHistoryUpdate).mockResolvedValue({ ok: true, intent: updateIntent() });
+    vi.mocked(checkHistoryUpdatePreconditions).mockResolvedValue({ ok: true });
+    let releaseUpdate: ((result: HistoryUpdateResult) => void) | undefined;
+    vi.mocked(runHistoryUpdate).mockImplementation(() => new Promise<HistoryUpdateResult>((resolve) => {
+      releaseUpdate = resolve;
+    }));
+
+    fakePanel().sendIntent({ kind: 'updateToHistoryRevision' });
+    await waitFor(() => historySessionSnapshot().updatePhase === 'updating');
+    const panel = fakePanel();
+
+    // 在途页「查看日志」：打开 P6 命令频道，不再落到裸 return。
+    fakePanel().sendIntent({ kind: 'bannerAction', bannerId: 'historyUpdate', actionId: 'viewTaskLog' });
+    await waitFor(() => vi.mocked(showOutput).mock.calls.length === 1);
+    expect(vi.mocked(showOutput)).toHaveBeenLastCalledWith(false, 'history');
+
+    // 在途页「关闭面板」：只关界面，任务继续（可关面板但不取消）。
+    fakePanel().sendIntent({ kind: 'bannerAction', bannerId: 'historyUpdate', actionId: 'closePanel' });
+    await waitFor(() => panel.disposed === true);
+    expect(getActiveTask('history')?.phase).toBe('updating');
+
+    releaseUpdate?.(updateResult());
+    await waitFor(() => getActiveTask('history') === undefined);
+    expect(readM4ScopeSession(UPDATE_SCOPE)?.terminalPage).toMatchObject({ kind: 'history-update' });
+  });
+
+  it('updateUnknown 横幅出口：「查看日志」打开 history 频道，「关闭面板」可关闭', async () => {
+    await openWithDetail();
+    vi.mocked(prepareHistoryUpdate).mockResolvedValue({ ok: true, intent: updateIntent() });
+    vi.mocked(checkHistoryUpdatePreconditions).mockResolvedValue({ ok: true });
+    vi.mocked(runHistoryUpdate).mockResolvedValue(updateResult({
+      outcome: 'unknown',
+      postNodeRevision: undefined,
+      readbackError: 'svn update 退出码 1',
+    }));
+
+    fakePanel().sendIntent({ kind: 'updateToHistoryRevision' });
+    await waitFor(() => historySessionSnapshot().updatePhase === 'updateUnknown');
+    const panel = fakePanel();
+
+    fakePanel().sendIntent({ kind: 'bannerAction', bannerId: 'historyUpdate', actionId: 'viewTaskLog' });
+    await waitFor(() => vi.mocked(showOutput).mock.calls.length === 1);
+    expect(vi.mocked(showOutput)).toHaveBeenLastCalledWith(false, 'history');
+
+    fakePanel().sendIntent({ kind: 'bannerAction', bannerId: 'historyUpdate', actionId: 'closePanel' });
+    await waitFor(() => panel.disposed === true);
+    // 关闭面板不改变写锁：未知记录保持到回扫收口。
+    expect(getOperationRegistry().writeRestriction('/wc')?.phase).toBe('unknown');
+  });
+
   it('未知：保持旧 BASE、记录 unknown 写锁；回扫仍未知保持，成功出口收口并释放写锁', async () => {
     await openWithDetail();
     vi.mocked(prepareHistoryUpdate).mockResolvedValue({ ok: true, intent: updateIntent() });
@@ -1663,5 +2127,253 @@ describe('P6 更新：关闭重开与宿主重启恢复', () => {
     await waitFor(() => getActiveTask('history') === undefined);
     expect(store.records).toEqual([]);
     expect(historyModelForTest()?.localBaseRevision()).toBe(41);
+  });
+
+  it('同一工作副本另一目标的更新任务结算后 busy 自动恢复（跨目标任务移除通知）', async () => {
+    await openWithDetail();
+    vi.mocked(prepareHistoryUpdate).mockResolvedValue({ ok: true, intent: updateIntent() });
+    vi.mocked(checkHistoryUpdatePreconditions).mockResolvedValue({ ok: true });
+    let releaseUpdate: ((result: HistoryUpdateResult) => void) | undefined;
+    vi.mocked(runHistoryUpdate).mockImplementation(() => new Promise<HistoryUpdateResult>((resolve) => {
+      releaseUpdate = resolve;
+    }));
+    fakePanel().sendIntent({ kind: 'updateToHistoryRevision' });
+    await waitFor(() => historySessionSnapshot().updatePhase === 'updating');
+
+    // 关闭目标 A 面板（任务继续），打开同一 wcRoot 的目标 B 面板。
+    fakePanel().dispose();
+    const nodeB = `${ROOT}/trunk/b.txt`;
+    infoHandler = (request) => {
+      if (request.url === ROOT || request.url === `${ROOT}/`) {
+        return { ok: true, xml: infoXml(ROOT, 42, 'dir') };
+      }
+      if (request.url === nodeB) {
+        return { ok: true, xml: infoXml(nodeB, request.revision ?? 42) };
+      }
+      return { ok: false, stderr: failStderr(['W170000', 'E200009']) };
+    };
+    logHandler = () => ({
+      ok: true,
+      xml: logXml([{ revision: 41, paths: [{ path: '/trunk/b.txt' }] }]),
+    });
+    await openHistoryPanel(localTarget({
+      wcRoot: '/wc',
+      localPath: '/wc/trunk/b.txt',
+      url: nodeB,
+      relativePath: 'trunk/b.txt',
+    }));
+    await waitFor(() => historySessionSnapshot().hasLoadedData === true);
+    // B 面板没有本作用域任务，只经占用态呈现 busy。
+    expect(getActiveTask('history')?.phase).toBe('updating');
+    expect(fakePanel().latestRenderHtml()).toContain('data-busy="1"');
+
+    // A 的任务结算：B 收到跨目标任务移除通知，重算占用并推送（busy 恢复）。
+    releaseUpdate?.(updateResult());
+    await waitFor(() => getActiveTask('history') === undefined);
+    await flush();
+    expect(fakePanel().latestRenderHtml()).toContain('data-busy="0"');
+  });
+
+  it('同一工作副本另一目标的 unknown 记录经当前面板回扫成功：当前目标 BASE 与终态页不被改写', async () => {
+    // 预置目标 A（trunk/a.txt）的未知更新记录（同一 wcRoot /wc）。
+    const store = memoryStore();
+    const registry = new OperationRegistry(store);
+    const begin = await registry.begin({
+      wcRoot: '/wc',
+      lockKey: '/wc',
+      kind: 'history-update',
+      operationId: 'op-target-a',
+      targetRelPath: 'trunk/a.txt',
+      nodeKind: 'file',
+      baseRevision: 40,
+      historyUpdateIntent: updateIntent(),
+    });
+    expect(begin.ok).toBe(true);
+    await registry.markPhase('op-target-a', 'unknown');
+    setOperationRegistryForTest(registry);
+
+    // 打开同一工作副本的目标 B 面板：未知记录经写锁展示回扫出口。
+    const nodeB = `${ROOT}/trunk/b.txt`;
+    infoHandler = (request) => {
+      if (request.url === ROOT || request.url === `${ROOT}/`) {
+        return { ok: true, xml: infoXml(ROOT, 42, 'dir') };
+      }
+      if (request.url === nodeB) {
+        return { ok: true, xml: infoXml(nodeB, request.revision ?? 42) };
+      }
+      return { ok: false, stderr: failStderr(['W170000', 'E200009']) };
+    };
+    logHandler = () => ({
+      ok: true,
+      xml: logXml([{ revision: 41, paths: [{ path: '/trunk/b.txt' }] }]),
+    });
+    await openHistoryPanel(localTarget({
+      wcRoot: '/wc',
+      localPath: '/wc/trunk/b.txt',
+      url: nodeB,
+      relativePath: 'trunk/b.txt',
+      baseRevision: 38,
+    }));
+    await waitFor(() => historySessionSnapshot().hasLoadedData === true);
+    expect(historySessionSnapshot()).toMatchObject({
+      updatePhase: 'updateUnknown',
+      updateTargetRelPath: 'trunk/a.txt',
+    });
+    expect(historyModelForTest()?.localBaseRevision()).toBe(38);
+
+    // 在当前面板回扫 A 的记录并成功：记录 finalize 释放写锁，但 A 的回读
+    // BASE 不得应用到 B 的 BASE 徽标/base-fallback 历史。
+    vi.mocked(rescanHistoryUpdate).mockResolvedValue(updateRescan({ outcome: 'updated', postNodeRevision: 41 }));
+    fakePanel().sendIntent({ kind: 'rescanHistoryUpdate' });
+    await waitFor(() => historySessionSnapshot().updatePhase === 'updated');
+    await waitFor(() => getActiveTask('history') === undefined);
+    expect(historySessionSnapshot().updateTargetRelPath).toBe('trunk/a.txt');
+    expect(historyModelForTest()?.localBaseRevision()).toBe(38);
+    expect(getOperationRegistry().writeRestriction('/wc')).toBeUndefined();
+    expect(await getOperationRegistry().loadAllRecords()).toEqual([]);
+
+    // 终态页不写当前作用域（重开 B 不得按 A 的终态还原）。
+    const bScope = {
+      scopeKind: 'history' as const,
+      targetKey: historyTargetKey('uuid-1', {
+        repositoryRootUrl: ROOT,
+        relativePath: 'trunk/b.txt',
+        kind: 'file',
+      }),
+      targetKind: 'file' as const,
+    };
+    expect(readM4ScopeSession(bScope)?.terminalPage).toBeUndefined();
+  });
+});
+
+describe('P6 逐行追溯（F46）', () => {
+  const blameDocumentUri = {
+    scheme: 'svn-anywhere-remote',
+    path: '/uuid-lab/2/key/a.txt',
+    query: '',
+    toString: () => 'svn-anywhere-remote:/uuid-lab/2/key/a.txt',
+  };
+
+  let lab: SvnLab | undefined;
+  afterEach(() => {
+    lab?.cleanup();
+    lab = undefined;
+  });
+
+  /** 真实 svnadmin + file:// 仓库：打开 r2 的历史并选中详情。 */
+  async function openRealLabHistory(): Promise<void> {
+    lab = createSvnLab('svn-anywhere-p6-blame-');
+    const wc = lab.checkout('wc');
+    writeLabFile(wc, 'a.txt', 'line1\nline2\n', true);
+    lab.svn(['commit', '-q', '-m', 'c1'], wc);
+    writeLabFile(wc, 'a.txt', 'line1 changed\nline2\n');
+    lab.svn(['commit', '-q', '-m', 'c2'], wc);
+    const nodeUrl = `${lab.repoUrl}/a.txt`;
+    const repoRoot = lab.repoUrl;
+    infoHandler = (request) => {
+      if (request.url === repoRoot || request.url === `${repoRoot}/`) {
+        return { ok: true, xml: infoXml(repoRoot, 2, 'dir', repoRoot) };
+      }
+      if (request.url === nodeUrl) {
+        return { ok: true, xml: infoXml(nodeUrl, request.revision ?? 2, 'file', repoRoot) };
+      }
+      return { ok: false, stderr: failStderr(['W170000', 'E200009']) };
+    };
+    logHandler = () => ({
+      ok: true,
+      xml: logXml([
+        { revision: 2, author: 'alice', paths: [{ path: '/a.txt' }] },
+        { revision: 1, author: 'bob', paths: [{ path: '/a.txt', action: 'A' }] },
+      ]),
+    });
+    await openHistoryPanel({
+      source: 'local',
+      wcRoot: wc,
+      localPath: join(wc, 'a.txt'),
+      url: nodeUrl,
+      repositoryRootUrl: lab.repoUrl,
+      repositoryUuid: 'uuid-lab',
+      relativePath: 'a.txt',
+      kind: 'file',
+      baseRevision: 2,
+    });
+    await waitFor(() => historySessionSnapshot().hasLoadedData === true);
+    detailInfoHandler = () => ({ ok: true, xml: infoXml(nodeUrl, 2, 'file', repoRoot) });
+    fakePanel().sendIntent({ kind: 'selectHistoryRevision', id: 'r2' });
+    await waitFor(() => historyModelForTest()?.detailState()?.resolution.status === 'present');
+  }
+
+  it('真实 svn lab：打开所选 revision 的只读快照并附加行尾归属，关闭文档即撤下', async () => {
+    await openRealLabHistory();
+    vi.mocked(openSnapshotNodeContent).mockReset();
+    vi.mocked(openSnapshotNodeContent).mockResolvedValue({
+      status: 'openedText',
+      uri: blameDocumentUri as unknown as vscode.Uri,
+      bytes: 20,
+      encoding: 'utf-8',
+      fellBack: false,
+      lenient: false,
+    });
+    blameMock.editor = makeFakeBlameEditor();
+
+    fakePanel().sendIntent({ kind: 'blameHistoryRevision' });
+    // 真实 svn blame 进程（file:// 仓库）可能超过默认等待窗口。
+    await waitFor(() => (blameMock.editor?.decorations.length ?? 0) > 0, 600);
+
+    // 打开的是该 revision 的只读内容（解析后实际 URL + 明确 revision）。
+    expect(vi.mocked(openSnapshotNodeContent)).toHaveBeenCalledTimes(1);
+    const openArgs = vi.mocked(openSnapshotNodeContent).mock.calls[0];
+    expect(openArgs[1]).toMatchObject({ rawUrl: expect.stringMatching(/\/a\.txt$/), relativePath: 'a.txt' });
+    expect(openArgs[2]).toBe(2);
+
+    // 真实 `svn blame --xml -r 2`：第一行归属 r2、第二行归属 r1（author
+    // 为提交用户，断言 revision 前缀即可）。
+    const applied = blameMock.editor!.decorations[0].options;
+    expect(applied).toHaveLength(2);
+    expect(applied[0].renderOptions?.after?.contentText).toMatch(/^r2 · /);
+    expect(applied[1].renderOptions?.after?.contentText).toMatch(/^r1 · /);
+    // 只读快照文档由 provider 承载（不是工作副本文件）。
+    expect(blameMock.openedDocuments).toEqual(['svn-anywhere-remote:/uuid-lab/2/key/a.txt']);
+
+    // 关闭只读文档：装饰撤下并释放装饰类型（视图只在编辑器存活期间存在）。
+    const disposedBefore = blameMock.decorationDisposed;
+    expect(blameMock.closeHandlers.length).toBeGreaterThan(0);
+    for (const handler of [...blameMock.closeHandlers]) {
+      handler({ uri: blameDocumentUri });
+    }
+    expect(blameMock.decorationDisposed).toBe(disposedBefore + 1);
+    expect(blameMock.editor!.decorations.at(-1)?.options).toEqual([]);
+  });
+
+  it('删除 revision：详情不存在时入口拒绝，不打开内容也不执行 blame', async () => {
+    await openRealLabHistory();
+    const model = historyModelForTest()!;
+    const detail = model.detailState()!;
+    model.applyDetailResolution(
+      { revision: detail.revision, epoch: detail.epoch },
+      { status: 'absent', deletedRevision: 2 },
+    );
+    vi.mocked(openSnapshotNodeContent).mockReset();
+    blameMock.editor = makeFakeBlameEditor();
+    fakePanel().sendIntent({ kind: 'blameHistoryRevision' });
+    await flush();
+    expect(vi.mocked(openSnapshotNodeContent)).not.toHaveBeenCalled();
+    expect(blameMock.editor.decorations).toHaveLength(0);
+    expect(fakePanel().toasts().length).toBeGreaterThan(0);
+  });
+
+  it('二进制内容：入口探测拒绝，不打开文本编辑器也不执行 blame', async () => {
+    await openRealLabHistory();
+    vi.mocked(probeRemoteContent).mockResolvedValue({
+      status: 'probed',
+      classification: { kind: 'binary', reason: 'nul' },
+      headBytes: 8,
+    });
+    vi.mocked(openSnapshotNodeContent).mockReset();
+    blameMock.editor = makeFakeBlameEditor();
+    fakePanel().sendIntent({ kind: 'blameHistoryRevision' });
+    await waitFor(() => fakePanel().toasts().some((message) => message.includes(strings.blamePanel.binary)));
+    expect(vi.mocked(openSnapshotNodeContent)).not.toHaveBeenCalled();
+    expect(blameMock.editor.decorations).toHaveLength(0);
   });
 });

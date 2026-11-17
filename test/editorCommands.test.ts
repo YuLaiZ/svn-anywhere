@@ -1,5 +1,5 @@
 /**
- * 编辑器集成命令入口测试（M4 阶段 4 任务 2/3，host/commands/editor）：
+ * 编辑器集成命令入口测试（host/commands/editor）：
  * - 当前活动文本文件语义：无活动编辑器/非 file 文档的明确提示；
  * - 拒绝原因 → 用户提示映射（信息 vs 警告、feature 名称）；
  * - 执行失败交统一错误收口；开启/关闭成功不弹提示；
@@ -122,6 +122,13 @@ describe('editorRejectNotice：拒绝原因 → 用户提示', () => {
     expect(editorRejectNotice('missing', 'inlineBlame').message).toContain(strings.editor.featureInlineBlame);
     expect(editorRejectNotice('deleted', 'quickDiff').level).toBe('info');
     expect(editorRejectNotice('directory', 'inlineBlame').level).toBe('info');
+  });
+
+  it('已 add 未提交（noCommittedRevision）用 blamePanel 的准确文案而不是「未纳入版本控制」', () => {
+    expect(editorRejectNotice('noCommittedRevision', 'inlineBlame')).toEqual({
+      level: 'info',
+      message: strings.blamePanel.noCommittedRevision,
+    });
   });
 
   it('二进制与超过 16 MiB 是警告提示', () => {
