@@ -1570,6 +1570,33 @@ describe('关闭重开与目标切换', () => {
     expect(historyModelForTest()?.target?.relativePath).toBe('trunk/a.txt');
   });
 
+  it('已有后台历史面板再次打开目标时先 reveal', async () => {
+    infoHandler = (request) => {
+      if (request.url === ROOT) {
+        return { ok: true, xml: infoXml(ROOT, 42, 'dir') };
+      }
+      return { ok: true, xml: infoXml(request.url, request.revision ?? 42) };
+    };
+    logHandler = (request) => ({
+      ok: true,
+      xml: logXml([{ revision: request.url === NODE ? 41 : 44 }]),
+    });
+    await openHistoryPanel(localTarget());
+    await waitFor(() => historySessionSnapshot().hasLoadedData === true);
+    const panel = fakePanel();
+    const revealedBefore = panel.revealed;
+
+    await openHistoryPanel(localTarget({
+      localPath: '/wc/trunk/b.txt',
+      url: `${ROOT}/trunk/b.txt`,
+      relativePath: 'trunk/b.txt',
+    }));
+    await waitFor(() => historyModelForTest()?.target?.relativePath === 'trunk/b.txt'
+      && historySessionSnapshot().hasLoadedData === true);
+
+    expect(panel.revealed).toBe(revealedBefore + 1);
+  });
+
   it('unresolved 点重试：重新解析 HEAD，成功后进入 live-head', async () => {
     let headFails = true;
     infoHandler = (request) => {

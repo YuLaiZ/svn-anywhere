@@ -2193,6 +2193,8 @@ describe('render：P7 窄面板 CSS 契约（294/400）', () => {
     const baseConflictActs = css.indexOf('.conflict-item .acts { margin-left: auto;');
     const narrowConflictActs = css.indexOf('.conflict-item .acts { margin-left: 0; }');
     expect(narrowConflictActs).toBeGreaterThan(baseConflictActs);
+    // 294px 下页脚摘要独占一行，动作按钮两列换行，避免最后一个动作被视口裁切。
+    expect(css).toMatch(/@media \(max-width: 400px\) \{[\s\S]*?\.footer-actions button \{[^}]*flex: 1 1 120px;/);
     expect(css).toContain('.confirm-dialog { width: 100%; padding: 12px; }');
   });
 });

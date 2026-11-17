@@ -772,6 +772,8 @@ export async function openHistoryPanel(target: HistoryOpenTarget): Promise<void>
     return;
   }
   if (handle !== undefined) {
+    // 用户再次打开历史时先带回前台；即使切换被占用态拒绝，也要让用户看到当前面板。
+    handle.reveal();
     // 同面板切换目标：生成新会话代次；busy 或写入在途时拒绝（P6 冻结规则）。
     const sessionId = handle.switchSession();
     if (sessionId === undefined) {

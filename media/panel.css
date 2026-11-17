@@ -1520,6 +1520,21 @@ button.th-sort.active { color: var(--vscode-textLink-foreground, var(--vscode-fo
 /* P7 窄面板（294/400px）：变体卡与属性三值改为单列，冲突行动作换行，
  * 模态卡片收窄；页面本身不横向溢出（滚动只发生在 pane-scroll 内）。 */
 @media (max-width: 400px) {
+  .footer .summary {
+    flex-basis: 100%;
+    min-width: 0;
+  }
+  .footer-actions {
+    flex: 1 1 100%;
+    min-width: 0;
+    margin-left: 0;
+  }
+  .footer-actions button {
+    flex: 1 1 120px;
+    min-width: 0;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+  }
   .choice-grid,
   .property-grid { grid-template-columns: 1fr; }
   .conflict-item .acts { margin-left: 0; }
