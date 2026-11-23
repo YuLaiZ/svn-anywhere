@@ -9,14 +9,16 @@
  *   runOrThrow/assertSuccess 决定是否中断；
  * - 所有包含命令与 args 的错误消息都经过 redactArgs，--password 不进明文。
  */
+import { workspaceLeasesForCommand } from './workspaceLock';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { closeSync, openSync, renameSync, rmSync, writeSync } from 'node:fs';
 import { statfs } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
+import { setTimeout as delay } from 'node:timers/promises';
 import { DEFAULT_ENCODING_FALLBACK, DEFAULT_OUTPUT_ENCODING, decodeBuffer, type DecodingFallbackNotice } from './encoding';
-import { INSUFFICIENT_DISK, OUTPUT_TOO_LARGE, SvnError, assertSuccess, classifyAuthFailure, tailText } from './errors';
+import { INSUFFICIENT_DISK, OUTPUT_TOO_LARGE, SvnError, assertSuccess, classifyAuthFailure, extractSvnErrorCodes, tailText } from './errors';
 import { redactArgs } from './redact';
 
 export const DEFAULT_TIMEOUT_MS = 120_000;
@@ -51,6 +53,8 @@ export interface RunOptions {
   cwd?: string;
   /** 超时毫秒数；超时后 kill 进程并抛 SvnError。默认 120 秒，0 表示不限时。 */
   timeoutMs?: number;
+  /** 远端只读查询的有限传输重试。仅 info/list/log 可以启用。 */
+  retryReadOnly?: { delayMs?: number; onRetry?: (error: SvnError) => void };
   /** 取消信号；宿主负责从 vscode.CancellationToken 桥接。 */
   signal?: AbortSignal;
   /**
@@ -189,9 +193,17 @@ function spawnSvn(
   collectStdout: boolean,
 ): Promise<RunResult> {
   return new Promise((resolve, reject) => {
+    if (options.signal?.aborted) {
+      reject(new SvnError({ message: 'SVN 操作已取消', command: args, cwd: options.cwd, code: 'CANCELLED' }));
+      return;
+    }
     let child: ChildProcess;
     try {
-      child = spawn(svnPath, args, {
+      const leases = workspaceLeasesForCommand(args, options.cwd);
+      const helper = leases[0]?.helper;
+      const descriptors = [...new Set(leases.flatMap((lease) => lease.fds))];
+      child = spawn(helper ?? svnPath, helper ? ['run', svnPath, ...args] : args, {
+        ...(helper ? { stdio: ['pipe', 'pipe', 'pipe', ...descriptors] } : {}),
         cwd: options.cwd,
         env: svnEnv(),
         windowsHide: true,
@@ -707,35 +719,56 @@ export async function runOrThrowWithRunner(
   options: RunOptions,
   runner: typeof run,
 ): Promise<RunResult> {
-  try {
-    const result = await runner(svnPath, args, options);
-    return assertSuccess(result, args, options.cwd);
-  } catch (err) {
-    const authKind = err instanceof SvnError
-      ? classifyAuthFailure(err.stderr, options.authScope?.scheme)
-      : undefined;
-    if (!options.getCredentials || authKind !== 'auth') {
-      throw err;
+  let currentArgs = args;
+  let currentOptions = options;
+  let authenticated = false;
+  let retried = false;
+  const retry = ['info', 'list', 'log'].includes(args[0]) ? options.retryReadOnly : undefined;
+  const checkCancelled = () => {
+    if (options.signal?.aborted) {
+      throw new SvnError({ message: 'SVN 操作已取消', command: args, cwd: options.cwd, code: 'CANCELLED' });
     }
-    const credentials = await options.getCredentials(options.authScope);
-    if (!credentials) {
-      throw err;
+  };
+  for (;;) {
+    checkCancelled();
+    try {
+      const result = await runner(svnPath, currentArgs, currentOptions);
+      return assertSuccess(result, currentArgs, options.cwd);
+    } catch (error) {
+      if (!(error instanceof SvnError)) throw error;
+      checkCancelled();
+      const authKind = classifyAuthFailure(error.stderr, options.authScope?.scheme);
+      if (authKind === 'auth' && options.getCredentials && !authenticated) {
+        const credentials = await options.getCredentials(options.authScope);
+        checkCancelled();
+        if (!credentials) throw error;
+        authenticated = true;
+        const credentialArgs = ['--username', credentials.username, '--password', credentials.password];
+        const separator = args.indexOf('--');
+        currentArgs = separator < 0
+          ? [...args, ...credentialArgs]
+          : [...args.slice(0, separator), ...credentialArgs, ...args.slice(separator)];
+        const onExit = options.onCredentialRetry?.(currentArgs);
+        currentOptions = typeof onExit === 'function' ? { ...options, onExit } : options;
+        continue;
+      }
+      if (!retry || retried || authKind || !isTransientReadFailure(error)) throw error;
+      retried = true;
+      retry.onRetry?.(error);
+      try {
+        await delay(retry.delayMs ?? 400, undefined, { signal: options.signal });
+      } catch (delayError) {
+        checkCancelled();
+        throw delayError;
+      }
     }
-    // svn 把 `--` 分隔符之后的一切参数当位置参数（选项不再生效）：
-    // 原始 args 含 `--` 时（M3 网络命令统一以 `-- <URL>` 收尾防 peg 误
-    // 解析），凭据必须插到 `--` 之前，`--` 及其后参数保持原序在尾部；
-    // 无 `--` 时维持尾部追加（svn 选项支持后置，M1/M2 命令形态不变）。
-    const credentialArgs = ['--username', credentials.username, '--password', credentials.password];
-    const separatorIndex = args.indexOf('--');
-    const retryArgs = separatorIndex >= 0
-      ? [...args.slice(0, separatorIndex), ...credentialArgs, ...args.slice(separatorIndex)]
-      : [...args, ...credentialArgs];
-    // onCredentialRetry 返回退出记录器时（host 层 logCommand 的返回值），
-    // 重试执行改用它作为 onExit：操作日志第二行记录重试命令（脱敏）与
-    // 各自真实耗时；否则维持复用外层 onExit 的既有行为。
-    const retryExit = options.onCredentialRetry?.(retryArgs);
-    const retryOptions = typeof retryExit === 'function' ? { ...options, onExit: retryExit } : options;
-    const result = await runner(svnPath, retryArgs, retryOptions);
-    return assertSuccess(result, retryArgs, options.cwd);
   }
+}
+
+function isTransientReadFailure(error: SvnError): boolean {
+  if (error.code === 'TIMEOUT') return true;
+  const codes = extractSvnErrorCodes(error.stderr);
+  const permitted = new Set(['E170013', 'E175002', 'E175012', 'E120108', 'E000104']);
+  const transient = new Set(['E175012', 'E120108', 'E000104']);
+  return codes.some((code) => transient.has(code)) && codes.every((code) => permitted.has(code));
 }

@@ -27,6 +27,8 @@ export const strings = {
     showStatus: '显示状态',
     commit: '提交',
     update: '更新',
+    editDepth: '深度编辑',
+    recoverOperation: '查看与恢复未完成操作',
     refreshStatus: '刷新状态',
     cleanup: '清理',
     relocate: '重定位（改仓库地址）',

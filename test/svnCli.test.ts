@@ -263,6 +263,44 @@ describe('runOrThrow', () => {
     }
   });
 
+  describe('只读传输重试', () => {
+    const timeout = () => new SvnError({ message: '超时', command: ['list'], code: 'TIMEOUT' });
+    const success = { stdout: '<lists/>', stderr: '', exitCode: 0 };
+
+    it('一次超时后重试并返回新的完整响应', async () => {
+      const runner = vi.fn().mockRejectedValueOnce(timeout()).mockResolvedValueOnce(success);
+      const onRetry = vi.fn();
+      await expect(runOrThrowWithRunner('svn', ['list'], { retryReadOnly: { delayMs: 0, onRetry } }, runner)).resolves.toBe(success);
+      expect(runner).toHaveBeenCalledTimes(2);
+      expect(onRetry).toHaveBeenCalledTimes(1);
+    });
+
+    it('传输重试耗尽后保留末次错误，写命令即使传入策略也不重试', async () => {
+      const runner = vi.fn().mockRejectedValue(timeout());
+      await expect(runOrThrowWithRunner('svn', ['log'], { retryReadOnly: { delayMs: 0 } }, runner)).rejects.toMatchObject({ code: 'TIMEOUT' });
+      expect(runner).toHaveBeenCalledTimes(2);
+      runner.mockClear();
+      await expect(runOrThrowWithRunner('svn', ['update'], { retryReadOnly: { delayMs: 0 } }, runner)).rejects.toMatchObject({ code: 'TIMEOUT' });
+      expect(runner).toHaveBeenCalledTimes(1);
+    });
+
+    it('退避期间取消时不再次启动', async () => {
+      const controller = new AbortController();
+      const runner = vi.fn().mockRejectedValue(timeout());
+      await expect(runOrThrowWithRunner('svn', ['info'], {
+        signal: controller.signal, retryReadOnly: { onRetry: () => controller.abort() },
+      }, runner)).rejects.toMatchObject({ code: 'CANCELLED' });
+      expect(runner).toHaveBeenCalledTimes(1);
+    });
+
+    it('权限错误及含模糊网络首码的异常仍只执行一次', async () => {
+      const denied = new SvnError({ command: ['list'], message: 'denied', stderr: 'E170013 E175013' });
+      const runner = vi.fn().mockRejectedValue(denied);
+      await expect(runOrThrowWithRunner('svn', ['list'], { retryReadOnly: { delayMs: 0 } }, runner)).rejects.toBe(denied);
+      expect(runner).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe('authScope 认证/权限细分', () => {
     type Runner = NonNullable<Parameters<typeof runOrThrowWithRunner>[3]>;
 

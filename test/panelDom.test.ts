@@ -95,6 +95,32 @@ beforeEach(() => {
   document.body.innerHTML = '';
 });
 
+describe('P8 预览焦点', () => {
+  it.each(['返回编辑', 'Escape'])('通过 %s 关闭后将焦点还给预览按钮', (dismiss) => {
+    const { app, sent } = setup({
+      footer: { summary: '1 项深度调整待确认', primary: { id: 'previewDepth', label: '预览变更' } },
+      confirmDialog: {
+        id: 'depth-preview-1',
+        title: '确认深度调整',
+        cancelLabel: '返回编辑',
+        cancelFocusIntent: 'previewDepth',
+        confirm: { id: 'applyDepthPreview', label: '应用变更' },
+      },
+    });
+    const cancel = document.querySelector<HTMLButtonElement>('[data-dialog-dismiss]')!;
+    expect(document.activeElement).toBe(cancel);
+    const before = sent.length;
+    if (dismiss === 'Escape') {
+      cancel.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    } else {
+      cancel.click();
+    }
+    expect(document.activeElement).toBe(document.querySelector('[data-intent="previewDepth"]'));
+    expect(sent.length).toBe(before);
+    app.dispose();
+  });
+});
+
 describe('挂载与握手', () => {
   it('挂载即发送 ready（协议版本 1）', () => {
     document.body.innerHTML = '<div id="app"></div>';

@@ -83,6 +83,7 @@ export interface ListSpec {
 }
 
 export interface FormFieldSpec {
+  directory?: { name: string; current: string; level?: number; toggle?: ActionSpec };
   id: string;
   label: string;
   value: string;
@@ -818,6 +819,8 @@ export interface ConfirmDialogSpec {
   confirm: ActionSpec;
   /** 取消按钮文案（宿主 i18n；缺省 strings.panel.dismiss）。 */
   cancelLabel?: string;
+  /** 取消后接收焦点的按钮意图。 */
+  cancelFocusIntent?: ActionSpec['id'];
 }
 
 /* ---------------- P7 批量处理（计划/结果；阶段 7） ---------------- */

@@ -363,7 +363,7 @@ describe('registerAllCommands 二次激活', () => {
     registerShowHistoryCommand(firstContext);
     registerScanConflictsCommand(firstContext);
     registerEditorCommands(firstContext);
-    expect(vscodeMock.registered).toHaveLength(22);
+    expect(vscodeMock.registered).toHaveLength(24);
     const firstHandles = vscodeMock.registered.map((r) => r.disposable);
 
     const secondContext = { subscriptions: [], globalState } as unknown as vscode.ExtensionContext;
@@ -373,8 +373,8 @@ describe('registerAllCommands 二次激活', () => {
     registerScanConflictsCommand(secondContext);
     registerEditorCommands(secondContext);
     expect(firstHandles.every((d) => d.disposed)).toBe(true);
-    expect(vscodeMock.registered).toHaveLength(44);
-    expect(vscodeMock.activeCommandIds.size).toBe(22);
+    expect(vscodeMock.registered).toHaveLength(48);
+    expect(vscodeMock.activeCommandIds.size).toBe(24);
   });
 });
 

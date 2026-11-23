@@ -6,6 +6,7 @@
  * 模块被 require（而非主程序运行）时导出 fakeVscode/state 供 test/mockHost.test.ts 验证。
  * 用法：`pnpm run mock-host`（先构建再运行）。任一场景失败退出码为 1。
  */
+process.env.SVN_ANYWHERE_TEST_IN_MEMORY = '1';
 const { mkdtempSync, rmSync, mkdirSync, writeFileSync, realpathSync, existsSync, readFileSync, symlinkSync, statSync, readdirSync } = require('node:fs');
 const { createHash } = require('node:crypto');
 const { tmpdir } = require('node:os');
@@ -4143,6 +4144,7 @@ async function main() {
       throw new Error('HTTP 矩阵缺少检出/导入自动化驱动出口');
     }
     const ports = [9061, 9081, 9101, 9141];
+    const matrixRun = Date.now().toString(36) + '-' + process.pid;
     for (const port of ports) {
       const baseUrl = `http://127.0.0.1:${port}/svn/test`;
       const parentDir = makeTempDir(`svn-anywhere-http-matrix-${port}-`);
@@ -4176,7 +4178,7 @@ async function main() {
       mkdirSync(sourceDir, { recursive: true });
       writeFileSync(join(sourceDir, 'matrix.txt'), `HTTP matrix ${port}\n`);
       const storageDir = makeTempDir(`svn-anywhere-http-import-${port}-`);
-      const targetUrl = `${baseUrl}/trunk/http-matrix-${port}`;
+      const targetUrl = `${baseUrl}/trunk/http-matrix-${port}-${matrixRun}`;
       const snapshot = importSnapshotOf([
         { path: 'matrix.txt', kind: 'file', size: Buffer.byteLength(`HTTP matrix ${port}\n`) },
       ]);
@@ -4475,6 +4477,78 @@ async function main() {
           readFileSync(join(local, name), 'utf8').includes('<<<<<<< .mine'));
       }
       panel.dispose();
+      rmSync(lab.lab, { recursive: true, force: true });
+    }
+  }
+
+  console.log('场景 70：P8 深度编辑——只更新旧版本 → 长期保留 → 普通更新跳过远端新目录');
+  {
+    const lab = makeSvnLab();
+    try {
+      const seeder = lab.checkout('seed');
+      mkdirSync(join(seeder, 'versions', 'V2.1.8'), { recursive: true });
+      mkdirSync(join(seeder, 'versions', 'archive'), { recursive: true });
+      writeFileSync(join(seeder, 'versions', 'V2.1.8', 'old.war'), 'r1');
+      writeFileSync(join(seeder, 'versions', 'archive', 'old.war'), 'archive');
+      svn(['add', 'versions'], seeder);
+      svn(['commit', '-m', 'old versions'], seeder);
+      const wc = lab.checkout('test');
+      const scope = join(wc, 'versions');
+      mkdirSync(join(seeder, 'versions', 'V2.1.9'));
+      writeFileSync(join(seeder, 'versions', 'V2.1.9', 'new.war'), 'new');
+      writeFileSync(join(seeder, 'versions', 'V2.1.8', 'old.war'), 'r2');
+      svn(['add', 'versions/V2.1.9'], seeder);
+      svn(['commit', '-m', 'remote new version'], seeder);
+
+      await state.registered.get('svnAnywhere.editDepth')({ fsPath: scope, scheme: 'file' });
+      const panel = [...state.panels].reverse().find((item) => item.viewType.startsWith('svn-anywhere-depth-') && !item.disposed);
+      check('目录右键命令注册并打开 P8', Boolean(panel));
+      if (!panel) throw new Error('P8 面板没有打开');
+      panel.sendReady();
+      const first = await waitRender(panel, 'V2.1.9', 600);
+      check('远端新增目录与三个操作入口同时可见', Boolean(first) &&
+        ['只更新所选', '以后只保留所选', '逐目录设置'].every((text) => first.html.includes(text)));
+      if (!first) throw new Error('P8 没有发布首屏');
+      const field = /data-field-id="([^"]+)"[^>]*aria-label="只更新所选 [^"]*\/archive"/.exec(first.html)?.[1];
+      if (!field) throw new Error('没有归档目录的更新选择项');
+      let posted = panel.webview.posted.length;
+      panel.sendAuto({ kind: 'syncInput', fieldId: field, value: 'false', inputRevision: 1 });
+      await waitNewRender(panel, '已选 1 个本地目录', posted, 400);
+      posted = panel.webview.posted.length;
+      panel.sendAuto({ kind: 'previewDepth' });
+      const preview = await waitNewRender(panel, '确认只更新所选目录', posted, 600);
+      const previewId = /data-preview-id="([^"]+)"/.exec(preview?.html ?? '')?.[1];
+      check('更新预览明确列出远端新目录本次跳过', Boolean(previewId) && preview.html.includes('本次跳过'));
+      if (!previewId) throw new Error('无法取得本次更新的确认 ID');
+      posted = panel.webview.posted.length;
+      panel.sendAuto({ kind: 'applyDepthPreview', previewId });
+      await waitNewRender(panel, '已更新 1 个目录', posted, 700);
+      check('只更新了现有版本内容，未下载远端新版本', !existsSync(join(scope, 'V2.1.9')) &&
+        readFileSync(join(scope, 'V2.1.8', 'old.war'), 'utf8') === 'r2');
+
+      posted = panel.webview.posted.length;
+      panel.sendAuto({ kind: 'setDepthTab', tab: 'keep' });
+      const keep = await waitNewRender(panel, '以后普通更新只保留', posted, 400);
+      const archive = /data-field-id="([^"]+)"[^>]*aria-label="以后只保留所选 [^"]*\/archive"/.exec(keep?.html ?? '')?.[1];
+      if (!archive) throw new Error('没有归档目录的长期保留选择项');
+      posted = panel.webview.posted.length;
+      panel.sendAuto({ kind: 'syncInput', fieldId: archive, value: 'false', inputRevision: 2 });
+      await waitNewRender(panel, '以后保留 1 个目录', posted, 400);
+      posted = panel.webview.posted.length;
+      panel.sendAuto({ kind: 'previewDepth' });
+      const persist = await waitNewRender(panel, '先从本地移除，随后重新检出', posted, 800);
+      const persistId = /data-preview-id="([^"]+)"/.exec(persist?.html ?? '')?.[1];
+      check('长期保留预览写明已选目录的临时移除与重新检出', Boolean(persistId));
+      if (!persistId) throw new Error('无法取得长期保留的确认 ID');
+      posted = panel.webview.posted.length;
+      panel.sendAuto({ kind: 'applyDepthPreview', previewId: persistId });
+      const result = await waitNewRender(panel, '已核实 2 个深度步骤', posted, 1000);
+      svn(['update'], wc);
+      check('长期设置生效：整副本普通更新仍跳过新目录和归档', Boolean(result) &&
+        svn(['info', '--show-item', 'depth', scope], wc).trim() === 'files' &&
+        existsSync(join(scope, 'V2.1.8')) && !existsSync(join(scope, 'V2.1.9')) && !existsSync(join(scope, 'archive')));
+      panel.dispose();
+    } finally {
       rmSync(lab.lab, { recursive: true, force: true });
     }
   }

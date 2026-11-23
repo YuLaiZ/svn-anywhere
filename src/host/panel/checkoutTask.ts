@@ -548,11 +548,12 @@ async function runCheckoutFlow(
     }
     // 进程已 spawn 即视为命令已发出（§2.1 映射表）：task 与记录转 running。
     task.phase = 'running';
+    const dispatch = await registry.markPhase(taskId, 'running');
+    if (!dispatch.ok) throw new Error('无法登记 SVN 写入派发状态');
     const runPromise = runOrThrow(svnPath, args, runOptions).then(
       () => undefined as unknown,
       (err: unknown) => err as unknown,
     );
-    await registry.markPhase(taskId, 'running');
     const err = await runPromise;
     parser.finish();
     await settleCommandOutcome(task, taskId, err, input.targetDir, parser, input.formSnapshot, input.pinnedRevision);

@@ -73,6 +73,10 @@ export type ConflictPropertyChoice = (typeof CONFLICT_PROPERTY_CHOICES)[number];
  * M4 追加 P5 仓库浏览器、P6 历史与比较、P7 冲突处理动作。
  */
 export type Intent =
+  | { kind: 'setDepthTab'; tab: 'update' | 'keep' | 'depth' }
+  | { kind: 'toggleDepthNode'; nodeId: string }
+  | { kind: 'applyDepthPreview'; previewId: string }
+  | { kind: 'previewDepth' | 'clearDepthDraft' | 'verifyDepth' | 'discardDepthRemainder' | 'loadDepthRows' }
   | { kind: 'refresh' }
   | { kind: 'openDiff'; itemId: string }
   | { kind: 'openFile'; itemId: string }
@@ -334,6 +338,8 @@ const INTENT_KINDS = new Set<string>([
   'startScan', 'cancelScan', 'rescan', 'confirmVacuum', 'revealFileInOS', 'showScopeHelp',
   'setSort', 'setPage',
   ...M4_INTENT_KINDS,
+  'setDepthTab', 'toggleDepthNode', 'applyDepthPreview', 'previewDepth', 'clearDepthDraft', 'verifyDepth',
+  'discardDepthRemainder', 'loadDepthRows',
 ]);
 
 /** 提交面板视图切换的合法取值。 */
@@ -705,6 +711,24 @@ function parseIntent(raw: unknown): { ok: true; intent: Intent } | { ok: false; 
         ? { ok: true, intent: { kind: kind as 'selectConflict' | 'copyConflictPath', id: id.value } }
         : { ok: false, reason: id.message };
     }
+    case 'setDepthTab': {
+      const tab = readEnum(raw, 'tab', ['update', 'keep', 'depth'] as const, label);
+      return tab.ok ? { ok: true, intent: { kind, tab: tab.value } } : { ok: false, reason: tab.message };
+    }
+    case 'toggleDepthNode': {
+      const nodeId = readString(raw, 'nodeId', label);
+      return nodeId.ok ? { ok: true, intent: { kind, nodeId: nodeId.value } } : { ok: false, reason: nodeId.message };
+    }
+    case 'applyDepthPreview': {
+      const previewId = readString(raw, 'previewId', label);
+      return previewId.ok ? { ok: true, intent: { kind, previewId: previewId.value } } : { ok: false, reason: previewId.message };
+    }
+    case 'previewDepth':
+    case 'clearDepthDraft':
+    case 'verifyDepth':
+    case 'discardDepthRemainder':
+    case 'loadDepthRows':
+      return { ok: true, intent: { kind } };
     case 'setConflictTab': {
       const tab = readEnum(raw, 'tab', CONFLICT_TABS, label);
       return tab.ok

@@ -1134,7 +1134,9 @@ async function pumpNetwork(
     }
     let stdout: string;
     try {
-      stdout = (await runOrThrow(readSvnPath(), request.args, options)).stdout;
+      stdout = (await runOrThrow(readSvnPath(), request.args, {
+        ...options, retryReadOnly: request.source.queryUrl.startsWith('file:') ? undefined : {},
+      })).stdout;
     } catch (err) {
       if (!isSessionCurrent(captured)) {
         return;
@@ -1360,7 +1362,9 @@ async function refreshBaseFallback(captured: CapturedSession): Promise<void> {
     const args = buildHistoryLogArgs(probeSource, captured.model.pageSize, captured.model.followCopies());
     let stdout: string;
     try {
-      stdout = (await runOrThrow(readSvnPath(), args, options)).stdout;
+      stdout = (await runOrThrow(readSvnPath(), args, {
+        ...options, retryReadOnly: probeSource.queryUrl.startsWith('file:') ? undefined : {},
+      })).stdout;
     } catch (err) {
       if (!isSessionCurrent(captured) || controller.signal.aborted) {
         return;

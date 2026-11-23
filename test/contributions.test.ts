@@ -87,8 +87,11 @@ describe('P6 历史入口贡献点（M4 阶段 3）', () => {
     expect(editor.some((item) => item.command === 'svnAnywhere.showHistory')).toBe(true);
   });
 
-  it('命令总数保持 22（17 个核心命令 + browseRepository + showHistory + toggleQuickDiff + toggleInlineBlame + scanConflicts）', () => {
-    expect(pkg.contributes.commands).toHaveLength(22);
+  it('M5 登记深度编辑和未完成操作恢复，共 24 条命令', () => {
+    expect(pkg.contributes.commands).toHaveLength(24);
+    expect(pkg.contributes.commands.map((entry) => entry.command)).toEqual(expect.arrayContaining([
+      'svnAnywhere.editDepth', 'svnAnywhere.recoverOperation',
+    ]));
   });
 });
 

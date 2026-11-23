@@ -561,11 +561,12 @@ async function runImportFlow(task: ImportTask, input: StartImportTaskInput, svnP
     }
     // 进程已 spawn 即视为命令已发出（§2.1 映射表）：task 与记录转 running。
     task.phase = 'running';
+    const dispatch = await registry.markPhase(operationId, 'running');
+    if (!dispatch.ok) throw new Error('无法登记 SVN 写入派发状态');
     const runPromise = runOrThrow(svnPath, args, runOptions).then(
       () => undefined as unknown,
       (err: unknown) => err as unknown,
     );
-    await registry.markPhase(operationId, 'running');
     const err = await runPromise;
     parser.finish();
     removeMessageTempDir(messageTemp.tempDir);

@@ -91,6 +91,17 @@ describe('OperationRegistry：同副本互斥（M2 语义回归）', () => {
     }
   });
 
+  it('持久化未返回时，同键的第二次申请也会被拦截', async () => {
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const registry = new OperationRegistry({ load: () => [], save: () => blocked, remove: () => {} });
+    const params = { wcRoot: '/wc/a', targetRelPath: '.', nodeKind: 'dir' } as const;
+    const first = registry.begin(params);
+    await expect(registry.begin(params)).resolves.toMatchObject({ ok: false, reason: 'busy' });
+    release();
+    await expect(first).resolves.toMatchObject({ ok: true });
+  });
+
   it('不同工作副本互不影响（互斥键是副本根，不是仓库 UUID）', async () => {
     const registry = new OperationRegistry();
     await registry.begin({ wcRoot: '/wc/a', targetRelPath: '.', nodeKind: 'dir', repositoryUuid: 'uuid-1' });
@@ -238,11 +249,13 @@ describe('restrictsWrite：kind×phase 矩阵', () => {
     }
   });
 
-  it('update/cleanup/daily：恒不限制（M1 命令成功/失败都 finally finish）', () => {
-    for (const kind of ['update', 'cleanup', 'daily'] as const) {
-      for (const phase of ['prepared', 'saving', 'committing', 'unknown', 'running'] as const) {
+  it('通用写操作在运行和结果未知时限制写入', () => {
+    for (const kind of ['update', 'cleanup', 'daily', 'relocate'] as const) {
+      for (const phase of ['prepared', 'saving', 'committing', 'done'] as const) {
         expect(restrictsWrite(recordOf(phase, kind))).toBe(false);
       }
+      expect(restrictsWrite(recordOf('unknown', kind))).toBe(true);
+      expect(restrictsWrite(recordOf('running', kind))).toBe(true);
     }
   });
 

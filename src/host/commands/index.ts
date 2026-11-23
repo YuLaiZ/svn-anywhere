@@ -3,12 +3,17 @@
  * 顺序按子菜单分组（信息、提交、日常操作、更新、高级、获取、维护）排列。
  */
 import type * as vscode from 'vscode';
+import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { commandAdd } from './add';
 import { commandCheckout } from './checkout';
 import { commandCleanup } from './cleanup';
 import { commandCommit } from './commit';
 import { commandDelete } from './delete';
 import { commandDiskUsage } from './diskUsage';
+import { commandRecoverOperation } from './recoverOperation';
+import { commandDepth, setDepthPanelContext } from '../panel/panels/depth';
 import { commandEditIgnore } from './ignore';
 import { commandImportLocal } from './importDir';
 import { commandMove } from './move';
@@ -39,6 +44,8 @@ const COMMANDS: ReadonlyArray<{ id: string; handler: CommandHandler; kind: Outpu
   { id: 'svnAnywhere.showRemoteInfo', handler: commandShowRemoteInfo, kind: 'other' },
   { id: 'svnAnywhere.commit', handler: commandCommit, kind: 'commit' },
   { id: 'svnAnywhere.update', handler: commandUpdate, kind: 'update' },
+  { id: 'svnAnywhere.editDepth', handler: commandDepth, kind: 'other' },
+  { id: 'svnAnywhere.recoverOperation', handler: commandRecoverOperation, kind: 'other' },
   { id: 'svnAnywhere.refreshStatus', handler: commandRefreshStatus, kind: 'status' },
   { id: 'svnAnywhere.cleanup', handler: commandCleanup, kind: 'other' },
   { id: 'svnAnywhere.relocate', handler: commandRelocate, kind: 'other' },
@@ -80,6 +87,7 @@ export async function registerAllCommands(context: vscode.ExtensionContext): Pro
   setCheckoutPanelContext(context);
   // P4 磁盘治理面板（面板创建上下文；命令入口在阶段 3 任务 6 接入）。
   setDiskPanelContext(context);
+  setDepthPanelContext(context);
   // P3 草稿存储（检出/导入面板共用，执行器预命令出口与面板恢复同源）。
   setDraftStorage(context.globalState);
   // P4 扫描中断持久化标记（扫描开始写入、结算清除、重启读取消费）。
@@ -91,7 +99,11 @@ export async function registerAllCommands(context: vscode.ExtensionContext): Pro
   setOperationTriageLogSink((line) => logLine(line, 'update'));
   // 每次 activate 都重载：记录可能被另一窗口写入同一 globalState，
   // 重跑 loadPending 是幂等的（active 收窄幂等、对运行登记中的键跳过陈旧化）。
-  await initializeOperationStore(context.globalState);
+  const helper = context.extensionUri?.fsPath && join(context.extensionUri.fsPath, 'out', 'workspace-lock');
+  const shared = process.env.SVN_ANYWHERE_TEST_IN_MEMORY !== '1' && helper && existsSync(helper)
+    ? { helper, directory: process.env.SVN_ANYWHERE_STATE_DIR || join(homedir(), '.svn-anywhere') }
+    : undefined;
+  await initializeOperationStore(context.globalState, shared);
   try {
     await cleanupOrphanSnapshots(context.globalStorageUri);
   } catch (err) {

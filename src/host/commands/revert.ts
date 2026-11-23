@@ -12,7 +12,7 @@ import { format, strings } from '../i18n';
 import { createLineBuffer, decodingRunOptions, logCommand, logExitCode, showOutput } from '../output';
 import { confirmModal } from '../ui/confirm';
 import { resolveWorkingCopyTarget } from './target';
-import { beginDailyWrite, finishDailyWrite, nodeKindFor, targetRelOf } from './dailyCommon';
+import { beginDailyWrite, executeRecordedWrite, nodeKindFor, targetRelOf } from './dailyCommon';
 
 /** 确认框中路径清单的最大列举条目。 */
 const REVERT_LIST_LIMIT = 50;
@@ -63,21 +63,19 @@ export async function commandRevert(uri?: vscode.Uri): Promise<void> {
     return;
   }
 
-  const operationId = await beginDailyWrite(target.wcRoot, relPath, isDir ? 'dir' : 'file');
+  const operationId = await beginDailyWrite(target.wcRoot, relPath, isDir ? 'dir' : 'file', 'revert');
   if (!operationId) {
     return;
   }
   const args = buildRevertArgs(relPath, { recursive: isDir });
-  try {
+  await executeRecordedWrite(operationId, async () => {
     const buffer = createLineBuffer();
     await runOrThrow(svnPath, args, {
       ...runOptions,
       onOutput: (chunk) => buffer.push(chunk),
       onExit: logCommand(svnPath, args, target.wcRoot),
     });
-  } finally {
-    await finishDailyWrite(operationId);
-  }
+  });
   void vscode.window.showInformationMessage(
     format(strings.revert.done, { count: String(pending.length), path: relPath }),
   );

@@ -2,7 +2,7 @@
   "name": "svn-anywhere",
   "displayName": "SVN Anywhere",
   "description": "在 VS Code 里管理任意布局的 SVN 工作副本",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "publisher": "yulaiz",
   "private": true,
   "engines": {
@@ -12,6 +12,8 @@
   "activationEvents": [
     "onStartupFinished",
     "onCommand:svnAnywhere.update",
+    "onCommand:svnAnywhere.editDepth",
+    "onCommand:svnAnywhere.recoverOperation",
     "onCommand:svnAnywhere.commit",
     "onCommand:svnAnywhere.showStatus",
     "onCommand:svnAnywhere.refreshStatus",
@@ -42,6 +44,16 @@
       }
     ],
     "commands": [
+      {
+        "command": "svnAnywhere.editDepth",
+        "title": "深度编辑",
+        "category": "SVN Anywhere"
+      },
+      {
+        "command": "svnAnywhere.recoverOperation",
+        "title": "查看与恢复未完成操作",
+        "category": "SVN Anywhere"
+      },
       {
         "command": "svnAnywhere.update",
         "title": "更新",
@@ -230,6 +242,15 @@
         {
           "command": "svnAnywhere.refreshStatus",
           "group": "3_update@2"
+        },
+        {
+          "command": "svnAnywhere.editDepth",
+          "when": "explorerResourceIsFolder",
+          "group": "3_update@4"
+        },
+        {
+          "command": "svnAnywhere.recoverOperation",
+          "group": "3_update@5"
         },
         {
           "command": "svnAnywhere.cleanup",

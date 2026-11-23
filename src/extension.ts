@@ -3,6 +3,7 @@
  */
 import * as vscode from 'vscode';
 import { run, runOrThrow, killAllActive } from './core/svnCli';
+import { getOperationRegistry } from './core/operations';
 import { SvnError, tailText } from './core/errors';
 import { escapePeg, findWorkingCopy } from './core/workspace';
 import { readSvnPath, readTimeoutMs } from './host/config';
@@ -234,3 +235,6 @@ export const __diskTaskApi = {
   /** 重启模拟：读取并一次性消费「扫描进行中」标记（自动化断言用）。 */
   consumeScanMarker,
 };
+
+/** 验证打包扩展在真实宿主中的跨窗口操作注册与子进程生命周期。 */
+export const __m5OperationApi = { getOperationRegistry, runOrThrow };

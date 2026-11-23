@@ -12,7 +12,7 @@
 import * as vscode from 'vscode';
 import { join, relative } from 'node:path';
 import { normalizeUpdateRevision, runUpdate, type UpdateRunResult } from '../../core/update';
-import { getOperationRegistry } from '../../core/operations';
+import { beginDailyWrite, executeRecordedWrite } from './dailyCommon';
 import { escapePeg } from '../../core/workspace';
 import { readSvnPath, readTimeoutMs } from '../config';
 import { format, strings } from '../i18n';
@@ -105,26 +105,8 @@ export async function promptUpdateRevision(): Promise<string | undefined> {
  * 更新前的注册表互斥：同一工作副本有在途/受限操作（提交中、结果未知、
  * 待协调）时拒绝执行；返回登记的操作 ID（执行完须 finish）或 undefined。
  */
-export async function beginUpdateOperation(wcRoot: string): Promise<string | undefined> {
-  const registry = getOperationRegistry();
-  const held = registry.writeRestriction(wcRoot);
-  if (held) {
-    void vscode.window.showWarningMessage(format(strings.panel.operationHeldBusy, { phase: held.phase }));
-    return undefined;
-  }
-  const begin = await registry.begin({ wcRoot, targetRelPath: '.', nodeKind: 'dir', kind: 'update' });
-  if (!begin.ok) {
-    // 判别联合收窄：busy 分支才有 heldBy（本调用不传 operationId，其他分支不可达）。
-    const heldPhase = begin.reason === 'busy' ? begin.heldBy.phase : begin.reason;
-    void vscode.window.showWarningMessage(format(strings.panel.operationHeldBusy, { phase: heldPhase }));
-    return undefined;
-  }
-  return begin.operationId;
-}
-
-/** 更新操作登记释放（幂等）。 */
-export async function finishUpdateOperation(operationId: string | undefined): Promise<void> {
-  await getOperationRegistry().finish(operationId);
+export async function beginUpdateOperation(wcRoot: string, targetArgs: string[] = ['.']): Promise<string | undefined> {
+  return beginDailyWrite(wcRoot, updateConflictScope(targetArgs), 'dir', 'update', targetArgs, 'update');
 }
 
 export interface UpdateRunOptions {
@@ -166,16 +148,12 @@ export async function performUpdatePaths(
   options: UpdateRunOptions = {},
 ): Promise<UpdateRunResult> {
   // 注册表互斥：同一副本有在途/受限操作时拒绝更新（含从资源管理器入口）。
-  const operationId = await beginUpdateOperation(wcRoot);
+  const operationId = await beginUpdateOperation(wcRoot, targetArgs);
   if (!operationId) {
     return { stdout: '', stderr: '', exitCode: 0, items: [], conflicts: [] };
   }
-  let result: UpdateRunResult;
-  try {
-    result = await executeUpdate(wcRoot, targetArgs, displayTarget, svnPath, options);
-  } finally {
-    await finishUpdateOperation(operationId);
-  }
+  const result = await executeRecordedWrite(operationId, () =>
+    executeUpdate(wcRoot, targetArgs, displayTarget, svnPath, options));
   // 带按钮的冲突提示在互斥锁释放后进行：通知会停留到用户处理，等待期间
   // 不能持有同副本写锁（否则还原/清理/提交等会被「未完成操作」拒绝）。
   if (options.conflictPrompt) {

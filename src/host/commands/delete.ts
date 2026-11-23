@@ -14,7 +14,7 @@ import { format, strings } from '../i18n';
 import { createLineBuffer, decodingRunOptions, logCommand, logExitCode, showOutput } from '../output';
 import { confirmModal } from '../ui/confirm';
 import { resolveWorkingCopyTarget } from './target';
-import { beginDailyWrite, finishDailyWrite, nodeKindFor, targetRelOf } from './dailyCommon';
+import { beginDailyWrite, executeRecordedWrite, nodeKindFor, targetRelOf } from './dailyCommon';
 
 /** 确认框中影响子树的最大列举条目（与提交面板行内删除一致）。 */
 const SUBTREE_LIST_LIMIT = 50;
@@ -75,22 +75,20 @@ export async function commandDelete(uri?: vscode.Uri): Promise<void> {
     return;
   }
 
-  const operationId = await beginDailyWrite(target.wcRoot, relPath, kind);
+  const operationId = await beginDailyWrite(target.wcRoot, relPath, kind, 'delete');
   if (!operationId) {
     return;
   }
   // --force：允许删除本地有修改的条目（确认框已列出影响，与面板行内删除一致）。
   const args = buildDeleteArgs(relPath, { force: true });
-  try {
+  await executeRecordedWrite(operationId, async () => {
     const buffer = createLineBuffer();
     await runOrThrow(svnPath, args, {
       ...runOptions,
       onOutput: (chunk) => buffer.push(chunk),
       onExit: logCommand(svnPath, args, target.wcRoot),
     });
-  } finally {
-    await finishDailyWrite(operationId);
-  }
+  });
   void vscode.window.showInformationMessage(format(strings.deleteOp.done, { path: relPath }));
   showOutput(false);
 }

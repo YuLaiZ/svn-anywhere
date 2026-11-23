@@ -13,7 +13,7 @@ import { readSvnPath, readTimeoutMs } from '../config';
 import { format, strings } from '../i18n';
 import { createLineBuffer, decodingRunOptions, logCommand, logExitCode, showOutput } from '../output';
 import { resolveWorkingCopyTarget } from './target';
-import { beginDailyWrite, finishDailyWrite, nodeKindOf, targetRelOf } from './dailyCommon';
+import { beginDailyWrite, executeRecordedWrite, nodeKindOf, targetRelOf } from './dailyCommon';
 
 export async function commandMove(uri?: vscode.Uri): Promise<void> {
   const target = await resolveWorkingCopyTarget(uri, strings.command.move);
@@ -70,21 +70,21 @@ export async function commandMove(uri?: vscode.Uri): Promise<void> {
     target.wcRoot,
     relPath,
     nodeKindOf(target.targetPath),
+    'move',
+    [relPath, dstArg],
   );
   if (!operationId) {
     return;
   }
   const args = buildMoveArgs(relPath, dstArg);
-  try {
+  await executeRecordedWrite(operationId, async () => {
     const buffer = createLineBuffer();
     await runOrThrow(svnPath, args, {
       ...runOptions,
       onOutput: (chunk) => buffer.push(chunk),
       onExit: logCommand(svnPath, args, target.wcRoot),
     });
-  } finally {
-    await finishDailyWrite(operationId);
-  }
+  });
   void vscode.window.showInformationMessage(
     format(strings.move.done, { src: relPath, dst: dstArg }),
   );

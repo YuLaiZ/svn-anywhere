@@ -522,11 +522,12 @@ async function runVacuumFlow(task: VacuumTask, input: StartVacuumTaskInput, svnP
       ...decodingRunOptions('disk'),
     };
     // 进程已 spawn 即视为命令已发出（§2.1 映射表）：记录转 running 后再等待结束。
+    const dispatch = await registry.markPhase(task.taskId, 'running');
+    if (!dispatch.ok) throw new Error('无法登记 SVN 写入派发状态');
     const runPromise = runOrThrow(svnPath, args, runOptions).then(
       () => undefined as unknown,
       (err: unknown) => err as unknown,
     );
-    await registry.markPhase(task.taskId, 'running').catch(() => undefined);
     const commandError = await runPromise;
     if (commandError !== undefined) {
       // 命令失败（可能部分完成）：failed-unconfirmed 保留至重新检测完成

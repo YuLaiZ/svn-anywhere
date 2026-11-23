@@ -5,7 +5,8 @@
 import * as vscode from 'vscode';
 import { statSync } from 'node:fs';
 import { relative } from 'node:path';
-import { getOperationRegistry } from '../../core/operations';
+import { SvnError } from '../../core/errors';
+import { getOperationRegistry, type BeginOperationParams } from '../../core/operations';
 import { format, strings } from '../i18n';
 import type { WcTarget } from './target';
 
@@ -49,16 +50,14 @@ export async function beginDailyWrite(
   wcRoot: string,
   targetRelPath: string,
   nodeKind: 'file' | 'dir',
+  writeAction: string,
+  explicitPaths: string[] = [targetRelPath],
+  kind: BeginOperationParams['kind'] = 'daily',
 ): Promise<string | undefined> {
   const registry = getOperationRegistry();
-  const held = registry.writeRestriction(wcRoot);
-  if (held) {
-    void vscode.window.showWarningMessage(format(strings.panel.operationHeldBusy, { phase: held.phase }));
-    return undefined;
-  }
-  const begin = await registry.begin({ wcRoot, targetRelPath, nodeKind, kind: 'daily' });
+  await registry.refreshWorkspace(wcRoot);
+  const begin = await registry.begin({ wcRoot, targetRelPath, nodeKind, kind, writeAction, explicitPaths });
   if (!begin.ok) {
-    // 判别联合收窄：busy 分支才有 heldBy（本调用不传 operationId，其他分支不可达）。
     const heldPhase = begin.reason === 'busy' ? begin.heldBy.phase : begin.reason;
     void vscode.window.showWarningMessage(format(strings.panel.operationHeldBusy, { phase: heldPhase }));
     return undefined;
@@ -66,7 +65,20 @@ export async function beginDailyWrite(
   return begin.operationId;
 }
 
-/** 日常写操作登记释放（幂等）。 */
-export async function finishDailyWrite(operationId: string | undefined): Promise<void> {
-  await getOperationRegistry().finish(operationId);
+export async function executeRecordedWrite<T>(operationId: string, run: () => PromiseLike<T>): Promise<T> {
+  const registry = getOperationRegistry();
+  const dispatched = await registry.markPhase(operationId, 'running');
+  if (!dispatched.ok) throw new Error('无法记录 SVN 操作的派发状态');
+  try {
+    const result = await run();
+    await registry.finalizeOperation(operationId, 'done');
+    return result;
+  } catch (error) {
+    if (error instanceof SvnError && ['ENOENT', 'EACCES', 'SPAWN_ERROR'].includes(error.code ?? '')) {
+      await registry.finalizeOperation(operationId, 'failed-unconfirmed');
+    } else {
+      await registry.markPhase(operationId, 'unknown');
+    }
+    throw error;
+  }
 }

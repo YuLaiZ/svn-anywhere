@@ -762,6 +762,8 @@ async function submitIgnore(sessionId: string): Promise<void> {
   const tempDir = mkdtempSync(join(tmpdir(), 'svn-anywhere-ignore-commit-'));
   activeTempDir = tempDir;
   try {
+    const registered = await registry.markPhase(operationId, 'committing', { tempWcPath: tempDir });
+    if (!registered.ok) throw new Error('无法登记提交临时目录');
     const tempWc = join(tempDir, 'wc');
     await checkoutDepthEmpty(svnPath, identity.url, identity.revision, tempWc, {
       ...runOptions(s.wcRoot),
@@ -910,36 +912,41 @@ async function runCoordinationUpdate(
   if (!s) {
     return;
   }
-  const svnPath = readSvnPath();
-  // 协调 update 实际是写命令：命令执行期临时登记运行键（协调态相位本身
-  // 不判 busy，只是 update 实际运行的窗口 hasRunning 命中——P4 扫描不与
-  // 其并发读 wc.db）；命令结束（成功/失败）即清除。
-  await runWithRunningKey(s.wcRoot, () =>
-    coordinateUpdate(svnPath, s.dirArg, {
-      ...runOptions(s.wcRoot),
-      getCredentials: promptForCredentials,
-      onCredentialRetry: (args) => logCommand(svnPath, args, s.wcRoot, 'commit'),
-    }),
-  );
-  if (handle && handle.sessionId !== sessionId) {
-    return;
-  }
-  if (await propertyConflicted(svnPath, s.dirArg, runOptions(s.wcRoot))) {
-    if (keepWorkingValue) {
-      // 用户已核对并决定保留当前工作值：清冲突标记，工作值保留为待提交修改。
-      await resolvePropertyConflict(svnPath, s.dirArg, runOptions(s.wcRoot));
-    } else {
-      await blockCoordination(operationId, revision, pending, strings.ignorePanel.reconcileBlockedConflict);
-      return;
+  const registry = getOperationRegistry();
+  const acquired = await registry.withRecoveryLease(operationId, async () => {
+    const svnPath = readSvnPath();
+    // 协调 update 实际是写命令：命令执行期临时登记运行键（协调态相位本身
+    // 不判 busy，只是 update 实际运行的窗口 hasRunning 命中——P4 扫描不与
+    // 其并发读 wc.db）；命令结束（成功/失败）即清除。
+    await runWithRunningKey(s.wcRoot, () =>
+      coordinateUpdate(svnPath, s.dirArg, {
+        ...runOptions(s.wcRoot),
+        getCredentials: promptForCredentials,
+        onCredentialRetry: (args) => logCommand(svnPath, args, s.wcRoot, 'commit'),
+      }),
+    );
+    if (handle && handle.sessionId !== sessionId) {
+      return true;
     }
-  }
-  // BASE 读回确认：目标节点 BASE 已更新到本次已知提交结果。
-  const base = await readIgnoreSnapshot(svnPath, s.dirArg, { ...runOptions(s.wcRoot), revision: 'BASE' });
-  if (!snapshotEqual(base, pending)) {
-    await blockCoordination(operationId, revision, pending, strings.ignorePanel.reconcileBlockedBase);
-    return;
-  }
-  await finishCoordination(operationId, revision, tempDir);
+    if (await propertyConflicted(svnPath, s.dirArg, runOptions(s.wcRoot))) {
+      if (keepWorkingValue) {
+        // 用户已核对并决定保留当前工作值：清冲突标记，工作值保留为待提交修改。
+        await resolvePropertyConflict(svnPath, s.dirArg, runOptions(s.wcRoot));
+      } else {
+        await blockCoordination(operationId, revision, pending, strings.ignorePanel.reconcileBlockedConflict);
+        return true;
+      }
+    }
+    // BASE 读回确认：目标节点 BASE 已更新到本次已知提交结果。
+    const base = await readIgnoreSnapshot(svnPath, s.dirArg, { ...runOptions(s.wcRoot), revision: 'BASE' });
+    if (!snapshotEqual(base, pending)) {
+      await blockCoordination(operationId, revision, pending, strings.ignorePanel.reconcileBlockedBase);
+      return true;
+    }
+    await finishCoordination(operationId, revision, tempDir);
+    return true;
+  });
+  if (acquired === undefined) throw new Error('其他窗口正在处理同一工作副本，请刷新状态');
 }
 
 /** 协调受阻：保留 revision 与操作记录，写锁定，只允许恢复协调。 */

@@ -395,7 +395,10 @@ export async function readRemoteNode(
   const { revision, ...runOptions } = options;
   const args = buildRemoteInfoArgs(url, revision);
   try {
-    const result = await runOrThrow(svnPath, args, withRemoteAuthScope(url, runOptions));
+    const result = await runOrThrow(svnPath, args, withRemoteAuthScope(url, {
+      ...runOptions,
+      retryReadOnly: runOptions.retryReadOnly ?? (url.startsWith('file:') ? undefined : {}),
+    }));
     const parsed = parseRemoteInfoXml(result.stdout);
     if (!parsed) {
       return {
@@ -696,23 +699,22 @@ export async function readRemoteDirectory(
   const { revision, maxEntries, maxXmlBytes, ...runOptions } = options;
   const parser = new DirectoryListParser({ maxEntries, maxXmlBytes });
   const args = buildRemoteListArgs(url, revision);
-  const scoped = withRemoteAuthScope(url, runOptions);
-  const streamOptions: RunOptions = {
-    ...scoped,
-    onCredentialRetry: (retryArgs) => {
-      parser.reset();
-      return scoped.onCredentialRetry?.(retryArgs);
-    },
-  };
+  const scoped = withRemoteAuthScope(url, {
+      ...runOptions,
+      retryReadOnly: runOptions.retryReadOnly ?? (url.startsWith('file:') ? undefined : {}),
+    });
   try {
     await runOrThrowWithRunner(
       svnPath,
       args,
-      streamOptions,
-      (runnerPath, runnerArgs, runnerOptions = {}) => runStream(runnerPath, runnerArgs, {
-        ...runnerOptions,
-        onStdoutChunk: (chunk) => parser.write(chunk),
-      }),
+      scoped,
+      (runnerPath, runnerArgs, runnerOptions = {}) => {
+        parser.reset();
+        return runStream(runnerPath, runnerArgs, {
+          ...runnerOptions,
+          onStdoutChunk: (chunk) => parser.write(chunk),
+        });
+      },
     );
     let listing: BrowseDirectoryListing;
     try {
@@ -939,23 +941,22 @@ export async function readRemoteDirectoryNames(
   const { revision, maxEntries, maxXmlBytes, ...runOptions } = options;
   const parser = new DirectoryNameListParser({ maxEntries, maxXmlBytes });
   const args = buildRemoteNameListArgs(url, revision);
-  const scoped = withRemoteAuthScope(url, runOptions);
-  const streamOptions: RunOptions = {
-    ...scoped,
-    onCredentialRetry: (retryArgs) => {
-      parser.reset();
-      return scoped.onCredentialRetry?.(retryArgs);
-    },
-  };
+  const scoped = withRemoteAuthScope(url, {
+      ...runOptions,
+      retryReadOnly: runOptions.retryReadOnly ?? (url.startsWith('file:') ? undefined : {}),
+    });
   try {
     await runOrThrowWithRunner(
       svnPath,
       args,
-      streamOptions,
-      (runnerPath, runnerArgs, runnerOptions = {}) => runStream(runnerPath, runnerArgs, {
-        ...runnerOptions,
-        onStdoutChunk: (chunk) => parser.write(chunk),
-      }),
+      scoped,
+      (runnerPath, runnerArgs, runnerOptions = {}) => {
+        parser.reset();
+        return runStream(runnerPath, runnerArgs, {
+          ...runnerOptions,
+          onStdoutChunk: (chunk) => parser.write(chunk),
+        });
+      },
     );
     let listing: BrowseDirectoryNames;
     try {

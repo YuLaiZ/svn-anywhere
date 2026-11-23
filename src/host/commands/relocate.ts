@@ -13,6 +13,7 @@ import { decodingRunOptions, logCommand, logExitCode, logLine, showOutput } from
 import { resolveWorkingCopyTarget } from './target';
 import { confirmModal } from '../ui/confirm';
 import { promptForCredentials } from '../auth';
+import { beginDailyWrite, executeRecordedWrite } from './dailyCommon';
 
 export async function commandRelocate(uri?: vscode.Uri): Promise<void> {
   const target = await resolveWorkingCopyTarget(uri, strings.command.relocate);
@@ -55,9 +56,11 @@ export async function commandRelocate(uri?: vscode.Uri): Promise<void> {
     return;
   }
 
+  const operationId = await beginDailyWrite(target.wcRoot, '.', 'dir', 'relocate', ['.'], 'relocate');
+  if (!operationId) return;
   const args = buildRelocateArgs(trimmedUrl, target.wcRoot);
   try {
-    await vscode.window.withProgress(
+    await executeRecordedWrite(operationId, () => vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Notification,
         title: format(strings.relocate.progress, { wcRoot: target.wcRoot }),
@@ -73,7 +76,7 @@ export async function commandRelocate(uri?: vscode.Uri): Promise<void> {
         });
         logLine(result.stdout.trim());
       },
-    );
+    ));
   } catch (err) {
     // 换仓库是最常见的失败原因，给出针对性提示而不是泛用错误框。
     const message = err instanceof Error ? err.message : String(err);

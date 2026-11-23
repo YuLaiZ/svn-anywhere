@@ -6,7 +6,7 @@ import * as vscode from 'vscode';
 import { statSync } from 'node:fs';
 import { dirname, relative } from 'node:path';
 import { runOrThrow } from '../../core/svnCli';
-import { getOperationRegistry } from '../../core/operations';
+import { beginDailyWrite, executeRecordedWrite } from './dailyCommon';
 import { escapePeg } from '../../core/workspace';
 import { readSvnPath, readTimeoutMs } from '../config';
 import { format, strings } from '../i18n';
@@ -40,27 +40,11 @@ export async function commandCleanup(uri?: vscode.Uri): Promise<void> {
   } catch {
     // 保留原路径
   }
-  // 注册表互斥：同一副本有在途/受限操作（提交中/结果未知/待协调）时拒绝清理。
-  const registry = getOperationRegistry();
-  const held = registry.writeRestriction(target.wcRoot);
-  if (held) {
-    void vscode.window.showWarningMessage(format(strings.panel.operationHeldBusy, { phase: held.phase }));
-    return;
-  }
-  const begin = await registry.begin({ wcRoot: target.wcRoot, targetRelPath: '.', nodeKind: 'dir', kind: 'cleanup' });
-  if (!begin.ok) {
-    // 判别联合收窄：busy 分支才有 heldBy（本调用不传 operationId，其他分支不可达）。
-    const heldPhase = begin.reason === 'busy' ? begin.heldBy.phase : begin.reason;
-    void vscode.window.showWarningMessage(format(strings.panel.operationHeldBusy, { phase: heldPhase }));
-    return;
-  }
-  const targetArg = escapePeg(relative(target.wcRoot, cleanupTarget));
-  const args = ['cleanup', targetArg];
-  try {
-    await runCleanup(svnPath, args, target, cleanupTarget);
-  } finally {
-    await registry.finish(begin.operationId);
-  }
+  const rel = relative(target.wcRoot, cleanupTarget) || '.';
+  const operationId = await beginDailyWrite(target.wcRoot, rel, 'dir', 'cleanup', [rel], 'cleanup');
+  if (!operationId) return;
+  await executeRecordedWrite(operationId, () =>
+    runCleanup(svnPath, ['cleanup', escapePeg(rel)], target, cleanupTarget));
 }
 
 async function runCleanup(
@@ -75,10 +59,14 @@ async function runCleanup(
       title: format(strings.cleanup.progress, { target: target.targetPath }),
       cancellable: true,
     },
-    async () => {
+    async (_progress, token) => {
+      const abort = new AbortController();
+      token.onCancellationRequested(() => abort.abort());
+      if (token.isCancellationRequested) abort.abort();
       const buffer = createLineBuffer();
       await runOrThrow(svnPath, args, {
         cwd: target.wcRoot,
+        signal: abort.signal,
         timeoutMs: readTimeoutMs(),
         ...decodingRunOptions('other'),
         onOutput: (chunk) => buffer.push(chunk),

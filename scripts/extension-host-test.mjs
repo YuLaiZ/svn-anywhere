@@ -400,7 +400,8 @@ async function main() {
     encoding: 'utf8',
     timeout: options.timeoutMs,
     maxBuffer: 32 * 1024 * 1024,
-    env: { ...process.env, M4_EXT_HOST_OUT: outDir, M4_EXT_HOST_RUN_ID: runId },
+    env: { ...process.env, M4_EXT_HOST_OUT: outDir, M4_EXT_HOST_RUN_ID: runId,
+      SVN_ANYWHERE_STATE_DIR: process.env.SVN_ANYWHERE_STATE_DIR || join(outDir, 'operation-state') },
   });
   // CLI 已返回不代表测试结束（macOS 上通常是异步执行），轮询到总超时预算耗尽。
   const wait = await waitForResult(resultPath, startedAt + options.timeoutMs, runId);

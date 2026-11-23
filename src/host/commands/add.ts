@@ -11,7 +11,7 @@ import { readSvnPath, readTimeoutMs } from '../config';
 import { format, strings } from '../i18n';
 import { createLineBuffer, decodingRunOptions, logCommand, logExitCode, showOutput } from '../output';
 import { resolveWorkingCopyTarget } from './target';
-import { beginDailyWrite, finishDailyWrite, nodeKindFor, targetRelOf } from './dailyCommon';
+import { beginDailyWrite, executeRecordedWrite, nodeKindFor, targetRelOf } from './dailyCommon';
 
 export async function commandAdd(uri?: vscode.Uri): Promise<void> {
   const target = await resolveWorkingCopyTarget(uri, strings.command.add);
@@ -37,22 +37,20 @@ export async function commandAdd(uri?: vscode.Uri): Promise<void> {
   }
   const kind = nodeKindFor(relPath, target.targetPath, status.entries);
 
-  const operationId = await beginDailyWrite(target.wcRoot, relPath, kind);
+  const operationId = await beginDailyWrite(target.wcRoot, relPath, kind, 'add');
   if (!operationId) {
     return;
   }
   // 目录递归添加（忽略模式由 svn 按 CLI 语义处理）；A 行流式进输出频道。
   const args = buildAddArgs(relPath, { parents: true });
-  try {
+  await executeRecordedWrite(operationId, async () => {
     const buffer = createLineBuffer();
     await runOrThrow(svnPath, args, {
       ...runOptions,
       onOutput: (chunk) => buffer.push(chunk),
       onExit: logCommand(svnPath, args, target.wcRoot),
     });
-  } finally {
-    await finishDailyWrite(operationId);
-  }
+  });
   void vscode.window.showInformationMessage(format(strings.add.done, { path: relPath }));
   showOutput(false);
 }

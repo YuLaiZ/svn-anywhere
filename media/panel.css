@@ -1547,3 +1547,24 @@ button.th-sort.active { color: var(--vscode-textLink-foreground, var(--vscode-fo
   .batch-summary { grid-template-columns: 1fr; }
   .batch-summary dd { margin-bottom: 2px; }
 }
+
+.directory-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(86px, .55fr) minmax(104px, .65fr);
+  align-items: center;
+  gap: 5px 10px;
+  padding: 7px 2px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+.directory-path { display: flex; align-items: center; gap: 5px; min-width: 0; overflow-wrap: anywhere; }
+.directory-path[data-directory-level="1"] { padding-left: 7px; }
+.directory-path[data-directory-level="2"] { padding-left: 14px; }
+.directory-path[data-directory-level="3"] { padding-left: 21px; }
+.directory-path[data-directory-level="4"] { padding-left: 28px; }
+.directory-field select { min-width: 0; max-width: 100%; }
+.directory-field input[type="checkbox"] { justify-self: start; }
+.directory-current { overflow-wrap: anywhere; }
+@media (max-width: 420px) {
+  .directory-field { grid-template-columns: minmax(0, 1fr) minmax(98px, .55fr); }
+  .directory-current { grid-row: 2; grid-column: 1 / -1; }
+}

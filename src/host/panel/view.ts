@@ -883,9 +883,12 @@ function renderConfirmDialog(state: PanelState): string {
         .map((line) => `<p>${escapeHtml(line)}</p>`)
         .join('');
   const cancelLabel = dialog.cancelLabel ?? strings.panel.dismiss;
+  const cancelFocus = dialog.cancelFocusIntent
+    ? ` data-cancel-focus-intent="${escapeHtml(dialog.cancelFocusIntent)}"`
+    : '';
   const level = dialog.level === 'warn' ? ' warn' : '';
   return (
-    `<div class="modal-backdrop" data-confirm-dialog-id="${escapeHtml(dialog.id)}">` +
+    `<div class="modal-backdrop" data-confirm-dialog-id="${escapeHtml(dialog.id)}"${cancelFocus}>` +
     `<section class="confirm-dialog${level}" role="dialog" aria-modal="true" aria-labelledby="${escapeHtml(titleId)}">` +
     `<h2 id="${escapeHtml(titleId)}">${escapeHtml(dialog.title)}</h2>${detail}` +
     `<div class="confirm-actions">` +
@@ -1309,6 +1312,17 @@ function renderForm(state: PanelState, locked: boolean): string {
     } else {
       control = `<input type="text" value="${escapeHtml(field.value)}" ${common}${disabled} aria-label="${escapeHtml(field.label)}">`;
       fieldHtml = `<div class="message-row"><label class="message-label" for="field-${escapeHtml(field.id)}">${escapeHtml(field.label)}</label></div>${control}`;
+    }
+    if (field.directory) {
+      const directory = field.directory;
+      const level = Math.max(0, Math.min(directory.level ?? 0, 16));
+      const toggle = directory.toggle ? renderActionButton(directory.toggle, {
+        intent: directory.toggle.id, argName: '', argValue: '', extraId: field.id,
+        gated: gateViewDisabled(state, directory.toggle.id),
+      }) : '';
+      return `<div class="directory-field"><div class="directory-path" data-directory-level="${level}">${toggle}` +
+        `<span title="${escapeHtml(field.label)}">${escapeHtml(directory.name)}</span></div>` +
+        `<span class="muted directory-current">${escapeHtml(directory.current)}</span>${control}</div>`;
     }
     const help = field.type !== 'textarea' && field.help ? `<p class="muted">${escapeHtml(field.help)}</p>` : '';
     const error = field.error ? `<p class="field-error">${escapeHtml(field.error)}</p>` : '';

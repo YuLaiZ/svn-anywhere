@@ -239,6 +239,15 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
         // P6 行选中只更新详情，不改变勾选集合。
         sendIntent({ kind: 'selectHistoryRevision', id: holder.dataset.rowId ?? '' });
         return;
+      case 'setDepthTab':
+        sendIntent({ kind: intent, tab: holder.dataset.tabId ?? '' });
+        return;
+      case 'toggleDepthNode':
+        sendIntent({ kind: intent, nodeId: holder.dataset.nodeId ?? '' });
+        return;
+      case 'applyDepthPreview':
+        sendIntent({ kind: intent, previewId: holder.dataset.previewId ?? '' });
+        return;
       case 'setConflictTab':
         // P7 分组 tab 只传 tab ID（协议字段 tab），冲突分组语义由宿主解释。
         sendIntent({ kind: 'setConflictTab', tab: holder.dataset.tabId ?? '' });
@@ -355,6 +364,12 @@ export function mountPanel(doc: Document, api: WebviewApi): PanelApp {
     );
     if (backdrop) {
       backdrop.hidden = true;
+      const focusIntent = backdrop.dataset.cancelFocusIntent;
+      if (focusIntent) {
+        root.querySelector<HTMLButtonElement>(
+          `button[data-intent="${cssEscape(focusIntent)}"]:enabled`,
+        )?.focus();
+      }
     }
   };
 

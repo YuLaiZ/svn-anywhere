@@ -22,6 +22,10 @@
  *   安全重跑分支。
  */
 import { join } from 'node:path';
+import {
+  FileOperationStore, WorkspaceLocks, overlappingWorkspaces, registerWorkspaceLease,
+  registerWorkspaceLeaseAlias, releaseWorkspaceLease,
+} from './workspaceLock';
 import type { ConflictKind } from './conflict';
 
 /** 操作状态机：M2 提交语义相位 + M3 新增的命令执行与残留核验相位。 */
@@ -54,7 +58,9 @@ export type OperationKind =
   | 'cleanup'
   | 'daily'
   | 'history-update'
-  | 'resolve';
+  | 'resolve'
+  | 'relocate'
+  | 'depth-edit';
 
 /** P2 单属性提交的属性载荷：原始/待提交属性的存在与值（值按行原样保留）。 */
 export interface PropertyRecord {
@@ -144,6 +150,29 @@ export interface PristineBefore {
   missingCount: number | null;
 }
 
+export type SparseDepth = 'exclude' | 'empty' | 'files' | 'immediates' | 'infinity';
+
+export interface DepthOperationStep {
+  path: string;
+  depth: SparseDepth;
+  beforeDepth: SparseDepth | null;
+  expectedUrl: string;
+  beforeFingerprint: string;
+  expectedFingerprint: string;
+}
+
+export interface DepthOperationIntent {
+  scopePath: string;
+  revision: number;
+  uuid: string;
+  steps: DepthOperationStep[];
+}
+
+export interface DepthOperationProgress {
+  verified: number;
+  dispatching?: number;
+}
+
 /** 持久化的操作记录。不含密码/凭据。M3/M4 新增字段一律可选（旧记录没有）。 */
 export interface OperationRecord {
   operationId: string;
@@ -163,6 +192,9 @@ export interface OperationRecord {
   property?: PropertyRecord;
   /** P1 批次与显式路径。 */
   explicitPaths?: string[];
+  depthIntent?: DepthOperationIntent;
+  depthProgress?: DepthOperationProgress;
+  writeAction?: string;
   /** 拆批提交中已确认成功的路径（每批追加，与 knownRevisions 同步落盘）：
    * 结果未知核实「已提交」时据此精确回显，不随全量显式路径夸大。 */
   committedPaths?: string[];
@@ -241,10 +273,11 @@ const WRITE_RESTRICTED_PHASES: Readonly<Record<OperationKind, ReadonlySet<Operat
   // 写 kind：写命令前 begin、结果未决时 unknown 冻结（写锁与操作记录契约）。
   'history-update': new Set(['prepared', 'running', 'unknown']),
   resolve: new Set(['prepared', 'running', 'unknown']),
-  // M1 命令成功/失败都 finally finish、无未知态相位：恒空。
-  update: new Set(),
-  cleanup: new Set(),
-  daily: new Set(),
+  update: new Set(['running', 'unknown']),
+  cleanup: new Set(['running', 'unknown']),
+  daily: new Set(['running', 'unknown']),
+  relocate: new Set(['running', 'unknown']),
+  'depth-edit': new Set(['prepared', 'running', 'unknown']),
 };
 
 /** kind → 在途相位集合（进程内运行登记与首载陈旧化分诊的判定口径）。 */
@@ -256,9 +289,11 @@ const RUNNING_PHASES: Readonly<Record<OperationKind, ReadonlySet<OperationPhase>
   vacuum: new Set(['prepared', 'running']),
   'history-update': new Set(['prepared', 'running']),
   resolve: new Set(['prepared', 'running']),
-  update: new Set(['prepared']),
-  cleanup: new Set(['prepared']),
-  daily: new Set(['prepared']),
+  update: new Set(['prepared', 'running']),
+  cleanup: new Set(['prepared', 'running']),
+  daily: new Set(['prepared', 'running']),
+  relocate: new Set(['prepared', 'running']),
+  'depth-edit': new Set(['prepared', 'running']),
 };
 
 /** kind → begin busy 拦截口径（active 收窄维度）= 在途相位 ∪ 限制写相位。 */
@@ -274,9 +309,11 @@ const BUSY_PHASES: Readonly<Record<OperationKind, ReadonlySet<OperationPhase>>> 
   vacuum: new Set(['prepared', 'running', 'unknown']),
   'history-update': new Set(['prepared', 'running', 'unknown']),
   resolve: new Set(['prepared', 'running', 'unknown']),
-  update: new Set(['prepared']),
-  cleanup: new Set(['prepared']),
-  daily: new Set(['prepared']),
+  update: new Set(['prepared', 'running', 'unknown']),
+  cleanup: new Set(['prepared', 'running', 'unknown']),
+  daily: new Set(['prepared', 'running', 'unknown']),
+  relocate: new Set(['prepared', 'running', 'unknown']),
+  'depth-edit': new Set(['prepared', 'running', 'unknown']),
 };
 
 /** markPhase patch 按 kind 的可变字段白名单（M2 基础集合 + import 增量）。 */
@@ -296,6 +333,8 @@ const PATCHABLE_FIELDS: Readonly<Record<OperationKind, ReadonlySet<string>>> = {
   'history-update': new Set(['baseRevision', 'resolvedRevision']),
   // resolve：固定意图只读，不放宽 patch——无任何可变字段。
   resolve: new Set(),
+  relocate: new Set(),
+  'depth-edit': new Set(['depthProgress']),
 };
 
 /** 该记录是否限制同一互斥键上的新写操作（按 kind×phase 矩阵判定）。 */
@@ -345,6 +384,8 @@ export interface BeginOperationParams {
   baseRevision?: number;
   property?: OperationRecord['property'];
   explicitPaths?: string[];
+  depthIntent?: DepthOperationIntent;
+  writeAction?: string;
   now?: number;
   /* ---------------- M3 接口增量：kind/lockKey/operationId 与全部固定字段。
    * begin 把传入 lockKey 与各固定字段原样复制进记录（可选参数不传即不写
@@ -394,6 +435,7 @@ export interface MarkPhasePatch {
   committedPaths?: string[];
   outcome?: 'merged';
   resolvedRevision?: number;
+  depthProgress?: DepthOperationProgress;
 }
 
 /** markPhase 结果：成功返回改写后记录；占用冲突带持有者；记录缺失为 missing。 */
@@ -430,9 +472,38 @@ export class OperationRegistry {
   private readonly active = new Map<string, OperationRecord>();
   /** 全部未完成记录（含历史限制与 residue-pending），供恢复与查询。 */
   private readonly records = new Map<string, OperationRecord>();
+  private readonly starting = new Map<string, OperationRecord>();
+  private readonly heldLeases = new Set<string>();
+  private readonly recovering = new Set<string>();
+  private readonly transitioning = new Set<string>();
 
-  constructor(store?: OperationStore) {
+  constructor(store?: OperationStore, private readonly locks?: WorkspaceLocks) {
     this.store = store;
+  }
+
+  private takeLease(record: OperationRecord): boolean {
+    if (!this.locks || this.heldLeases.has(record.operationId)) return true;
+    const lease = this.locks.acquire(lockKeyOf(record));
+    if (!lease) return false;
+    registerWorkspaceLease(record.operationId, lease);
+    this.heldLeases.add(record.operationId);
+    if (record.tempWcPath) registerWorkspaceLeaseAlias(record.operationId, record.tempWcPath);
+    return true;
+  }
+
+  private releaseLease(operationId: string): void {
+    if (this.heldLeases.delete(operationId)) releaseWorkspaceLease(operationId);
+  }
+
+  private conflicts(key: string, record: OperationRecord): boolean {
+    return key === lockKeyOf(record) || (!!this.locks && overlappingWorkspaces(key, lockKeyOf(record)));
+  }
+
+  /** 在取得内核锁后读取其他窗口的未决结果。 */
+  private async conflictingRecord(key: string, except?: string): Promise<OperationRecord | undefined> {
+    if (!this.locks) return undefined;
+    const records = await this.store?.load() ?? [];
+    return records.find((record) => record.operationId !== except && blocksBegin(record) && this.conflicts(key, record));
   }
 
   /**
@@ -452,7 +523,7 @@ export class OperationRegistry {
    * markPhase 终态与 finish 之间）顺带 finish 清理——M2 kind 的终态记录
    * 维持源码现状（跳过但保留在 globalState）。
    */
-  async loadPending(): Promise<void> {
+  async loadPending(workspaceKey?: string): Promise<void> {
     if (!this.store) {
       return;
     }
@@ -462,6 +533,7 @@ export class OperationRegistry {
     for (const record of loaded) {
       const kind = kindOf(record);
       const key = lockKeyOf(record);
+      if (workspaceKey && !this.conflicts(workspaceKey, record)) continue;
       if (record.phase === 'done' || record.phase === 'failed-unconfirmed') {
         if (
           kind === 'checkout' ||
@@ -477,8 +549,12 @@ export class OperationRegistry {
       }
       this.records.set(record.operationId, record);
       const inFlight = RUNNING_PHASES[kind].has(record.phase);
+      if (this.locks && inFlight && (runningOperations.has(key) || !this.takeLease(record))) {
+        if (blocksBegin(record) && !this.active.has(key)) this.active.set(key, record);
+        continue;
+      }
       if (inFlight && !runningOperations.has(key)) {
-        if (kind === 'update' || kind === 'cleanup' || kind === 'daily') {
+        if (!this.locks && record.phase === 'prepared' && !record.writeAction && (kind === 'update' || kind === 'cleanup' || kind === 'daily')) {
           // M1 命令可安全重跑：转终态后随即移除，不冒充任何结论。
           await this.markPhase(record.operationId, 'failed-unconfirmed');
           await this.finish(record.operationId);
@@ -486,12 +562,10 @@ export class OperationRegistry {
           (triageLogSink ?? ((message: string) => console.log(message)))(line);
           continue;
         }
-        const folded: OperationPhase = kind === 'checkout' ? 'residue-pending' : 'unknown';
+        const folded: OperationPhase = kind === 'checkout' || (kind === 'depth-edit' && record.depthProgress?.dispatching === undefined)
+          ? 'residue-pending' : 'unknown';
         const result = await this.markPhase(record.operationId, folded);
-        if (!result.ok && result.reason === 'conflict') {
-          // 同键已有更新的持有者：较旧记录跳过折算（保留在 records 供查询）。
-          continue;
-        }
+        if (!result.ok) this.releaseLease(record.operationId);
         continue;
       }
       // active 收窄（幂等）：只有按矩阵产生 busy/写限制的记录进入 active。
@@ -513,18 +587,12 @@ export class OperationRegistry {
    */
   async begin(params: BeginOperationParams): Promise<BeginResult> {
     const key = params.lockKey ?? params.wcRoot;
-    const heldBy = this.active.get(key);
-    if (heldBy && blocksBegin(heldBy)) {
-      return { ok: false, reason: 'busy', heldBy };
-    }
-    let operationId = params.operationId;
-    if (operationId) {
-      const existing = this.store ? await this.store.load() : [...this.records.values()];
-      if (existing.some((item) => item.operationId === operationId) || this.records.has(operationId)) {
-        return { ok: false, reason: 'idConflict' };
-      }
-    } else {
-      operationId = randomOperationId();
+    const reserved = [...this.starting.values()].find((record) => this.conflicts(key, record));
+    const heldBy = reserved ?? (!this.locks ? this.active.get(key) : undefined);
+    if (heldBy && blocksBegin(heldBy)) return { ok: false, reason: 'busy', heldBy };
+    const operationId = params.operationId ?? randomOperationId();
+    if (this.heldLeases.has(operationId) || [...this.starting.values()].some((record) => record.operationId === operationId)) {
+      return { ok: false, reason: 'idConflict' };
     }
     const record: OperationRecord = {
       operationId,
@@ -537,6 +605,8 @@ export class OperationRegistry {
       baseRevision: params.baseRevision,
       property: params.property,
       explicitPaths: params.explicitPaths,
+      depthIntent: params.depthIntent,
+      writeAction: params.writeAction,
       phase: 'prepared',
       knownRevisions: [],
       updatedAt: params.now ?? Date.now(),
@@ -554,12 +624,31 @@ export class OperationRegistry {
       historyUpdateIntent: params.historyUpdateIntent,
       resolveIntent: params.resolveIntent,
     };
-    await this.store?.save(record);
-    this.records.set(record.operationId, record);
-    this.active.set(key, record);
-    // prepared 是全部 kind 的在途相位：begin 成功即登记运行键。
-    runningOperations.add(key);
-    return { ok: true, operationId: record.operationId, record };
+    this.starting.set(key, record);
+    let started = false;
+    try {
+      if (this.records.has(operationId) && !this.locks) return { ok: false, reason: 'idConflict' };
+      if (!this.takeLease(record)) {
+        const heldBy = await this.conflictingRecord(key);
+        return { ok: false, reason: 'busy', heldBy: heldBy ?? record };
+      }
+      const external = await this.conflictingRecord(key);
+      if (external) return { ok: false, reason: 'busy', heldBy: external };
+      if (params.operationId) {
+        const existing = this.store ? await this.store.load() : [...this.records.values()];
+        if (existing.some((item) => item.operationId === operationId) ||
+            (this.records.has(operationId) && !this.locks)) return { ok: false, reason: 'idConflict' };
+      }
+      await this.store?.save(record);
+      this.records.set(operationId, record);
+      this.active.set(key, record);
+      runningOperations.add(key);
+      started = true;
+      return { ok: true, operationId, record };
+    } finally {
+      this.starting.delete(key);
+      if (!started) this.releaseLease(operationId);
+    }
   }
 
   /**
@@ -587,36 +676,59 @@ export class OperationRegistry {
       ...filtered,
       knownRevisions: filtered.knownRevisions ?? record.knownRevisions,
       phase,
-      updatedAt: now ?? Date.now(),
+      updatedAt: now ?? Math.max(Date.now(), record.updatedAt + 1),
     };
     const key = lockKeyOf(next);
     const restrictedTarget = blocksBegin(next);
-    if (restrictedTarget) {
-      const held = this.active.get(key);
-      if (held && held.operationId !== operationId) {
-        return { ok: false, reason: 'conflict', heldBy: held };
+    if (this.transitioning.has(operationId)) return { ok: false, reason: 'conflict', heldBy: record };
+    this.transitioning.add(operationId);
+    const alreadyHeld = this.heldLeases.has(operationId);
+    try {
+      if (!this.takeLease(record)) return { ok: false, reason: 'conflict', heldBy: record };
+      if (this.locks && !alreadyHeld) {
+        const latest = (await this.store?.load())?.find((item) => item.operationId === operationId);
+        if (!latest) return { ok: false, reason: 'missing' };
+        if (latest.phase !== record.phase || latest.updatedAt !== record.updatedAt) {
+          return { ok: false, reason: 'conflict', heldBy: latest };
+        }
+        const external = await this.conflictingRecord(key, operationId);
+        if (external) return { ok: false, reason: 'conflict', heldBy: external };
+      }
+      if (restrictedTarget) {
+        const held = this.active.get(key);
+        if (held && held.operationId !== operationId) {
+          return { ok: false, reason: 'conflict', heldBy: held };
+        }
+      }
+      await this.store?.save(next);
+      if (next.tempWcPath) registerWorkspaceLeaseAlias(operationId, next.tempWcPath);
+      this.records.set(operationId, next);
+      if (restrictedTarget) {
+        this.active.set(key, next);
+      } else if (this.active.get(key)?.operationId === operationId) {
+        this.active.delete(key);
+      }
+      // 运行登记双向挂钩：转入在途相位补登记（覆盖续检 markPhase('running')——
+      // residue-pending 期间登记已清）；转出在途相位清除（同会话进入 unknown/
+      // 协调态后不调 finish，清除必须挂 markPhase，否则键残留、P4 永久 busy）。
+      const wasRunning = RUNNING_PHASES[kind].has(record.phase);
+      const isRunning = RUNNING_PHASES[kind].has(phase);
+      if (isRunning) {
+        runningOperations.add(key);
+      } else if (wasRunning) {
+        // 仅当该记录确在在途时清除：residue-pending 等非在途记录本就未登记，
+        // 不会误清同键另一在途记录的登记（在途必在 active、同键唯一持有）。
+        runningOperations.delete(key);
+      }
+      return { ok: true, record: next };
+    } finally {
+      this.transitioning.delete(operationId);
+      const current = this.records.get(operationId);
+      if (!this.recovering.has(operationId) &&
+          (!current || !RUNNING_PHASES[kind].has(current.phase) || (!alreadyHeld && current === record))) {
+        this.releaseLease(operationId);
       }
     }
-    this.records.set(operationId, next);
-    if (restrictedTarget) {
-      this.active.set(key, next);
-    } else if (this.active.get(key)?.operationId === operationId) {
-      this.active.delete(key);
-    }
-    // 运行登记双向挂钩：转入在途相位补登记（覆盖续检 markPhase('running')——
-    // residue-pending 期间登记已清）；转出在途相位清除（同会话进入 unknown/
-    // 协调态后不调 finish，清除必须挂 markPhase，否则键残留、P4 永久 busy）。
-    const wasRunning = RUNNING_PHASES[kind].has(record.phase);
-    const isRunning = RUNNING_PHASES[kind].has(phase);
-    if (isRunning) {
-      runningOperations.add(key);
-    } else if (wasRunning) {
-      // 仅当该记录确在在途时清除：residue-pending 等非在途记录本就未登记，
-      // 不会误清同键另一在途记录的登记（在途必在 active、同键唯一持有）。
-      runningOperations.delete(key);
-    }
-    await this.store?.save(next);
-    return { ok: true, record: next };
   }
 
   /**
@@ -633,8 +745,8 @@ export class OperationRegistry {
     patch: MarkPhasePatch = {},
     now?: number,
   ): Promise<void> {
-    await this.markPhase(operationId, phase, patch, now);
-    await this.finish(operationId);
+    const result = await this.markPhase(operationId, phase, patch, now);
+    if (result.ok) await this.finish(operationId);
   }
 
   /** 操作彻底结束（协调完成等）后移除记录；幂等；未登记的 ID 忽略。 */
@@ -643,7 +755,13 @@ export class OperationRegistry {
       return;
     }
     const record = this.records.get(operationId);
-    if (record) {
+    if (!record || !this.takeLease(record)) return;
+    try {
+      if (this.locks) {
+        const current = (await this.store?.load())?.find((item) => item.operationId === operationId);
+        if (current && (current.phase !== record.phase || current.updatedAt !== record.updatedAt)) return;
+      }
+      await this.store?.remove(operationId);
       const key = lockKeyOf(record);
       if (this.active.get(key)?.operationId === operationId) {
         this.active.delete(key);
@@ -652,14 +770,44 @@ export class OperationRegistry {
         runningOperations.delete(key);
       }
       this.records.delete(operationId);
+    } finally {
+      this.releaseLease(operationId);
     }
-    await this.store?.remove(operationId);
+  }
+
+  async withRecoveryLease<T>(operationId: string, work: (record: OperationRecord) => Promise<T>): Promise<T | undefined> {
+    const record = this.records.get(operationId);
+    if (!record || this.recovering.has(operationId) || this.hasRunning(lockKeyOf(record))) return undefined;
+    this.recovering.add(operationId);
+    try {
+      if (!this.takeLease(record)) return undefined;
+      if (this.locks) {
+        const latest = (await this.store?.load())?.find((item) => item.operationId === operationId);
+        if (!latest || latest.phase !== record.phase || latest.updatedAt !== record.updatedAt) return undefined;
+        if (await this.conflictingRecord(lockKeyOf(record), operationId)) return undefined;
+      }
+      return await work(record);
+    } finally {
+      this.recovering.delete(operationId);
+      this.releaseLease(operationId);
+    }
+  }
+
+  async refreshWorkspace(key: string): Promise<void> {
+    if (!this.locks || this.hasRunning(key)) return;
+    for (const record of this.records.values()) {
+      if (!this.conflicts(key, record) || this.hasRunning(lockKeyOf(record)) || this.recovering.has(record.operationId)) continue;
+      this.records.delete(record.operationId);
+      if (this.active.get(lockKeyOf(record))?.operationId === record.operationId) this.active.delete(lockKeyOf(record));
+    }
+    await this.loadPending(key);
   }
 
   /** 查询互斥键当前是否处于写限制（unknown/待协调/在途提交等，按 kind×phase）。 */
   writeRestriction(wcRoot: string): OperationRecord | undefined {
     const held = this.active.get(wcRoot);
-    return held && restrictsWrite(held) ? held : undefined;
+    if (held && restrictsWrite(held)) return held;
+    return this.locks ? [...this.active.values()].find((record) => restrictsWrite(record) && this.conflicts(wcRoot, record)) : undefined;
   }
 
   /** 互斥键上未完成的全部记录（含限制态与 residue-pending），供恢复入口展示。 */
@@ -771,7 +919,32 @@ export function setOperationTriageLogSink(sink: ((line: string) => void) | undef
  * 用宿主 globalState 构造操作存储并初始化全局注册表：activate 时调用。
  * loadPending 的 active 收窄幂等、对运行登记中的键跳过陈旧化，重跑无害。
  */
-export async function initializeOperationStore(memento: MementoLike): Promise<void> {
+export async function initializeOperationStore(
+  memento: MementoLike,
+  shared?: { directory: string; helper: string },
+): Promise<void> {
+  if (shared) {
+    const locks = new WorkspaceLocks(join(shared.directory, 'locks'), shared.helper);
+    const store = new FileOperationStore(join(shared.directory, 'operations'));
+    const legacy = memento.get<OperationRecord[]>(OPERATIONS_KEY, []);
+    const migrated = new Set(memento.get<string[]>(OPERATIONS_KEY + '.migrated', []));
+    for (const record of legacy) {
+      if (migrated.has(record.operationId)) continue;
+      const lease = locks.acquire(lockKeyOf(record));
+      if (!lease) continue;
+      try {
+        if (!(await store.load()).some((item) => item.operationId === record.operationId)) await store.save(record);
+        migrated.add(record.operationId);
+        await memento.update(OPERATIONS_KEY + '.migrated', [...migrated]);
+      } finally {
+        lease.close();
+      }
+    }
+    const registry = new OperationRegistry(store, locks);
+    await registry.loadPending();
+    setGlobalOperationRegistry(registry);
+    return;
+  }
   const store: OperationStore = {
     load: () => memento.get<OperationRecord[]>(OPERATIONS_KEY, []),
     async save(record) {
